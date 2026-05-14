@@ -29,8 +29,7 @@ add_custom_command(
         "${GENERATED_DIR}/cart_info_reader.h"
         "${GENERATED_DIR}/cart_config_reader.h"
         "${GENERATED_DIR}/flatbuffers_common_reader.h"
-        "${GENERATED_DIR}/flatbuffers_common_builder.h"
-    COMMAND "$<TARGET_FILE:flatcc_cli>" --common --reader
+    COMMAND "$<TARGET_FILE:flatcc_cli>" --common_reader --reader
             -o "${GENERATED_DIR}"
             "${SCHEMAS_DIR}/cart_info.fbs"
             "${SCHEMAS_DIR}/cart_config.fbs"
@@ -47,7 +46,6 @@ add_custom_target(flatbuffers_generated ALL
         "${GENERATED_DIR}/cart_info_reader.h"
         "${GENERATED_DIR}/cart_config_reader.h"
         "${GENERATED_DIR}/flatbuffers_common_reader.h"
-        "${GENERATED_DIR}/flatbuffers_common_builder.h"
 )
 
 # Runtime libraries — empty stubs for Phase 1.
