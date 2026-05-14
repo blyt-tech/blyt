@@ -4,6 +4,10 @@
 namespace blyt;
 
 table CartInfo {
+    api_version: string;   // e.g. "0.0" — checked against runtime range at load time
+    title:       string;
+    author:      string;
+    console:     string;   // "blyt32", "blytty", etc.; defaults to "blyt32" if absent
 }
 
 root_type CartInfo;

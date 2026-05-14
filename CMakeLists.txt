@@ -48,14 +48,24 @@ add_custom_target(flatbuffers_generated ALL
         "${GENERATED_DIR}/flatbuffers_common_reader.h"
 )
 
-# Runtime libraries — empty stubs for Phase 1.
-# Will be converted to STATIC/SHARED targets as source is added.
+# Runtime libraries
 add_library(libblytcommon    INTERFACE)
 add_library(libblytcommonlua INTERFACE)
 add_library(libblyt32        INTERFACE)
 add_library(libblyt32lua     INTERFACE)
 add_library(libblytc         INTERFACE)
-add_library(libblyt          INTERFACE)
+
+add_library(libblyt STATIC
+    src/libblyt/cart_load.c
+)
+set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
+target_include_directories(libblyt
+    PUBLIC  include
+    PRIVATE src/libblyt
+            third_party/flatcc/include
+            "${GENERATED_DIR}"
+)
+add_dependencies(libblyt flatbuffers_generated)
 
 # Frontend stubs — Phase 1
 add_library(blyt_libretro INTERFACE)

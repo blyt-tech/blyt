@@ -4,6 +4,7 @@
 namespace blyt;
 
 table CartConfig {
+    fps: uint8 = 60;
 }
 
 root_type CartConfig;
