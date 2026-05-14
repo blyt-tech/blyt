@@ -1,0 +1,19 @@
+# Thin shim for the libretro buildbot (ADR-0126).
+# No build logic lives here — all logic is in CMakeLists.txt.
+# Translates buildbot environment variables to cmake arguments.
+
+BUILD_DIR ?= build-libretro
+
+.PHONY: all clean
+
+all: $(BUILD_DIR)/Makefile
+	$(MAKE) -C $(BUILD_DIR) blyt_libretro
+
+$(BUILD_DIR)/Makefile:
+	cmake -B $(BUILD_DIR) -G "Unix Makefiles" \
+		-DCMAKE_BUILD_TYPE=Release \
+		$(if $(CROSS_COMPILE),-DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc) \
+		$(if $(platform),-DPLATFORM=$(platform))
+
+clean:
+	rm -rf $(BUILD_DIR)

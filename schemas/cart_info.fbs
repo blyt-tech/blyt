@@ -1,0 +1,9 @@
+// Cart metadata embedded in the .cart.info ELF section.
+// Read by the runtime loader; written by blytbuild.
+
+namespace blyt;
+
+table CartInfo {
+}
+
+root_type CartInfo;

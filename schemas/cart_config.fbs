@@ -1,0 +1,9 @@
+// Cart configuration embedded in the .cart.config ELF section.
+// Read by the runtime loader; written by blytbuild.
+
+namespace blyt;
+
+table CartConfig {
+}
+
+root_type CartConfig;
