@@ -13,32 +13,41 @@ file(READ "${CMAKE_BINARY_DIR}/version.txt" BLYT_VERSION)
 string(STRIP "${BLYT_VERSION}" BLYT_VERSION)
 message(STATUS "blyt version: ${BLYT_VERSION}")
 
-# FlatBuffers codegen — shared between C runtime and Rust packer (ADR-0126)
-find_program(FLATC flatc REQUIRED)
-message(STATUS "Found flatc: ${FLATC}")
+# flatcc — pure C FlatBuffers schema compiler, built from source (ADR-0126)
+set(FLATCC_TEST OFF CACHE BOOL "" FORCE)
+set(FLATCC_CXX_TEST OFF CACHE BOOL "" FORCE)
+set(FLATCC_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/flatcc EXCLUDE_FROM_ALL)
 
+# FlatBuffers codegen — generates pure C reader headers for the runtime (ADR-0126)
 set(SCHEMAS_DIR "${CMAKE_SOURCE_DIR}/schemas")
 set(GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/flatbuffers")
 file(MAKE_DIRECTORY "${GENERATED_DIR}")
 
 add_custom_command(
     OUTPUT
-        "${GENERATED_DIR}/cart_info_generated.h"
-        "${GENERATED_DIR}/cart_config_generated.h"
-    COMMAND "${FLATC}" --cpp -o "${GENERATED_DIR}"
-        "${SCHEMAS_DIR}/cart_info.fbs"
-        "${SCHEMAS_DIR}/cart_config.fbs"
+        "${GENERATED_DIR}/cart_info_reader.h"
+        "${GENERATED_DIR}/cart_config_reader.h"
+        "${GENERATED_DIR}/flatbuffers_common_reader.h"
+        "${GENERATED_DIR}/flatbuffers_common_builder.h"
+    COMMAND "$<TARGET_FILE:flatcc_cli>" --common --reader
+            -o "${GENERATED_DIR}"
+            "${SCHEMAS_DIR}/cart_info.fbs"
+            "${SCHEMAS_DIR}/cart_config.fbs"
     DEPENDS
+        flatcc_cli
         "${SCHEMAS_DIR}/cart_info.fbs"
         "${SCHEMAS_DIR}/cart_config.fbs"
-    COMMENT "Generating FlatBuffers headers"
+    COMMENT "Generating FlatBuffers C headers"
     VERBATIM
 )
 
 add_custom_target(flatbuffers_generated ALL
     DEPENDS
-        "${GENERATED_DIR}/cart_info_generated.h"
-        "${GENERATED_DIR}/cart_config_generated.h"
+        "${GENERATED_DIR}/cart_info_reader.h"
+        "${GENERATED_DIR}/cart_config_reader.h"
+        "${GENERATED_DIR}/flatbuffers_common_reader.h"
+        "${GENERATED_DIR}/flatbuffers_common_builder.h"
 )
 
 # Runtime libraries — empty stubs for Phase 1.

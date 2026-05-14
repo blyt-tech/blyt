@@ -19,3 +19,6 @@
 [submodule "third_party/musl"]
 	path = third_party/musl
 	url = https://github.com/blyt-tech/musl
+[submodule "third_party/flatcc"]
+	path = third_party/flatcc
+	url = https://github.com/dvidelabs/flatcc
