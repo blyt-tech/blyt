@@ -4,6 +4,15 @@
 
 BUILD_DIR ?= build-libretro
 
+# Version stamping (ADR-0128): append timestamp to dev versions.
+VERSION_BASE := $(shell cat version.txt)
+ifeq ($(findstring -dev,$(VERSION_BASE)),-dev)
+    BLYT_VERSION := $(VERSION_BASE)-$(shell date +%Y%m%d-%H%M%S)
+else
+    BLYT_VERSION := $(VERSION_BASE)
+endif
+$(shell mkdir -p $(BUILD_DIR) && echo "$(BLYT_VERSION)" > $(BUILD_DIR)/version.txt)
+
 .PHONY: all clean
 
 all: $(BUILD_DIR)/Makefile

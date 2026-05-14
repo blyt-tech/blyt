@@ -19,6 +19,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build flatbuffers-compiler
 
+      - name: Stamp version
+        run: |
+          mkdir -p build
+          VERSION=$(cat version.txt)
+          if [[ "$VERSION" == *-dev ]]; then
+            echo "${VERSION}-$(date +%Y%m%d-%H%M%S)" > build/version.txt
+          else
+            cp version.txt build/version.txt
+          fi
+          echo "BLYT_VERSION=$(cat build/version.txt)" >> "$GITHUB_OUTPUT"
+
       - name: Configure
         run: cmake -B build -G Ninja
 

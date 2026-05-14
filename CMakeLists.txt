@@ -4,6 +4,15 @@ project(blyt C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Version (ADR-0128): copy version.txt to build/version.txt if not already
+# present (CI pre-creates it with a timestamp; local dev gets a verbatim copy).
+if(NOT EXISTS "${CMAKE_BINARY_DIR}/version.txt")
+    file(COPY "${CMAKE_SOURCE_DIR}/version.txt" DESTINATION "${CMAKE_BINARY_DIR}")
+endif()
+file(READ "${CMAKE_BINARY_DIR}/version.txt" BLYT_VERSION)
+string(STRIP "${BLYT_VERSION}" BLYT_VERSION)
+message(STATUS "blyt version: ${BLYT_VERSION}")
+
 # FlatBuffers codegen — shared between C runtime and Rust packer (ADR-0126)
 find_program(FLATC flatc REQUIRED)
 message(STATUS "Found flatc: ${FLATC}")
