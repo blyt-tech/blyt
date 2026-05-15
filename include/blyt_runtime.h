@@ -9,23 +9,28 @@ extern "C" {
 /* --- Cart loading -------------------------------------------------------- */
 
 typedef enum blyt_cart_err {
-    BLYT_CART_OK                = 0,
-    BLYT_CART_ERR_IO            = 1,  /* file I/O error */
-    BLYT_CART_ERR_TOO_SMALL     = 2,  /* file too small to contain an ELF header */
-    BLYT_CART_ERR_NOT_ELF       = 3,  /* bad ELF magic */
-    BLYT_CART_ERR_BAD_CLASS     = 4,  /* not ELFCLASS32 */
-    BLYT_CART_ERR_BAD_ENDIAN    = 5,  /* not little-endian */
-    BLYT_CART_ERR_BAD_OSABI     = 6,  /* EI_OSABI != ELFOSABI_NONE */
-    BLYT_CART_ERR_BAD_MACHINE   = 7,  /* e_machine != EM_RISCV */
-    BLYT_CART_ERR_BAD_FLAGS     = 8,  /* e_flags != expected RVC|ILP32F */
-    BLYT_CART_ERR_BAD_SHDR      = 9,  /* section header table out of bounds */
-    BLYT_CART_ERR_UNKNOWN_SECT  = 10, /* unrecognised ELF section name */
-    BLYT_CART_ERR_BAD_NEEDED    = 11, /* DT_NEEDED allowlist violation */
-    BLYT_CART_ERR_NO_CART_INFO  = 12, /* .cart.info section missing */
-    BLYT_CART_ERR_BAD_PREAMBLE  = 13, /* section preamble tag or version mismatch */
+    BLYT_CART_OK = 0,
+    BLYT_CART_ERR_IO = 1, /* file I/O error */
+    BLYT_CART_ERR_TOO_SMALL = 2, /* file too small to contain an ELF header */
+    BLYT_CART_ERR_NOT_ELF = 3, /* bad ELF magic */
+    BLYT_CART_ERR_BAD_CLASS = 4, /* not ELFCLASS32 */
+    BLYT_CART_ERR_BAD_ENDIAN = 5, /* not little-endian */
+    BLYT_CART_ERR_BAD_OSABI = 6, /* EI_OSABI != ELFOSABI_NONE */
+    BLYT_CART_ERR_BAD_MACHINE = 7, /* e_machine != EM_RISCV */
+    BLYT_CART_ERR_BAD_FLAGS = 8, /* e_flags != expected RVC|ILP32F */
+    BLYT_CART_ERR_BAD_SHDR = 9, /* section header table out of bounds */
+    BLYT_CART_ERR_UNKNOWN_SECT = 10, /* unrecognised ELF section name */
+    BLYT_CART_ERR_BAD_NEEDED = 11, /* DT_NEEDED allowlist violation */
+    BLYT_CART_ERR_NO_CART_INFO = 12, /* .cart.info section missing */
+    BLYT_CART_ERR_BAD_PREAMBLE = 13, /* section preamble tag or version mismatch */
     BLYT_CART_ERR_BAD_CART_INFO = 14, /* .cart.info FlatBuffers parse error */
     BLYT_CART_ERR_BAD_CART_CONFIG = 15, /* .cart.config FlatBuffers parse error */
-    BLYT_CART_ERR_API_VERSION   = 16, /* api_version unsupported */
+    BLYT_CART_ERR_API_VERSION = 16, /* api_version unsupported */
+    BLYT_CART_ERR_BAD_SEGMENT = 17, /* segment layout violation */
+    BLYT_CART_ERR_BAD_INTERP = 18, /* PT_INTERP present (forbidden on custom-loader path) */
+    BLYT_CART_ERR_NO_RELRO = 19, /* PT_GNU_RELRO absent */
+    BLYT_CART_ERR_BAD_OPCODE = 20, /* ecall or ebreak found in executable segment */
+    BLYT_CART_ERR_BAD_IMPORT = 21, /* imported symbol not on allowlist */
 } blyt_cart_err_t;
 
 typedef struct blyt_cart blyt_cart_t;

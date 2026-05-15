@@ -7,10 +7,9 @@
 /* Runtime API version range (checked against .cart.info api_version). */
 #define BLYT_API_VERSION_MAJOR 0
 #define BLYT_API_VERSION_MINOR 0
-#define BLYT_API_VERSION_STR   "0.0"
 
 /* .cart.info preamble type tag (ADR-0073) */
-#define CART_INFO_TAG   "CINF"
+#define CART_INFO_TAG "CINF"
 /* .cart.config preamble type tag (ADR-0073) */
 #define CART_CONFIG_TAG "CCFG"
 
@@ -23,7 +22,7 @@
 #define SECT_PREAMBLE_SIZE 8u
 
 struct blyt_cart {
-    int    fd;
-    void  *map;
+    int fd;
+    void *map;
     size_t map_size;
 };
