@@ -50,7 +50,7 @@ jobs:
         run: cmake --build build
 
       - name: Check Rust formatting
-        run: cargo fmt --check --manifest-path blytbuild/Cargo.toml
+        run: cargo fmt --check --manifest-path devtool/Cargo.toml
 
-      - name: Build blytbuild
-        run: cargo build --manifest-path blytbuild/Cargo.toml --workspace
+      - name: Build blyt devtool
+        run: cargo build --manifest-path devtool/Cargo.toml --workspace
