@@ -18,6 +18,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build
+          pip3 install clang-format==22.1.5 cmakelang yamllint
+
+      - name: Check formatting
+        run: |
+          clang-format --dry-run --Werror \
+            src/libblyt/*.h src/libblyt/*.c \
+            include/*.h \
+            tests/unit/*.c
+          cmake-format --check CMakeLists.txt
+          yamllint .github/workflows/ci.yml
 
       - name: Init flatcc submodule
         run: git submodule update --init --depth 1 third_party/flatcc
@@ -38,6 +48,9 @@ jobs:
 
       - name: Build
         run: cmake --build build
+
+      - name: Check Rust formatting
+        run: cargo fmt --check --manifest-path blytbuild/Cargo.toml
 
       - name: Build blytbuild
         run: cargo build --manifest-path blytbuild/Cargo.toml --workspace

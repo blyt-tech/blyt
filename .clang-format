@@ -1,0 +1,27 @@
+Language: C
+BasedOnStyle: LLVM
+
+# No vertical alignment anywhere
+AlignConsecutiveAssignments: None
+AlignConsecutiveDeclarations: None
+AlignConsecutiveMacros: None
+AlignTrailingComments:
+  Kind: Never
+
+# 4-space indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# Column limit
+ColumnLimit: 100
+
+# Pointer style: int *p not int* p
+PointerAlignment: Right
+
+# Brace style
+BreakBeforeBraces: Attach
+
+# Keep short functions/ifs on one line only when they truly fit
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
