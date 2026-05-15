@@ -256,7 +256,7 @@ else()
   endif()
 endif()
 
-# Frontend stub — libretro (Phase 4)
+# Frontend stub — libretro (not yet implemented)
 add_library(blyt_libretro INTERFACE)
 
 # -------------------------------------------------------------------------
@@ -306,3 +306,9 @@ target_include_directories(test_cart_run PRIVATE include src/libblyt
 target_compile_definitions(test_cart_run PRIVATE ${RV32EMU_FEATURE_DEFS})
 target_link_libraries(test_cart_run PRIVATE libblytemu)
 add_test(NAME test_cart_run COMMAND test_cart_run)
+
+# verify_cart: standalone tool used in CI to confirm blyt build output passes
+# load-time security checks. Not a ctest test; invoked directly with a cart.
+add_executable(verify_cart tests/tools/verify_cart.c)
+target_include_directories(verify_cart PRIVATE include)
+target_link_libraries(verify_cart PRIVATE libblyt)

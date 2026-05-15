@@ -48,8 +48,8 @@ static const char *const KNOWN_SECTIONS_EXACT[] = {
 };
 
 static const char *const KNOWN_SECTIONS_PREFIX[] = {
-    ".text.", ".data.",  ".bss.",    ".rodata.", ".rel.", ".rela.",
-    ".note.", ".debug_", ".zdebug_", ".gnu.",    NULL,
+    ".text.", ".data.",  ".bss.",    ".rodata.", ".rel.",   ".rela.",
+    ".note.", ".debug_", ".zdebug_", ".gnu.",    ".riscv.", NULL,
 };
 
 static int section_name_known(const char *name) {
@@ -85,8 +85,8 @@ static int needed_name_allowed(const char *name) {
 
 /* -------------------------------------------------------------------------
  * Symbol import allowlist (ADR-0112)
- * Populated as APIs are implemented. Empty in Phase 2 — carts with any
- * STB_GLOBAL/SHN_UNDEF imports are rejected until symbols are added here.
+ * Populated as APIs are implemented. Carts with STB_GLOBAL/SHN_UNDEF
+ * imports not on this list are rejected at load time.
  * ------------------------------------------------------------------------- */
 
 static const char *const SYMBOL_ALLOWLIST[] = {

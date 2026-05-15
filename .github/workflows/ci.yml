@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libsdl2-dev
+          sudo apt-get install -y cmake ninja-build libsdl2-dev lld llvm
           pip3 install clang-format==22.1.5 cmakelang yamllint
 
       - name: Check formatting
@@ -26,6 +26,7 @@ jobs:
             src/libblyt/*.h src/libblyt/*.c \
             include/*.h \
             tests/unit/*.c \
+            tests/tools/*.c \
             frontends/sdl/main.c
           cmake-format --check CMakeLists.txt
           yamllint .github/workflows/ci.yml
@@ -63,3 +64,14 @@ jobs:
 
       - name: Build blyt devtool
         run: cargo build --manifest-path devtool/Cargo.toml --workspace
+
+      - name: Build hello cart
+        env:
+          BLYT_SDK_DIR: ${{ github.workspace }}
+          BLYT_OBJCOPY: llvm-objcopy
+        run: |
+          cargo run --manifest-path devtool/Cargo.toml -- \
+            build tests/game/hello --output build/hello.blyt
+
+      - name: Verify hello cart passes load-time security checks
+        run: build/verify_cart build/hello.blyt

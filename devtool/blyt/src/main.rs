@@ -1,44 +1,42 @@
-use std::env;
+mod build;
+
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::process;
 
-fn cmd_build(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("usage: blyt build <source.c> [--output <out.blyt>]");
-        eprintln!();
-        eprintln!("  Compile and link a cart source file into a .blyt cart.");
-        eprintln!();
-        eprintln!("  Requires a configured RISC-V cross-compiler toolchain.");
-        eprintln!("  Set BLYT_CLANG to the clang binary (default: clang).");
-        eprintln!("  Example:");
-        eprintln!("    BLYT_CLANG=clang-18 blyt build hello.c -o hello.blyt");
-        eprintln!();
-        eprintln!("  Note: full build support (SDK toolchain, .cart.info generation,");
-        eprintln!("  linker script) is not yet implemented.");
-        process::exit(1);
-    }
-    eprintln!("blyt build: not yet implemented");
-    eprintln!("  source: {}", args[0]);
-    process::exit(1);
+#[derive(Parser)]
+#[command(name = "blyt", version = env!("BLYT_VERSION"), about = "Blyt cart development tool")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Compile and link a cart project into a .blyt cart file
+    Build {
+        /// Path to the cart project directory (default: current directory)
+        #[arg(default_value = ".")]
+        project_dir: PathBuf,
+
+        /// Output path for the .blyt cart (default: <project-dir-name>.blyt)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let cli = Cli::parse();
 
-    if args.len() < 2 {
-        println!("blyt {}", env!("BLYT_VERSION"));
-        println!();
-        println!("usage: blyt <command> [args]");
-        println!();
-        println!("commands:");
-        println!("  build   compile and link a cart source file");
-        return;
-    }
+    let result = match cli.command {
+        Commands::Build {
+            project_dir,
+            output,
+        } => build::run(&project_dir, output.as_deref()),
+    };
 
-    match args[1].as_str() {
-        "build" => cmd_build(&args[2..]),
-        cmd => {
-            eprintln!("blyt: unknown command '{}'", cmd);
-            process::exit(1);
-        }
+    if let Err(e) = result {
+        eprintln!("blyt: {e}");
+        process::exit(1);
     }
 }

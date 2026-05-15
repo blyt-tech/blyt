@@ -1,10 +1,10 @@
 /*
- * Unit tests for the Phase 3 ECALL dispatch mechanism.
+ * Unit tests for the ECALL dispatch mechanism in the cart runner.
  *
- * These tests create minimal RISC-V ELF binaries containing ecall
- * instructions (bypassing Phase 2 security checks, which is intentional
- * for unit testing the executor in isolation) and verify that the blyt
- * ecall handler dispatches correctly.
+ * These tests drive rv32emu directly with hand-crafted RISC-V ELFs that
+ * contain ecall instructions.  The load-time security checks (blyt_cart_open)
+ * are intentionally bypassed here — the goal is to isolate and test the
+ * runtime ECALL dispatch logic.
  *
  * Tested:
  *   1. BLYT_ECALL_CONSOLE_DEBUG fires the log callback with the right string.

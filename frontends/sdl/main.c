@@ -38,9 +38,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Run the cart in the emulator. The cart may produce console output but
-     * has no graphics API yet (Phase 3). We process pending events so the
-     * window stays responsive during execution. */
+    /* Run the cart in the emulator. The cart may produce console debug output.
+     * We process pending events so the window stays responsive. */
     blyt_cart_run_err_t run_err = blyt_cart_run(cart, log_callback);
 
     if (run_err == BLYT_RUN_ERR_ECALL_TRAP) {
@@ -58,7 +57,7 @@ int main(int argc, char *argv[]) {
                 quit = true;
         }
         SDL_Delay(16);
-        /* In Phase 3 there is no game loop — quit once the cart has finished */
+        /* No game loop yet — quit once the cart has returned from blyt_main */
         quit = true;
     }
 
