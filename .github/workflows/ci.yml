@@ -56,28 +56,14 @@ jobs:
       - name: Build
         run: cmake --build build
 
-      - name: Test
+      - name: C unit tests
         run: ctest --test-dir build --output-on-failure
 
       - name: Check Rust formatting
-        run: cargo fmt --check --manifest-path devtool/Cargo.toml
+        run: cargo fmt --check --manifest-path devtool/Cargo.toml --all
 
-      - name: Build blyt devtool
-        run: cargo build --manifest-path devtool/Cargo.toml --workspace
-
-      - name: Build hello cart
+      - name: Rust tests (unit + integration)
         env:
           BLYT_SDK_DIR: ${{ github.workspace }}
           BLYT_OBJCOPY: llvm-objcopy
-        run: |
-          cargo run --manifest-path devtool/Cargo.toml -- \
-            build tests/game/hello --output build/hello.blyt
-
-      - name: Verify hello cart passes load-time security checks
-        run: build/verify_cart build/hello.blyt
-
-      - name: Run hello cart end-to-end
-        run: |
-          output=$(build/blytrun --headless build/hello.blyt)
-          echo "cart output: $output"
-          echo "$output" | grep -qF "hello from cart"
+        run: cargo test --manifest-path devtool/Cargo.toml --workspace
