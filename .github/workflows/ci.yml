@@ -75,3 +75,9 @@ jobs:
 
       - name: Verify hello cart passes load-time security checks
         run: build/verify_cart build/hello.blyt
+
+      - name: Run hello cart end-to-end
+        run: |
+          output=$(build/blytrun --headless build/hello.blyt)
+          echo "cart output: $output"
+          echo "$output" | grep -qF "hello from cart"
