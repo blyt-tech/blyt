@@ -25,4 +25,5 @@ struct blyt_cart {
     int fd;
     void *map;
     size_t map_size;
+    char *path; /* heap-allocated copy of the path passed to blyt_cart_open */
 };

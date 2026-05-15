@@ -59,9 +59,8 @@ typedef void (*blyt_log_fn)(const char *msg);
 
 typedef enum blyt_cart_run_err {
     BLYT_RUN_OK = 0,
-    BLYT_RUN_ERR_TMPFILE = 1, /* failed to create temp file for ELF */
-    BLYT_RUN_ERR_EMU = 2, /* emulator setup failed */
-    BLYT_RUN_ERR_ECALL_TRAP = 3, /* cart issued a non-permitted ecall */
+    BLYT_RUN_ERR_EMU = 1, /* emulator setup failed */
+    BLYT_RUN_ERR_ECALL_TRAP = 2, /* cart issued a non-permitted ecall */
 } blyt_cart_run_err_t;
 
 /*

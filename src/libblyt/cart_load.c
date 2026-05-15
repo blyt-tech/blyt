@@ -573,6 +573,12 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         cart->fd = fd;
         cart->map = map;
         cart->map_size = map_size;
+        cart->path = strdup(path);
+        if (!cart->path) {
+            free(cart);
+            err = BLYT_CART_ERR_IO;
+            goto fail;
+        }
         *out = cart;
         return BLYT_CART_OK;
     }
@@ -588,6 +594,7 @@ void blyt_cart_close(blyt_cart_t *cart) {
         return;
     munmap(cart->map, cart->map_size);
     close(cart->fd);
+    free(cart->path);
     free(cart);
 }
 

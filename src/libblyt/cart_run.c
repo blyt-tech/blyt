@@ -1,6 +1,5 @@
 #include "cart_run.h"
 
-#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -245,19 +244,6 @@ static void patch_got(const blyt_cart_t *cart, memory_t *mem) {
  * ------------------------------------------------------------------------- */
 
 blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn) {
-    /* Write cart data to a temp file so rv32emu can open it */
-    char tmp_path[] = "/tmp/blyt_cart_XXXXXX";
-    int tmp_fd = mkstemp(tmp_path);
-    if (tmp_fd < 0)
-        return BLYT_RUN_ERR_TMPFILE;
-
-    ssize_t written = write(tmp_fd, cart->map, cart->map_size);
-    close(tmp_fd);
-    if (written < 0 || (size_t)written != cart->map_size) {
-        unlink(tmp_path);
-        return BLYT_RUN_ERR_TMPFILE;
-    }
-
     blyt_run_ctx_t ctx = {.log_fn = log_fn, .ecall_trapped = false};
     g_run_ctx = &ctx;
 
@@ -273,11 +259,10 @@ blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn) {
         .fd_stdin = STDIN_FILENO,
         .fd_stdout = STDOUT_FILENO,
         .fd_stderr = STDERR_FILENO,
-        .data.user.elf_program = tmp_path,
+        .data.user.elf_program = cart->path,
     };
 
     riscv_t *rv = rv_create(&attr);
-    unlink(tmp_path);
 
     if (!rv) {
         g_run_ctx = NULL;
