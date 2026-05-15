@@ -90,7 +90,7 @@ static int needed_name_allowed(const char *name) {
  * ------------------------------------------------------------------------- */
 
 static const char *const SYMBOL_ALLOWLIST[] = {
-    /* Phase 3: blyt_console_debug will be added here */
+    "blyt_console_debug",
     NULL,
 };
 

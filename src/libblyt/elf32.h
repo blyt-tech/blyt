@@ -170,3 +170,16 @@ typedef struct {
 #define DT_NEEDED 1
 #define DT_STRTAB 5
 #define DT_STRSZ 10
+
+/* ELF32 relocation with explicit addend */
+typedef struct {
+    Elf32_Addr r_offset;
+    Elf32_Word r_info;
+    Elf32_Sword r_addend;
+} Elf32_Rela;
+
+#define ELF32_R_SYM(i) ((i) >> 8)
+#define ELF32_R_TYPE(i) ((i) & 0xFFu)
+
+/* RISC-V relocation types */
+#define R_RISCV_JUMP_SLOT 5u

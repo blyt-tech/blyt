@@ -48,6 +48,30 @@ void blyt_cart_close(blyt_cart_t *cart);
 /* Return a static human-readable string for a blyt_cart_err_t value. */
 const char *blyt_cart_err_str(blyt_cart_err_t err);
 
+/* --- Cart execution ------------------------------------------------------ */
+
+/*
+ * Called by the runtime to deliver a blyt_console_debug message to the
+ * frontend. The string is NUL-terminated and lives only for the duration of
+ * the callback.
+ */
+typedef void (*blyt_log_fn)(const char *msg);
+
+typedef enum blyt_cart_run_err {
+    BLYT_RUN_OK = 0,
+    BLYT_RUN_ERR_TMPFILE = 1, /* failed to create temp file for ELF */
+    BLYT_RUN_ERR_EMU = 2, /* emulator setup failed */
+    BLYT_RUN_ERR_ECALL_TRAP = 3, /* cart issued a non-permitted ecall */
+} blyt_cart_run_err_t;
+
+/*
+ * Execute the cart in the rv32emu emulator.
+ * log_fn receives blyt_console_debug messages; may be NULL to discard them.
+ * Returns BLYT_RUN_OK on clean exit; BLYT_RUN_ERR_ECALL_TRAP if the cart
+ * attempted a syscall not on the allowlist.
+ */
+blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn);
+
 #ifdef __cplusplus
 }
 #endif

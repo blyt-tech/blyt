@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake ninja-build libsdl2-dev
           pip3 install clang-format==22.1.5 cmakelang yamllint
 
       - name: Check formatting
@@ -25,12 +25,16 @@ jobs:
           clang-format --dry-run --Werror \
             src/libblyt/*.h src/libblyt/*.c \
             include/*.h \
-            tests/unit/*.c
+            tests/unit/*.c \
+            frontends/sdl/main.c
           cmake-format --check CMakeLists.txt
           yamllint .github/workflows/ci.yml
 
-      - name: Init flatcc submodule
-        run: git submodule update --init --depth 1 third_party/flatcc
+      - name: Init submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/flatcc \
+            third_party/rv32emu
 
       - name: Stamp version
         run: |
@@ -48,6 +52,9 @@ jobs:
 
       - name: Build
         run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
 
       - name: Check Rust formatting
         run: cargo fmt --check --manifest-path devtool/Cargo.toml
