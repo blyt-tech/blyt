@@ -35,6 +35,8 @@ jobs:
           git submodule update --init --depth 1 \
             third_party/flatcc \
             third_party/rv32emu
+          git -C third_party/rv32emu submodule update --init --depth 1 \
+            src/softfloat
 
       - name: Stamp version
         run: |

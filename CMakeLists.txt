@@ -55,10 +55,99 @@ add_custom_target(
           "${GENERATED_DIR}/flatbuffers_common_reader.h")
 
 # -------------------------------------------------------------------------
+# Berkeley SoftFloat — IEEE 754 software FP for the F extension. rv32emu's
+# Makefile generates an empty platform.h; we replicate that here.
+# -------------------------------------------------------------------------
+set(SOFTFLOAT_SRC
+    "${CMAKE_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
+set(SOFTFLOAT_PLATFORM_DIR "${CMAKE_BINARY_DIR}/softfloat")
+file(MAKE_DIRECTORY "${SOFTFLOAT_PLATFORM_DIR}")
+file(WRITE "${SOFTFLOAT_PLATFORM_DIR}/platform.h" "")
+
+# rv32emu's Makefile compiles a specific subset of softfloat sources for the
+# SOFTFLOAT_FAST_INT64 path.  The non-fast-int64 (*M.c helpers, BF16, and a
+# handful of other files) must be excluded.  We glob the source directory then
+# remove those files explicitly.
+file(GLOB SOFTFLOAT_SOURCES "${SOFTFLOAT_SRC}/*.c")
+set(SOFTFLOAT_EXCLUDE_NAMES
+    # Non-FAST_INT64 M-word-array helpers
+    bf16_isSignalingNaN.c
+    bf16_to_f32.c
+    f32_to_bf16.c
+    s_addCarryM.c
+    s_addComplCarryM.c
+    s_addExtF80M.c
+    s_addF128M.c
+    s_addM.c
+    s_compare128M.c
+    s_compare96M.c
+    s_compareNonnormExtF80M.c
+    s_invalidExtF80M.c
+    s_invalidF128M.c
+    s_isNaNF128M.c
+    s_mul128MTo256M.c
+    s_mul64To128M.c
+    s_mulAddF128M.c
+    s_negXM.c
+    s_normExtF80SigM.c
+    s_normRoundPackMToExtF80M.c
+    s_normRoundPackMToF128M.c
+    s_normSubnormalBF16Sig.c
+    s_normSubnormalF128SigM.c
+    s_remStepMBy32.c
+    s_roundMToI64.c
+    s_roundMToUI64.c
+    s_roundPackMToExtF80M.c
+    s_roundPackMToF128M.c
+    s_roundPackToBF16.c
+    s_shiftLeftM.c
+    s_shiftNormSigF128M.c
+    s_shiftRightJamM.c
+    s_shiftRightM.c
+    s_shortShiftLeft64To96M.c
+    s_shortShiftLeftM.c
+    s_shortShiftRightExtendM.c
+    s_shortShiftRightJamM.c
+    s_shortShiftRightM.c
+    s_sub1XM.c
+    s_subM.c
+    s_tryPropagateNaNExtF80M.c
+    s_tryPropagateNaNF128M.c)
+foreach(f ${SOFTFLOAT_EXCLUDE_NAMES})
+  list(REMOVE_ITEM SOFTFLOAT_SOURCES "${SOFTFLOAT_SRC}/${f}")
+endforeach()
+# Add the five RISCV-specialization files (from SOFTFLOAT_OBJS_SPECIALIZE)
+list(
+  APPEND
+  SOFTFLOAT_SOURCES
+  "${SOFTFLOAT_SRC}/RISCV/softfloat_raiseFlags.c"
+  "${SOFTFLOAT_SRC}/RISCV/s_propagateNaNF16UI.c"
+  "${SOFTFLOAT_SRC}/RISCV/s_propagateNaNF32UI.c"
+  "${SOFTFLOAT_SRC}/RISCV/s_propagateNaNF64UI.c"
+  "${SOFTFLOAT_SRC}/RISCV/s_propagateNaNF128UI.c")
+
+add_library(libsoftfloat STATIC ${SOFTFLOAT_SOURCES})
+target_include_directories(
+  libsoftfloat PUBLIC "${SOFTFLOAT_SRC}/include" "${SOFTFLOAT_SRC}/RISCV"
+                      "${SOFTFLOAT_PLATFORM_DIR}")
+target_compile_options(
+  libsoftfloat
+  PRIVATE -DLITTLEENDIAN=1
+          -DINLINE_LEVEL=5
+          -DSOFTFLOAT_ROUND_ODD
+          -DSOFTFLOAT_FAST_INT64
+          -DSOFTFLOAT_FAST_DIV64TO32
+          "-DINLINE=static inline"
+          -Wno-unused-parameter
+          -Wno-unused-variable
+          -Wno-sign-compare
+          -Wno-implicit-fallthrough
+          -Wno-uninitialized)
+
+# -------------------------------------------------------------------------
 # rv32emu — user-mode RISC-V emulator, built from source as a static library. We
-# compile only the user-mode sources (no JIT, no SDL, no system/MMU, no GDBSTUB)
-# and disable EXT_F to avoid the uninitialized softfloat submodule (Phase 3
-# carts do not use floating-point instructions).
+# compile only the user-mode sources (no JIT, no SDL, no system/MMU, no
+# GDBSTUB).
 # -------------------------------------------------------------------------
 set(RV32EMU_DIR "${CMAKE_SOURCE_DIR}/third_party/rv32emu/src")
 
@@ -85,8 +174,7 @@ set(RV32EMU_FEATURE_DEFS
     RV32_FEATURE_T2C=0
     RV32_FEATURE_SYSTEM=0
     RV32_FEATURE_ELF_LOADER=0
-    RV32_FEATURE_ARCH_TEST=0
-    RV32_FEATURE_EXT_F=0)
+    RV32_FEATURE_ARCH_TEST=0)
 
 # For libblytemu: force-include common.h so that every rv32emu .c file gets
 # RV32_HAS, FORCE_INLINE, HAVE_MMAP, etc. without needing to include it
@@ -94,6 +182,7 @@ set(RV32EMU_FEATURE_DEFS
 target_compile_definitions(libblytemu PRIVATE ${RV32EMU_FEATURE_DEFS})
 target_compile_options(libblytemu PRIVATE -include "${RV32EMU_DIR}/common.h")
 target_include_directories(libblytemu PUBLIC ${RV32EMU_DIR})
+target_link_libraries(libblytemu PRIVATE libsoftfloat)
 
 # -------------------------------------------------------------------------
 # Runtime libraries
@@ -125,21 +214,21 @@ add_dependencies(libblyt flatbuffers_generated)
 # -------------------------------------------------------------------------
 find_package(SDL2 QUIET)
 if(SDL2_FOUND OR TARGET SDL2::SDL2)
-  add_executable(blyt_sdl frontends/sdl/main.c)
-  target_include_directories(blyt_sdl PRIVATE include)
-  target_link_libraries(blyt_sdl PRIVATE libblyt SDL2::SDL2)
-  message(STATUS "SDL2 found via find_package — blyt_sdl will be built")
+  add_executable(blytrun frontends/sdl/main.c)
+  target_include_directories(blytrun PRIVATE include)
+  target_link_libraries(blytrun PRIVATE libblyt SDL2::SDL2)
+  message(STATUS "SDL2 found via find_package — blytrun (SDL2) will be built")
 else()
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
     pkg_check_modules(SDL2 QUIET sdl2)
   endif()
   if(SDL2_FOUND)
-    add_executable(blyt_sdl frontends/sdl/main.c)
-    target_include_directories(blyt_sdl PRIVATE include ${SDL2_INCLUDE_DIRS})
-    target_compile_options(blyt_sdl PRIVATE ${SDL2_CFLAGS_OTHER})
-    target_link_libraries(blyt_sdl PRIVATE libblyt ${SDL2_LIBRARIES})
-    message(STATUS "SDL2 found via pkg-config — blyt_sdl will be built")
+    add_executable(blytrun frontends/sdl/main.c)
+    target_include_directories(blytrun PRIVATE include ${SDL2_INCLUDE_DIRS})
+    target_compile_options(blytrun PRIVATE ${SDL2_CFLAGS_OTHER})
+    target_link_libraries(blytrun PRIVATE libblyt ${SDL2_LIBRARIES})
+    message(STATUS "SDL2 found via pkg-config — blytrun (SDL2) will be built")
   else()
     # Last resort: try sdl2-config
     find_program(SDL2_CONFIG sdl2-config)
@@ -154,14 +243,15 @@ else()
         OUTPUT_STRIP_TRAILING_WHITESPACE)
       separate_arguments(SDL2_CFLAGS_LIST UNIX_COMMAND "${SDL2_CFLAGS}")
       separate_arguments(SDL2_LDFLAGS_LIST UNIX_COMMAND "${SDL2_LDFLAGS}")
-      add_executable(blyt_sdl frontends/sdl/main.c)
-      target_include_directories(blyt_sdl PRIVATE include)
-      target_compile_options(blyt_sdl PRIVATE ${SDL2_CFLAGS_LIST})
-      target_link_options(blyt_sdl PRIVATE ${SDL2_LDFLAGS_LIST})
-      target_link_libraries(blyt_sdl PRIVATE libblyt)
-      message(STATUS "SDL2 found via sdl2-config — blyt_sdl will be built")
+      add_executable(blytrun frontends/sdl/main.c)
+      target_include_directories(blytrun PRIVATE include)
+      target_compile_options(blytrun PRIVATE ${SDL2_CFLAGS_LIST})
+      target_link_options(blytrun PRIVATE ${SDL2_LDFLAGS_LIST})
+      target_link_libraries(blytrun PRIVATE libblyt)
+      message(
+        STATUS "SDL2 found via sdl2-config — blytrun (SDL2) will be built")
     else()
-      message(STATUS "SDL2 not found — blyt_sdl frontend will not be built")
+      message(STATUS "SDL2 not found — blytrun (SDL2) will not be built")
     endif()
   endif()
 endif()
