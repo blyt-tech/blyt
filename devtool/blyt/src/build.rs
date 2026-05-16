@@ -8,63 +8,57 @@ use std::process::Command;
  *
  * 8-byte preamble (ADR-0073): "CINF" + format_major(u16le=0) + format_minor(u16le=0)
  * followed by the FlatBuffers CartInfo table with api_version_major=0 and
- * api_version_minor=0 (both fields explicitly set; 12 bytes as produced by
- * flatcc for this schema).
+ * api_version_minor=0 (12 bytes as produced by flatcc for this schema).
  * ------------------------------------------------------------------------- */
 const CART_INFO: &[u8] = &[
-    // Preamble
-    b'C', b'I', b'N', b'F', 0x00, 0x00, 0x00, 0x00,
-    // FlatBuffers CartInfo(api_version_major=0, api_version_minor=0)
-    0x04, 0x00, 0x00, 0x00, 0xfc, 0xff, 0xff, 0xff, 0x04, 0x00, 0x04, 0x00,
+    b'C', b'I', b'N', b'F', 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0xfc, 0xff, 0xff, 0xff,
+    0x04, 0x00, 0x04, 0x00,
 ];
 
 /* -------------------------------------------------------------------------
- * Linker script
+ * Linker script (ADR-0024, ADR-0112)
  *
- * Produces a static RV32 ELF that passes the cart load-time security checks:
- *   - Entry point (blyt_main) in an executable PT_LOAD segment
- *   - No PT_INTERP (custom-loader path)
- *   - PT_GNU_RELRO present (covers .rodata)
- *   - No ecall/ebreak in executable segments — cart code calls blyt API via
- *     direct JAL to the linker-defined trampoline addresses
+ * Produces an ET_EXEC RV32 ELF with DT_NEEDED: libblyt32.so.  Cart code
+ * calls blyt API functions via PLT; the runtime dynamic loader resolves
+ * PLT/GOT entries against libblyt32.so before execution begins.
  *
- * Blyt API functions are defined at their runtime trampoline addresses.
- * The runtime injects these trampolines into emulated memory before
- * execution starts (see src/libblyt/ecall.h for the address layout).
+ * Security requirements (ADR-0112):
+ *   - No PT_INTERP: --no-dynamic-linker is added at link time
+ *   - PT_GNU_RELRO + BIND_NOW: explicit relro PHDR + -z,relro -z,now
+ *   - No ecall in cart code: cart calls blyt API via PLT only
+ *   - Entry point in PF_X PT_LOAD segment: blyt_main in .text
  * ------------------------------------------------------------------------- */
 const LINKER_SCRIPT: &str = "
 ENTRY(blyt_main)
 
-/* Runtime-injected trampolines — addresses written by the runtime into
- * emulated memory before blyt_main is called (ecall.h BLYT_TRAMPOLINE_*). */
-blyt_console_debug = 0x300C;
-
 PHDRS {
-    text    PT_LOAD      FLAGS(5);  /* r-x: code */
-    rodata  PT_LOAD      FLAGS(4);  /* r--: read-only data */
-    relro   PT_GNU_RELRO FLAGS(4);  /* RELRO covers .rodata */
-    data    PT_LOAD      FLAGS(6);  /* rw-: mutable data */
+    text    PT_LOAD      FLAGS(5);   /* r-x */
+    rodata  PT_LOAD      FLAGS(4);   /* r-- */
+    relro   PT_GNU_RELRO FLAGS(4);   /* RELRO: .got, .got.plt, .data.rel.ro */
+    data    PT_LOAD      FLAGS(6);   /* rw- */
+    dynamic PT_DYNAMIC   FLAGS(6);   /* .dynamic */
 }
 
 SECTIONS {
     . = 0x10000;
 
-    .text : ALIGN(4) {
-        *(.text .text.*)
-    } :text
+    .text : ALIGN(4) { *(.text .text.*) } :text
+    .plt : ALIGN(4) { *(.plt) } :text
 
     . = ALIGN(4096);
-    .rodata : ALIGN(4) {
-        *(.rodata .rodata.*)
-    } :rodata :relro
+    .rodata : ALIGN(4) { *(.rodata .rodata.*) } :rodata
+    .eh_frame_hdr : { *(.eh_frame_hdr) } :rodata
+    .eh_frame : { *(.eh_frame) } :rodata
 
     . = ALIGN(4096);
-    .data : ALIGN(4) {
-        *(.data .data.*)
-    } :data
-    .bss (NOLOAD) : ALIGN(4) {
-        *(.bss .bss.*)
-    } :data
+    .data.rel.ro : ALIGN(4) { *(.data.rel.ro .data.rel.ro.*) } :relro
+    .got : ALIGN(4) { *(.got) } :relro
+    .dynamic : ALIGN(4) { *(.dynamic) } :relro :dynamic
+    .got.plt : ALIGN(4) { *(.got.plt) } :relro
+
+    . = ALIGN(4096);
+    .data : ALIGN(4) { *(.data .data.*) } :data
+    .bss (NOLOAD) : ALIGN(4) { *(.bss .bss.*) *(COMMON) } :data
 }
 ";
 
@@ -100,6 +94,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<(), BuildError> 
     let objcopy = std::env::var("BLYT_OBJCOPY").unwrap_or_else(|_| "llvm-objcopy".to_string());
 
     let sdk_include = find_sdk_include()?;
+    let lib_dir = find_lib_dir(&sdk_include)?;
 
     let c_src_dir = project_dir.join("src/game/c");
     let c_files = collect_c_files(&c_src_dir)?;
@@ -126,7 +121,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<(), BuildError> 
     }
 
     let raw_elf = build_dir.join("cart.elf");
-    link_cart(&clang, &obj_files, &ld_script, &raw_elf)?;
+    link_cart(&clang, &obj_files, &ld_script, &lib_dir, &raw_elf)?;
 
     let output_path = output
         .map(PathBuf::from)
@@ -149,10 +144,9 @@ fn default_output(project_dir: &Path) -> PathBuf {
 /* -------------------------------------------------------------------------
  * SDK include directory
  *
- * Looks for the directory containing blyt.h in order:
- *   1. $BLYT_SDK_DIR/include  (or $BLYT_SDK_DIR if blyt.h is directly inside)
- *   2. Ancestors of the running binary (for dev: devtool/target/.../blyt
- *      → the repo root has include/blyt.h)
+ * Looks for the directory containing blyt.h:
+ *   1. $BLYT_SDK_DIR/include (or $BLYT_SDK_DIR if blyt.h is directly inside)
+ *   2. Ancestors of the running binary
  * ------------------------------------------------------------------------- */
 
 fn find_sdk_include() -> Result<PathBuf, BuildError> {
@@ -182,6 +176,36 @@ fn find_sdk_include() -> Result<PathBuf, BuildError> {
 
     Err(err(
         "cannot find blyt.h — set BLYT_SDK_DIR to the blyt repository root",
+    ))
+}
+
+/* -------------------------------------------------------------------------
+ * Library directory
+ *
+ * Looks for the directory containing libblyt32.so:
+ *   1. $BLYT_LIB_DIR
+ *   2. <sdk_root>/build  (BLYT_SDK_DIR is the repo root; build/ has the .so)
+ * ------------------------------------------------------------------------- */
+
+fn find_lib_dir(sdk_include: &Path) -> Result<PathBuf, BuildError> {
+    if let Ok(d) = std::env::var("BLYT_LIB_DIR") {
+        let p = PathBuf::from(d);
+        if p.join("libblyt32.so").exists() {
+            return Ok(p);
+        }
+    }
+
+    // sdk_include is <repo>/include; try <repo>/build
+    if let Some(repo_root) = sdk_include.parent() {
+        let candidate = repo_root.join("build");
+        if candidate.join("libblyt32.so").exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(err(
+        "cannot find libblyt32.so — set BLYT_LIB_DIR to the directory \
+         containing it (usually the CMake build directory)",
     ))
 }
 
@@ -232,7 +256,6 @@ fn compile_c(
             "-mabi=ilp32f",
             "-nostdlib",
             "-fno-exceptions",
-            "-fno-plt",
             "-c",
         ])
         .arg("-I")
@@ -250,13 +273,21 @@ fn compile_c(
 }
 
 /* -------------------------------------------------------------------------
- * Linking: .o files → raw ELF
+ * Linking: .o files → raw ELF (ET_EXEC, dynamically linked against libblyt32.so)
+ *
+ * --no-dynamic-linker  suppress PT_INTERP — runtime is the loader (ADR-0119)
+ * -no-pie              ET_EXEC at fixed address (Spike C validated approach)
+ * -z,relro -z,now      BIND_NOW + RELRO required by ADR-0112
+ * -lblyt32             creates DT_NEEDED: libblyt32.so and PLT/GOT entries
+ * -rpath-link          lets lld find libblyt32.so for symbol resolution at
+ *                      link time without embedding RPATH in the cart
  * ------------------------------------------------------------------------- */
 
 fn link_cart(
     clang: &str,
     objs: &[PathBuf],
     ld_script: &Path,
+    lib_dir: &Path,
     output: &Path,
 ) -> Result<(), BuildError> {
     let mut cmd = Command::new(clang);
@@ -266,9 +297,10 @@ fn link_cart(
         "-mabi=ilp32f",
         "-nostdlib",
         "-fuse-ld=lld",
-        // Explicit PHDRS in the linker script provides GNU_RELRO; disable
-        // lld's automatic -z,relro to avoid a duplicate PT_GNU_RELRO segment.
-        "-Wl,-z,norelro",
+        "-no-pie",
+        "-Wl,--no-dynamic-linker",
+        "-Wl,-z,relro",
+        "-Wl,-z,now",
         "-Wl,--build-id=none",
     ])
     .arg(format!("-T{}", ld_script.display()))
@@ -278,6 +310,9 @@ fn link_cart(
     for obj in objs {
         cmd.arg(obj);
     }
+
+    cmd.arg("-L").arg(lib_dir).arg("-lblyt32");
+    cmd.arg(format!("-Wl,-rpath-link,{}", lib_dir.display()));
 
     let status = cmd
         .status()
@@ -292,11 +327,7 @@ fn link_cart(
 /* -------------------------------------------------------------------------
  * Cart finalisation: inject .cart.info, strip toolchain metadata
  *
- * .riscv.attributes is emitted by clang/lld but not needed at runtime.
- * .comment contains toolchain version strings; no value in a cart binary.
- * Both are stripped to keep the cart clean and avoid triggering the loader's
- * unknown-section check (.riscv.attributes is also in the known-sections list
- * in cart_load.c, but removing it is still good hygiene).
+ * .riscv.attributes and .comment are toolchain metadata with no runtime use.
  * ------------------------------------------------------------------------- */
 
 fn finalise_cart(

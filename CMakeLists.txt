@@ -185,11 +185,55 @@ target_include_directories(libblytemu PUBLIC ${RV32EMU_DIR})
 target_link_libraries(libblytemu PRIVATE libsoftfloat)
 
 # -------------------------------------------------------------------------
-# Runtime libraries
+# -------------------------------------------------------------------------
+# libblyt32.so — guest-side RV32IMAFC shared library (ECALL stubs)
+#
+# Cross-compiled for the cart target (riscv32, ILP32F).  The resulting .so is
+# mapped into rv32emu guest memory by cart_run.c before execution begins. Cart
+# code calls blyt API functions via PLT; those PLT entries resolve to function
+# bodies here which issue ecall instructions to the host runtime.
+#
+# Requires clang with riscv32 target support and lld.  Skipped gracefully when
+# the toolchain is not available.
+# -------------------------------------------------------------------------
+find_program(CLANG_RV32 clang)
+find_program(LLD_FOUND ld.lld)
+if(CLANG_RV32 AND LLD_FOUND)
+  # Verify that this clang can actually target riscv32 (Apple clang cannot).
+  execute_process(
+    COMMAND ${CLANG_RV32} --target=riscv32 -march=rv32imafc -mabi=ilp32f -x c -E
+            - -o /dev/null
+    INPUT_FILE /dev/null
+    RESULT_VARIABLE CLANG_RV32_OK
+    ERROR_QUIET OUTPUT_QUIET)
+endif()
+if(CLANG_RV32
+   AND LLD_FOUND
+   AND CLANG_RV32_OK EQUAL 0)
+  set(LIBBLYT32_SRC "${CMAKE_SOURCE_DIR}/src/libblyt32/blyt32.c")
+  set(LIBBLYT32_OUT "${CMAKE_BINARY_DIR}/libblyt32.so")
+  add_custom_command(
+    OUTPUT "${LIBBLYT32_OUT}"
+    COMMAND
+      "${CLANG_RV32}" --target=riscv32 -march=rv32imafc -mabi=ilp32f -shared
+      -fPIC -nostdlib -fuse-ld=lld -Wl,-soname,libblyt32.so -I
+      "${CMAKE_SOURCE_DIR}/include" -o "${LIBBLYT32_OUT}" "${LIBBLYT32_SRC}"
+    DEPENDS "${LIBBLYT32_SRC}" "${CMAKE_SOURCE_DIR}/include/blyt.h"
+    COMMENT "Cross-compiling libblyt32.so (RV32IMAFC)"
+    VERBATIM)
+  add_custom_target(libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}")
+  message(STATUS "libblyt32.so: will be built (clang=${CLANG_RV32})")
+else()
+  message(
+    STATUS "libblyt32.so: skipping — need clang with riscv32 support and ld.lld"
+  )
+endif()
+
+# -------------------------------------------------------------------------
+# Host runtime libraries (stubs for future expansion; only libblyt is real)
 # -------------------------------------------------------------------------
 add_library(libblytcommon INTERFACE)
 add_library(libblytcommonlua INTERFACE)
-add_library(libblyt32 INTERFACE)
 add_library(libblyt32lua INTERFACE)
 add_library(libblytc INTERFACE)
 

@@ -24,6 +24,7 @@ jobs:
         run: |
           clang-format --dry-run --Werror \
             src/libblyt/*.h src/libblyt/*.c \
+            src/libblyt32/*.c \
             include/*.h \
             tests/unit/*.c \
             tests/tools/*.c \
@@ -65,5 +66,6 @@ jobs:
       - name: Rust tests (unit + integration)
         env:
           BLYT_SDK_DIR: ${{ github.workspace }}
+          BLYT_LIB_DIR: ${{ github.workspace }}/build
           BLYT_OBJCOPY: llvm-objcopy
         run: cargo test --manifest-path devtool/Cargo.toml --workspace

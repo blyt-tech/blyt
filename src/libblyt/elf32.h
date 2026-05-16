@@ -165,11 +165,24 @@ typedef struct {
 #define SHT_GNU_VERNEED 0x6ffffffeu
 #define SHT_GNU_VERDEF 0x6ffffffdu
 
+/* ELF object types */
+#define ET_EXEC 2u
+#define ET_DYN 3u
+
 /* Dynamic tags */
 #define DT_NULL 0
 #define DT_NEEDED 1
+#define DT_PLTRELSZ 2
 #define DT_STRTAB 5
+#define DT_SYMTAB 6
+#define DT_RELA 7
+#define DT_RELASZ 8
+#define DT_RELAENT 9
 #define DT_STRSZ 10
+#define DT_SYMENT 11
+#define DT_PLTREL 20
+#define DT_JMPREL 23
+#define DT_BIND_NOW 24
 
 /* ELF32 relocation with explicit addend */
 typedef struct {
@@ -182,4 +195,7 @@ typedef struct {
 #define ELF32_R_TYPE(i) ((i) & 0xFFu)
 
 /* RISC-V relocation types */
+#define R_RISCV_32 1u
+#define R_RISCV_RELATIVE 3u
 #define R_RISCV_JUMP_SLOT 5u
+#define R_RISCV_GLOB_DAT 19u

@@ -33,6 +33,11 @@
 #include "ecall.h"
 #include "elf32.h"
 
+/* addi x17, x0, 1 — used to set a7=BLYT_ECALL_CONSOLE_DEBUG in test code.
+ * Only the test needs this; ecall.h defines RV32_LI_A7_0 for the EXIT
+ * trampoline but not RV32_LI_A7_1 (libblyt32.so provides that in guest). */
+#define RV32_LI_A7_1 UINT32_C(0x00100893)
+
 /* -------------------------------------------------------------------------
  * Minimal ELF builder for the test
  *

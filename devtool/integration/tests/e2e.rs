@@ -15,9 +15,14 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Path to the CMake build directory (contains blytrun and libblyt32.so).
+fn build_dir() -> PathBuf {
+    repo_root().join("build")
+}
+
 /// Path to the blytrun binary produced by the CMake build.
 fn blytrun() -> PathBuf {
-    repo_root().join("build").join("blytrun")
+    build_dir().join("blytrun")
 }
 
 /// Create a minimal cart project in `dir` with a single C source file.
@@ -34,6 +39,7 @@ fn build_cart(project_dir: &std::path::Path) -> PathBuf {
         .unwrap()
         .args(["build", project_dir.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &root)
+        .env("BLYT_LIB_DIR", build_dir())
         .env("BLYT_OBJCOPY", "llvm-objcopy")
         .assert()
         .success();
@@ -70,6 +76,7 @@ void blyt_main(void) {
 
     Command::new(blytrun())
         .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", build_dir())
         .assert()
         .success()
         .stdout(predicate::str::contains("hello from cart"));
@@ -97,6 +104,7 @@ void blyt_main(void) {
 
     Command::new(blytrun())
         .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", build_dir())
         .assert()
         .success()
         .stdout(predicate::str::contains("first"))
@@ -116,6 +124,7 @@ fn build_empty_project_fails_with_error() {
         .unwrap()
         .args(["build", project.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &root)
+        .env("BLYT_LIB_DIR", build_dir())
         .env("BLYT_OBJCOPY", "llvm-objcopy")
         .assert()
         .failure()
@@ -127,6 +136,7 @@ fn build_empty_project_fails_with_error() {
 fn run_missing_cart_fails() {
     Command::new(blytrun())
         .args(["--headless", "/nonexistent/path/cart.blyt"])
+        .env("BLYT_LIB_DIR", build_dir())
         .assert()
         .failure();
 }
