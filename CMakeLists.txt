@@ -185,16 +185,14 @@ target_include_directories(libblytemu PUBLIC ${RV32EMU_DIR})
 target_link_libraries(libblytemu PRIVATE libsoftfloat)
 
 # -------------------------------------------------------------------------
-# -------------------------------------------------------------------------
-# libblyt32.so — guest-side RV32IMAFC shared library (ECALL stubs)
+# Guest-side RV32IMAFC shared libraries
 #
-# Cross-compiled for the cart target (riscv32, ILP32F).  The resulting .so is
-# mapped into rv32emu guest memory by cart_run.c before execution begins. Cart
-# code calls blyt API functions via PLT; those PLT entries resolve to function
-# bodies here which issue ecall instructions to the host runtime.
+# libblytcommon.so — variant-portable shared API (blyt.h); ECALL stubs for all
+# functions declared in blyt.h.  Re-exported by each variant library.
+# libblyt32.so — Blyt32 variant library; has DT_NEEDED: libblytcommon.so and
+# re-exports blyt_* symbols to carts via thin wrappers.
 #
-# Requires clang with riscv32 target support and lld.  Skipped gracefully when
-# the toolchain is not available.
+# Requires clang with riscv32 target support and lld.
 # -------------------------------------------------------------------------
 find_program(CLANG_RV32 clang)
 find_program(LLD_FOUND ld.lld)
@@ -210,23 +208,49 @@ endif()
 if(CLANG_RV32
    AND LLD_FOUND
    AND CLANG_RV32_OK EQUAL 0)
+  set(RV32_FLAGS
+      --target=riscv32
+      -march=rv32imafc
+      -mabi=ilp32f
+      -shared
+      -fPIC
+      -nostdlib
+      -fuse-ld=lld)
+  set(RV32_INCLUDE -I "${CMAKE_SOURCE_DIR}/include")
+  set(BLYT_H "${CMAKE_SOURCE_DIR}/include/blyt.h")
+
+  # libblytcommon.so — variant-portable blyt.h ECALL stubs
+  set(LIBBLYTCOMMON_SRC "${CMAKE_SOURCE_DIR}/src/libblytcommon/blyt_common.c")
+  set(LIBBLYTCOMMON_OUT "${CMAKE_BINARY_DIR}/libblytcommon.so")
+  add_custom_command(
+    OUTPUT "${LIBBLYTCOMMON_OUT}"
+    COMMAND "${CLANG_RV32}" ${RV32_FLAGS} -Wl,-soname,libblytcommon.so
+            ${RV32_INCLUDE} -o "${LIBBLYTCOMMON_OUT}" "${LIBBLYTCOMMON_SRC}"
+    DEPENDS "${LIBBLYTCOMMON_SRC}" "${BLYT_H}"
+    COMMENT "Cross-compiling libblytcommon.so (RV32IMAFC)"
+    VERBATIM)
+
+  # libblyt32.so — Blyt32 variant; links against libblytcommon.so
   set(LIBBLYT32_SRC "${CMAKE_SOURCE_DIR}/src/libblyt32/blyt32.c")
   set(LIBBLYT32_OUT "${CMAKE_BINARY_DIR}/libblyt32.so")
   add_custom_command(
     OUTPUT "${LIBBLYT32_OUT}"
     COMMAND
-      "${CLANG_RV32}" --target=riscv32 -march=rv32imafc -mabi=ilp32f -shared
-      -fPIC -nostdlib -fuse-ld=lld -Wl,-soname,libblyt32.so -I
-      "${CMAKE_SOURCE_DIR}/include" -o "${LIBBLYT32_OUT}" "${LIBBLYT32_SRC}"
-    DEPENDS "${LIBBLYT32_SRC}" "${CMAKE_SOURCE_DIR}/include/blyt.h"
+      "${CLANG_RV32}" ${RV32_FLAGS} -Wl,-soname,libblyt32.so ${RV32_INCLUDE} -L
+      "${CMAKE_BINARY_DIR}" -lblytcommon -Wl,-rpath-link,"${CMAKE_BINARY_DIR}"
+      -o "${LIBBLYT32_OUT}" "${LIBBLYT32_SRC}"
+    DEPENDS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}"
     COMMENT "Cross-compiling libblyt32.so (RV32IMAFC)"
     VERBATIM)
-  add_custom_target(libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}")
-  message(STATUS "libblyt32.so: will be built (clang=${CLANG_RV32})")
+
+  add_custom_target(libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}"
+                                             "${LIBBLYTCOMMON_OUT}")
+  message(
+    STATUS "libblytcommon.so + libblyt32.so: will be built (${CLANG_RV32})")
 else()
   message(
-    STATUS "libblyt32.so: skipping — need clang with riscv32 support and ld.lld"
-  )
+    STATUS
+      "libblytcommon.so + libblyt32.so: skipping (need clang riscv32 + ld.lld)")
 endif()
 
 # -------------------------------------------------------------------------

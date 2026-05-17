@@ -24,6 +24,7 @@ jobs:
         run: |
           clang-format --dry-run --Werror \
             src/libblyt/*.h src/libblyt/*.c \
+            src/libblytcommon/*.c \
             src/libblyt32/*.c \
             include/*.h \
             tests/unit/*.c \
