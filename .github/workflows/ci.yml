@@ -23,10 +23,11 @@ jobs:
       - name: Check formatting
         run: |
           clang-format --dry-run --Werror \
-            src/libblyt/*.h src/libblyt/*.c \
-            src/libblytcommon/*.c \
-            src/libblyt32/*.c \
-            include/*.h \
+            runtime/host/src/libblyt/*.h runtime/host/src/libblyt/*.c \
+            runtime/guest/src/libblytcommon/*.c \
+            runtime/guest/src/libblyt32/*.c \
+            runtime/guest/include/*.h \
+            runtime/host/include/*.h \
             tests/unit/*.c \
             tests/tools/*.c \
             tests/game/hello/src/game/c/*.c \

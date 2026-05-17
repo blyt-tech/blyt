@@ -147,7 +147,7 @@ set(RV32_BASE
     # -Wl,--shared explicitly tells lld to produce ET_DYN; clang may inject
     # -Bstatic for bare-metal riscv targets which overrides -shared otherwise.
     -Wl,--shared
-    -I "${BLYT_SOURCE_DIR}/include")
+    -I "${BLYT_SOURCE_DIR}/runtime/guest/include")
 if(FOUND_LLD)
   list(APPEND RV32_BASE "-fuse-ld=${FOUND_LLD}")
 endif()
@@ -158,7 +158,7 @@ message(STATUS "Building libblytcommon.so…")
 execute_process(
   COMMAND "${FOUND_CLANG}" ${RV32_BASE} -Wl,-soname,libblytcommon.so
           -o "${SDK_LIB}/libblytcommon.so"
-          "${BLYT_SOURCE_DIR}/src/libblytcommon/blyt_common.c"
+          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
   RESULT_VARIABLE R)
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblytcommon.so")
@@ -170,8 +170,9 @@ message(STATUS "Building libblyt32.so…")
 # remains a separate library for cross-variant code that links blyt.h directly.
 execute_process(
   COMMAND "${FOUND_CLANG}" ${RV32_BASE} -Wl,-soname,libblyt32.so -o
-          "${SDK_LIB}/libblyt32.so" "${BLYT_SOURCE_DIR}/src/libblyt32/blyt32.c"
-          "${BLYT_SOURCE_DIR}/src/libblytcommon/blyt_common.c"
+          "${SDK_LIB}/libblyt32.so"
+          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
+          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
   RESULT_VARIABLE R)
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblyt32.so")
@@ -183,9 +184,8 @@ endif()
 
 file(MAKE_DIRECTORY "${SDK_INC}")
 file(
-  COPY "${BLYT_SOURCE_DIR}/include/blyt.h"
-       "${BLYT_SOURCE_DIR}/include/blyt32.h"
-       "${BLYT_SOURCE_DIR}/include/blyt_runtime.h"
+  COPY "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt.h"
+       "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt32.h"
   DESTINATION "${SDK_INC}")
 
 # -------------------------------------------------------------------------

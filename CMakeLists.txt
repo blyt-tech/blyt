@@ -216,11 +216,12 @@ if(CLANG_RV32
       -fPIC
       -nostdlib
       -fuse-ld=lld)
-  set(RV32_INCLUDE -I "${CMAKE_SOURCE_DIR}/include")
-  set(BLYT_H "${CMAKE_SOURCE_DIR}/include/blyt.h")
+  set(RV32_INCLUDE -I "${CMAKE_SOURCE_DIR}/runtime/guest/include")
+  set(BLYT_H "${CMAKE_SOURCE_DIR}/runtime/guest/include/blyt.h")
 
   # libblytcommon.so — variant-portable blyt.h ECALL stubs
-  set(LIBBLYTCOMMON_SRC "${CMAKE_SOURCE_DIR}/src/libblytcommon/blyt_common.c")
+  set(LIBBLYTCOMMON_SRC
+      "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c")
   set(LIBBLYTCOMMON_OUT "${CMAKE_BINARY_DIR}/libblytcommon.so")
   add_custom_command(
     OUTPUT "${LIBBLYTCOMMON_OUT}"
@@ -231,7 +232,7 @@ if(CLANG_RV32
     VERBATIM)
 
   # libblyt32.so — Blyt32 variant; links against libblytcommon.so
-  set(LIBBLYT32_SRC "${CMAKE_SOURCE_DIR}/src/libblyt32/blyt32.c")
+  set(LIBBLYT32_SRC "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c")
   set(LIBBLYT32_OUT "${CMAKE_BINARY_DIR}/libblyt32.so")
   add_custom_command(
     OUTPUT "${LIBBLYT32_OUT}"
@@ -261,13 +262,14 @@ add_library(libblytcommonlua INTERFACE)
 add_library(libblyt32lua INTERFACE)
 add_library(libblytc INTERFACE)
 
-add_library(libblyt STATIC src/libblyt/cart_load.c src/libblyt/cart_run.c)
+add_library(libblyt STATIC runtime/host/src/libblyt/cart_load.c
+                           runtime/host/src/libblyt/cart_run.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 target_include_directories(
   libblyt
-  PUBLIC include
-  PRIVATE src/libblyt third_party/flatcc/include "${GENERATED_DIR}"
-          ${RV32EMU_DIR})
+  PUBLIC runtime/host/include
+  PRIVATE runtime/host/src/libblyt third_party/flatcc/include
+          "${GENERATED_DIR}" ${RV32EMU_DIR})
 # cart_run.c includes common.h explicitly; the -D flags ensure feature macros
 # expand correctly when rv32emu headers are pulled in from cart_run.c.
 target_compile_definitions(libblyt PRIVATE ${RV32EMU_FEATURE_DEFS})
@@ -283,7 +285,6 @@ add_dependencies(libblyt flatbuffers_generated)
 find_package(SDL2 QUIET)
 if(SDL2_FOUND OR TARGET SDL2::SDL2)
   add_executable(blytrun frontends/sdl/main.c)
-  target_include_directories(blytrun PRIVATE include)
   target_link_libraries(blytrun PRIVATE libblyt SDL2::SDL2)
   message(STATUS "SDL2 found via find_package — blytrun (SDL2) will be built")
 else()
@@ -293,7 +294,7 @@ else()
   endif()
   if(SDL2_FOUND)
     add_executable(blytrun frontends/sdl/main.c)
-    target_include_directories(blytrun PRIVATE include ${SDL2_INCLUDE_DIRS})
+    target_include_directories(blytrun PRIVATE ${SDL2_INCLUDE_DIRS})
     target_compile_options(blytrun PRIVATE ${SDL2_CFLAGS_OTHER})
     target_link_libraries(blytrun PRIVATE libblyt ${SDL2_LIBRARIES})
     message(STATUS "SDL2 found via pkg-config — blytrun (SDL2) will be built")
@@ -312,7 +313,6 @@ else()
       separate_arguments(SDL2_CFLAGS_LIST UNIX_COMMAND "${SDL2_CFLAGS}")
       separate_arguments(SDL2_LDFLAGS_LIST UNIX_COMMAND "${SDL2_LDFLAGS}")
       add_executable(blytrun frontends/sdl/main.c)
-      target_include_directories(blytrun PRIVATE include)
       target_compile_options(blytrun PRIVATE ${SDL2_CFLAGS_LIST})
       target_link_options(blytrun PRIVATE ${SDL2_LDFLAGS_LIST})
       target_link_libraries(blytrun PRIVATE libblyt)
@@ -359,7 +359,7 @@ add_custom_target(
 
 add_executable(test_cart_load tests/unit/test_cart_load.c)
 target_include_directories(
-  test_cart_load PRIVATE include src/libblyt third_party/flatcc/include
+  test_cart_load PRIVATE runtime/host/src/libblyt third_party/flatcc/include
                          "${TEST_GENERATED_DIR}")
 target_link_libraries(test_cart_load PRIVATE libblyt flatccrt)
 add_dependencies(test_cart_load flatbuffers_test_generated)
@@ -369,7 +369,7 @@ add_test(NAME test_cart_load COMMAND test_cart_load)
 # The test includes common.h explicitly (first), then rv32emu headers; we pass
 # the same feature definitions that libblytemu uses.
 add_executable(test_cart_run tests/unit/test_cart_run.c)
-target_include_directories(test_cart_run PRIVATE include src/libblyt
+target_include_directories(test_cart_run PRIVATE runtime/host/src/libblyt
                                                  ${RV32EMU_DIR})
 target_compile_definitions(test_cart_run PRIVATE ${RV32EMU_FEATURE_DEFS})
 target_link_libraries(test_cart_run PRIVATE libblytemu)
@@ -378,7 +378,6 @@ add_test(NAME test_cart_run COMMAND test_cart_run)
 # verify_cart: standalone tool used in CI to confirm blyt build output passes
 # load-time security checks. Not a ctest test; invoked directly with a cart.
 add_executable(verify_cart tests/tools/verify_cart.c)
-target_include_directories(verify_cart PRIVATE include)
 target_link_libraries(verify_cart PRIVATE libblyt)
 
 # -------------------------------------------------------------------------

@@ -16,12 +16,13 @@
 #include "elf32.h"
 
 /*
- * rv32emu headers — common.h must come first.
+ * rv32emu headers — common.h must come first; ${RV32EMU_DIR} is on the
+ * include path so these can be referenced by name rather than relative path.
  */
-#include "../../third_party/rv32emu/src/common.h"
-#include "../../third_party/rv32emu/src/io.h"
-#include "../../third_party/rv32emu/src/riscv.h"
-#include "../../third_party/rv32emu/src/riscv_private.h"
+#include "common.h"
+#include "io.h"
+#include "riscv.h"
+#include "riscv_private.h"
 
 /* -------------------------------------------------------------------------
  * Constants

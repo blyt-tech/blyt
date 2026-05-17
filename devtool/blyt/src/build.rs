@@ -218,15 +218,22 @@ fn find_objcopy() -> String {
 fn find_sdk_include() -> Result<PathBuf, BuildError> {
     if let Ok(sdk) = std::env::var("BLYT_SDK_DIR") {
         let sdk = PathBuf::from(sdk);
+        // Assembled SDK layout: build/sdk/include/blyt.h
         let via_include = sdk.join("include");
         if via_include.join("blyt.h").exists() {
             return Ok(via_include);
+        }
+        // Repo source layout: <repo>/runtime/guest/include/blyt.h
+        let via_guest = sdk.join("runtime/guest/include");
+        if via_guest.join("blyt.h").exists() {
+            return Ok(via_guest);
         }
         if sdk.join("blyt.h").exists() {
             return Ok(sdk);
         }
         return Err(err(format!(
-            "BLYT_SDK_DIR={} does not contain include/blyt.h",
+            "BLYT_SDK_DIR={} does not contain blyt.h \
+             (looked in include/ and runtime/guest/include/)",
             sdk.display()
         )));
     }
@@ -239,12 +246,12 @@ fn find_sdk_include() -> Result<PathBuf, BuildError> {
         }
     }
 
-    // Repo layout: walk up from the binary looking for include/blyt.h
+    // Repo layout: walk up from the binary looking for runtime/guest/include/blyt.h
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().skip(1) {
-            let candidate = ancestor.join("include").join("blyt.h");
+            let candidate = ancestor.join("runtime/guest/include").join("blyt.h");
             if candidate.exists() {
-                return Ok(ancestor.join("include"));
+                return Ok(ancestor.join("runtime/guest/include"));
             }
         }
     }
