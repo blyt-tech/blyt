@@ -51,9 +51,24 @@ void blyt_quit_ready(void) {
 }
 
 /* -------------------------------------------------------------------------
- * Weak no-op defaults for optional cart lifecycle entry points (ADR-0087).
- * Carts that need custom behaviour override these with strong definitions.
+ * Cart lifecycle entry point stubs (ADR-0087)
+ *
+ * Required callbacks (init/update/draw) have weak no-op stubs so that
+ * libblytcommon.so builds cleanly on all platforms.  The load-time security
+ * check (blyt_cart_open) verifies carts always override them with strong
+ * definitions before execution begins.
+ *
+ * Optional callbacks also have weak no-op defaults; carts override only
+ * what they need.  on_quit calls blyt_quit_ready() so unhandled quit
+ * requests exit the update/draw loop cleanly.
  * ------------------------------------------------------------------------- */
+
+__attribute__((weak)) void blyt_cart_init(void) {
+}
+__attribute__((weak)) void blyt_cart_update(void) {
+}
+__attribute__((weak)) void blyt_cart_draw(void) {
+}
 
 __attribute__((weak)) void blyt_cart_on_new_state(void) {
 }

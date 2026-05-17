@@ -380,3 +380,27 @@ add_test(NAME test_cart_run COMMAND test_cart_run)
 add_executable(verify_cart tests/tools/verify_cart.c)
 target_include_directories(verify_cart PRIVATE include)
 target_link_libraries(verify_cart PRIVATE libblyt)
+
+# -------------------------------------------------------------------------
+# SDK assembly target
+#
+# cmake --build build --target sdk
+#
+# Downloads a pre-built LLVM toolchain if no riscv32-capable clang is found,
+# builds libblytcommon.so + libblyt32.so (RV32IMAFC), copies the devtool and
+# headers, and assembles a self-contained SDK under build/sdk/.
+#
+# After building, carts can be built with: build/sdk/bin/blyt build
+# <project-dir>
+# -------------------------------------------------------------------------
+add_custom_target(
+  sdk
+  COMMAND
+    ${CMAKE_COMMAND} -DBLYT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DBLYT_BINARY_DIR=${CMAKE_BINARY_DIR}
+    -DCMAKE_HOST_SYSTEM_NAME=${CMAKE_HOST_SYSTEM_NAME}
+    -DCMAKE_HOST_SYSTEM_PROCESSOR=${CMAKE_HOST_SYSTEM_PROCESSOR} -P
+    ${CMAKE_SOURCE_DIR}/cmake/blyt_sdk.cmake
+  USES_TERMINAL
+  COMMENT "Assembling blyt SDK in build/sdk/"
+  VERBATIM)

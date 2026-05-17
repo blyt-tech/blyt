@@ -20,6 +20,8 @@ static const char *const KNOWN_SECTIONS_EXACT[] = {
     ".text",
     ".data",
     ".bss",
+    ".sbss", /* RISC-V small-data BSS (GP-relative) */
+    ".sdata", /* RISC-V small-data (GP-relative) */
     ".rodata",
     ".dynamic",
     ".dynsym",

@@ -461,6 +461,18 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     blyt_symtab_t all_syms;
     all_syms.count = 0;
 
+    /* Add the cart's exported symbols first so that the cart's strong
+     * definitions win over the weak no-op stubs in the runtime libraries.
+     * build_symtab uses first-wins; cart symbols must be seeded before BFS. */
+    {
+        blyt_lib_t cart_syms = {
+            .map = (const uint8_t *)cart->map,
+            .size = cart->map_size,
+            .bias = 0, /* ET_EXEC: absolute addresses */
+        };
+        build_symtab(&cart_syms, &all_syms);
+    }
+
     /* BFS queue of library names to load (names come from DT_NEEDED entries
      * which are pointers into mmap'd files — collected before munmap). */
     char name_buf[MAX_RUNTIME_LIBS][64]; /* stable copies of library names */
@@ -567,20 +579,9 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     }
 
     if (ok) {
-        /* Add the cart's own exported symbols to the combined table first so
-         * they take priority over library weak defaults (e.g. blyt_cart_on_quit
-         * defined in the cart overrides the weak no-op in libblytcommon.so).
-         * Cart is ET_EXEC at fixed addresses (bias = 0). */
-        blyt_lib_t cart_as_lib = {
-            .map = cart->map,
-            .size = cart->map_size,
-            .bias = 0,
-        };
-        build_symtab(&cart_as_lib, &all_syms);
-
-        /* Resolve PLT/GOT for each loaded library.  libblytcommon.so's PLT
-         * for cart callbacks (blyt_cart_init etc.) is resolved here against
-         * the cart symbols we just added. */
+        /* Resolve PLT/GOT for each loaded library.  The runtime libraries'
+         * PLT entries for cart callbacks (blyt_cart_init etc.) are resolved
+         * against the cart symbols already seeded in all_syms above. */
         for (int i = 0; i < nlibs; i++) {
             resolve_elf_plt(libs[i].map, libs[i].size, mem, libs[i].bias, &all_syms);
         }

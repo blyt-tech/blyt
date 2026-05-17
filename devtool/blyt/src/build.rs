@@ -90,8 +90,8 @@ fn err(msg: impl Into<String>) -> BuildError {
  * ------------------------------------------------------------------------- */
 
 pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<(), BuildError> {
-    let clang = std::env::var("BLYT_CLANG").unwrap_or_else(|_| "clang".to_string());
-    let objcopy = std::env::var("BLYT_OBJCOPY").unwrap_or_else(|_| "llvm-objcopy".to_string());
+    let clang = find_clang();
+    let objcopy = find_objcopy();
 
     let sdk_include = find_sdk_include()?;
     let lib_dir = find_lib_dir(&sdk_include)?;
@@ -163,11 +163,56 @@ fn default_output(project_dir: &Path) -> PathBuf {
 }
 
 /* -------------------------------------------------------------------------
+ * Toolchain discovery
+ *
+ * Resolution order for clang and llvm-objcopy:
+ *   1. $BLYT_CLANG / $BLYT_OBJCOPY environment variables
+ *   2. <sdk>/toolchain/bin/  — when running from a built SDK (build/sdk/bin/)
+ *   3. System PATH fallback
+ * ------------------------------------------------------------------------- */
+
+fn sdk_root_from_exe() -> Option<PathBuf> {
+    // Binary is at <sdk>/bin/blyt; SDK root is the parent of bin/.
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().and_then(|b| b.parent().map(PathBuf::from)))
+}
+
+fn find_clang() -> String {
+    if let Ok(c) = std::env::var("BLYT_CLANG") {
+        return c;
+    }
+    // SDK layout: use the blyt-prefixed clang symlink from bin/
+    if let Some(sdk) = sdk_root_from_exe() {
+        let p = sdk.join("bin/blyt-clang");
+        if p.exists() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    "clang".to_string()
+}
+
+fn find_objcopy() -> String {
+    if let Ok(o) = std::env::var("BLYT_OBJCOPY") {
+        return o;
+    }
+    // SDK layout: use the blyt-prefixed objcopy symlink from bin/
+    if let Some(sdk) = sdk_root_from_exe() {
+        let p = sdk.join("bin/blyt-objcopy");
+        if p.exists() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    "llvm-objcopy".to_string()
+}
+
+/* -------------------------------------------------------------------------
  * SDK include directory
  *
  * Looks for the directory containing blyt.h:
  *   1. $BLYT_SDK_DIR/include (or $BLYT_SDK_DIR if blyt.h is directly inside)
- *   2. Ancestors of the running binary
+ *   2. <sdk>/include/ — when running from a built SDK (build/sdk/bin/)
+ *   3. Ancestors of the running binary
  * ------------------------------------------------------------------------- */
 
 fn find_sdk_include() -> Result<PathBuf, BuildError> {
@@ -186,6 +231,15 @@ fn find_sdk_include() -> Result<PathBuf, BuildError> {
         )));
     }
 
+    // SDK layout: <sdk>/include/blyt.h when running from <sdk>/bin/blyt
+    if let Some(sdk) = sdk_root_from_exe() {
+        let p = sdk.join("include/blyt.h");
+        if p.exists() {
+            return Ok(sdk.join("include"));
+        }
+    }
+
+    // Repo layout: walk up from the binary looking for include/blyt.h
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().skip(1) {
             let candidate = ancestor.join("include").join("blyt.h");
@@ -196,7 +250,8 @@ fn find_sdk_include() -> Result<PathBuf, BuildError> {
     }
 
     Err(err(
-        "cannot find blyt.h — set BLYT_SDK_DIR to the blyt repository root",
+        "cannot find blyt.h — run `cmake --build build --target sdk` \
+         and use build/sdk/bin/blyt, or set BLYT_SDK_DIR",
     ))
 }
 
@@ -205,7 +260,9 @@ fn find_sdk_include() -> Result<PathBuf, BuildError> {
  *
  * Looks for the directory containing libblyt32.so:
  *   1. $BLYT_LIB_DIR
- *   2. <sdk_root>/build  (BLYT_SDK_DIR is the repo root; build/ has the .so)
+ *   2. <sdk>/lib/  — SDK layout (build/sdk/lib/)
+ *   3. <repo>/build/sdk/lib/  — repo-local SDK
+ *   4. <repo>/build/  — repo CMake build output (CI)
  * ------------------------------------------------------------------------- */
 
 fn find_lib_dir(sdk_include: &Path) -> Result<PathBuf, BuildError> {
@@ -216,17 +273,27 @@ fn find_lib_dir(sdk_include: &Path) -> Result<PathBuf, BuildError> {
         }
     }
 
-    // sdk_include is <repo>/include; try <repo>/build
+    // SDK layout: <sdk>/lib/libblyt32.so when running from <sdk>/bin/blyt
+    if let Some(sdk) = sdk_root_from_exe() {
+        let p = sdk.join("lib");
+        if p.join("libblyt32.so").exists() {
+            return Ok(p);
+        }
+    }
+
+    // Repo layout: build/sdk/lib/ or build/
     if let Some(repo_root) = sdk_include.parent() {
-        let candidate = repo_root.join("build");
-        if candidate.join("libblyt32.so").exists() {
-            return Ok(candidate);
+        for subdir in &["build/sdk/lib", "build"] {
+            let candidate = repo_root.join(subdir);
+            if candidate.join("libblyt32.so").exists() {
+                return Ok(candidate);
+            }
         }
     }
 
     Err(err(
-        "cannot find libblyt32.so — set BLYT_LIB_DIR to the directory \
-         containing it (usually the CMake build directory)",
+        "cannot find libblyt32.so — run `cmake --build build --target sdk` \
+         to build the blyt SDK, then use build/sdk/bin/blyt",
     ))
 }
 
@@ -299,9 +366,10 @@ fn compile_c(
  * --no-dynamic-linker  suppress PT_INTERP — runtime is the loader (ADR-0119)
  * -no-pie              ET_EXEC at fixed address (Spike C validated approach)
  * -z,relro -z,now      BIND_NOW + RELRO required by ADR-0112
+ * -Bdynamic            override clang's -Bstatic injection for bare-metal riscv
  * -lblyt32             creates DT_NEEDED: libblyt32.so and PLT/GOT entries
- * -rpath-link          lets lld find libblyt32.so for symbol resolution at
- *                      link time without embedding RPATH in the cart
+ * -lblytcommon         resolves symbols from libblytcommon.so; lld does not
+ *                      follow DT_NEEDED chains transitively during link
  * ------------------------------------------------------------------------- */
 
 fn link_cart(
@@ -312,13 +380,24 @@ fn link_cart(
     output: &Path,
 ) -> Result<(), BuildError> {
     let mut cmd = Command::new(clang);
+
+    // Prepend the SDK bin/ (or toolchain bin/) to PATH so -fuse-ld=lld
+    // resolves to the SDK's own linker rather than whatever the host has.
+    if let Some(sdk_bin) = sdk_root_from_exe().map(|s| s.join("bin")) {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", sdk_bin.display(), existing);
+        cmd.env("PATH", new_path);
+    }
     cmd.args([
         "--target=riscv32",
         "-march=rv32imafc",
         "-mabi=ilp32f",
         "-nostdlib",
+        // The SDK's clang finds ld.lld alongside itself in toolchain/bin/;
+        // blyt-lld in bin/ is a convenience symlink for direct invocation.
         "-fuse-ld=lld",
         "-no-pie",
+        "-Wl,-Bdynamic",
         "-Wl,--no-dynamic-linker",
         "-Wl,-z,relro",
         "-Wl,-z,now",
@@ -332,8 +411,9 @@ fn link_cart(
         cmd.arg(obj);
     }
 
+    // libblyt32.so is self-contained (includes libblytcommon.so sources), so
+    // the cart's DT_NEEDED is only {libblyt32.so} (ADR-0024).
     cmd.arg("-L").arg(lib_dir).arg("-lblyt32");
-    cmd.arg(format!("-Wl,-rpath-link,{}", lib_dir.display()));
 
     let status = cmd
         .status()
