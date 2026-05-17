@@ -58,6 +58,13 @@ const char *blyt_cart_err_str(blyt_cart_err_t err);
  */
 typedef void (*blyt_log_fn)(const char *msg);
 
+/*
+ * Called by the runtime at the end of each update+draw frame.
+ * The frontend uses this to poll events, cap frame rate, present graphics,
+ * etc.  May be NULL (headless / no per-frame host work needed).
+ */
+typedef void (*blyt_frame_fn)(void *userdata);
+
 typedef enum blyt_cart_run_err {
     BLYT_RUN_OK = 0,
     BLYT_RUN_ERR_EMU = 1, /* emulator setup failed */
@@ -66,11 +73,14 @@ typedef enum blyt_cart_run_err {
 
 /*
  * Execute the cart in the rv32emu emulator.
- * log_fn receives blyt_console_debug messages; may be NULL to discard them.
- * Returns BLYT_RUN_OK on clean exit; BLYT_RUN_ERR_ECALL_TRAP if the cart
- * attempted a syscall not on the allowlist.
+ * log_fn   — receives blyt_console_debug messages; NULL to discard.
+ * frame_fn — called once per update+draw frame (after blyt_cart_draw).
+ *            The frontend uses it to poll host events, present the frame,
+ *            etc.  NULL for headless execution.
+ * userdata — passed through to frame_fn unchanged; NULL if frame_fn is NULL.
  */
-blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn);
+blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn, blyt_frame_fn frame_fn,
+                                  void *userdata);
 
 #ifdef __cplusplus
 }

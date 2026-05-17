@@ -17,6 +17,7 @@
  */
 #define BLYT_ECALL_EXIT 0 /* internal: halt emulation cleanly */
 #define BLYT_ECALL_CONSOLE_DEBUG 1 /* blyt_console_debug: a0=ptr, a1=len */
+#define BLYT_ECALL_FRAME_DONE 2 /* end of one update+draw cycle */
 
 /*
  * EXIT trampoline — injected into rv32emu guest memory by the runtime.

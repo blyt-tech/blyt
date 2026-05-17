@@ -30,6 +30,11 @@ void blyt_cart_cleanup(void);
  * cart decides it is finished (e.g. after showing a credits sequence). */
 void blyt_quit_ready(void);
 
+/* Signal the end of one update+draw frame to the host runtime.
+ * Called automatically by blyt_main after each blyt_cart_draw(); cart code
+ * does not need to call this directly. */
+void blyt_frame_done(void);
+
 /* -------------------------------------------------------------------------
  * Debug output (ADR-0085, ECALL 1)
  * ------------------------------------------------------------------------- */

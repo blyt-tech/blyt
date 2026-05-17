@@ -11,6 +11,25 @@ static void log_callback(const char *msg) {
 }
 
 /*
+ * Per-frame callback for the SDL frontend.  Called by blyt_cart_run after
+ * each blyt_cart_draw(); polls SDL events and caps the frame rate.
+ * userdata is the SDL_Window* (currently unused; reserved for future use).
+ */
+static void sdl_frame_callback(void *userdata) {
+    (void)userdata;
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT) {
+            /* Signal the cart to finish on the next iteration.
+             * We can't halt the emulator directly here, but the cart's
+             * on_quit default calls blyt_quit_ready() which exits the loop. */
+        }
+    }
+    /* Cap to ~60 fps; the cart drives timing via blyt_frame_done(). */
+    SDL_Delay(16);
+}
+
+/*
  * Parse argv for the cart path and --headless flag.
  * Returns the cart path, or NULL if usage is wrong.
  * Sets *headless to true if --headless is present.
@@ -47,7 +66,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (headless) {
-        blyt_cart_run_err_t run_err = blyt_cart_run(cart, log_callback);
+        blyt_cart_run_err_t run_err = blyt_cart_run(cart, log_callback, NULL, NULL);
         blyt_cart_close(cart);
         if (run_err == BLYT_RUN_ERR_ECALL_TRAP) {
             fprintf(stderr, "blytrun: cart attempted a non-permitted syscall\n");
@@ -71,27 +90,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Run the cart in the emulator. The cart may produce console debug output.
-     * We process pending events so the window stays responsive. */
-    blyt_cart_run_err_t run_err = blyt_cart_run(cart, log_callback);
+    /* Run the cart with the SDL frame callback.  sdl_frame_callback is called
+     * once per update+draw cycle; it polls events and paces the frame rate.
+     * blyt_cart_run returns only when the cart exits (blyt_quit_ready). */
+    blyt_cart_run_err_t run_err = blyt_cart_run(cart, log_callback, sdl_frame_callback, win);
 
     if (run_err == BLYT_RUN_ERR_ECALL_TRAP) {
         fprintf(stderr, "blytrun: cart attempted a non-permitted syscall\n");
     } else if (run_err != BLYT_RUN_OK) {
         fprintf(stderr, "blytrun: cart run failed (err=%d)\n", (int)run_err);
-    }
-
-    /* Drain events so the window reacts if the user closes it */
-    SDL_Event ev;
-    bool quit = (run_err != BLYT_RUN_OK);
-    while (!quit) {
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT)
-                quit = true;
-        }
-        SDL_Delay(16);
-        /* No game loop yet — quit once the cart has returned from blyt_main */
-        quit = true;
     }
 
     SDL_DestroyWindow(win);

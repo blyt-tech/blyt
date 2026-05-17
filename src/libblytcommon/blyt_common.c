@@ -51,6 +51,19 @@ void blyt_quit_ready(void) {
 }
 
 /* -------------------------------------------------------------------------
+ * blyt_frame_done — end-of-frame signal (ECALL 2)
+ *
+ * Called by blyt_main after each blyt_cart_draw().  The host intercepts this
+ * ECALL, runs its frame callback (SDL event polling, frame-rate cap, etc.),
+ * then resumes the emulator for the next frame without halting it.
+ * ------------------------------------------------------------------------- */
+
+void blyt_frame_done(void) {
+    register long a7 __asm__("a7") = 2; /* BLYT_ECALL_FRAME_DONE */
+    __asm__ volatile("ecall" : : "r"(a7) : "memory");
+}
+
+/* -------------------------------------------------------------------------
  * Cart lifecycle entry point stubs (ADR-0087)
  *
  * Required callbacks (init/update/draw) have weak no-op stubs so that
@@ -96,8 +109,11 @@ void blyt_main(void) {
     blyt_cart_on_new_state();
 
     while (!g_quit_requested) {
+        /* blyt_frame_done() fires ECALL 2 after draw; the host handles it
+         * (SDL events, frame-rate cap, etc.) then resumes the emulator. */
         blyt_cart_update();
         blyt_cart_draw();
+        blyt_frame_done();
     }
 
     blyt_cart_on_quit();

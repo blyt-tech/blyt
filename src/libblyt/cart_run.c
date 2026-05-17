@@ -49,7 +49,10 @@
 
 typedef struct {
     blyt_log_fn log_fn;
+    blyt_frame_fn frame_fn;
+    void *frame_userdata;
     bool ecall_trapped;
+    bool frame_done; /* set by BLYT_ECALL_FRAME_DONE; cleared by the step loop */
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -110,6 +113,14 @@ static void blyt_ecall_handler(riscv_t *rv) {
         rv->PC += 4;
         return;
     }
+
+    case BLYT_ECALL_FRAME_DONE:
+        /* Signal the step loop to invoke the frame callback, then resume.
+         * Do NOT halt — the emulator continues into the next frame. */
+        rv->PC += 4;
+        if (g_run_ctx)
+            g_run_ctx->frame_done = true;
+        return;
 
     default:
         rv_halt(rv);
@@ -600,8 +611,13 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
  * blyt_cart_run — public entry point
  * ------------------------------------------------------------------------- */
 
-blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn) {
-    blyt_run_ctx_t ctx = {.log_fn = log_fn, .ecall_trapped = false};
+blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn, blyt_frame_fn frame_fn,
+                                  void *userdata) {
+    blyt_run_ctx_t ctx = {.log_fn = log_fn,
+                          .frame_fn = frame_fn,
+                          .frame_userdata = userdata,
+                          .ecall_trapped = false,
+                          .frame_done = false};
     g_run_ctx = &ctx;
 
     vm_attr_t attr = {
@@ -645,7 +661,20 @@ blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn) {
      * emulator halts cleanly. */
     rv_set_reg(rv, rv_reg_ra, BLYT_TRAMPOLINE_EXIT_ADDR);
 
-    rv_run(rv);
+    /* Step loop: run the emulator one rv_step() burst at a time.  After each
+     * BLYT_ECALL_FRAME_DONE the ecall handler sets ctx.frame_done; we then
+     * invoke the frontend's frame callback (SDL event poll, frame-rate cap,
+     * etc.) before resuming.  This interleaves host and guest work per frame
+     * without threading. */
+    while (!rv_has_halted(rv) && !ctx.ecall_trapped) {
+        rv_step(rv);
+        if (ctx.frame_done) {
+            ctx.frame_done = false;
+            if (ctx.frame_fn)
+                ctx.frame_fn(ctx.frame_userdata);
+        }
+    }
+
     rv_delete(rv);
 
     bool trapped = ctx.ecall_trapped;
