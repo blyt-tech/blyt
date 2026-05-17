@@ -90,7 +90,17 @@ static int needed_name_allowed(const char *name) {
  * ------------------------------------------------------------------------- */
 
 static const char *const SYMBOL_ALLOWLIST[] = {
+    "blyt_main", /* imported by _blyt_entry — the cart's ELF entry point */
     "blyt_console_debug",
+    "blyt_quit_ready",
+    NULL,
+};
+
+/* Required exports: every cart must define these (ADR-0087). */
+static const char *const REQUIRED_ENTRY_POINTS[] = {
+    "blyt_cart_init",
+    "blyt_cart_update",
+    "blyt_cart_draw",
     NULL,
 };
 
@@ -561,6 +571,41 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
     }
 
     /* -----------------------------------------------------------------------
+     * Required entry point validation (ADR-0087)
+     *
+     * blyt_cart_init, blyt_cart_update, and blyt_cart_draw must be present
+     * as defined (non-UNDEF, STB_GLOBAL) symbols in the cart's .dynsym.
+     * --------------------------------------------------------------------- */
+
+    if (sect_dynsym && sect_dynstr_sh) {
+        const char *symstr = (const char *)((const uint8_t *)map + sect_dynstr_sh->sh_offset);
+        size_t symstr_size = sect_dynstr_sh->sh_size;
+        const uint8_t *sym_data = (const uint8_t *)map + sect_dynsym->sh_offset;
+        size_t sym_count = sect_dynsym->sh_size / sect_dynsym->sh_entsize;
+
+        for (int r = 0; REQUIRED_ENTRY_POINTS[r]; r++) {
+            int found = 0;
+            for (size_t j = 0; j < sym_count; j++) {
+                const Elf32_Sym *sym = (const Elf32_Sym *)(sym_data + j * sect_dynsym->sh_entsize);
+                if (ELF32_ST_BIND(sym->st_info) != STB_GLOBAL)
+                    continue;
+                if (sym->st_shndx == SHN_UNDEF)
+                    continue;
+                if (sym->st_name >= symstr_size)
+                    continue;
+                if (strcmp(symstr + sym->st_name, REQUIRED_ENTRY_POINTS[r]) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                err = BLYT_CART_ERR_MISSING_ENTRY;
+                goto fail;
+            }
+        }
+    }
+
+    /* -----------------------------------------------------------------------
      * Success
      * --------------------------------------------------------------------- */
 
@@ -644,6 +689,8 @@ const char *blyt_cart_err_str(blyt_cart_err_t err) {
         return "ecall or ebreak in executable segment";
     case BLYT_CART_ERR_BAD_IMPORT:
         return "imported symbol not on allowlist";
+    case BLYT_CART_ERR_MISSING_ENTRY:
+        return "required cart entry point missing (blyt_cart_init/update/draw)";
     }
     return "unknown error";
 }

@@ -567,9 +567,20 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     }
 
     if (ok) {
-        /* Resolve PLT/GOT for each loaded library (e.g. libblyt32.so's PLT
-         * entries pointing into libblytcommon.so must be resolved before
-         * the cart executes). */
+        /* Add the cart's own exported symbols to the combined table first so
+         * they take priority over library weak defaults (e.g. blyt_cart_on_quit
+         * defined in the cart overrides the weak no-op in libblytcommon.so).
+         * Cart is ET_EXEC at fixed addresses (bias = 0). */
+        blyt_lib_t cart_as_lib = {
+            .map = cart->map,
+            .size = cart->map_size,
+            .bias = 0,
+        };
+        build_symtab(&cart_as_lib, &all_syms);
+
+        /* Resolve PLT/GOT for each loaded library.  libblytcommon.so's PLT
+         * for cart callbacks (blyt_cart_init etc.) is resolved here against
+         * the cart symbols we just added. */
         for (int i = 0; i < nlibs; i++) {
             resolve_elf_plt(libs[i].map, libs[i].size, mem, libs[i].bias, &all_syms);
         }
@@ -624,6 +635,13 @@ blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn) {
     }
 
     rv->io.on_ecall = blyt_ecall_handler;
+
+    /* rv_create already set PC = e_entry (_blyt_entry in the cart's .text).
+     * _blyt_entry calls blyt_main via PLT; dynlink resolved that PLT entry
+     * to blyt_main in libblytcommon.so before rv_run is called, so the
+     * call proceeds correctly on both emulated and native targets.
+     * RA is set to the EXIT trampoline so that when blyt_main returns the
+     * emulator halts cleanly. */
     rv_set_reg(rv, rv_reg_ra, BLYT_TRAMPOLINE_EXIT_ADDR);
 
     rv_run(rv);

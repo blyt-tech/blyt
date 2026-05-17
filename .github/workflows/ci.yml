@@ -29,6 +29,7 @@ jobs:
             include/*.h \
             tests/unit/*.c \
             tests/tools/*.c \
+            tests/game/hello/src/game/c/*.c \
             frontends/sdl/main.c
           cmake-format --check CMakeLists.txt
           yamllint .github/workflows/ci.yml

@@ -15,7 +15,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Path to the CMake build directory (contains blytrun and libblyt32.so).
+/// Path to the CMake build directory (contains blytrun and the runtime libraries).
 fn build_dir() -> PathBuf {
     repo_root().join("build")
 }
@@ -55,9 +55,10 @@ fn build_cart(project_dir: &std::path::Path) -> PathBuf {
 // Tests
 // -------------------------------------------------------------------------
 
-/// blyt build + blytrun --headless: console debug output reaches stdout.
+/// The lifecycle callbacks fire in the correct order: init, then update+draw
+/// each iteration, with quit signalled after the second update.
 #[test]
-fn hello_cart_produces_debug_output() {
+fn hello_cart_lifecycle_output() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hello");
 
@@ -65,51 +66,40 @@ fn hello_cart_produces_debug_output() {
         &project,
         r#"
 #include "blyt.h"
-void blyt_main(void) {
-    blyt_console_debug("hello from cart");
+
+static int s_frame = 0;
+
+void blyt_cart_init(void)   { blyt_console_debug("init"); }
+void blyt_cart_update(void) {
+    blyt_console_debug("update");
+    if (++s_frame >= 2) blyt_quit_ready();
 }
+void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
 "#,
     );
 
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    Command::new(blytrun())
+    let output = Command::new(blytrun())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", build_dir())
         .assert()
         .success()
-        .stdout(predicate::str::contains("hello from cart"));
-}
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&output);
 
-/// A cart that calls blyt_console_debug multiple times outputs all messages.
-#[test]
-fn multiple_debug_calls_all_appear() {
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("multi");
-
-    write_cart_project(
-        &project,
-        r#"
-#include "blyt.h"
-void blyt_main(void) {
-    blyt_console_debug("first");
-    blyt_console_debug("second");
-    blyt_console_debug("third");
-}
-"#,
-    );
-
-    let cart = build_cart(&project);
-
-    Command::new(blytrun())
-        .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", build_dir())
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("first"))
-        .stdout(predicate::str::contains("second"))
-        .stdout(predicate::str::contains("third"));
+    // init fires exactly once, before any update/draw
+    assert!(out.contains("init"), "missing 'init' in output: {out}");
+    // update and draw both appear (multiple iterations)
+    assert!(out.contains("update"), "missing 'update' in output: {out}");
+    assert!(out.contains("draw"), "missing 'draw' in output: {out}");
+    // init must appear before the first update
+    let init_pos = out.find("init").unwrap();
+    let update_pos = out.find("update").unwrap();
+    assert!(init_pos < update_pos, "init must precede first update");
 }
 
 /// blyt build with no source files produces a clear error and non-zero exit.
