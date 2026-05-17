@@ -288,10 +288,14 @@ fn find_lib_dir(sdk_include: &Path) -> Result<PathBuf, BuildError> {
         }
     }
 
-    // Repo layout: build/sdk/lib/ or build/
-    if let Some(repo_root) = sdk_include.parent() {
+    // Repo layout: walk up from sdk_include looking for build/sdk/lib/ or build/
+    // sdk_include may be deep inside the repo (e.g. runtime/guest/include),
+    // so we walk ancestors rather than assuming a fixed depth.
+    let mut dir = sdk_include.to_path_buf();
+    while let Some(parent) = dir.parent() {
+        dir = parent.to_path_buf();
         for subdir in &["build/sdk/lib", "build"] {
-            let candidate = repo_root.join(subdir);
+            let candidate = dir.join(subdir);
             if candidate.join("libblyt32.so").exists() {
                 return Ok(candidate);
             }

@@ -1,6 +1,7 @@
 #include "cart_load.h"
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -534,18 +535,29 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
             goto fail;
         }
 
-        if (blyt_CartInfo_verify_as_root(fb, fb_size) != flatcc_verify_ok) {
+        /* The FlatBuffers verifier requires 4-byte-aligned input.  The
+         * section may land at any file offset, so copy to an aligned buffer. */
+        void *fb_aligned = malloc(fb_size);
+        if (!fb_aligned) {
+            err = BLYT_CART_ERR_IO;
+            goto fail;
+        }
+        memcpy(fb_aligned, fb, fb_size);
+        int verify_result = blyt_CartInfo_verify_as_root(fb_aligned, fb_size);
+        blyt_CartInfo_table_t info = blyt_CartInfo_as_root(fb_aligned);
+        uint16_t api_major = (verify_result == flatcc_verify_ok && info)
+                                 ? blyt_CartInfo_api_version_major(info)
+                                 : BLYT_API_VERSION_MAJOR + 1;
+        free(fb_aligned);
+
+        if (verify_result != flatcc_verify_ok) {
             err = BLYT_CART_ERR_BAD_CART_INFO;
             goto fail;
         }
-
-        blyt_CartInfo_table_t info = blyt_CartInfo_as_root(fb);
         if (!info) {
             err = BLYT_CART_ERR_BAD_CART_INFO;
             goto fail;
         }
-
-        uint16_t api_major = blyt_CartInfo_api_version_major(info);
         if (api_major != BLYT_API_VERSION_MAJOR) {
             err = BLYT_CART_ERR_API_VERSION;
             goto fail;
@@ -566,7 +578,16 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
             goto fail;
         }
 
-        if (blyt_CartConfig_verify_as_root(fb, fb_size) != flatcc_verify_ok) {
+        void *fb_aligned = malloc(fb_size);
+        if (!fb_aligned) {
+            err = BLYT_CART_ERR_IO;
+            goto fail;
+        }
+        memcpy(fb_aligned, fb, fb_size);
+        int verify_result = blyt_CartConfig_verify_as_root(fb_aligned, fb_size);
+        free(fb_aligned);
+
+        if (verify_result != flatcc_verify_ok) {
             err = BLYT_CART_ERR_BAD_CART_CONFIG;
             goto fail;
         }

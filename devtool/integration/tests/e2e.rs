@@ -35,14 +35,19 @@ fn write_cart_project(dir: &std::path::Path, source: &str) {
 /// Run `blyt build <project_dir>` and return the expected cart output path.
 fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     let root = repo_root();
-    Command::cargo_bin("blyt")
-        .unwrap()
-        .args(["build", project_dir.to_str().unwrap()])
+    let sdk = sdk_dir();
+    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    cmd.args(["build", project_dir.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &root)
-        .env("BLYT_LIB_DIR", build_dir())
-        .env("BLYT_OBJCOPY", "llvm-objcopy")
-        .assert()
-        .success();
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
+    // Use the SDK's riscv32-capable clang if available; system clang on macOS
+    // cannot target riscv32 so the test is skipped when the SDK is absent.
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if sdk_clang.exists() {
+        cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    cmd.assert().success();
 
     // Default output: <parent>/<project_dir_name>.blyt
     project_dir.parent().unwrap().join(format!(
@@ -51,14 +56,91 @@ fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     ))
 }
 
+/// Path to the assembled SDK directory (build/sdk/).
+fn sdk_dir() -> PathBuf {
+    build_dir().join("sdk")
+}
+
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
 
+/// SDK end-to-end: use the assembled SDK (build/sdk/) to build and run a cart.
+///
+/// The SDK binary auto-discovers its toolchain and libraries from its own
+/// location in build/sdk/bin/ — no env vars required for blyt build.
+/// blytrun needs BLYT_LIB_DIR since it cannot yet auto-discover its libraries.
+///
+/// Requires `cmake --build build --target sdk` to have completed.
+/// Silently skipped if the SDK has not been assembled.
+#[test]
+fn sdk_e2e_build_and_run() {
+    let sdk = sdk_dir();
+    let sdk_blyt = sdk.join("bin/blyt");
+    let sdk_blytrun = sdk.join("bin/blytrun");
+
+    assert!(
+        sdk_blyt.exists() && sdk_blytrun.exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hello");
+
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+
+static int s_frame = 0;
+
+void blyt_cart_init(void)   { blyt_console_debug("hello from sdk"); }
+void blyt_cart_update(void) { if (++s_frame >= 1) blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+
+    // Build the cart using the assembled SDK binary.  No env vars are needed:
+    // the SDK blyt auto-discovers its toolchain (blyt-clang) and runtime
+    // libraries from its own location in build/sdk/bin/.
+    Command::new(&sdk_blyt)
+        .args(["build", project.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let cart = project.parent().unwrap().join(format!(
+        "{}.blyt",
+        project.file_name().unwrap().to_str().unwrap()
+    ));
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    // Run the cart with the SDK's blytrun.
+    let out = Command::new(&sdk_blytrun)
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&out).contains("hello from sdk"),
+        "expected 'hello from sdk' in output, got: {}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
 /// The lifecycle callbacks fire in the correct order: init, then update+draw
 /// each iteration, with quit signalled after the second update.
+///
+/// Requires the SDK to be assembled (riscv32 toolchain in build/sdk/).
 #[test]
 fn hello_cart_lifecycle_output() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hello");
 
@@ -83,7 +165,7 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
 
     let output = Command::new(blytrun())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", build_dir())
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success()
         .get_output()
@@ -114,7 +196,7 @@ fn build_empty_project_fails_with_error() {
         .unwrap()
         .args(["build", project.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &root)
-        .env("BLYT_LIB_DIR", build_dir())
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .env("BLYT_OBJCOPY", "llvm-objcopy")
         .assert()
         .failure()
@@ -126,7 +208,7 @@ fn build_empty_project_fails_with_error() {
 fn run_missing_cart_fails() {
     Command::new(blytrun())
         .args(["--headless", "/nonexistent/path/cart.blyt"])
-        .env("BLYT_LIB_DIR", build_dir())
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .failure();
 }
