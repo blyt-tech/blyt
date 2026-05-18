@@ -103,6 +103,7 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "free",
     "realloc",
     "calloc",
+    "abort",
 
     /* libblytc.so — string */
     "memcpy",

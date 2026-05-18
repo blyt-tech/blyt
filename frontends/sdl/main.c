@@ -72,6 +72,10 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "blytrun: cart attempted a non-permitted syscall\n");
             return 1;
         }
+        if (run_err == BLYT_RUN_ERR_ABORT) {
+            fprintf(stderr, "blytrun: cart aborted (fatal internal error)\n");
+            return 1;
+        }
         return (run_err == BLYT_RUN_OK) ? 0 : 1;
     }
 
@@ -97,6 +101,8 @@ int main(int argc, char *argv[]) {
 
     if (run_err == BLYT_RUN_ERR_ECALL_TRAP) {
         fprintf(stderr, "blytrun: cart attempted a non-permitted syscall\n");
+    } else if (run_err == BLYT_RUN_ERR_ABORT) {
+        fprintf(stderr, "blytrun: cart aborted (fatal internal error)\n");
     } else if (run_err != BLYT_RUN_OK) {
         fprintf(stderr, "blytrun: cart run failed (err=%d)\n", (int)run_err);
     }

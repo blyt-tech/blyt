@@ -110,10 +110,15 @@ void __stdio_exit_needed(void) {
  * hanging or corrupting state.  This should never fire in practice.
  */
 
-static void blytc_abort(void) {
+/* Issue BLYT_ECALL_EXIT with a non-zero exit code (a0=1) so the runtime
+ * reports BLYT_RUN_ERR_ABORT rather than BLYT_RUN_OK.  This makes a fatal
+ * internal error (syscall safety net, assert, explicit abort) distinguishable
+ * from a clean return from blyt_main (which uses the trampoline with a0=0). */
+static _Noreturn void blytc_abort(void) {
 #ifdef __riscv
-    register long a7 __asm__("a7") = 0; /* BLYT_ECALL_EXIT — halt emulator */
-    __asm__ volatile("ecall" : : "r"(a7) : "memory");
+    register long a7 __asm__("a7") = 0; /* BLYT_ECALL_EXIT */
+    register long a0 __asm__("a0") = 1; /* non-zero exit code = abort */
+    __asm__ volatile("ecall" : : "r"(a7), "r"(a0) : "memory");
 #endif
     __builtin_unreachable();
 }
@@ -122,6 +127,13 @@ long __syscall_ret(unsigned long r) {
     (void)r;
     blytc_abort();
     return -1; /* unreachable */
+}
+
+/* stdlib abort() — expected by stdlib.h and assert.h.  musl's implementation
+ * raises SIGABRT, which has no valid handler in the cart environment; issue
+ * BLYT_ECALL_EXIT with a non-zero code instead. */
+void abort(void) {
+    blytc_abort();
 }
 
 /* ---- wide character stubs for vfprintf %ls / %lc (C locale, ASCII only) ---- */

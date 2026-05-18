@@ -58,7 +58,8 @@ typedef struct {
     blyt_log_fn log_fn;
     blyt_frame_fn frame_fn;
     void *frame_userdata;
-    bool ecall_trapped;
+    bool ecall_trapped; /* cart issued a non-permitted ecall */
+    bool ecall_aborted; /* cart called abort() — ECALL_EXIT with a0 != 0 */
     bool frame_done; /* set by BLYT_ECALL_FRAME_DONE; cleared by the step loop */
 } blyt_run_ctx_t;
 
@@ -76,10 +77,11 @@ static void write_u32_le(uint8_t *dst, uint32_t val) {
 }
 
 static bool inject_exit_trampoline(memory_t *mem) {
-    uint8_t stub[12];
-    write_u32_le(stub + 0, RV32_LI_A7_0);
-    write_u32_le(stub + 4, RV32_ECALL);
-    write_u32_le(stub + 8, RV32_UNIMP);
+    uint8_t stub[16];
+    write_u32_le(stub + 0, RV32_LI_A0_0); /* a0 = 0 (clean exit code) */
+    write_u32_le(stub + 4, RV32_LI_A7_0); /* a7 = BLYT_ECALL_EXIT */
+    write_u32_le(stub + 8, RV32_ECALL);
+    write_u32_le(stub + 12, RV32_UNIMP);
     return memory_write(mem, BLYT_TRAMPOLINE_EXIT_ADDR, stub, sizeof(stub));
 }
 
@@ -91,9 +93,13 @@ static void blyt_ecall_handler(riscv_t *rv) {
     uint32_t num = rv_get_reg(rv, rv_reg_a7);
 
     switch (num) {
-    case BLYT_ECALL_EXIT:
+    case BLYT_ECALL_EXIT: {
+        uint32_t code = rv_get_reg(rv, rv_reg_a0);
         rv_halt(rv);
+        if (code != 0 && g_run_ctx)
+            g_run_ctx->ecall_aborted = true;
         return;
+    }
 
     case BLYT_ECALL_CONSOLE_DEBUG: {
         uint32_t vaddr = rv_get_reg(rv, rv_reg_a0);
@@ -726,7 +732,7 @@ blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn, blyt_fr
      * invoke the frontend's frame callback (SDL event poll, frame-rate cap,
      * etc.) before resuming.  This interleaves host and guest work per frame
      * without threading. */
-    while (!rv_has_halted(rv) && !ctx.ecall_trapped) {
+    while (!rv_has_halted(rv) && !ctx.ecall_trapped && !ctx.ecall_aborted) {
         rv_step(rv);
         if (ctx.frame_done) {
             ctx.frame_done = false;
@@ -738,7 +744,12 @@ blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn, blyt_fr
     rv_delete(rv);
 
     bool trapped = ctx.ecall_trapped;
+    bool aborted = ctx.ecall_aborted;
     g_run_ctx = NULL;
 
-    return trapped ? BLYT_RUN_ERR_ECALL_TRAP : BLYT_RUN_OK;
+    if (trapped)
+        return BLYT_RUN_ERR_ECALL_TRAP;
+    if (aborted)
+        return BLYT_RUN_ERR_ABORT;
+    return BLYT_RUN_OK;
 }

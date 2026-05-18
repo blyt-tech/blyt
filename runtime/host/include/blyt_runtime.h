@@ -68,7 +68,8 @@ typedef void (*blyt_frame_fn)(void *userdata);
 typedef enum blyt_cart_run_err {
     BLYT_RUN_OK = 0,
     BLYT_RUN_ERR_EMU = 1, /* emulator setup failed */
-    BLYT_RUN_ERR_ECALL_TRAP = 2, /* cart issued a non-permitted ecall */
+    BLYT_RUN_ERR_ECALL_TRAP = 2, /* cart issued a non-permitted ecall (e.g. OS syscall) */
+    BLYT_RUN_ERR_ABORT = 3, /* cart called abort() — fatal internal error */
 } blyt_cart_run_err_t;
 
 /*

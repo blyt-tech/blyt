@@ -203,6 +203,41 @@ fn build_empty_project_fails_with_error() {
         .stderr(predicate::str::contains("no .c files"));
 }
 
+/// A cart that calls abort() must exit with a non-zero status and the
+/// frontend must report the abort (not confuse it with a clean exit).
+#[test]
+fn cart_abort_surfaces_as_error() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("abort_cart");
+
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+#include <stdlib.h>
+
+void blyt_cart_init(void)   { abort(); }
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .assert()
+        .failure() // non-zero exit — abort is not a clean exit
+        .stderr(predicate::str::contains("aborted"));
+}
+
 /// blytrun --headless rejects a non-existent cart path with a non-zero exit.
 #[test]
 fn run_missing_cart_fails() {
@@ -506,5 +541,9 @@ void blyt_cart_draw(void)   {}
 
     // A successful build (link step) is the assertion — no need to run.
     let cart = build_cart(&project);
-    assert!(cart.exists(), "symbol probe cart not found at {}", cart.display());
+    assert!(
+        cart.exists(),
+        "symbol probe cart not found at {}",
+        cart.display()
+    );
 }
