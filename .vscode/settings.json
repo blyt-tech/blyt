@@ -16,9 +16,14 @@
     // Env vars passed to test runs via rust-analyzer's "Run Test" / "Debug Test"
     // code lenses.  The integration tests assert on BLYT_SDK_DIR to find blyt.h
     // and on BLYT_LIB_DIR to locate libblyt32.so at runtime.
+    // BLYT_SDK_DIR is needed so the unpackaged target/debug/blyt binary can
+    // find blyt.h and libblyt32.so without being installed into the SDK.
+    // BLYT_OBJCOPY is intentionally absent: sdk_e2e_build_and_run runs the
+    // SDK binary directly and expects it to auto-discover blyt-objcopy; the
+    // other tests set BLYT_OBJCOPY explicitly, so inheriting it here would
+    // only interfere.
     "rust-analyzer.runnables.extraEnv": {
-        "BLYT_SDK_DIR": "${workspaceFolder}/build/sdk",
-        "BLYT_OBJCOPY": "llvm-objcopy"
+        "BLYT_SDK_DIR": "${workspaceFolder}/build/sdk"
     },
 
     // clang-format is applied on save for C files
