@@ -194,13 +194,12 @@ file(
 
 file(MAKE_DIRECTORY "${SDK_BIN}")
 execute_process(
-  COMMAND cargo build --manifest-path
-          "${BLYT_SOURCE_DIR}/devtool/Cargo.toml"
+  COMMAND cargo build --manifest-path "${BLYT_SOURCE_DIR}/Cargo.toml" --bin blyt
   RESULT_VARIABLE R)
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build blyt devtool")
 endif()
-file(COPY "${BLYT_SOURCE_DIR}/devtool/target/debug/blyt" DESTINATION "${SDK_BIN}")
+file(COPY "${BLYT_SOURCE_DIR}/target/debug/blyt" DESTINATION "${SDK_BIN}")
 
 # Expose the SDK's own toolchain binaries under blyt-prefixed names in bin/.
 # Using blyt-lld / blyt-objcopy avoids any collision with host tools and lets

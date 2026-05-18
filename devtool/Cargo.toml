@@ -1,3 +1,0 @@
-[workspace]
-members = ["blyt", "integration"]
-resolver = "2"
