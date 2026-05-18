@@ -201,22 +201,22 @@ if(NOT R EQUAL 0)
 endif()
 file(COPY "${BLYT_SOURCE_DIR}/target/debug/blyt" DESTINATION "${SDK_BIN}")
 
-# Expose the SDK's own toolchain binaries under blyt-prefixed names in bin/.
+# Expose toolchain binaries under blyt-prefixed names in bin/.
 # Using blyt-lld / blyt-objcopy avoids any collision with host tools and lets
 # blyt build use -fuse-ld=blyt-lld reliably across platforms.
-if(EXISTS "${SDK_TOOLCHAIN}/bin/ld.lld")
-  file(CREATE_LINK "${SDK_TOOLCHAIN}/bin/ld.lld" "${SDK_BIN}/blyt-lld" SYMBOLIC)
+# FOUND_* may point into a downloaded SDK_TOOLCHAIN (macOS) or to system
+# tools (Linux); we create the symlinks in both cases.
+if(FOUND_CLANG)
+  file(CREATE_LINK "${FOUND_CLANG}" "${SDK_BIN}/blyt-clang" SYMBOLIC)
+endif()
+if(FOUND_LLD)
+  file(CREATE_LINK "${FOUND_LLD}" "${SDK_BIN}/blyt-lld" SYMBOLIC)
   # Also keep ld.lld for direct invocation
-  file(CREATE_LINK "${SDK_TOOLCHAIN}/bin/ld.lld" "${SDK_BIN}/ld.lld" SYMBOLIC)
+  file(CREATE_LINK "${FOUND_LLD}" "${SDK_BIN}/ld.lld" SYMBOLIC)
 endif()
-if(EXISTS "${SDK_TOOLCHAIN}/bin/llvm-objcopy")
-  file(CREATE_LINK "${SDK_TOOLCHAIN}/bin/llvm-objcopy" "${SDK_BIN}/blyt-objcopy"
-       SYMBOLIC)
-  file(CREATE_LINK "${SDK_TOOLCHAIN}/bin/llvm-objcopy" "${SDK_BIN}/llvm-objcopy"
-       SYMBOLIC)
-endif()
-if(EXISTS "${SDK_TOOLCHAIN}/bin/clang")
-  file(CREATE_LINK "${SDK_TOOLCHAIN}/bin/clang" "${SDK_BIN}/blyt-clang" SYMBOLIC)
+if(FOUND_OBJCOPY)
+  file(CREATE_LINK "${FOUND_OBJCOPY}" "${SDK_BIN}/blyt-objcopy" SYMBOLIC)
+  file(CREATE_LINK "${FOUND_OBJCOPY}" "${SDK_BIN}/llvm-objcopy" SYMBOLIC)
 endif()
 
 # -------------------------------------------------------------------------

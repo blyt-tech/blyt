@@ -2,3 +2,5 @@ build/
 build-*/
 target/
 devtool/target/
+.vscode/
+tests/game/*.blyt

@@ -63,6 +63,9 @@ jobs:
       - name: C unit tests
         run: ctest --test-dir build --output-on-failure
 
+      - name: Build SDK
+        run: cmake --build build --target sdk
+
       - name: Check Rust formatting
         run: cargo fmt --check --all
 
