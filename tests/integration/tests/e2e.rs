@@ -34,12 +34,10 @@ fn write_cart_project(dir: &std::path::Path, source: &str) {
 
 /// Run `blyt build <project_dir>` and return the expected cart output path.
 fn build_cart(project_dir: &std::path::Path) -> PathBuf {
-    let root = repo_root();
     let sdk = sdk_dir();
     let mut cmd = Command::cargo_bin("blyt").unwrap();
     cmd.args(["build", project_dir.to_str().unwrap()])
-        .env("BLYT_SDK_DIR", &root)
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .env("BLYT_SDK_DIR", &sdk)
         .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
     // Use the SDK's riscv32-capable clang if available; system clang on macOS
     // cannot target riscv32 so the test is skipped when the SDK is absent.
@@ -191,13 +189,11 @@ fn build_empty_project_fails_with_error() {
     let project = tmp.path().join("empty");
     fs::create_dir_all(project.join("src/game/c")).unwrap();
 
-    let root = repo_root();
     Command::cargo_bin("blyt")
         .unwrap()
         .args(["build", project.to_str().unwrap()])
-        .env("BLYT_SDK_DIR", &root)
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
-        .env("BLYT_OBJCOPY", "llvm-objcopy")
+        .env("BLYT_SDK_DIR", sdk_dir())
+        .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
         .assert()
         .failure()
         .stderr(predicate::str::contains("no .c files"));

@@ -218,22 +218,12 @@ fn find_objcopy() -> String {
 fn find_sdk_include() -> Result<PathBuf, BuildError> {
     if let Ok(sdk) = std::env::var("BLYT_SDK_DIR") {
         let sdk = PathBuf::from(sdk);
-        // Assembled SDK layout: build/sdk/include/blyt.h
         let via_include = sdk.join("include");
         if via_include.join("blyt.h").exists() {
             return Ok(via_include);
         }
-        // Repo source layout: <repo>/runtime/guest/include/blyt.h
-        let via_guest = sdk.join("runtime/guest/include");
-        if via_guest.join("blyt.h").exists() {
-            return Ok(via_guest);
-        }
-        if sdk.join("blyt.h").exists() {
-            return Ok(sdk);
-        }
         return Err(err(format!(
-            "BLYT_SDK_DIR={} does not contain blyt.h \
-             (looked in include/ and runtime/guest/include/)",
+            "BLYT_SDK_DIR={} does not contain include/blyt.h",
             sdk.display()
         )));
     }
@@ -266,15 +256,23 @@ fn find_sdk_include() -> Result<PathBuf, BuildError> {
  * Library directory
  *
  * Looks for the directory containing libblyt32.so:
- *   1. $BLYT_LIB_DIR
- *   2. <sdk>/lib/  — SDK layout (build/sdk/lib/)
- *   3. <repo>/build/sdk/lib/  — repo-local SDK
- *   4. <repo>/build/  — repo CMake build output (CI)
+ *   1. $BLYT_LIB_DIR  (explicit override)
+ *   2. $BLYT_SDK_DIR/lib/  — derived from SDK dir
+ *   3. <sdk>/lib/  — SDK layout (running from build/sdk/bin/blyt)
+ *   4. Walk up from sdk_include looking for build/sdk/lib/ or build/
  * ------------------------------------------------------------------------- */
 
 fn find_lib_dir(sdk_include: &Path) -> Result<PathBuf, BuildError> {
     if let Ok(d) = std::env::var("BLYT_LIB_DIR") {
         let p = PathBuf::from(d);
+        if p.join("libblyt32.so").exists() {
+            return Ok(p);
+        }
+    }
+
+    // Derive from BLYT_SDK_DIR: lib/ is always adjacent to include/
+    if let Ok(sdk) = std::env::var("BLYT_SDK_DIR") {
+        let p = PathBuf::from(sdk).join("lib");
         if p.join("libblyt32.so").exists() {
             return Ok(p);
         }

@@ -13,6 +13,14 @@
     // rust-analyzer: single workspace root covering devtool/ and tests/integration/
     "rust-analyzer.linkedProjects": ["${workspaceFolder}/Cargo.toml"],
 
+    // Env vars passed to test runs via rust-analyzer's "Run Test" / "Debug Test"
+    // code lenses.  The integration tests assert on BLYT_SDK_DIR to find blyt.h
+    // and on BLYT_LIB_DIR to locate libblyt32.so at runtime.
+    "rust-analyzer.runnables.extraEnv": {
+        "BLYT_SDK_DIR": "${workspaceFolder}/build/sdk",
+        "BLYT_OBJCOPY": "llvm-objcopy"
+    },
+
     // clang-format is applied on save for C files
     "editor.formatOnSave": true,
     "[c]": {
