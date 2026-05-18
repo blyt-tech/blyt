@@ -47,6 +47,14 @@
             "problemMatcher": []
         },
         {
+            "label": "cargo: build blyt",
+            "type": "shell",
+            "command": "cargo build --bin blyt",
+            "options": { "cwd": "${workspaceFolder}" },
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": ["$rustc"]
+        },
+        {
             "label": "test: C unit tests",
             "type": "shell",
             "command": "ctest --test-dir build --output-on-failure",

@@ -42,6 +42,21 @@
             ]
         },
         {
+            // Debug the blyt devtool building the hello cart.
+            // Useful for stepping through build.rs (compile, link, finalise_cart).
+            "name": "blyt: build hello cart",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/blyt",
+            "args": ["build", "${workspaceFolder}/tests/game/hello"],
+            "env": {
+                "BLYT_SDK_DIR": "${workspaceFolder}",
+                "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib"
+            },
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo: build blyt"
+        },
+        {
             "name": "test: test_cart_load",
             "type": "lldb",
             "request": "launch",
