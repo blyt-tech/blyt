@@ -26,6 +26,8 @@ jobs:
             runtime/host/src/libblyt/*.h runtime/host/src/libblyt/*.c \
             runtime/guest/src/libblytcommon/*.c \
             runtime/guest/src/libblyt32/*.c \
+            runtime/guest/src/libblytc/blytc_arena.c \
+            runtime/guest/src/libblytc/blytc_stubs.c \
             runtime/guest/include/*.h \
             runtime/host/include/*.h \
             tests/unit/*.c \
@@ -39,7 +41,8 @@ jobs:
         run: |
           git submodule update --init --depth 1 \
             third_party/flatcc \
-            third_party/rv32emu
+            third_party/rv32emu \
+            third_party/musl
           git -C third_party/rv32emu submodule update --init --depth 1 \
             src/softfloat
 

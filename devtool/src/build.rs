@@ -57,8 +57,10 @@ SECTIONS {
     .got.plt : ALIGN(4) { *(.got.plt) } :relro
 
     . = ALIGN(4096);
-    .data : ALIGN(4) { *(.data .data.*) } :data
-    .bss (NOLOAD) : ALIGN(4) { *(.bss .bss.*) *(COMMON) } :data
+    .sdata : ALIGN(4) { *(.sdata .sdata.*) } :data
+    .data  : ALIGN(4) { *(.data .data.*) } :data
+    .sbss  (NOLOAD) : ALIGN(4) { *(.sbss .sbss.*) } :data
+    .bss   (NOLOAD) : ALIGN(4) { *(.bss .bss.*) *(COMMON) } :data
 }
 ";
 
@@ -420,8 +422,10 @@ fn link_cart(
         cmd.arg(obj);
     }
 
-    // libblyt32.so is self-contained (includes libblytcommon.so sources), so
-    // the cart's DT_NEEDED is only {libblyt32.so} (ADR-0024).
+    // Link against libblyt32.so only; the cart's DT_NEEDED is {libblyt32.so}.
+    // The SDK's libblyt32.so absorbs all libblytc sources (malloc, string,
+    // math, etc.) so lld resolves them directly from libblyt32.so's .dynsym.
+    // libblytc.so is loaded at runtime via libblyt32.so's DT_NEEDED entry.
     cmd.arg("-L").arg(lib_dir).arg("-lblyt32");
 
     let status = cmd

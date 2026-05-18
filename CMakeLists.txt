@@ -208,10 +208,12 @@ target_link_libraries(libblytemu PRIVATE libsoftfloat)
 # -------------------------------------------------------------------------
 # Guest-side RV32IMAFC shared libraries
 #
-# libblytcommon.so — variant-portable shared API (blyt.h); ECALL stubs for all
-# functions declared in blyt.h.  Re-exported by each variant library.
-# libblyt32.so — Blyt32 variant library; has DT_NEEDED: libblytcommon.so and
-# re-exports blyt_* symbols to carts via thin wrappers.
+# libblytcommon.so — variant-portable shared API (blyt.h); ECALL stubs for
+#   all functions declared in blyt.h.
+# libblytc.so — runtime-provided C library (ADR-0120): trimmed musl subset
+#   (malloc, string, math, printf, fmemopen).  Requires third_party/musl.
+# libblyt32.so — Blyt32 variant library; DT_NEEDED: libblytcommon.so,
+#   libblytc.so.  Carts link against this and get the C library transitively.
 #
 # Requires clang with riscv32 target support and lld.
 # -------------------------------------------------------------------------
@@ -255,27 +257,202 @@ if(CLANG_RV32
     COMMENT "Cross-compiling libblytcommon.so (RV32IMAFC)"
     VERBATIM)
 
-  # libblyt32.so — Blyt32 variant; links against libblytcommon.so
+  # ---- libblytc.so — runtime-provided C library (ADR-0120) ----
+  #
+  # Built from a curated subset of musl 1.2 sources (third_party/musl) plus
+  # our own arena allocator and internal stubs.  Requires the musl submodule.
+  set(MUSL_DIR "${CMAKE_SOURCE_DIR}/third_party/musl")
+  set(LIBBLYTC_BITS_DIR "${CMAKE_BINARY_DIR}/libblytc/bits")
+  set(LIBBLYTC_ALLTYPES_H "${LIBBLYTC_BITS_DIR}/alltypes.h")
+  set(LIBBLYTC_OUT "${CMAKE_BINARY_DIR}/libblytc.so")
+
+  if(EXISTS "${MUSL_DIR}/include/stdio.h")
+    # Generate bits/alltypes.h from the musl arch + generic templates.
+    # Set up bits/ directory: copy all arch/riscv32/bits/*.h, then generate
+    # the two that need processing.  Runs at configure time.
+    file(MAKE_DIRECTORY "${LIBBLYTC_BITS_DIR}")
+    file(GLOB _BITS_HDRS "${MUSL_DIR}/arch/riscv32/bits/*.h")
+    foreach(_H ${_BITS_HDRS})
+      file(COPY "${_H}" DESTINATION "${LIBBLYTC_BITS_DIR}")
+    endforeach()
+
+    execute_process(
+      COMMAND
+        sh -c
+        "cat '${MUSL_DIR}/arch/riscv32/bits/alltypes.h.in' \
+              '${MUSL_DIR}/include/alltypes.h.in' \
+         | sed -f '${MUSL_DIR}/tools/mkalltypes.sed'"
+      OUTPUT_FILE "${LIBBLYTC_ALLTYPES_H}"
+      RESULT_VARIABLE ALLTYPES_RESULT
+      ERROR_QUIET)
+
+    if(NOT ALLTYPES_RESULT EQUAL 0)
+      message(
+        WARNING "libblytc.so: failed to generate bits/alltypes.h — skipping")
+      set(MUSL_DIR "")
+    endif()
+
+    # Generate bits/syscall.h: copy .in then append SYS_xxx alias for each
+    # __NR_xxx (matching musl's Makefile rule).
+    if(MUSL_DIR)
+      execute_process(
+        COMMAND
+          sh -c
+          "cp '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
+              '${LIBBLYTC_BITS_DIR}/syscall.h' \
+           && sed -n -e 's/__NR_/SYS_/p' \
+               '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
+               >> '${LIBBLYTC_BITS_DIR}/syscall.h'"
+        RESULT_VARIABLE SYSCALL_RESULT
+        ERROR_QUIET)
+      if(NOT SYSCALL_RESULT EQUAL 0)
+        message(WARNING "libblytc.so: failed to generate bits/syscall.h")
+        set(MUSL_DIR "")
+      endif()
+    endif()
+  else()
+    message(
+      STATUS
+        "libblytc.so: third_party/musl not initialised — skipping \
+(run: git submodule update --init third_party/musl)")
+    set(MUSL_DIR "")
+  endif()
+
+  if(MUSL_DIR)
+    # musl source subsets — generic C only (no arch-specific subdirectories).
+    file(GLOB LIBBLYTC_STRING_SRCS "${MUSL_DIR}/src/string/*.c")
+    # strsignal calls __lctrans_cur (locale translation); exclude it.
+    list(REMOVE_ITEM LIBBLYTC_STRING_SRCS "${MUSL_DIR}/src/string/strsignal.c")
+    file(GLOB LIBBLYTC_MATH_SRCS "${MUSL_DIR}/src/math/*.c")
+    file(GLOB LIBBLYTC_CTYPE_SRCS "${MUSL_DIR}/src/ctype/*.c")
+
+    set(LIBBLYTC_STDLIB_SRCS
+        "${MUSL_DIR}/src/stdlib/strtol.c"
+        "${MUSL_DIR}/src/stdlib/strtod.c"
+        "${MUSL_DIR}/src/stdlib/qsort.c"
+        "${MUSL_DIR}/src/stdlib/qsort_nr.c"
+        "${MUSL_DIR}/src/stdlib/abs.c"
+        "${MUSL_DIR}/src/stdlib/atoi.c"
+        "${MUSL_DIR}/src/stdlib/atol.c"
+        "${MUSL_DIR}/src/stdlib/atof.c")
+
+    # floatscan / intscan / shgetc are internal helpers for strtod / strtol.
+    set(LIBBLYTC_INTERNAL_SRCS
+        "${MUSL_DIR}/src/internal/floatscan.c"
+        "${MUSL_DIR}/src/internal/intscan.c"
+        "${MUSL_DIR}/src/internal/shgetc.c")
+
+    # stdio subset: vsnprintf / snprintf / vfprintf / fmemopen + minimal FILE
+    # infrastructure.  Excludes anything that issues real syscalls (fopen,
+    # fread, fwrite via fd, etc.).
+    set(LIBBLYTC_STDIO_SRCS
+        "${MUSL_DIR}/src/stdio/vsnprintf.c"
+        "${MUSL_DIR}/src/stdio/snprintf.c"
+        "${MUSL_DIR}/src/stdio/vfprintf.c"
+        "${MUSL_DIR}/src/stdio/fwrite.c"
+        "${MUSL_DIR}/src/stdio/fmemopen.c"
+        "${MUSL_DIR}/src/stdio/__overflow.c"
+        "${MUSL_DIR}/src/stdio/__towrite.c"
+        "${MUSL_DIR}/src/stdio/__toread.c"
+        "${MUSL_DIR}/src/stdio/__uflow.c"
+        "${MUSL_DIR}/src/stdio/__fmodeflags.c")
+
+    set(LIBBLYTC_OWN_SRCS
+        "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_arena.c"
+        "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c")
+
+    set(LIBBLYTC_SRCS
+        ${LIBBLYTC_STRING_SRCS}
+        ${LIBBLYTC_MATH_SRCS}
+        ${LIBBLYTC_CTYPE_SRCS}
+        ${LIBBLYTC_STDLIB_SRCS}
+        ${LIBBLYTC_INTERNAL_SRCS}
+        ${LIBBLYTC_STDIO_SRCS}
+        ${LIBBLYTC_OWN_SRCS})
+
+    # Include paths for musl internal compilation.
+    # LIBBLYTC_BITS_DIR provides the generated bits/alltypes.h.
+    set(LIBBLYTC_INCLUDES
+        -I "${MUSL_DIR}/src/include" # defines `hidden` and other internal macros
+        -I "${MUSL_DIR}/include"
+        -I "${MUSL_DIR}/arch/riscv32"
+        -I "${MUSL_DIR}/arch/generic"
+        -I "${MUSL_DIR}/src/internal"
+        -I "${CMAKE_BINARY_DIR}/libblytc") # bits/alltypes.h lives here
+
+    # Determinism and musl-compatibility compile flags.
+    set(LIBBLYTC_CFLAGS
+        -ffp-contract=off
+        -fno-fast-math
+        -fno-strict-aliasing
+        -Wno-unused-parameter
+        -Wno-sign-compare
+        -Wno-implicit-fallthrough
+        -Wno-unused-variable
+        -Wno-deprecated-non-prototype)
+
+    add_custom_command(
+      OUTPUT "${LIBBLYTC_OUT}"
+      COMMAND
+        "${CLANG_RV32}" ${RV32_FLAGS} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
+        -Wl,-soname,libblytc.so -o "${LIBBLYTC_OUT}" ${LIBBLYTC_SRCS}
+      DEPENDS ${LIBBLYTC_SRCS} "${LIBBLYTC_ALLTYPES_H}"
+      COMMENT "Cross-compiling libblytc.so (RV32IMAFC, musl subset)"
+      VERBATIM)
+
+    message(STATUS "libblytc.so: will be built (musl at ${MUSL_DIR})")
+  endif()
+
+  # libblyt32.so — Blyt32 variant.
+  # DT_NEEDED: libblytcommon.so, libblytc.so (the latter via --no-as-needed so
+  # the entry is added even though libblyt32.so's own code doesn't reference
+  # libblytc symbols directly).
   set(LIBBLYT32_SRC "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c")
   set(LIBBLYT32_OUT "${CMAKE_BINARY_DIR}/libblyt32.so")
+
+  if(MUSL_DIR)
+    # Full build: DT_NEEDED for both libblytcommon.so and libblytc.so.
+    set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}"
+                       "${LIBBLYTC_OUT}")
+    set(LIBBLYT32_LINK
+        -L "${CMAKE_BINARY_DIR}" -lblytcommon -Wl,--no-as-needed -lblytc
+        -Wl,--as-needed -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
+  else()
+    # musl unavailable: build without libblytc.so dependency.
+    set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}")
+    set(LIBBLYT32_LINK
+        -L "${CMAKE_BINARY_DIR}" -lblytcommon
+        -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
+  endif()
+
   add_custom_command(
     OUTPUT "${LIBBLYT32_OUT}"
     COMMAND
-      "${CLANG_RV32}" ${RV32_FLAGS} -Wl,-soname,libblyt32.so ${RV32_INCLUDE} -L
-      "${CMAKE_BINARY_DIR}" -lblytcommon -Wl,-rpath-link,"${CMAKE_BINARY_DIR}"
-      -o "${LIBBLYT32_OUT}" "${LIBBLYT32_SRC}"
-    DEPENDS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}"
+      "${CLANG_RV32}" ${RV32_FLAGS} -Wl,-soname,libblyt32.so ${RV32_INCLUDE}
+      ${LIBBLYT32_LINK} -o "${LIBBLYT32_OUT}" "${LIBBLYT32_SRC}"
+    DEPENDS ${LIBBLYT32_DEPS}
     COMMENT "Cross-compiling libblyt32.so (RV32IMAFC)"
     VERBATIM)
 
-  add_custom_target(libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}"
-                                             "${LIBBLYTCOMMON_OUT}")
-  message(
-    STATUS "libblytcommon.so + libblyt32.so: will be built (${CLANG_RV32})")
+  if(MUSL_DIR)
+    add_custom_target(
+      libblyt32_so ALL
+      DEPENDS "${LIBBLYT32_OUT}" "${LIBBLYTCOMMON_OUT}" "${LIBBLYTC_OUT}")
+    message(
+      STATUS
+        "libblytcommon.so + libblytc.so + libblyt32.so: will be built \
+(${CLANG_RV32})")
+  else()
+    add_custom_target(libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}"
+                                               "${LIBBLYTCOMMON_OUT}")
+    message(
+      STATUS "libblytcommon.so + libblyt32.so: will be built (${CLANG_RV32})")
+  endif()
 else()
   message(
     STATUS
-      "libblytcommon.so + libblyt32.so: skipping (need clang riscv32 + ld.lld)")
+      "libblytcommon.so + libblyt32.so + libblytc.so: skipping \
+(need clang riscv32 + ld.lld)")
 endif()
 
 # -------------------------------------------------------------------------

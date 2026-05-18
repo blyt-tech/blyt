@@ -41,6 +41,12 @@
 /* Maximum number of runtime libraries loaded per cart execution. */
 #define MAX_RUNTIME_LIBS 8
 
+/* Cart heap arena (ADR-0120): 16 MiB region in guest address space.
+ * Placed at 64 MiB — well above the cart/trampoline region (~64 KiB) and
+ * below the runtime library region (128 MiB). */
+#define BLYT_ARENA_BASE 0x04000000u /* 64 MiB */
+#define BLYT_ARENA_SIZE (16u * 1024u * 1024u) /* 16 MiB */
+
 /* Maximum exported symbols tracked across all loaded runtime libraries. */
 #define MAX_SYMS 512
 
@@ -215,13 +221,30 @@ static bool map_lib_segments(const blyt_lib_t *lib, memory_t *mem) {
 }
 
 /* -------------------------------------------------------------------------
- * Apply R_RISCV_RELATIVE relocations from a library's SHT_RELA sections
+ * Apply load-time relocations from a library's SHT_RELA sections.
+ *
+ * Handles:
+ *   R_RISCV_RELATIVE — B + A  (load-base relative; most data pointers)
+ *   R_RISCV_32       — S + A  (symbol-relative; e.g. internal GOT pointers
+ *                              for module-local data variables like the arena
+ *                              globals in libblytc.so)
+ *
+ * R_RISCV_JUMP_SLOT and R_RISCV_GLOB_DAT are handled separately by
+ * resolve_elf_plt (they require the combined cross-library symbol table).
  * ------------------------------------------------------------------------- */
 
 static void apply_lib_rela(const blyt_lib_t *lib, memory_t *mem) {
     const Elf32_Ehdr *eh = (const Elf32_Ehdr *)lib->map;
     if (eh->e_shentsize < sizeof(Elf32_Shdr) || eh->e_shnum == 0)
         return;
+
+    /* Locate .dynsym (needed for R_RISCV_32 symbol lookup). */
+    const Elf32_Shdr *shdrs = (const Elf32_Shdr *)(lib->map + eh->e_shoff);
+    const Elf32_Shdr *dynsym_sh = NULL;
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        if (shdrs[i].sh_type == SHT_DYNSYM && !dynsym_sh)
+            dynsym_sh = &shdrs[i];
+    }
 
     for (uint16_t i = 0; i < eh->e_shnum; i++) {
         size_t off = (size_t)eh->e_shoff + (size_t)i * eh->e_shentsize;
@@ -237,11 +260,27 @@ static void apply_lib_rela(const blyt_lib_t *lib, memory_t *mem) {
             if (roff + sizeof(Elf32_Rela) > lib->size)
                 break;
             const Elf32_Rela *r = (const Elf32_Rela *)(lib->map + roff);
-            if (ELF32_R_TYPE(r->r_info) == R_RISCV_RELATIVE) {
-                uint32_t val = lib->bias + (uint32_t)r->r_addend;
-                uint8_t v[4];
-                write_u32_le(v, val);
+            uint32_t type = ELF32_R_TYPE(r->r_info);
+            uint8_t v[4];
+
+            if (type == R_RISCV_RELATIVE) {
+                write_u32_le(v, lib->bias + (uint32_t)r->r_addend);
                 memory_write(mem, lib->bias + r->r_offset, v, 4);
+            } else if (type == R_RISCV_32 && dynsym_sh &&
+                       dynsym_sh->sh_entsize >= sizeof(Elf32_Sym)) {
+                uint32_t sym_idx = ELF32_R_SYM(r->r_info);
+                size_t sym_off =
+                    (size_t)dynsym_sh->sh_offset + (size_t)sym_idx * dynsym_sh->sh_entsize;
+                if (sym_off + sizeof(Elf32_Sym) > lib->size)
+                    continue;
+                const Elf32_Sym *sym = (const Elf32_Sym *)(lib->map + sym_off);
+                /* For symbols defined in this library (not UNDEF), compute
+                 * their runtime address: bias + st_value + addend. */
+                if (sym->st_shndx != SHN_UNDEF) {
+                    uint32_t val = lib->bias + sym->st_value + (uint32_t)r->r_addend;
+                    write_u32_le(v, val);
+                    memory_write(mem, lib->bias + r->r_offset, v, 4);
+                }
             }
         }
     }
@@ -600,6 +639,26 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
 
         /* Resolve the cart's PLT/GOT against the combined symbol table. */
         resolve_elf_plt(cart->map, cart->map_size, mem, 0, &all_syms);
+
+        /* Initialise the libblytc.so arena (ADR-0120).
+         *
+         * blytc_arena_base and blytc_arena_size are exported data symbols in
+         * libblytc.so's .dynsym.  We write the arena guest address and size
+         * directly into those .data locations so the arena allocator can start
+         * serving malloc() calls when cart code runs.
+         *
+         * The arena occupies BLYT_ARENA_SIZE bytes at BLYT_ARENA_BASE in the
+         * guest address space.  The region falls between the cart load area
+         * (~64 KiB) and the runtime library area (128 MiB), so no overlap. */
+        uint32_t sym_base = symtab_lookup(&all_syms, "blytc_arena_base");
+        uint32_t sym_size = symtab_lookup(&all_syms, "blytc_arena_size");
+        if (sym_base != 0 && sym_size != 0) {
+            uint8_t v[4];
+            write_u32_le(v, BLYT_ARENA_BASE);
+            memory_write(mem, sym_base, v, 4);
+            write_u32_le(v, BLYT_ARENA_SIZE);
+            memory_write(mem, sym_size, v, 4);
+        }
     }
 
     for (int i = 0; i < nlibs; i++)

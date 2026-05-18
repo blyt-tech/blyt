@@ -164,15 +164,142 @@ if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblytcommon.so")
 endif()
 
-message(STATUS "Building libblyt32.so…")
-# libblyt32.so is self-contained: it statically absorbs libblytcommon.so's
-# source so the cart's DT_NEEDED is only {libblyt32.so}.  libblytcommon.so
-# remains a separate library for cross-variant code that links blyt.h directly.
+message(STATUS "Building libblytc.so…")
+# libblytc.so — trimmed musl-based C library (ADR-0120).
+# Curated musl source subsets + our arena allocator and internal stubs.
+set(MUSL_DIR "${BLYT_SOURCE_DIR}/third_party/musl")
+set(LIBBLYTC_BITS_DIR "${BLYT_BINARY_DIR}/libblytc/bits")
+set(LIBBLYTC_ALLTYPES_H "${LIBBLYTC_BITS_DIR}/alltypes.h")
+
+if(NOT EXISTS "${MUSL_DIR}/include/stdio.h")
+  message(
+    FATAL_ERROR
+    "third_party/musl not initialised. "
+    "Run: git submodule update --init third_party/musl")
+endif()
+
+# Set up bits/ directory: copy all arch/riscv32/bits/*.h files, then generate
+# the two that require processing (alltypes.h from template; syscall.h from .in).
+file(MAKE_DIRECTORY "${LIBBLYTC_BITS_DIR}")
+file(GLOB _BITS_HDRS "${MUSL_DIR}/arch/riscv32/bits/*.h")
+foreach(_H ${_BITS_HDRS})
+  file(COPY "${_H}" DESTINATION "${LIBBLYTC_BITS_DIR}")
+endforeach()
+
 execute_process(
-  COMMAND "${FOUND_CLANG}" ${RV32_BASE} -Wl,-soname,libblyt32.so -o
-          "${SDK_LIB}/libblyt32.so"
-          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
-          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
+  COMMAND
+    sh -c
+    "cat '${MUSL_DIR}/arch/riscv32/bits/alltypes.h.in' \
+          '${MUSL_DIR}/include/alltypes.h.in' \
+     | sed -f '${MUSL_DIR}/tools/mkalltypes.sed'"
+  OUTPUT_FILE "${LIBBLYTC_ALLTYPES_H}"
+  RESULT_VARIABLE R)
+if(NOT R EQUAL 0)
+  message(FATAL_ERROR "Failed to generate bits/alltypes.h for libblytc.so")
+endif()
+
+# Generate bits/syscall.h: copy .in then append SYS_xxx aliases for each
+# __NR_xxx (matching musl's Makefile: sed -n -e s/__NR_/SYS_/p < .in >> out).
+execute_process(
+  COMMAND
+    sh -c
+    "cp '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
+        '${LIBBLYTC_BITS_DIR}/syscall.h' \
+     && sed -n -e 's/__NR_/SYS_/p' \
+         '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
+         >> '${LIBBLYTC_BITS_DIR}/syscall.h'"
+  RESULT_VARIABLE R)
+if(NOT R EQUAL 0)
+  message(FATAL_ERROR "Failed to generate bits/syscall.h for libblytc.so")
+endif()
+
+file(GLOB LIBBLYTC_STRING_SRCS "${MUSL_DIR}/src/string/*.c")
+# strsignal calls __lctrans_cur (locale translation); exclude it.
+list(REMOVE_ITEM LIBBLYTC_STRING_SRCS "${MUSL_DIR}/src/string/strsignal.c")
+
+file(GLOB LIBBLYTC_MATH_SRCS "${MUSL_DIR}/src/math/*.c")
+file(GLOB LIBBLYTC_CTYPE_SRCS "${MUSL_DIR}/src/ctype/*.c")
+
+set(LIBBLYTC_SRCS
+    ${LIBBLYTC_STRING_SRCS}
+    ${LIBBLYTC_MATH_SRCS}
+    ${LIBBLYTC_CTYPE_SRCS}
+    "${MUSL_DIR}/src/stdlib/strtol.c"
+    "${MUSL_DIR}/src/stdlib/strtod.c"
+    "${MUSL_DIR}/src/stdlib/qsort.c"
+    "${MUSL_DIR}/src/stdlib/qsort_nr.c"
+    "${MUSL_DIR}/src/stdlib/abs.c"
+    "${MUSL_DIR}/src/stdlib/atoi.c"
+    "${MUSL_DIR}/src/stdlib/atol.c"
+    "${MUSL_DIR}/src/stdlib/atof.c"
+    "${MUSL_DIR}/src/internal/floatscan.c"
+    "${MUSL_DIR}/src/internal/intscan.c"
+    "${MUSL_DIR}/src/internal/shgetc.c"
+    "${MUSL_DIR}/src/stdio/vsnprintf.c"
+    "${MUSL_DIR}/src/stdio/snprintf.c"
+    "${MUSL_DIR}/src/stdio/vfprintf.c"
+    "${MUSL_DIR}/src/stdio/fwrite.c"
+    "${MUSL_DIR}/src/stdio/fmemopen.c"
+    "${MUSL_DIR}/src/stdio/__overflow.c"
+    "${MUSL_DIR}/src/stdio/__towrite.c"
+    "${MUSL_DIR}/src/stdio/__toread.c"
+    "${MUSL_DIR}/src/stdio/__uflow.c"
+    "${MUSL_DIR}/src/stdio/__fmodeflags.c"
+    "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_arena.c"
+    "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c")
+
+set(LIBBLYTC_INCLUDES
+    -I "${MUSL_DIR}/src/include" # defines `hidden` and other internal macros
+    -I "${MUSL_DIR}/include"
+    -I "${MUSL_DIR}/arch/riscv32"
+    -I "${MUSL_DIR}/arch/generic"
+    -I "${MUSL_DIR}/src/internal"
+    -I "${LIBBLYTC_BITS_DIR}/..")
+
+set(LIBBLYTC_CFLAGS
+    -ffp-contract=off
+    -fno-fast-math
+    -fno-strict-aliasing
+    -Wno-unused-parameter
+    -Wno-sign-compare
+    -Wno-implicit-fallthrough
+    -Wno-unused-variable
+    -Wno-deprecated-non-prototype)
+
+execute_process(
+  COMMAND
+    "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
+    -Wl,-soname,libblytc.so -o "${SDK_LIB}/libblytc.so" ${LIBBLYTC_SRCS}
+  RESULT_VARIABLE R)
+if(NOT R EQUAL 0)
+  message(FATAL_ERROR "Failed to build libblytc.so")
+endif()
+
+message(STATUS "Building libblyt32.so…")
+# libblyt32.so — Blyt32 variant.
+#
+# Self-contained for cart LINK TIME: absorbs both libblytcommon sources and
+# ALL libblytc sources so carts need only -lblyt32 at build time.  Exporting
+# malloc/free/string/math functions directly from libblyt32.so's .dynsym lets
+# lld resolve them without adding libblytc.so to the cart's DT_NEEDED.
+#
+# Runtime: libblyt32.so declares DT_NEEDED: libblytc.so (forced via
+# --no-as-needed).  The runtime's BFS dynamic loader picks up libblytc.so
+# transitively.  The first-wins symbol rule means libblyt32.so's baked-in
+# copies of malloc etc. are used on the emulated/libretro path; libblytc.so's
+# copies are shadowed but the library is present for the hardware trusted-exec
+# path where ld.so resolves against it directly.
+execute_process(
+  COMMAND
+    "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
+    -Wl,-soname,libblyt32.so
+    -L "${SDK_LIB}"
+    -Wl,--no-as-needed -lblytc -Wl,--as-needed
+    -Wl,-rpath-link,"${SDK_LIB}"
+    -o "${SDK_LIB}/libblyt32.so"
+    "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
+    "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
+    ${LIBBLYTC_SRCS}
   RESULT_VARIABLE R)
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblyt32.so")
@@ -182,11 +309,60 @@ endif()
 # Step 3: SDK headers
 # -------------------------------------------------------------------------
 
+# Start with a clean include/ so removed headers don't linger across rebuilds.
+file(REMOVE_RECURSE "${SDK_INC}")
 file(MAKE_DIRECTORY "${SDK_INC}")
 file(
   COPY "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt.h"
        "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt32.h"
   DESTINATION "${SDK_INC}")
+
+# Copy the curated subset of musl public headers that correspond to functions
+# libblytc.so actually provides (ADR-0120).  Excluded: filesystem I/O (fopen,
+# unistd, dirent), pthreads, signals, dynamic loading, networking.
+# Cart code that includes an omitted header gets a compile-time error rather
+# than a confusing link-time undefined-symbol failure.
+foreach(
+  _H
+  # Infrastructure pulled in by most musl headers
+  features.h
+  alloca.h
+  stdc-predef.h
+  # Our curated API surface (ADR-0120)
+  assert.h
+  complex.h
+  ctype.h
+  endian.h
+  errno.h
+  fenv.h
+  float.h
+  inttypes.h
+  iso646.h
+  limits.h
+  locale.h
+  math.h
+  stdarg.h
+  stdalign.h
+  stdbool.h
+  stddef.h
+  stdint.h
+  stdnoreturn.h
+  stdio.h
+  stdlib.h
+  string.h
+  strings.h
+  time.h
+  uchar.h
+  wchar.h
+  wctype.h)
+  file(COPY "${MUSL_DIR}/include/${_H}" DESTINATION "${SDK_INC}")
+endforeach()
+
+# subdirectory headers needed by the above
+file(COPY "${MUSL_DIR}/include/sys/types.h" DESTINATION "${SDK_INC}/sys")
+
+# bits/ (generated): alltypes.h, syscall.h, and arch-specific headers
+file(COPY "${LIBBLYTC_BITS_DIR}/" DESTINATION "${SDK_INC}/bits")
 
 # -------------------------------------------------------------------------
 # Step 4: blyt devtool

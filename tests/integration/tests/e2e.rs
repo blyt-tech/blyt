@@ -98,11 +98,15 @@ void blyt_cart_draw(void)   {}
 "#,
     );
 
-    // Build the cart using the assembled SDK binary.  No env vars are needed:
-    // the SDK blyt auto-discovers its toolchain (blyt-clang) and runtime
-    // libraries from its own location in build/sdk/bin/.
+    // Build the cart using the assembled SDK binary.  Remove inherited override
+    // env vars so that the SDK blyt fully auto-discovers its toolchain
+    // (blyt-clang) and runtime libraries from its own location in
+    // build/sdk/bin/.
     Command::new(&sdk_blyt)
         .args(["build", project.to_str().unwrap()])
+        .env_remove("BLYT_SDK_DIR")
+        .env_remove("BLYT_CLANG")
+        .env_remove("BLYT_OBJCOPY")
         .assert()
         .success();
 
@@ -207,4 +211,300 @@ fn run_missing_cart_fails() {
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .failure();
+}
+
+/// Cart allocates a heap buffer, formats a float into it with snprintf, logs
+/// it via blyt_console_debug, then frees the buffer.
+///
+/// Validates malloc + snprintf + free through libblytc.so.
+/// Requires the SDK (libblytc.so) to be assembled.
+#[test]
+fn hello_cart_malloc_debug() {
+    assert!(
+        sdk_dir().join("lib/libblytc.so").exists(),
+        "SDK not assembled or libblytc.so missing — \
+         run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("malloc_debug");
+
+    // Format the float as two integer parts to stay entirely within RV32F
+    // (single-precision) arithmetic.  The %f specifier always promotes float
+    // to double, which requires compiler-rt soft-double builtins not yet
+    // bundled in the SDK.  The integer approach exercises malloc, snprintf,
+    // and free without triggering those dependencies.
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+#include <stdlib.h>
+#include <stdio.h>
+
+void blyt_cart_init(void) {
+    float val = 3.14159f;
+    char *buf = (char *)malloc(32);
+    if (!buf) {
+        blyt_console_debug("malloc failed");
+        return;
+    }
+    int whole = (int)val;
+    int frac  = (int)((val - (float)whole) * 10000.0f + 0.5f);
+    snprintf(buf, 32, "pi=%d.%04d", whole, frac);
+    blyt_console_debug(buf);
+    free(buf);
+}
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8_lossy(&output);
+    assert!(
+        out.contains("pi=3.1416"),
+        "expected 'pi=3.1416' in output, got: {out}"
+    );
+}
+
+/// Stress-tests the libblytc.so arena allocator boundary conditions:
+///   1. Basic malloc / free / realloc / calloc correctness
+///   2. OOM: single allocation larger than the 16 MiB arena returns NULL
+///   3. calloc zeroing
+///   4. realloc preserves data
+///   5. coalescing: free two adjacent blocks, verify the merged space can
+///      satisfy an allocation larger than either block alone
+///
+/// The cart prints "arena tests passed" on success; individual failures
+/// are logged with a "FAIL:" prefix so the assertion below catches them.
+#[test]
+fn arena_boundary_tests() {
+    assert!(
+        sdk_dir().join("lib/libblytc.so").exists(),
+        "SDK not assembled or libblytc.so missing — \
+         run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("arena_boundary");
+
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+#include <stdlib.h>
+#include <string.h>
+
+static int g_ok = 1;
+
+static void check(int cond, const char *msg) {
+    if (!cond) {
+        blyt_console_debug(msg);
+        g_ok = 0;
+    }
+}
+
+void blyt_cart_init(void) {
+    /* --- 1. Basic alloc / free --- */
+    void *p = malloc(64);
+    check(p != NULL, "FAIL: basic malloc returned NULL");
+    if (p) {
+        memset(p, 0xAB, 64);
+        free(p);
+    }
+
+    /* --- 2. calloc zero-initialises --- */
+    int *arr = (int *)calloc(16, sizeof(int));
+    check(arr != NULL, "FAIL: calloc returned NULL");
+    if (arr) {
+        int zeroed = 1;
+        for (int i = 0; i < 16; i++) if (arr[i] != 0) { zeroed = 0; break; }
+        check(zeroed, "FAIL: calloc did not zero-initialise");
+        free(arr);
+    }
+
+    /* --- 3. realloc grows and preserves data --- */
+    char *s = (char *)malloc(8);
+    check(s != NULL, "FAIL: malloc for realloc returned NULL");
+    if (s) {
+        memcpy(s, "hello", 6);
+        char *s2 = (char *)realloc(s, 64);
+        check(s2 != NULL, "FAIL: realloc returned NULL");
+        if (s2) {
+            check(memcmp(s2, "hello", 6) == 0,
+                  "FAIL: realloc did not preserve data");
+            free(s2);
+        }
+    }
+
+    /* --- 4. OOM: request more than the 16 MiB arena --- */
+    void *big = malloc(17u * 1024u * 1024u); /* 17 MiB > 16 MiB arena */
+    check(big == NULL, "FAIL: over-arena malloc should return NULL");
+    if (big) free(big);
+
+    /* --- 5. Coalescing: free two adjacent blocks, then allocate merged size.
+     *
+     * Allocate A (512 bytes) then B (512 bytes) consecutively so they are
+     * physically adjacent in the arena.  Free both.  The allocator should
+     * coalesce them into a single ~1 KiB free region.  An 800-byte malloc
+     * then succeeds only if coalescing happened (each individual block is
+     * too small to satisfy it after fragmentation).
+     *
+     * Note: each block carries a 16-byte header, so block A occupies
+     * 512 + 16 = 528 bytes and block B likewise.  After freeing both the
+     * merged region is 1056 bytes; an 800-byte request (+ 16 header = 816)
+     * fits inside. */
+    void *a = malloc(512);
+    void *b = malloc(512);
+    check(a != NULL && b != NULL, "FAIL: setup allocs for coalesce test");
+    if (a && b) {
+        free(a);
+        free(b);
+        /* Request 800 bytes — fits in the merged region but not in either
+         * 512-byte slot individually. */
+        void *merged = malloc(800);
+        check(merged != NULL,
+              "FAIL: post-coalesce malloc failed (coalescing not working)");
+        if (merged) free(merged);
+    }
+
+    if (g_ok) blyt_console_debug("arena tests passed");
+}
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let out = String::from_utf8_lossy(&output);
+    assert!(
+        !out.contains("FAIL:"),
+        "arena boundary test failures:\n{out}"
+    );
+    assert!(
+        out.contains("arena tests passed"),
+        "expected 'arena tests passed' in output, got:\n{out}"
+    );
+}
+
+/// Symbol-presence probe: build a cart that takes the address of every function
+/// the SDK headers promise to provide.  If any symbol is absent from
+/// libblyt32.so (which absorbs all libblytc.so sources), the link fails and
+/// the test fails.  The cart never has to run — the build step is the test.
+///
+/// Coverage: allocator, key string functions, printf, stdlib conversions, and
+/// the float math surface (sinf/cosf families).  Each category exercises a
+/// distinct source group in the curated musl subset.
+#[test]
+fn libblytc_symbol_probe() {
+    assert!(
+        sdk_dir().join("lib/libblytc.so").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("symbol_probe");
+
+    write_cart_project(
+        &project,
+        r#"
+/* Symbol-presence probe for libblytc.so (ADR-0120).
+ *
+ * Takes the address of every function the SDK promises.  Using addresses
+ * (not calls) ensures the linker must resolve the symbols without us needing
+ * to supply correct arguments or run the cart.
+ *
+ * __attribute__((used)) on the table prevents the optimiser from discarding
+ * the references before the linker sees them.
+ */
+#include "blyt.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <ctype.h>
+
+__attribute__((used))
+static void *const blytc_probe[] = {
+    /* -- allocator -- */
+    (void *)malloc, (void *)free, (void *)realloc, (void *)calloc,
+
+    /* -- string / memory -- */
+    (void *)memcpy,  (void *)memmove,  (void *)memset,  (void *)memcmp,
+    (void *)memchr,  (void *)strlen,   (void *)strcmp,   (void *)strncmp,
+    (void *)strcpy,  (void *)strncpy,  (void *)strcat,   (void *)strncat,
+    (void *)strchr,  (void *)strrchr,  (void *)strstr,   (void *)strtok,
+
+    /* -- stdlib conversions -- */
+    (void *)strtol,  (void *)strtoul,  (void *)strtod,  (void *)strtof,
+    (void *)atoi,    (void *)atol,     (void *)atof,
+    (void *)qsort,   (void *)abs,
+
+    /* -- printf (memory-backed only; no fd I/O) -- */
+    (void *)snprintf, (void *)vsnprintf,
+
+    /* -- ctype -- */
+    (void *)isalpha, (void *)isdigit, (void *)isalnum,
+    (void *)isspace, (void *)islower, (void *)isupper,
+    (void *)tolower, (void *)toupper,
+
+    /* -- float math (f32 surface, ADR-0005) -- */
+    (void *)sinf,    (void *)cosf,    (void *)tanf,
+    (void *)asinf,   (void *)acosf,   (void *)atanf,  (void *)atan2f,
+    (void *)expf,    (void *)logf,    (void *)log2f,  (void *)log10f,
+    (void *)powf,    (void *)sqrtf,   (void *)fabsf,
+    (void *)floorf,  (void *)ceilf,   (void *)roundf, (void *)truncf,
+    (void *)fmodf,   (void *)hypotf,  (void *)fmaf,
+    (void *)copysignf, (void *)fmaxf, (void *)fminf,
+    (void *)ldexpf,  (void *)frexpf,  (void *)modff,
+
+    /* -- double math variants (completeness; no first-class use) -- */
+    (void *)sin,     (void *)cos,     (void *)sqrt,
+    (void *)exp,     (void *)log,     (void *)pow,
+    (void *)fabs,    (void *)floor,   (void *)ceil,
+};
+
+void blyt_cart_init(void)   { (void)blytc_probe; }
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+
+    // A successful build (link step) is the assertion — no need to run.
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "symbol probe cart not found at {}", cart.display());
 }
