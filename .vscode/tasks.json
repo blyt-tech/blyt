@@ -1,0 +1,75 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cmake: configure",
+            "type": "shell",
+            "command": "cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+            "options": { "cwd": "${workspaceFolder}" },
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": []
+        },
+        {
+            "label": "cmake: build",
+            "type": "shell",
+            "command": "cmake --build build",
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "cmake: build sdk",
+            "type": "shell",
+            "command": "cmake --build build --target sdk",
+            "options": { "cwd": "${workspaceFolder}" },
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": []
+        },
+        {
+            // Builds tests/game/hello.blyt using the SDK's blyt binary.
+            // The SDK blyt auto-discovers its toolchain and libraries from its own location.
+            "label": "build: hello cart",
+            "type": "shell",
+            "command": "${workspaceFolder}/build/sdk/bin/blyt build ${workspaceFolder}/tests/game/hello",
+            "options": { "cwd": "${workspaceFolder}" },
+            "dependsOn": ["cmake: build sdk"],
+            "dependsOrder": "sequence",
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": []
+        },
+        {
+            // Compound pre-launch task: builds blytrun, the SDK, and the hello cart in order.
+            "label": "build: hello cart launch deps",
+            "dependsOn": ["cmake: build", "cmake: build sdk", "build: hello cart"],
+            "dependsOrder": "sequence",
+            "presentation": { "reveal": "silent" },
+            "problemMatcher": []
+        },
+        {
+            "label": "test: C unit tests",
+            "type": "shell",
+            "command": "ctest --test-dir build --output-on-failure",
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "test",
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": []
+        },
+        {
+            "label": "test: Rust tests",
+            "type": "shell",
+            "command": "cargo test --workspace",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "BLYT_SDK_DIR": "${workspaceFolder}",
+                    "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib",
+                    "BLYT_OBJCOPY": "llvm-objcopy"
+                }
+            },
+            "group": "test",
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": ["$rustc"]
+        }
+    ]
+}

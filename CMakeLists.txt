@@ -23,6 +23,9 @@ set(FLATCC_CXX_TEST
 set(FLATCC_INSTALL
     OFF
     CACHE BOOL "" FORCE)
+set(FLATCC_DEBUG_CLANG_SANITIZE
+    OFF
+    CACHE BOOL "" FORCE)
 add_subdirectory(third_party/flatcc EXCLUDE_FROM_ALL)
 
 # FlatBuffers codegen — generates pure C reader headers for the runtime
@@ -179,8 +182,26 @@ set(RV32EMU_FEATURE_DEFS
 # For libblytemu: force-include common.h so that every rv32emu .c file gets
 # RV32_HAS, FORCE_INLINE, HAVE_MMAP, etc. without needing to include it
 # explicitly (rv32emu's own Makefile uses a generated config.h for this).
+#
+# Generate a single wrapper header that includes common.h then, on macOS only,
+# overrides HAVE_MMAP back to 0.  Using one force-include avoids cmake
+# deduplicating two -include flags with the same name.
+#
+# rv32emu's demand-paging (PROT_NONE + SIGSEGV handler) causes LLDB to intercept
+# every first memory touch as EXC_BAD_ACCESS before the program's handler can
+# respond.  The malloc-based fallback (HAVE_MMAP=0) is functionally equivalent
+# for blyt.
+set(RV32EMU_CONFIG_H "${CMAKE_BINARY_DIR}/rv32emu_config.h")
+if(APPLE)
+  file(WRITE "${RV32EMU_CONFIG_H}"
+       "#include \"${RV32EMU_DIR}/common.h\"\n" "#undef HAVE_MMAP\n"
+       "#define HAVE_MMAP 0 /* macOS/LLDB: avoid demand-paging */\n")
+else()
+  file(WRITE "${RV32EMU_CONFIG_H}" "#include \"${RV32EMU_DIR}/common.h\"\n")
+endif()
+
 target_compile_definitions(libblytemu PRIVATE ${RV32EMU_FEATURE_DEFS})
-target_compile_options(libblytemu PRIVATE -include "${RV32EMU_DIR}/common.h")
+target_compile_options(libblytemu PRIVATE -include "${RV32EMU_CONFIG_H}")
 target_include_directories(libblytemu PUBLIC ${RV32EMU_DIR})
 target_link_libraries(libblytemu PRIVATE libsoftfloat)
 
@@ -403,3 +424,25 @@ add_custom_target(
   USES_TERMINAL
   COMMENT "Assembling blyt SDK in build/sdk/"
   VERBATIM)
+
+# -------------------------------------------------------------------------
+# macOS: generate .dSYM bundles after linking so LLDB can locate source for code
+# in static libraries (rv32emu, flatcc).  cmake+Ninja does not run dsymutil
+# automatically; without .dSYM bundles, LLDB falls back to N_OSO stabs which are
+# less reliable and can leave source files unresolvable.
+# -------------------------------------------------------------------------
+if(APPLE)
+  find_program(DSYMUTIL dsymutil)
+  if(DSYMUTIL)
+    foreach(_bin blytrun test_cart_load test_cart_run verify_cart)
+      if(TARGET ${_bin})
+        add_custom_command(
+          TARGET ${_bin}
+          POST_BUILD
+          COMMAND "${DSYMUTIL}" "$<TARGET_FILE:${_bin}>"
+          COMMENT "dsymutil ${_bin}"
+          VERBATIM)
+      endif()
+    endforeach()
+  endif()
+endif()

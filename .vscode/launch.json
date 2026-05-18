@@ -1,0 +1,67 @@
+{
+    // Requires the CodeLLDB extension (vadimcn.vscode-lldb) for "type": "lldb".
+    // Works for both C/C++ and Rust targets.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // Run the hello cart headlessly — fastest way to verify blyt_console_debug
+            // output without opening an SDL2 window.
+            // Cart is built by blyt into tests/game/hello.blyt (gitignored).
+            "name": "blytrun: hello cart (headless)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/blytrun",
+            "args": ["--headless", "${workspaceFolder}/tests/game/hello.blyt"],
+            "env": {
+                "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib"
+            },
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "build: hello cart launch deps",
+            // rv32emu uses demand-paging: memory is mapped PROT_NONE and activated
+            // via a SIGSEGV handler on first access.  Tell LLDB to pass these signals
+            // through rather than treating them as crashes.
+            "initCommands": [
+                "process handle SIGSEGV --stop false --pass true",
+                "process handle SIGBUS --stop false --pass true"
+            ]
+        },
+        {
+            "name": "blytrun: hello cart (SDL2)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/blytrun",
+            "args": ["${workspaceFolder}/tests/game/hello.blyt"],
+            "env": {
+                "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib"
+            },
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "build: hello cart launch deps",
+            "initCommands": [
+                "process handle SIGSEGV --stop false --pass true",
+                "process handle SIGBUS --stop false --pass true"
+            ]
+        },
+        {
+            "name": "test: test_cart_load",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/test_cart_load",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cmake: build"
+        },
+        {
+            "name": "test: test_cart_run",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/test_cart_run",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cmake: build",
+            "initCommands": [
+                "process handle SIGSEGV --stop false --pass true",
+                "process handle SIGBUS --stop false --pass true"
+            ]
+        }
+    ]
+}
