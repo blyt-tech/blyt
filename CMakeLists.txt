@@ -234,6 +234,9 @@ if(CLANG_RV32
       -march=rv32imafc
       -mabi=ilp32f
       -shared
+      # -Wl,--shared explicitly tells lld to produce ET_DYN; clang may inject
+      # -Bstatic for bare-metal riscv targets which overrides -shared otherwise.
+      -Wl,--shared
       -fPIC
       -nostdlib
       -fuse-ld=lld)
