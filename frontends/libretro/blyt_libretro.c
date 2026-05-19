@@ -45,6 +45,7 @@ static retro_log_printf_t g_log_cb = NULL;
 static blyt_cart_t *g_cart = NULL;
 static blyt_session_t *g_session = NULL;
 static bool g_cart_done = false;
+static blyt_cart_run_err_t g_run_err = BLYT_RUN_OK;
 
 /* -------------------------------------------------------------------------
  * Log callback passed to libblyt — routes blyt_console_debug to retro_log
@@ -177,12 +178,14 @@ RETRO_API void retro_unload_game(void) {
     blyt_cart_close(g_cart);
     g_cart = NULL;
     g_cart_done = false;
+    g_run_err = BLYT_RUN_OK;
 }
 
 RETRO_API void retro_reset(void) {
     blyt_session_destroy(g_session);
     g_session = g_cart ? blyt_session_create(g_cart, libretro_log) : NULL;
     g_cart_done = false;
+    g_run_err = BLYT_RUN_OK;
 }
 
 RETRO_API void retro_run(void) {
@@ -193,6 +196,7 @@ RETRO_API void retro_run(void) {
         blyt_cart_run_err_t err = blyt_session_run_frame(g_session);
         if (err != BLYT_RUN_FRAME_DONE) {
             g_cart_done = true;
+            g_run_err = err;
             if (err == BLYT_RUN_ERR_ECALL_TRAP && g_log_cb)
                 g_log_cb(RETRO_LOG_ERROR, "blyt: cart attempted a non-permitted ecall\n");
             else if (err == BLYT_RUN_ERR_ABORT && g_log_cb)
@@ -248,4 +252,8 @@ RETRO_API size_t retro_get_memory_size(unsigned id) {
  * when the cart has exited and the run loop should stop. */
 bool blyt_libretro_is_done(void) {
     return g_cart_done;
+}
+
+blyt_cart_run_err_t blyt_libretro_run_err(void) {
+    return g_run_err;
 }

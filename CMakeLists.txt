@@ -522,6 +522,16 @@ else()
   endif()
 endif()
 
+# blytrun drives the runtime via the libretro API (blyt_libretro.c compiled in
+# directly, without BLYT_EMBED_LIBS so dynlink uses BLYT_LIB_DIR as usual).
+if(TARGET blytrun)
+  target_sources(blytrun PRIVATE frontends/libretro/blyt_libretro.c)
+  target_include_directories(
+    blytrun PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
+                    "${CMAKE_SOURCE_DIR}/runtime/host/include")
+  target_compile_definitions(blytrun PRIVATE BLYT_VERSION="${BLYT_VERSION}")
+endif()
+
 # -------------------------------------------------------------------------
 # blyt_libretro — libretro core (Phase 4)
 #

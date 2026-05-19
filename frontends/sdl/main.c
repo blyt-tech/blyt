@@ -1,39 +1,114 @@
 #include <SDL.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "blyt_runtime.h"
+#include "libretro.h"
 
-static void log_callback(const char *msg) {
-    printf("%s\n", msg);
+/* blyt_libretro.c is compiled into this binary (without BLYT_EMBED_LIBS),
+ * so dynlink falls back to BLYT_LIB_DIR for the guest runtime libraries. */
+
+/* -------------------------------------------------------------------------
+ * Forward declarations of the retro_* functions from blyt_libretro.c
+ * ------------------------------------------------------------------------- */
+
+void retro_set_environment(retro_environment_t cb);
+void retro_set_video_refresh(retro_video_refresh_t cb);
+void retro_set_audio_sample(retro_audio_sample_t cb);
+void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb);
+void retro_set_input_poll(retro_input_poll_t cb);
+void retro_set_input_state(retro_input_state_t cb);
+void retro_init(void);
+void retro_deinit(void);
+void retro_get_system_av_info(struct retro_system_av_info *info);
+bool retro_load_game(const struct retro_game_info *game);
+void retro_unload_game(void);
+void retro_run(void);
+
+/* Used only by the SDL frontend (direct link) for loop termination and exit
+ * status — not part of the standard libretro interface. */
+bool blyt_libretro_is_done(void);
+blyt_cart_run_err_t blyt_libretro_run_err(void);
+
+/* -------------------------------------------------------------------------
+ * Logging
+ * ------------------------------------------------------------------------- */
+
+static void RETRO_CALLCONV sdl_log(enum retro_log_level level, const char *fmt, ...) {
+    FILE *out = (level >= RETRO_LOG_ERROR) ? stderr : stdout;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(out, fmt, args);
+    va_end(args);
 }
 
-/*
- * Per-frame callback for the SDL frontend.  Called by blyt_cart_run after
- * each blyt_cart_draw(); polls SDL events and caps the frame rate.
- * userdata is the SDL_Window* (currently unused; reserved for future use).
- */
-static void sdl_frame_callback(void *userdata) {
-    (void)userdata;
+/* -------------------------------------------------------------------------
+ * Environment callback
+ * ------------------------------------------------------------------------- */
+
+static bool env_callback(unsigned cmd, void *data) {
+    switch (cmd) {
+    case RETRO_ENVIRONMENT_GET_LOG_INTERFACE: {
+        struct retro_log_callback *log = (struct retro_log_callback *)data;
+        log->log = sdl_log;
+        return true;
+    }
+    case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
+        return true; /* noted; ignored until graphics land */
+    default:
+        return false;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Libretro callbacks
+ * ------------------------------------------------------------------------- */
+
+static void video_refresh(const void *data, unsigned width, unsigned height, size_t pitch) {
+    (void)data;
+    (void)width;
+    (void)height;
+    (void)pitch;
+}
+
+static void audio_sample(int16_t left, int16_t right) {
+    (void)left;
+    (void)right;
+}
+
+static size_t audio_sample_batch(const int16_t *data, size_t frames) {
+    (void)data;
+    return frames;
+}
+
+static bool g_quit = false;
+static bool g_sdl_ready = false;
+
+static void input_poll(void) {
+    if (!g_sdl_ready)
+        return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-            /* Signal the cart to finish on the next iteration.
-             * We can't halt the emulator directly here, but the cart's
-             * on_quit default calls blyt_quit_ready() which exits the loop. */
-        }
+        if (ev.type == SDL_QUIT)
+            g_quit = true;
     }
-    /* Cap to ~60 fps; the cart drives timing via blyt_frame_done(). */
-    SDL_Delay(16);
 }
 
-/*
- * Parse argv for the cart path and --headless flag.
- * Returns the cart path, or NULL if usage is wrong.
- * Sets *headless to true if --headless is present.
- */
+static int16_t input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
+    (void)port;
+    (void)device;
+    (void)index;
+    (void)id;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * main
+ * ------------------------------------------------------------------------- */
+
 static const char *parse_args(int argc, char *argv[], bool *headless) {
     const char *cart = NULL;
     *headless = false;
@@ -58,57 +133,64 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    blyt_cart_t *cart = NULL;
-    blyt_cart_err_t load_err = blyt_cart_open(cart_path, &cart);
-    if (load_err != BLYT_CART_OK) {
-        fprintf(stderr, "blytrun: failed to load cart: %s\n", blyt_cart_err_str(load_err));
+    retro_set_environment(env_callback);
+    retro_set_video_refresh(video_refresh);
+    retro_set_audio_sample(audio_sample);
+    retro_set_audio_sample_batch(audio_sample_batch);
+    retro_set_input_poll(input_poll);
+    retro_set_input_state(input_state);
+    retro_init();
+
+    struct retro_game_info game = {.path = cart_path, .data = NULL, .size = 0, .meta = NULL};
+    if (!retro_load_game(&game)) {
+        fprintf(stderr, "blytrun: failed to load cart: %s\n", cart_path);
+        retro_deinit();
         return 1;
     }
 
-    if (headless) {
-        blyt_cart_run_err_t run_err = blyt_cart_run(cart, log_callback, NULL, NULL);
-        blyt_cart_close(cart);
-        if (run_err == BLYT_RUN_ERR_ECALL_TRAP) {
-            fprintf(stderr, "blytrun: cart attempted a non-permitted syscall\n");
+    struct retro_system_av_info av;
+    retro_get_system_av_info(&av);
+    double fps = av.timing.fps > 0.0 ? av.timing.fps : 60.0;
+    uint32_t frame_ms = (uint32_t)(1000.0 / fps);
+
+    SDL_Window *win = NULL;
+    if (!headless) {
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
+            fprintf(stderr, "blytrun: SDL_Init failed: %s\n", SDL_GetError());
+            retro_unload_game();
+            retro_deinit();
             return 1;
         }
-        if (run_err == BLYT_RUN_ERR_ABORT) {
-            fprintf(stderr, "blytrun: cart aborted (fatal internal error)\n");
+        g_sdl_ready = true;
+        win = SDL_CreateWindow("blyt", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               (int)av.geometry.base_width * 2, (int)av.geometry.base_height * 2,
+                               SDL_WINDOW_SHOWN);
+        if (!win) {
+            fprintf(stderr, "blytrun: SDL_CreateWindow failed: %s\n", SDL_GetError());
+            SDL_Quit();
+            retro_unload_game();
+            retro_deinit();
             return 1;
         }
-        return (run_err == BLYT_RUN_OK) ? 0 : 1;
     }
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
-        fprintf(stderr, "blytrun: SDL_Init failed: %s\n", SDL_GetError());
-        blyt_cart_close(cart);
-        return 1;
+    while (!g_quit && !blyt_libretro_is_done()) {
+        uint32_t t0 = g_sdl_ready ? SDL_GetTicks() : 0;
+        retro_run();
+        if (g_sdl_ready) {
+            uint32_t elapsed = SDL_GetTicks() - t0;
+            if (elapsed < frame_ms)
+                SDL_Delay(frame_ms - elapsed);
+        }
     }
 
-    SDL_Window *win = SDL_CreateWindow("blyt", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640,
-                                       480, SDL_WINDOW_SHOWN);
-    if (!win) {
-        fprintf(stderr, "blytrun: SDL_CreateWindow failed: %s\n", SDL_GetError());
+    if (win) {
+        SDL_DestroyWindow(win);
         SDL_Quit();
-        blyt_cart_close(cart);
-        return 1;
     }
 
-    /* Run the cart with the SDL frame callback.  sdl_frame_callback is called
-     * once per update+draw cycle; it polls events and paces the frame rate.
-     * blyt_cart_run returns only when the cart exits (blyt_quit_ready). */
-    blyt_cart_run_err_t run_err = blyt_cart_run(cart, log_callback, sdl_frame_callback, win);
-
-    if (run_err == BLYT_RUN_ERR_ECALL_TRAP) {
-        fprintf(stderr, "blytrun: cart attempted a non-permitted syscall\n");
-    } else if (run_err == BLYT_RUN_ERR_ABORT) {
-        fprintf(stderr, "blytrun: cart aborted (fatal internal error)\n");
-    } else if (run_err != BLYT_RUN_OK) {
-        fprintf(stderr, "blytrun: cart run failed (err=%d)\n", (int)run_err);
-    }
-
-    SDL_DestroyWindow(win);
-    SDL_Quit();
-    blyt_cart_close(cart);
+    blyt_cart_run_err_t run_err = blyt_libretro_run_err();
+    retro_unload_game();
+    retro_deinit();
     return (run_err == BLYT_RUN_OK) ? 0 : 1;
 }
