@@ -173,7 +173,7 @@ fn default_output(project_dir: &Path) -> PathBuf {
  *   3. System PATH fallback
  * ------------------------------------------------------------------------- */
 
-fn sdk_root_from_exe() -> Option<PathBuf> {
+pub(crate) fn sdk_root_from_exe() -> Option<PathBuf> {
     // Binary is at <sdk>/bin/blyt; SDK root is the parent of bin/.
     std::env::current_exe()
         .ok()

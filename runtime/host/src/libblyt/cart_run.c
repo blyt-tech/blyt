@@ -559,8 +559,11 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     blyt_lib_t libs[MAX_RUNTIME_LIBS];
     int nlibs = 0;
 
-    blyt_symtab_t all_syms;
-    all_syms.count = 0;
+    /* blyt_symtab_t holds 512 × 132-byte entries (~66 KiB).  Heap-allocate
+     * so it does not overflow small stacks (e.g. Emscripten's 64 KiB default). */
+    blyt_symtab_t *all_syms = calloc(1, sizeof(*all_syms));
+    if (!all_syms)
+        return BLYT_RUN_ERR_EMU;
 
     /* Seed cart symbols first so cart's strong definitions win over library stubs. */
     {
@@ -570,7 +573,7 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
             .bias = 0,
             .mmapped = false,
         };
-        build_symtab(&cart_syms, &all_syms);
+        build_symtab(&cart_syms, all_syms);
     }
 
     char name_buf[MAX_RUNTIME_LIBS][64];
@@ -646,7 +649,7 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
         }
 
         apply_lib_rela(&lib, mem);
-        build_symtab(&lib, &all_syms);
+        build_symtab(&lib, all_syms);
         libs[nlibs++] = lib;
 
         /* Enqueue transitive DT_NEEDED dependencies */
@@ -670,13 +673,13 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
 
     if (ok) {
         for (int i = 0; i < nlibs; i++) {
-            resolve_elf_plt(libs[i].map, libs[i].size, mem, libs[i].bias, &all_syms);
+            resolve_elf_plt(libs[i].map, libs[i].size, mem, libs[i].bias, all_syms);
         }
-        resolve_elf_plt(cart->map, cart->map_size, mem, 0, &all_syms);
+        resolve_elf_plt(cart->map, cart->map_size, mem, 0, all_syms);
 
         /* Initialise the libblytc.so arena (ADR-0120). */
-        uint32_t sym_base = symtab_lookup(&all_syms, "blytc_arena_base");
-        uint32_t sym_size = symtab_lookup(&all_syms, "blytc_arena_size");
+        uint32_t sym_base = symtab_lookup(all_syms, "blytc_arena_base");
+        uint32_t sym_size = symtab_lookup(all_syms, "blytc_arena_size");
         if (sym_base != 0 && sym_size != 0) {
             uint8_t v[4];
             write_u32_le(v, BLYT_ARENA_BASE);
@@ -691,6 +694,7 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
             munmap((void *)libs[i].map, libs[i].size);
     }
 
+    free(all_syms);
     return ok ? BLYT_RUN_OK : BLYT_RUN_ERR_EMU;
 }
 

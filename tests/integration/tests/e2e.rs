@@ -707,3 +707,80 @@ void blyt_cart_draw(void)   {}
         "frame 0 does not match golden testcard_frame0.bin"
     );
 }
+
+/// WASM gate test: run an idle cart inside blyt_wasm.js under Node.js and
+/// compare the first rendered XRGB8888 frame byte-for-byte against the same
+/// golden file used by testcard_frame0_matches_golden.
+///
+/// Requires the WASM runtime to have been built:
+///   emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm
+/// (or cmake --build build --target sdk when emcc is present).
+///
+/// Silently skipped when blyt_wasm.js is not found.
+#[test]
+fn wasm_testcard_frame0_matches_golden() {
+    let wasm_dir = find_wasm_dir();
+    if !wasm_dir.join("blyt_wasm.js").exists() {
+        eprintln!(
+            "wasm_testcard_frame0_matches_golden: blyt_wasm.js not found — \
+             build with: emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm"
+        );
+        return;
+    }
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let golden_path = repo_root().join("tests/testcard_frame0.bin");
+    assert!(
+        golden_path.exists(),
+        "golden file missing: {}",
+        golden_path.display()
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_testcard");
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+void blyt_cart_init(void)   {}
+void blyt_cart_update(void) {}
+void blyt_cart_draw(void)   {}
+"#,
+    );
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let frame_path = tmp.path().join("wasm_frame0.bin");
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+
+    Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+            frame_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(frame_path.exists(), "wasm_frame0.bin was not written");
+    let got = fs::read(&frame_path).expect("reading wasm_frame0.bin");
+    let want = fs::read(&golden_path).expect("reading golden");
+    assert_eq!(got.len(), want.len(), "WASM frame size mismatch");
+    assert_eq!(
+        got, want,
+        "WASM frame 0 does not match golden testcard_frame0.bin"
+    );
+}
+
+fn find_wasm_dir() -> std::path::PathBuf {
+    // Prefer direct emcmake build output; fall back to SDK wasm/ directory.
+    let direct = repo_root().join("build-wasm");
+    if direct.join("blyt_wasm.js").exists() {
+        return direct;
+    }
+    build_dir().join("sdk/wasm")
+}

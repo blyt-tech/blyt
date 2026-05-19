@@ -1,4 +1,5 @@
 mod build;
+mod run;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -23,6 +24,12 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Serve a .blyt cart in the browser via the WASM runtime
+    Run {
+        /// Path to the .blyt cart file to run
+        cart: PathBuf,
+    },
 }
 
 fn main() {
@@ -32,7 +39,8 @@ fn main() {
         Commands::Build {
             project_dir,
             output,
-        } => build::run(&project_dir, output.as_deref()),
+        } => build::run(&project_dir, output.as_deref()).map_err(|e| e.to_string()),
+        Commands::Run { cart } => run::run(&cart).map_err(|e| e.to_string()),
     };
 
     if let Err(e) = result {

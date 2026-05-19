@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>blyt</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #111;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        font-family: monospace;
+        color: #ccc;
+      }
+      #canvas {
+        /* 2× scale: 320×240 → 640×480 */
+        width: 640px;
+        height: 480px;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        border: 1px solid #333;
+      }
+      #status {
+        margin-top: 8px;
+        font-size: 12px;
+        color: #666;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas" width="320" height="240"></canvas>
+    <div id="status">Loading…</div>
+
+    <script>
+      /* Pre-load the cart into the Emscripten virtual filesystem before
+       * main() runs.  The cart is served as /cart.blyt by `blyt run`
+       * alongside this page.
+       *
+       * addRunDependency / removeRunDependency delay Emscripten's main()
+       * call until the async fetch completes. */
+      var Module = {
+        canvas: document.getElementById("canvas"),
+
+        preRun: [
+          function () {
+            Module.addRunDependency("blyt-cart");
+            fetch("cart.blyt")
+              .then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.arrayBuffer();
+              })
+              .then(function (buf) {
+                FS.writeFile("/cart.blyt", new Uint8Array(buf));
+                document.getElementById("status").textContent = "Running…";
+                Module.removeRunDependency("blyt-cart");
+              })
+              .catch(function (e) {
+                document.getElementById("status").textContent =
+                  "Cart load failed: " + e;
+                console.error("[blyt] cart load failed:", e);
+                Module.removeRunDependency("blyt-cart");
+              });
+          },
+        ],
+
+        onRuntimeInitialized: function () {
+          /* main() has been called; loop is running via emscripten_set_main_loop */
+        },
+
+        print: function (text) {
+          console.log(text);
+        },
+        printErr: function (text) {
+          console.error(text);
+        },
+      };
+    </script>
+    {{{ SCRIPT }}}
+  </body>
+</html>

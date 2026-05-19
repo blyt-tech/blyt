@@ -2,16 +2,13 @@
 #
 # Assembles a self-contained blyt SDK under build/sdk/:
 #
-#   build/sdk/
-#     bin/        blyt (devtool), blytrun (SDL2 runtime)
-#     include/    blyt.h, blyt32.h, blyt_runtime.h
-#     lib/        libblytcommon.so, libblyt32.so  (RV32IMAFC)
-#     toolchain/  clang, ld.lld, llvm-objcopy, …
+# build/sdk/ bin/        blyt (devtool), blytrun (SDL2 runtime) include/ blyt.h,
+# blyt32.h, blyt_runtime.h lib/        libblytcommon.so, libblyt32.so
+# (RV32IMAFC) toolchain/  clang, ld.lld, llvm-objcopy, …
 #
-# Invoked via `cmake --build build --target sdk`.
-# Required variables (injected by the sdk target in CMakeLists.txt):
-#   BLYT_SOURCE_DIR, BLYT_BINARY_DIR,
-#   CMAKE_HOST_SYSTEM_NAME, CMAKE_HOST_SYSTEM_PROCESSOR
+# Invoked via `cmake --build build --target sdk`. Required variables (injected
+# by the sdk target in CMakeLists.txt): BLYT_SOURCE_DIR, BLYT_BINARY_DIR,
+# CMAKE_HOST_SYSTEM_NAME, CMAKE_HOST_SYSTEM_PROCESSOR
 
 set(SDK_DIR "${BLYT_BINARY_DIR}/sdk")
 set(SDK_BIN "${SDK_DIR}/bin")
@@ -26,10 +23,14 @@ set(DOWNLOADS "${BLYT_BINARY_DIR}/downloads")
 
 # Check known locations for an existing riscv32-capable clang + lld pair.
 set(CANDIDATE_PAIRS
-    "/opt/homebrew/opt/llvm/bin/clang" "/opt/homebrew/opt/llvm/bin/ld.lld"
-    "/opt/homebrew/opt/llvm/bin/clang" "/opt/homebrew/opt/llvm/bin/lld"
-    "/usr/bin/clang"                   "/usr/bin/ld.lld"
-    "/usr/local/bin/clang"             "/usr/local/bin/ld.lld")
+    "/opt/homebrew/opt/llvm/bin/clang"
+    "/opt/homebrew/opt/llvm/bin/ld.lld"
+    "/opt/homebrew/opt/llvm/bin/clang"
+    "/opt/homebrew/opt/llvm/bin/lld"
+    "/usr/bin/clang"
+    "/usr/bin/ld.lld"
+    "/usr/local/bin/clang"
+    "/usr/local/bin/ld.lld")
 
 set(FOUND_CLANG "")
 set(FOUND_LLD "")
@@ -52,8 +53,7 @@ foreach(IDX RANGE ${PAIR_LAST})
             -E - -o /dev/null
     INPUT_FILE /dev/null
     RESULT_VARIABLE RV32_OK
-    ERROR_QUIET
-    OUTPUT_QUIET)
+    ERROR_QUIET OUTPUT_QUIET)
   if(RV32_OK EQUAL 0)
     set(FOUND_CLANG "${CAND_CLANG}")
     set(FOUND_LLD "${CAND_LLD}")
@@ -82,9 +82,8 @@ if(NOT FOUND_CLANG)
     endif()
   else()
     message(
-      FATAL_ERROR
-      "Unsupported host platform '${CMAKE_HOST_SYSTEM_NAME}'. "
-      "Set BLYT_CLANG to a clang that can target riscv32.")
+      FATAL_ERROR "Unsupported host platform '${CMAKE_HOST_SYSTEM_NAME}'. "
+                  "Set BLYT_CLANG to a clang that can target riscv32.")
   endif()
 
   set(LLVM_ARCHIVE "clang+llvm-${LLVM_VER}-${LLVM_TRIPLE}.tar.xz")
@@ -97,9 +96,10 @@ if(NOT FOUND_CLANG)
     if(NOT EXISTS "${LLVM_ARCHIVE_PATH}")
       message(STATUS "Downloading LLVM ${LLVM_VER} (${LLVM_TRIPLE})…")
       file(MAKE_DIRECTORY "${DOWNLOADS}")
-      file(DOWNLOAD "${LLVM_URL}" "${LLVM_ARCHIVE_PATH}"
-           SHOW_PROGRESS
-           STATUS DL_STATUS)
+      file(
+        DOWNLOAD "${LLVM_URL}" "${LLVM_ARCHIVE_PATH}"
+        SHOW_PROGRESS
+        STATUS DL_STATUS)
       list(GET DL_STATUS 0 DL_CODE)
       if(NOT DL_CODE EQUAL 0)
         file(REMOVE "${LLVM_ARCHIVE_PATH}")
@@ -119,7 +119,8 @@ if(NOT FOUND_CLANG)
 
     file(GLOB EXTRACTED_DIR "${SDK_DIR}/clang+llvm-*")
     if(NOT EXTRACTED_DIR)
-      message(FATAL_ERROR "Could not find extracted LLVM directory in ${SDK_DIR}")
+      message(
+        FATAL_ERROR "Could not find extracted LLVM directory in ${SDK_DIR}")
     endif()
     file(RENAME "${EXTRACTED_DIR}" "${SDK_TOOLCHAIN}")
   endif()
@@ -147,7 +148,8 @@ set(RV32_BASE
     # -Wl,--shared explicitly tells lld to produce ET_DYN; clang may inject
     # -Bstatic for bare-metal riscv targets which overrides -shared otherwise.
     -Wl,--shared
-    -I "${BLYT_SOURCE_DIR}/runtime/guest/include")
+    -I
+    "${BLYT_SOURCE_DIR}/runtime/guest/include")
 if(FOUND_LLD)
   list(APPEND RV32_BASE "-fuse-ld=${FOUND_LLD}")
 endif()
@@ -156,30 +158,30 @@ message(STATUS "Building libblytcommon.so…")
 # --allow-undefined: blyt_cart_init/update/draw are provided by the cart at
 # runtime (reverse symbol lookup); lld requires explicit permission for this.
 execute_process(
-  COMMAND "${FOUND_CLANG}" ${RV32_BASE} -Wl,-soname,libblytcommon.so
-          -o "${SDK_LIB}/libblytcommon.so"
-          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
+  COMMAND
+    "${FOUND_CLANG}" ${RV32_BASE} -Wl,-soname,libblytcommon.so -o
+    "${SDK_LIB}/libblytcommon.so"
+    "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
   RESULT_VARIABLE R)
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblytcommon.so")
 endif()
 
 message(STATUS "Building libblytc.so…")
-# libblytc.so — trimmed musl-based C library (ADR-0120).
-# Curated musl source subsets + our arena allocator and internal stubs.
+# libblytc.so — trimmed musl-based C library (ADR-0120). Curated musl source
+# subsets + our arena allocator and internal stubs.
 set(MUSL_DIR "${BLYT_SOURCE_DIR}/third_party/musl")
 set(LIBBLYTC_BITS_DIR "${BLYT_BINARY_DIR}/libblytc/bits")
 set(LIBBLYTC_ALLTYPES_H "${LIBBLYTC_BITS_DIR}/alltypes.h")
 
 if(NOT EXISTS "${MUSL_DIR}/include/stdio.h")
-  message(
-    FATAL_ERROR
-    "third_party/musl not initialised. "
-    "Run: git submodule update --init third_party/musl")
+  message(FATAL_ERROR "third_party/musl not initialised. "
+                      "Run: git submodule update --init third_party/musl")
 endif()
 
 # Set up bits/ directory: copy all arch/riscv32/bits/*.h files, then generate
-# the two that require processing (alltypes.h from template; syscall.h from .in).
+# the two that require processing (alltypes.h from template; syscall.h from
+# .in).
 file(MAKE_DIRECTORY "${LIBBLYTC_BITS_DIR}")
 file(GLOB _BITS_HDRS "${MUSL_DIR}/arch/riscv32/bits/*.h")
 foreach(_H ${_BITS_HDRS})
@@ -187,9 +189,7 @@ foreach(_H ${_BITS_HDRS})
 endforeach()
 
 execute_process(
-  COMMAND
-    sh -c
-    "cat '${MUSL_DIR}/arch/riscv32/bits/alltypes.h.in' \
+  COMMAND sh -c "cat '${MUSL_DIR}/arch/riscv32/bits/alltypes.h.in' \
           '${MUSL_DIR}/include/alltypes.h.in' \
      | sed -f '${MUSL_DIR}/tools/mkalltypes.sed'"
   OUTPUT_FILE "${LIBBLYTC_ALLTYPES_H}"
@@ -202,8 +202,7 @@ endif()
 # __NR_xxx (matching musl's Makefile: sed -n -e s/__NR_/SYS_/p < .in >> out).
 execute_process(
   COMMAND
-    sh -c
-    "cp '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
+    sh -c "cp '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
         '${LIBBLYTC_BITS_DIR}/syscall.h' \
      && sed -n -e 's/__NR_/SYS_/p' \
          '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
@@ -249,12 +248,18 @@ set(LIBBLYTC_SRCS
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c")
 
 set(LIBBLYTC_INCLUDES
-    -I "${MUSL_DIR}/src/include" # defines `hidden` and other internal macros
-    -I "${MUSL_DIR}/include"
-    -I "${MUSL_DIR}/arch/riscv32"
-    -I "${MUSL_DIR}/arch/generic"
-    -I "${MUSL_DIR}/src/internal"
-    -I "${LIBBLYTC_BITS_DIR}/..")
+    -I
+    "${MUSL_DIR}/src/include" # defines `hidden` and other internal macros
+    -I
+    "${MUSL_DIR}/include"
+    -I
+    "${MUSL_DIR}/arch/riscv32"
+    -I
+    "${MUSL_DIR}/arch/generic"
+    -I
+    "${MUSL_DIR}/src/internal"
+    -I
+    "${LIBBLYTC_BITS_DIR}/..")
 
 set(LIBBLYTC_CFLAGS
     -ffp-contract=off
@@ -267,9 +272,8 @@ set(LIBBLYTC_CFLAGS
     -Wno-deprecated-non-prototype)
 
 execute_process(
-  COMMAND
-    "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-    -Wl,-soname,libblytc.so -o "${SDK_LIB}/libblytc.so" ${LIBBLYTC_SRCS}
+  COMMAND "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
+          -Wl,-soname,libblytc.so -o "${SDK_LIB}/libblytc.so" ${LIBBLYTC_SRCS}
   RESULT_VARIABLE R)
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblytc.so")
@@ -278,25 +282,22 @@ endif()
 message(STATUS "Building libblyt32.so…")
 # libblyt32.so — Blyt32 variant.
 #
-# Self-contained for cart LINK TIME: absorbs both libblytcommon sources and
-# ALL libblytc sources so carts need only -lblyt32 at build time.  Exporting
+# Self-contained for cart LINK TIME: absorbs both libblytcommon sources and ALL
+# libblytc sources so carts need only -lblyt32 at build time.  Exporting
 # malloc/free/string/math functions directly from libblyt32.so's .dynsym lets
 # lld resolve them without adding libblytc.so to the cart's DT_NEEDED.
 #
 # Runtime: libblyt32.so declares DT_NEEDED: libblytc.so (forced via
 # --no-as-needed).  The runtime's BFS dynamic loader picks up libblytc.so
-# transitively.  The first-wins symbol rule means libblyt32.so's baked-in
-# copies of malloc etc. are used on the emulated/libretro path; libblytc.so's
-# copies are shadowed but the library is present for the hardware trusted-exec
-# path where ld.so resolves against it directly.
+# transitively.  The first-wins symbol rule means libblyt32.so's baked-in copies
+# of malloc etc. are used on the emulated/libretro path; libblytc.so's copies
+# are shadowed but the library is present for the hardware trusted-exec path
+# where ld.so resolves against it directly.
 execute_process(
   COMMAND
     "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-    -Wl,-soname,libblyt32.so
-    -L "${SDK_LIB}"
-    -Wl,--no-as-needed -lblytc -Wl,--as-needed
-    -Wl,-rpath-link,"${SDK_LIB}"
-    -o "${SDK_LIB}/libblyt32.so"
+    -Wl,-soname,libblyt32.so -L "${SDK_LIB}" -Wl,--no-as-needed -lblytc
+    -Wl,--as-needed -Wl,-rpath-link,"${SDK_LIB}" -o "${SDK_LIB}/libblyt32.so"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     ${LIBBLYTC_SRCS}
@@ -312,16 +313,15 @@ endif()
 # Start with a clean include/ so removed headers don't linger across rebuilds.
 file(REMOVE_RECURSE "${SDK_INC}")
 file(MAKE_DIRECTORY "${SDK_INC}")
-file(
-  COPY "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt.h"
-       "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt32.h"
-  DESTINATION "${SDK_INC}")
+file(COPY "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt.h"
+          "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt32.h"
+     DESTINATION "${SDK_INC}")
 
 # Copy the curated subset of musl public headers that correspond to functions
 # libblytc.so actually provides (ADR-0120).  Excluded: filesystem I/O (fopen,
-# unistd, dirent), pthreads, signals, dynamic loading, networking.
-# Cart code that includes an omitted header gets a compile-time error rather
-# than a confusing link-time undefined-symbol failure.
+# unistd, dirent), pthreads, signals, dynamic loading, networking. Cart code
+# that includes an omitted header gets a compile-time error rather than a
+# confusing link-time undefined-symbol failure.
 foreach(
   _H
   # Infrastructure pulled in by most musl headers
@@ -377,11 +377,11 @@ if(NOT R EQUAL 0)
 endif()
 file(COPY "${BLYT_SOURCE_DIR}/target/debug/blyt" DESTINATION "${SDK_BIN}")
 
-# Expose toolchain binaries under blyt-prefixed names in bin/.
-# Using blyt-lld / blyt-objcopy avoids any collision with host tools and lets
-# blyt build use -fuse-ld=blyt-lld reliably across platforms.
-# FOUND_* may point into a downloaded SDK_TOOLCHAIN (macOS) or to system
-# tools (Linux); we create the symlinks in both cases.
+# Expose toolchain binaries under blyt-prefixed names in bin/. Using blyt-lld /
+# blyt-objcopy avoids any collision with host tools and lets blyt build use
+# -fuse-ld=blyt-lld reliably across platforms. FOUND_* may point into a
+# downloaded SDK_TOOLCHAIN (macOS) or to system tools (Linux); we create the
+# symlinks in both cases.
 if(FOUND_CLANG)
   file(CREATE_LINK "${FOUND_CLANG}" "${SDK_BIN}/blyt-clang" SYMBOLIC)
 endif()
@@ -407,12 +407,12 @@ endif()
 # Step 6: blyt_libretro.so — host-side libretro core
 #
 # The libretro core embeds the guest .so files built above so it is
-# self-contained.  It links against the cmake-built host static libs
-# (libblyt, rv32emu, softfloat, flatccrt).
+# self-contained.  It links against the cmake-built host static libs (libblyt,
+# rv32emu, softfloat, flatccrt).
 #
-# If the cmake main build already produced blyt_libretro.so (Linux CI,
-# where lld is available), that file is used as-is.  Otherwise the core is
-# compiled here using the host C compiler.
+# If the cmake main build already produced blyt_libretro.so (Linux CI, where lld
+# is available), that file is used as-is.  Otherwise the core is compiled here
+# using the host C compiler.
 # -------------------------------------------------------------------------
 
 set(LIBRETRO_OUT "${BLYT_BINARY_DIR}/blyt_libretro.so")
@@ -425,9 +425,10 @@ else()
   set(EMBEDDED_LIBS_C "${BLYT_BINARY_DIR}/blyt_embedded_libs.c")
 
   execute_process(
-    COMMAND python3 "${BLYT_SOURCE_DIR}/cmake/bin2c.py" blytcommon_so
-            "${SDK_LIB}/libblytcommon.so" blytc_so "${SDK_LIB}/libblytc.so"
-            blyt32_so "${SDK_LIB}/libblyt32.so" "${EMBEDDED_LIBS_C}"
+    COMMAND
+      python3 "${BLYT_SOURCE_DIR}/cmake/bin2c.py" blytcommon_so
+      "${SDK_LIB}/libblytcommon.so" blytc_so "${SDK_LIB}/libblytc.so" blyt32_so
+      "${SDK_LIB}/libblyt32.so" "${EMBEDDED_LIBS_C}"
     RESULT_VARIABLE R)
   if(NOT R EQUAL 0)
     message(FATAL_ERROR "Failed to generate blyt_embedded_libs.c")
@@ -449,13 +450,11 @@ else()
   execute_process(
     COMMAND
       "${HOST_CC}" ${LINK_FLAGS} -fPIC -o "${LIBRETRO_OUT}"
-      "-DBLYT_VERSION=\"${BLYT_VERSION}\""
-      "-DBLYT_EMBED_LIBS"
+      "-DBLYT_VERSION=\"${BLYT_VERSION}\"" "-DBLYT_EMBED_LIBS"
       "${BLYT_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
-      "${EMBEDDED_LIBS_C}"
-      -I "${BLYT_SOURCE_DIR}/third_party/libretro-common/include"
-      -I "${BLYT_SOURCE_DIR}/runtime/host/include"
-      "${BLYT_BINARY_DIR}/libblyt.a"
+      "${EMBEDDED_LIBS_C}" -I
+      "${BLYT_SOURCE_DIR}/third_party/libretro-common/include" -I
+      "${BLYT_SOURCE_DIR}/runtime/host/include" "${BLYT_BINARY_DIR}/libblyt.a"
       "${BLYT_BINARY_DIR}/liblibblytemu.a"
       "${BLYT_BINARY_DIR}/liblibsoftfloat.a"
       "${BLYT_SOURCE_DIR}/third_party/flatcc/lib/libflatccrt.a"
@@ -481,6 +480,63 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# Step 7: WASM runtime (optional — requires Emscripten)
+#
+# Builds blyt_wasm.html + blyt_wasm.js + blyt_wasm.wasm using the guest
+# libraries assembled in Step 2.  The outputs are placed in build/sdk/wasm/ so
+# `blyt run` can locate them via the SDK layout.
+#
+# Skipped silently when emcc is not on PATH.
+# -------------------------------------------------------------------------
+
+set(SDK_WASM "${SDK_DIR}/wasm")
+
+find_program(EMCC emcc)
+if(EMCC)
+  message(STATUS "Building WASM runtime (emcc found at ${EMCC})…")
+
+  file(MAKE_DIRECTORY "${SDK_WASM}")
+
+  # Configure the WASM cmake project pointing at the SDK guest libs.
+  execute_process(
+    COMMAND
+      emcmake ${CMAKE_COMMAND} -B "${BLYT_BINARY_DIR}/build-wasm" -S
+      "${BLYT_SOURCE_DIR}/frontends/wasm" "-DBLYT_GUEST_LIB_DIR=${SDK_LIB}"
+      "-DBLYT_VERSION=${BLYT_VERSION}" -G "Unix Makefiles"
+    RESULT_VARIABLE R
+    OUTPUT_QUIET)
+  if(NOT R EQUAL 0)
+    message(
+      WARNING "blyt_wasm: emcmake cmake configure failed — skipping WASM step")
+    set(EMCC "")
+  endif()
+endif()
+
+if(EMCC)
+  execute_process(COMMAND ${CMAKE_COMMAND} --build
+                          "${BLYT_BINARY_DIR}/build-wasm" RESULT_VARIABLE R)
+  if(NOT R EQUAL 0)
+    message(WARNING "blyt_wasm: build failed — skipping WASM step")
+    set(EMCC "")
+  endif()
+endif()
+
+if(EMCC)
+  foreach(_F blyt_wasm.html blyt_wasm.js blyt_wasm.wasm)
+    if(EXISTS "${BLYT_BINARY_DIR}/build-wasm/${_F}")
+      file(COPY "${BLYT_BINARY_DIR}/build-wasm/${_F}" DESTINATION "${SDK_WASM}")
+    endif()
+  endforeach()
+  message(STATUS "blyt WASM runtime assembled at ${SDK_WASM}")
+  message(STATUS "  Run a cart:  ${SDK_BIN}/blyt run <cart.blyt>")
+else()
+  message(
+    STATUS
+      "blyt_wasm: skipped (emcc not found — install Emscripten to build WASM runtime)"
+  )
+endif()
+
+# -------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------
 
@@ -492,4 +548,6 @@ if(EXISTS "${SDK_TOOLCHAIN}")
   message(STATUS "  toolchain: ${SDK_TOOLCHAIN}")
 endif()
 message(STATUS "")
-message(STATUS "Build a cart:  BLYT_SDK_DIR=${SDK_DIR} ${SDK_BIN}/blyt build <project>")
+message(
+  STATUS
+    "Build a cart:  BLYT_SDK_DIR=${SDK_DIR} ${SDK_BIN}/blyt build <project>")
