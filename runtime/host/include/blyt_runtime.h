@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* --- Cart loading -------------------------------------------------------- */
 
@@ -126,6 +127,31 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session);
 
 /* Destroy a session and free all emulator resources. */
 void blyt_session_destroy(blyt_session_t *session);
+
+/* --- Frame output -------------------------------------------------------- */
+
+/* Dimensions of the framebuffer. */
+#define BLYT_FRAME_W 320
+#define BLYT_FRAME_H 240
+
+/*
+ * The runtime keeps an internal palette-indexed framebuffer.  Before the cart
+ * issues any drawing call the runtime fills it with the PM5544 test card.
+ * After the first drawing call it reflects the cart's rendered output.
+ *
+ * Frontends expand to their preferred pixel format by doing a palette lookup:
+ *   blyt_session_expand_frame(session, xrgb_buf);   // convenience: XRGB8888
+ * or by reading the raw buffers and doing their own conversion:
+ *   blyt_session_get_pixels(session)   → uint8_t[320*240] palette indices
+ *   blyt_session_get_palette(session)  → uint32_t[256]   XRGB8888 entries
+ * Both pointers are valid for the lifetime of the session.
+ */
+const uint8_t *blyt_session_get_pixels(const blyt_session_t *session);
+const uint32_t *blyt_session_get_palette(const blyt_session_t *session);
+
+/* Expand the current frame to XRGB8888 via palette lookup.
+ * xrgb_out must hold at least BLYT_FRAME_W * BLYT_FRAME_H uint32_t. */
+void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out);
 
 #ifdef __cplusplus
 }

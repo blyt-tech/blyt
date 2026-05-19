@@ -460,8 +460,10 @@ add_library(libblytcommonlua INTERFACE)
 add_library(libblyt32lua INTERFACE)
 add_library(libblytc INTERFACE)
 
-add_library(libblyt STATIC runtime/host/src/libblyt/cart_load.c
-                           runtime/host/src/libblyt/cart_run.c)
+add_library(
+  libblyt STATIC
+  runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
+  runtime/host/src/libblyt/testcard.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 target_include_directories(
   libblyt

@@ -14,6 +14,7 @@
 #include "cart_load.h"
 #include "ecall.h"
 #include "elf32.h"
+#include "testcard.h"
 
 /*
  * rv32emu headers — common.h must come first; ${RV32EMU_DIR} is on the
@@ -111,6 +112,12 @@ struct blyt_session {
      * so it must not be stack-allocated in blyt_session_create. */
     vm_attr_t attr;
     blyt_run_ctx_t ctx;
+    /* Palette-indexed framebuffer: filled by the runtime until the cart draws.
+     * Frontends call blyt_session_expand_frame() to convert to XRGB8888. */
+    uint8_t pixels[BLYT_FRAME_W * BLYT_FRAME_H];
+    uint32_t palette[256]; /* XRGB8888 — set at session create, updated by cart */
+    uint32_t frame_count;
+    bool cart_has_drawn;
 };
 
 /* -------------------------------------------------------------------------
@@ -730,6 +737,8 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     s->rv->io.on_ecall = blyt_ecall_handler;
     rv_set_reg(s->rv, rv_reg_ra, BLYT_TRAMPOLINE_EXIT_ADDR);
 
+    blyt_testcard_init_palette(s->palette);
+
     return s;
 }
 
@@ -741,6 +750,8 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
            !session->ctx.ecall_aborted) {
         rv_step(session->rv);
         if (session->ctx.frame_done) {
+            if (!session->cart_has_drawn)
+                blyt_testcard_draw(session->frame_count++, session->pixels);
             g_run_ctx = NULL;
             return BLYT_RUN_FRAME_DONE;
         }
@@ -762,6 +773,21 @@ void blyt_session_destroy(blyt_session_t *session) {
         return;
     rv_delete(session->rv);
     free(session);
+}
+
+const uint8_t *blyt_session_get_pixels(const blyt_session_t *session) {
+    return session->pixels;
+}
+
+const uint32_t *blyt_session_get_palette(const blyt_session_t *session) {
+    return session->palette;
+}
+
+void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out) {
+    const uint8_t *px = session->pixels;
+    const uint32_t *pal = session->palette;
+    for (int i = 0; i < BLYT_FRAME_W * BLYT_FRAME_H; i++)
+        xrgb_out[i] = pal[px[i]];
 }
 
 /* -------------------------------------------------------------------------

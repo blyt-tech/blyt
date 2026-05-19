@@ -67,11 +67,31 @@ static bool env_callback(unsigned cmd, void *data) {
  * Libretro callbacks
  * ------------------------------------------------------------------------- */
 
+static SDL_Renderer *g_renderer = NULL;
+static SDL_Texture *g_texture = NULL;
+
+/* --dump-frame0: write first XRGB8888 frame as raw bytes then exit. */
+static const char *g_dump_frame0_path = NULL;
+static bool g_quit; /* forward declaration — defined below */
+
 static void video_refresh(const void *data, unsigned width, unsigned height, size_t pitch) {
-    (void)data;
-    (void)width;
-    (void)height;
-    (void)pitch;
+    if (g_dump_frame0_path && data) {
+        FILE *f = fopen(g_dump_frame0_path, "wb");
+        if (f) {
+            for (unsigned row = 0; row < height; row++)
+                fwrite((const char *)data + row * pitch, 4, width, f);
+            fclose(f);
+        }
+        g_dump_frame0_path = NULL; /* only dump once */
+        g_quit = true;
+        return;
+    }
+    if (!data || !g_renderer || !g_texture)
+        return;
+    SDL_UpdateTexture(g_texture, NULL, data, (int)pitch);
+    SDL_RenderClear(g_renderer);
+    SDL_RenderCopy(g_renderer, g_texture, NULL, NULL);
+    SDL_RenderPresent(g_renderer);
 }
 
 static void audio_sample(int16_t left, int16_t right) {
@@ -115,6 +135,9 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) {
             *headless = true;
+        } else if (strcmp(argv[i], "--dump-frame0") == 0 && i + 1 < argc) {
+            g_dump_frame0_path = argv[++i];
+            *headless = true; /* frame dump implies headless */
         } else if (argv[i][0] != '-') {
             cart = argv[i];
         } else {
@@ -172,6 +195,11 @@ int main(int argc, char *argv[]) {
             retro_deinit();
             return 1;
         }
+        g_renderer = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+        if (g_renderer)
+            g_texture =
+                SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING,
+                                  (int)av.geometry.base_width, (int)av.geometry.base_height);
     }
 
     while (!g_quit && !blyt_libretro_is_done()) {
@@ -185,6 +213,10 @@ int main(int argc, char *argv[]) {
     }
 
     if (win) {
+        if (g_texture)
+            SDL_DestroyTexture(g_texture);
+        if (g_renderer)
+            SDL_DestroyRenderer(g_renderer);
         SDL_DestroyWindow(win);
         SDL_Quit();
     }

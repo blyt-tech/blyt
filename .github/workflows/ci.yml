@@ -35,7 +35,8 @@ jobs:
             tests/game/hello/src/game/c/*.c \
             frontends/sdl/main.c \
             frontends/libretro/blyt_libretro.c \
-            tests/unit/test_session_api.c
+            tests/unit/test_session_api.c \
+            runtime/host/src/libblyt/testcard.c
           cmake-format --check CMakeLists.txt
           yamllint .github/workflows/ci.yml
 

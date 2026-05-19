@@ -47,6 +47,10 @@ static blyt_session_t *g_session = NULL;
 static bool g_cart_done = false;
 static blyt_cart_run_err_t g_run_err = BLYT_RUN_OK;
 
+/* XRGB8888 expansion buffer — filled by blyt_session_expand_frame() each
+ * frame and passed to the frontend video callback. */
+static uint32_t g_xrgb[BLYT_FRAME_W * BLYT_FRAME_H];
+
 /* -------------------------------------------------------------------------
  * Log callback passed to libblyt — routes blyt_console_debug to retro_log
  * ------------------------------------------------------------------------- */
@@ -122,10 +126,10 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info) {
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
     memset(info, 0, sizeof(*info));
-    info->geometry.base_width = 320;
-    info->geometry.base_height = 240;
-    info->geometry.max_width = 320;
-    info->geometry.max_height = 240;
+    info->geometry.base_width = BLYT_FRAME_W;
+    info->geometry.base_height = BLYT_FRAME_H;
+    info->geometry.max_width = BLYT_FRAME_W;
+    info->geometry.max_height = BLYT_FRAME_H;
     info->geometry.aspect_ratio = 4.0f / 3.0f;
     info->timing.fps = 60.0;
     info->timing.sample_rate = 44100.0;
@@ -204,9 +208,10 @@ RETRO_API void retro_run(void) {
         }
     }
 
-    /* No framebuffer yet — pass NULL (frontend duplicates the previous frame) */
-    if (g_video_cb)
-        g_video_cb(NULL, 320, 240, 0);
+    if (g_video_cb && g_session) {
+        blyt_session_expand_frame(g_session, g_xrgb);
+        g_video_cb(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H, BLYT_FRAME_W * (uint32_t)sizeof(uint32_t));
+    }
 }
 
 RETRO_API size_t retro_serialize_size(void) {

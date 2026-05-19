@@ -3,3 +3,5 @@ build-*/
 target/
 devtool/target/
 tests/game/*.blyt
+.cache/
+.cache/

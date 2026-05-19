@@ -655,3 +655,55 @@ void blyt_cart_draw(void)   {}
         String::from_utf8_lossy(&out)
     );
 }
+
+/// Test card frame 0: runs an idle cart with --dump-frame0 and compares the
+/// raw XRGB8888 output byte-for-byte against the checked-in golden file
+/// (tests/testcard_frame0.bin).  Fails if the rendering changes unexpectedly.
+#[test]
+fn testcard_frame0_matches_golden() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let golden_path = repo_root().join("tests/testcard_frame0.bin");
+    assert!(
+        golden_path.exists(),
+        "golden file missing: {}",
+        golden_path.display()
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("testcard");
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+void blyt_cart_init(void)   {}
+void blyt_cart_update(void) {}
+void blyt_cart_draw(void)   {}
+"#,
+    );
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let frame_path = tmp.path().join("frame0.bin");
+    Command::new(blytrun())
+        .args([
+            "--dump-frame0",
+            frame_path.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .assert()
+        .success();
+
+    assert!(frame_path.exists(), "frame0.bin was not written");
+    let got = fs::read(&frame_path).expect("reading frame0.bin");
+    let want = fs::read(&golden_path).expect("reading golden");
+    assert_eq!(got.len(), want.len(), "frame size mismatch");
+    assert_eq!(
+        got, want,
+        "frame 0 does not match golden testcard_frame0.bin"
+    );
+}
