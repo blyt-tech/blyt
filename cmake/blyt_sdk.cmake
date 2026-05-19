@@ -404,6 +404,83 @@ if(EXISTS "${BLYT_BINARY_DIR}/blytrun")
 endif()
 
 # -------------------------------------------------------------------------
+# Step 6: blyt_libretro.so — host-side libretro core
+#
+# The libretro core embeds the guest .so files built above so it is
+# self-contained.  It links against the cmake-built host static libs
+# (libblyt, rv32emu, softfloat, flatccrt).
+#
+# If the cmake main build already produced blyt_libretro.so (Linux CI,
+# where lld is available), that file is used as-is.  Otherwise the core is
+# compiled here using the host C compiler.
+# -------------------------------------------------------------------------
+
+set(LIBRETRO_OUT "${BLYT_BINARY_DIR}/blyt_libretro.so")
+
+if(EXISTS "${LIBRETRO_OUT}")
+  message(STATUS "blyt_libretro.so: already built by cmake — using existing")
+else()
+  message(STATUS "Building blyt_libretro.so (host)…")
+
+  set(EMBEDDED_LIBS_C "${BLYT_BINARY_DIR}/blyt_embedded_libs.c")
+
+  execute_process(
+    COMMAND python3 "${BLYT_SOURCE_DIR}/cmake/bin2c.py" blytcommon_so
+            "${SDK_LIB}/libblytcommon.so" blytc_so "${SDK_LIB}/libblytc.so"
+            blyt32_so "${SDK_LIB}/libblyt32.so" "${EMBEDDED_LIBS_C}"
+    RESULT_VARIABLE R)
+  if(NOT R EQUAL 0)
+    message(FATAL_ERROR "Failed to generate blyt_embedded_libs.c")
+  endif()
+
+  # Locate host C compiler (prefer cc, fall back to clang/gcc)
+  find_program(HOST_CC NAMES cc clang gcc)
+  if(NOT HOST_CC)
+    message(FATAL_ERROR "Could not find a host C compiler (cc/clang/gcc)")
+  endif()
+
+  # Platform-specific shared-library flags
+  if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+    set(LINK_FLAGS -bundle -undefined dynamic_lookup)
+  else()
+    set(LINK_FLAGS -shared)
+  endif()
+
+  execute_process(
+    COMMAND
+      "${HOST_CC}" ${LINK_FLAGS} -fPIC -o "${LIBRETRO_OUT}"
+      "-DBLYT_VERSION=\"${BLYT_VERSION}\""
+      "-DBLYT_EMBED_LIBS"
+      "${BLYT_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
+      "${EMBEDDED_LIBS_C}"
+      -I "${BLYT_SOURCE_DIR}/third_party/libretro-common/include"
+      -I "${BLYT_SOURCE_DIR}/runtime/host/include"
+      "${BLYT_BINARY_DIR}/libblyt.a"
+      "${BLYT_BINARY_DIR}/liblibblytemu.a"
+      "${BLYT_BINARY_DIR}/liblibsoftfloat.a"
+      "${BLYT_SOURCE_DIR}/third_party/flatcc/lib/libflatccrt.a"
+    RESULT_VARIABLE R)
+  if(NOT R EQUAL 0)
+    message(FATAL_ERROR "Failed to build blyt_libretro.so")
+  endif()
+
+  # macOS requires a code signature on dynamically loaded bundles; use ad-hoc
+  # signing (no developer certificate) so dlopen succeeds under SIP.
+  if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+    find_program(CODESIGN codesign)
+    if(CODESIGN)
+      execute_process(COMMAND "${CODESIGN}" --force --sign - "${LIBRETRO_OUT}"
+                      RESULT_VARIABLE R)
+      if(NOT R EQUAL 0)
+        message(FATAL_ERROR "codesign failed for blyt_libretro.so")
+      endif()
+    endif()
+  endif()
+
+  message(STATUS "Built ${LIBRETRO_OUT}")
+endif()
+
+# -------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------
 

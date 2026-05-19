@@ -175,6 +175,10 @@ static void test_ecall_handler(riscv_t *rv) {
         return;
     }
 
+    case BLYT_ECALL_FRAME_DONE:
+        rv->PC += 4;
+        return;
+
     default:
         rv_halt(rv);
         if (g_test_ctx)
@@ -385,6 +389,55 @@ static void test_unknown_ecall_traps(void) {
 }
 
 /* -------------------------------------------------------------------------
+ * Test 4: BLYT_ECALL_FRAME_DONE (a7=2) advances PC without trapping.
+ *
+ * RV32 program:
+ *   addi a7, x0, 2   ; BLYT_ECALL_FRAME_DONE
+ *   ecall
+ *   addi a7, x0, 0   ; BLYT_ECALL_EXIT
+ *   ecall
+ * ------------------------------------------------------------------------- */
+
+static void test_frame_done_advances_pc(void) {
+    const char *name = "frame_done_ecall_advances_pc";
+
+    /* addi x17, x0, 2 = 0x00200893 */
+    static const uint32_t prog[] = {
+        UINT32_C(0x00200893), /* addi a7, x0, 2 (BLYT_ECALL_FRAME_DONE) */
+        RV32_ECALL,
+        RV32_LI_A7_0,
+        RV32_ECALL,
+    };
+
+    char *path = build_and_write_test_elf(prog, 4, "");
+    if (!path) {
+        FAIL(name, "failed to build test ELF");
+        return;
+    }
+
+    vm_attr_t attr;
+    riscv_t *rv = make_rv_from_path(path, &attr);
+    unlink(path);
+    free(path);
+    if (!rv) {
+        FAIL(name, "rv_create failed");
+        return;
+    }
+
+    test_ctx_t ctx = {.log_fn = NULL, .ecall_trapped = 0};
+    g_test_ctx = &ctx;
+
+    rv_run(rv);
+    rv_delete(rv);
+    g_test_ctx = NULL;
+
+    if (ctx.ecall_trapped)
+        FAIL(name, "frame_done ecall trapped unexpectedly");
+    else
+        PASS(name);
+}
+
+/* -------------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------------- */
 
@@ -392,6 +445,7 @@ int main(void) {
     test_console_debug();
     test_exit_halts();
     test_unknown_ecall_traps();
+    test_frame_done_advances_pc();
 
     if (failures == 0) {
         printf("All tests passed.\n");

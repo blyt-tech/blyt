@@ -51,19 +51,67 @@
 #define MAX_SYMS 512
 
 /* -------------------------------------------------------------------------
- * ECALL handler global context
+ * In-memory library registry
+ *
+ * Frontends (e.g. libretro) that embed guest libraries as compiled-in data
+ * call blyt_register_lib() before creating a session.  dynlink checks here
+ * first before falling back to the BLYT_LIB_DIR filesystem path.
+ * ------------------------------------------------------------------------- */
+
+#define MAX_REGISTERED_LIBS 8
+
+typedef struct {
+    char name[64];
+    const void *data;
+    size_t size;
+} blyt_registered_lib_t;
+
+static blyt_registered_lib_t g_registered_libs[MAX_REGISTERED_LIBS];
+static int g_registered_lib_count = 0;
+
+void blyt_register_lib(const char *name, const void *data, size_t size) {
+    if (g_registered_lib_count >= MAX_REGISTERED_LIBS)
+        return;
+    /* Ignore duplicate registrations */
+    for (int i = 0; i < g_registered_lib_count; i++) {
+        if (strcmp(g_registered_libs[i].name, name) == 0)
+            return;
+    }
+    blyt_registered_lib_t *r = &g_registered_libs[g_registered_lib_count++];
+    strncpy(r->name, name, sizeof(r->name) - 1);
+    r->name[sizeof(r->name) - 1] = '\0';
+    r->data = data;
+    r->size = size;
+}
+
+void blyt_clear_libs(void) {
+    g_registered_lib_count = 0;
+}
+
+/* -------------------------------------------------------------------------
+ * ECALL handler context
  * ------------------------------------------------------------------------- */
 
 typedef struct {
     blyt_log_fn log_fn;
-    blyt_frame_fn frame_fn;
-    void *frame_userdata;
     bool ecall_trapped; /* cart issued a non-permitted ecall */
     bool ecall_aborted; /* cart called abort() — ECALL_EXIT with a0 != 0 */
-    bool frame_done; /* set by BLYT_ECALL_FRAME_DONE; cleared by the step loop */
+    bool frame_done; /* set by BLYT_ECALL_FRAME_DONE; cleared by run_frame */
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
+
+/* -------------------------------------------------------------------------
+ * Session
+ * ------------------------------------------------------------------------- */
+
+struct blyt_session {
+    riscv_t *rv;
+    /* vm_attr_t must outlive rv: rv_create stores &attr in rv->data (rv->priv),
+     * so it must not be stack-allocated in blyt_session_create. */
+    vm_attr_t attr;
+    blyt_run_ctx_t ctx;
+};
 
 /* -------------------------------------------------------------------------
  * EXIT trampoline
@@ -128,8 +176,6 @@ static void blyt_ecall_handler(riscv_t *rv) {
     }
 
     case BLYT_ECALL_FRAME_DONE:
-        /* Signal the step loop to invoke the frame callback, then resume.
-         * Do NOT halt — the emulator continues into the next frame. */
         rv->PC += 4;
         if (g_run_ctx)
             g_run_ctx->frame_done = true;
@@ -170,16 +216,14 @@ static uint32_t symtab_lookup(const blyt_symtab_t *st, const char *name) {
  * ------------------------------------------------------------------------- */
 
 typedef struct {
-    const uint8_t *map; /* host-side mmap */
+    const uint8_t *map; /* host-side mapping */
     size_t size;
-    uint32_t bias; /* guest load bias (GUEST_LIB_BASE + n*STRIDE for ET_DYN) */
+    uint32_t bias; /* guest load bias */
+    bool mmapped; /* true if map was mmap'd and must be munmap'd on cleanup */
 } blyt_lib_t;
 
 /* -------------------------------------------------------------------------
  * ELF virtual-address → host pointer (for ET_DYN with base=0 at link time)
- *
- * Converts an ELF virtual address (as emitted by the linker for a PIC .so
- * with assumed base 0) to a pointer into the host-mapped library bytes.
  * ------------------------------------------------------------------------- */
 
 static const void *vaddr_to_ptr(const uint8_t *map, size_t map_size, const Elf32_Ehdr *eh,
@@ -280,8 +324,6 @@ static void apply_lib_rela(const blyt_lib_t *lib, memory_t *mem) {
                 if (sym_off + sizeof(Elf32_Sym) > lib->size)
                     continue;
                 const Elf32_Sym *sym = (const Elf32_Sym *)(lib->map + sym_off);
-                /* For symbols defined in this library (not UNDEF), compute
-                 * their runtime address: bias + st_value + addend. */
                 if (sym->st_shndx != SHN_UNDEF) {
                     uint32_t val = lib->bias + sym->st_value + (uint32_t)r->r_addend;
                     write_u32_le(v, val);
@@ -311,7 +353,6 @@ static void build_symtab(const blyt_lib_t *lib, blyt_symtab_t *st) {
         if (dynsym && i == dynsym->sh_link && shdrs[i].sh_type == SHT_STRTAB)
             dynstr = &shdrs[i];
     }
-    /* Fallback: use sh_link from dynsym */
     if (dynsym && !dynstr && dynsym->sh_link < eh->e_shnum)
         dynstr = &shdrs[dynsym->sh_link];
     if (!dynsym || !dynstr || dynsym->sh_entsize < sizeof(Elf32_Sym))
@@ -333,7 +374,6 @@ static void build_symtab(const blyt_lib_t *lib, blyt_symtab_t *st) {
             continue;
         const char *name = strtab + sym->st_name;
 
-        /* Don't override a symbol already in the table (first wins). */
         if (symtab_lookup(st, name) != 0)
             continue;
 
@@ -346,9 +386,6 @@ static void build_symtab(const blyt_lib_t *lib, blyt_symtab_t *st) {
 
 /* -------------------------------------------------------------------------
  * Parse DT_NEEDED entries from a library's PT_DYNAMIC segment
- *
- * Writes at most max_out library names (pointers into lib->map) to names[].
- * Returns the number of names found.
  * ------------------------------------------------------------------------- */
 
 static int get_dt_needed(const blyt_lib_t *lib, const char **names, int max_out) {
@@ -363,7 +400,6 @@ static int get_dt_needed(const blyt_lib_t *lib, const char **names, int max_out)
         if (ph->p_type != PT_DYNAMIC)
             continue;
 
-        /* Find the dynamic string table via DT_STRTAB */
         const Elf32_Dyn *dyn = (const Elf32_Dyn *)(lib->map + ph->p_offset);
         size_t ndyn = ph->p_filesz / sizeof(Elf32_Dyn);
         const char *strtab = NULL;
@@ -385,17 +421,13 @@ static int get_dt_needed(const blyt_lib_t *lib, const char **names, int max_out)
             if (dyn[k].d_tag == DT_NEEDED)
                 names[count++] = strtab + dyn[k].d_un.d_val;
         }
-        break; /* only one PT_DYNAMIC */
+        break;
     }
     return count;
 }
 
 /* -------------------------------------------------------------------------
  * Resolve PLT/GOT entries in an ELF binary against the combined symbol table
- *
- * Handles R_RISCV_JUMP_SLOT and R_RISCV_GLOB_DAT.  For ET_DYN libraries,
- * elf_bias is the load bias; for ET_EXEC carts elf_bias is 0 (r_offset is
- * already an absolute virtual address).
  * ------------------------------------------------------------------------- */
 
 static void resolve_elf_plt(const uint8_t *map, size_t map_size, memory_t *mem, uint32_t elf_bias,
@@ -450,19 +482,35 @@ static void resolve_elf_plt(const uint8_t *map, size_t map_size, memory_t *mem, 
 
             uint8_t v[4];
             write_u32_le(v, resolved);
-            /* elf_bias=0 for ET_EXEC (r_offset is absolute);
-             * elf_bias=load_base for ET_DYN (r_offset is relative). */
             memory_write(mem, elf_bias + r->r_offset, v, 4);
         }
     }
 }
 
 /* -------------------------------------------------------------------------
- * Open a library file and mmap it
+ * Open a library — check the in-memory registry first, then fall back to
+ * loading from BLYT_LIB_DIR.  Sets *mmapped_out to true only when the data
+ * was mmap'd from a file and must be munmap'd by the caller.
  * ------------------------------------------------------------------------- */
 
 static bool open_lib(const char *lib_dir, const char *lib_name, const uint8_t **map_out,
-                     size_t *size_out) {
+                     size_t *size_out, bool *mmapped_out) {
+    /* Registry lookup (e.g. libs embedded in the libretro core) */
+    for (int i = 0; i < g_registered_lib_count; i++) {
+        if (strcmp(g_registered_libs[i].name, lib_name) == 0) {
+            *map_out = (const uint8_t *)g_registered_libs[i].data;
+            *size_out = g_registered_libs[i].size;
+            *mmapped_out = false;
+            return true;
+        }
+    }
+
+    /* Filesystem fallback */
+    if (!lib_dir || lib_dir[0] == '\0') {
+        fprintf(stderr, "blyt: %s not in registry and BLYT_LIB_DIR not set\n", lib_name);
+        return false;
+    }
+
     char path[4096];
     int n = snprintf(path, sizeof(path), "%s/%s", lib_dir, lib_name);
     if (n < 0 || (size_t)n >= sizeof(path))
@@ -487,27 +535,16 @@ static bool open_lib(const char *lib_dir, const char *lib_name, const uint8_t **
 
     *map_out = (const uint8_t *)m;
     *size_out = (size_t)st.st_size;
+    *mmapped_out = true;
     return true;
 }
 
 /* -------------------------------------------------------------------------
  * Top-level dynamic loader
- *
- * Loads the runtime libraries required by the cart using a BFS over DT_NEEDED
- * entries (cart → libblyt32.so → libblytcommon.so → …).  For each library:
- *   1. Map its PT_LOAD segments into rv32emu guest memory.
- *   2. Apply its R_RISCV_RELATIVE relocations.
- *   3. Add its exported symbols to the combined symbol table.
- * Then resolve PLT/GOT entries for each loaded library (against the combined
- * table), and finally resolve the cart's PLT/GOT.
  * ------------------------------------------------------------------------- */
 
 static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     const char *lib_dir = getenv("BLYT_LIB_DIR");
-    if (!lib_dir || lib_dir[0] == '\0') {
-        fprintf(stderr, "blyt: BLYT_LIB_DIR not set — cannot locate runtime libraries\n");
-        return BLYT_RUN_ERR_EMU;
-    }
 
     vm_attr_t *attr = PRIV(rv);
     memory_t *mem = attr->mem;
@@ -518,25 +555,22 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     blyt_symtab_t all_syms;
     all_syms.count = 0;
 
-    /* Add the cart's exported symbols first so that the cart's strong
-     * definitions win over the weak no-op stubs in the runtime libraries.
-     * build_symtab uses first-wins; cart symbols must be seeded before BFS. */
+    /* Seed cart symbols first so cart's strong definitions win over library stubs. */
     {
         blyt_lib_t cart_syms = {
             .map = (const uint8_t *)cart->map,
             .size = cart->map_size,
-            .bias = 0, /* ET_EXEC: absolute addresses */
+            .bias = 0,
+            .mmapped = false,
         };
         build_symtab(&cart_syms, &all_syms);
     }
 
-    /* BFS queue of library names to load (names come from DT_NEEDED entries
-     * which are pointers into mmap'd files — collected before munmap). */
-    char name_buf[MAX_RUNTIME_LIBS][64]; /* stable copies of library names */
+    char name_buf[MAX_RUNTIME_LIBS][64];
     int qhead = 0;
     int qtail = 0;
 
-    /* Seed the queue from the cart's DT_NEEDED */
+    /* Seed BFS queue from the cart's DT_NEEDED */
     {
         const Elf32_Ehdr *ceh = (const Elf32_Ehdr *)cart->map;
         if (ceh->e_shentsize >= sizeof(Elf32_Shdr) && ceh->e_shnum > 0) {
@@ -575,19 +609,10 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     while (qhead < qtail && nlibs < MAX_RUNTIME_LIBS) {
         const char *lib_name = name_buf[qhead++];
 
-        /* Skip if already loaded */
-        bool dup = false;
-        for (int i = 0; i < nlibs; i++) {
-            /* Check against the SONAME embedded in the library — simplified:
-             * compare load order name against queue name. */
-            (void)i;
-            /* Use library index as proxy: just check name_buf uniqueness. */
-        }
-        (void)dup; /* handled implicitly — each unique name loaded once */
-
         const uint8_t *lmap;
         size_t lsz;
-        if (!open_lib(lib_dir, lib_name, &lmap, &lsz)) {
+        bool mmapped;
+        if (!open_lib(lib_dir, lib_name, &lmap, &lsz, &mmapped)) {
             ok = false;
             break;
         }
@@ -595,7 +620,8 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
         const Elf32_Ehdr *leh = (const Elf32_Ehdr *)lmap;
         if (lsz < sizeof(Elf32_Ehdr) || leh->e_ident[EI_MAG0] != ELFMAG0 ||
             leh->e_machine != EM_RISCV) {
-            munmap((void *)lmap, lsz);
+            if (mmapped)
+                munmap((void *)lmap, lsz);
             ok = false;
             break;
         }
@@ -603,10 +629,11 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
         uint32_t bias =
             (leh->e_type == ET_DYN) ? GUEST_LIB_BASE + (uint32_t)nlibs * GUEST_LIB_STRIDE : 0;
 
-        blyt_lib_t lib = {.map = lmap, .size = lsz, .bias = bias};
+        blyt_lib_t lib = {.map = lmap, .size = lsz, .bias = bias, .mmapped = mmapped};
 
         if (!map_lib_segments(&lib, mem)) {
-            munmap((void *)lmap, lsz);
+            if (mmapped)
+                munmap((void *)lmap, lsz);
             ok = false;
             break;
         }
@@ -615,11 +642,10 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
         build_symtab(&lib, &all_syms);
         libs[nlibs++] = lib;
 
-        /* Enqueue this library's DT_NEEDED for transitive loading */
+        /* Enqueue transitive DT_NEEDED dependencies */
         const char *needed[MAX_RUNTIME_LIBS];
         int nneeded = get_dt_needed(&lib, needed, MAX_RUNTIME_LIBS);
         for (int i = 0; i < nneeded && qtail < MAX_RUNTIME_LIBS; i++) {
-            /* Check if already queued */
             bool already = false;
             for (int q = 0; q < qtail; q++) {
                 if (strcmp(name_buf[q], needed[i]) == 0) {
@@ -636,26 +662,12 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     }
 
     if (ok) {
-        /* Resolve PLT/GOT for each loaded library.  The runtime libraries'
-         * PLT entries for cart callbacks (blyt_cart_init etc.) are resolved
-         * against the cart symbols already seeded in all_syms above. */
         for (int i = 0; i < nlibs; i++) {
             resolve_elf_plt(libs[i].map, libs[i].size, mem, libs[i].bias, &all_syms);
         }
-
-        /* Resolve the cart's PLT/GOT against the combined symbol table. */
         resolve_elf_plt(cart->map, cart->map_size, mem, 0, &all_syms);
 
-        /* Initialise the libblytc.so arena (ADR-0120).
-         *
-         * blytc_arena_base and blytc_arena_size are exported data symbols in
-         * libblytc.so's .dynsym.  We write the arena guest address and size
-         * directly into those .data locations so the arena allocator can start
-         * serving malloc() calls when cart code runs.
-         *
-         * The arena occupies BLYT_ARENA_SIZE bytes at BLYT_ARENA_BASE in the
-         * guest address space.  The region falls between the cart load area
-         * (~64 KiB) and the runtime library area (128 MiB), so no overlap. */
+        /* Initialise the libblytc.so arena (ADR-0120). */
         uint32_t sym_base = symtab_lookup(&all_syms, "blytc_arena_base");
         uint32_t sym_size = symtab_lookup(&all_syms, "blytc_arena_size");
         if (sym_base != 0 && sym_size != 0) {
@@ -667,84 +679,75 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
         }
     }
 
-    for (int i = 0; i < nlibs; i++)
-        munmap((void *)libs[i].map, libs[i].size);
+    for (int i = 0; i < nlibs; i++) {
+        if (libs[i].mmapped)
+            munmap((void *)libs[i].map, libs[i].size);
+    }
 
     return ok ? BLYT_RUN_OK : BLYT_RUN_ERR_EMU;
 }
 
 /* -------------------------------------------------------------------------
- * blyt_cart_run — public entry point
+ * Session API — public entry points
  * ------------------------------------------------------------------------- */
 
-blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn, blyt_frame_fn frame_fn,
-                                  void *userdata) {
-    blyt_run_ctx_t ctx = {.log_fn = log_fn,
-                          .frame_fn = frame_fn,
-                          .frame_userdata = userdata,
-                          .ecall_trapped = false,
-                          .frame_done = false};
-    g_run_ctx = &ctx;
+blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
+    blyt_session_t *s = calloc(1, sizeof(*s));
+    if (!s)
+        return NULL;
 
-    vm_attr_t attr = {
-        .mem_size = BLYT_EMU_MEM_SIZE,
-        .stack_size = BLYT_STACK_SIZE,
-        .args_offset_size = 0,
-        .argc = 0,
-        .argv = NULL,
-        .log_level = LOG_WARN,
-        .cycle_per_step = BLYT_CYCLE_PER_STEP,
-        .allow_misalign = false,
-        .fd_stdin = STDIN_FILENO,
-        .fd_stdout = STDOUT_FILENO,
-        .fd_stderr = STDERR_FILENO,
-        .data.user.elf_program = cart->path,
-    };
+    s->ctx.log_fn = log_fn;
 
-    riscv_t *rv = rv_create(&attr);
-    if (!rv) {
-        g_run_ctx = NULL;
-        return BLYT_RUN_ERR_EMU;
+    s->attr.mem_size = BLYT_EMU_MEM_SIZE;
+    s->attr.stack_size = BLYT_STACK_SIZE;
+    s->attr.args_offset_size = 0;
+    s->attr.argc = 0;
+    s->attr.argv = NULL;
+    s->attr.log_level = LOG_WARN;
+    s->attr.cycle_per_step = BLYT_CYCLE_PER_STEP;
+    s->attr.allow_misalign = false;
+    s->attr.fd_stdin = STDIN_FILENO;
+    s->attr.fd_stdout = STDOUT_FILENO;
+    s->attr.fd_stderr = STDERR_FILENO;
+    s->attr.data.user.elf_program = cart->path;
+
+    s->rv = rv_create(&s->attr);
+    if (!s->rv) {
+        free(s);
+        return NULL;
     }
 
-    vm_attr_t *rattr = PRIV(rv);
+    vm_attr_t *rattr = PRIV(s->rv);
     inject_exit_trampoline(rattr->mem);
 
-    blyt_cart_run_err_t load_err = dynlink(rv, cart);
+    blyt_cart_run_err_t load_err = dynlink(s->rv, cart);
     if (load_err != BLYT_RUN_OK) {
-        rv_delete(rv);
-        g_run_ctx = NULL;
-        return load_err;
+        rv_delete(s->rv);
+        free(s);
+        return NULL;
     }
 
-    rv->io.on_ecall = blyt_ecall_handler;
+    s->rv->io.on_ecall = blyt_ecall_handler;
+    rv_set_reg(s->rv, rv_reg_ra, BLYT_TRAMPOLINE_EXIT_ADDR);
 
-    /* rv_create already set PC = e_entry (_blyt_entry in the cart's .text).
-     * _blyt_entry calls blyt_main via PLT; dynlink resolved that PLT entry
-     * to blyt_main in libblytcommon.so before rv_run is called, so the
-     * call proceeds correctly on both emulated and native targets.
-     * RA is set to the EXIT trampoline so that when blyt_main returns the
-     * emulator halts cleanly. */
-    rv_set_reg(rv, rv_reg_ra, BLYT_TRAMPOLINE_EXIT_ADDR);
+    return s;
+}
 
-    /* Step loop: run the emulator one rv_step() burst at a time.  After each
-     * BLYT_ECALL_FRAME_DONE the ecall handler sets ctx.frame_done; we then
-     * invoke the frontend's frame callback (SDL event poll, frame-rate cap,
-     * etc.) before resuming.  This interleaves host and guest work per frame
-     * without threading. */
-    while (!rv_has_halted(rv) && !ctx.ecall_trapped && !ctx.ecall_aborted) {
-        rv_step(rv);
-        if (ctx.frame_done) {
-            ctx.frame_done = false;
-            if (ctx.frame_fn)
-                ctx.frame_fn(ctx.frame_userdata);
+blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
+    g_run_ctx = &session->ctx;
+    session->ctx.frame_done = false;
+
+    while (!rv_has_halted(session->rv) && !session->ctx.ecall_trapped &&
+           !session->ctx.ecall_aborted) {
+        rv_step(session->rv);
+        if (session->ctx.frame_done) {
+            g_run_ctx = NULL;
+            return BLYT_RUN_FRAME_DONE;
         }
     }
 
-    rv_delete(rv);
-
-    bool trapped = ctx.ecall_trapped;
-    bool aborted = ctx.ecall_aborted;
+    bool trapped = session->ctx.ecall_trapped;
+    bool aborted = session->ctx.ecall_aborted;
     g_run_ctx = NULL;
 
     if (trapped)
@@ -752,4 +755,31 @@ blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn, blyt_fr
     if (aborted)
         return BLYT_RUN_ERR_ABORT;
     return BLYT_RUN_OK;
+}
+
+void blyt_session_destroy(blyt_session_t *session) {
+    if (!session)
+        return;
+    rv_delete(session->rv);
+    free(session);
+}
+
+/* -------------------------------------------------------------------------
+ * blyt_cart_run — blocking wrapper around the session API
+ * ------------------------------------------------------------------------- */
+
+blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn, blyt_frame_fn frame_fn,
+                                  void *userdata) {
+    blyt_session_t *s = blyt_session_create(cart, log_fn);
+    if (!s)
+        return BLYT_RUN_ERR_EMU;
+
+    blyt_cart_run_err_t err;
+    while ((err = blyt_session_run_frame(s)) == BLYT_RUN_FRAME_DONE) {
+        if (frame_fn)
+            frame_fn(userdata);
+    }
+
+    blyt_session_destroy(s);
+    return err;
 }

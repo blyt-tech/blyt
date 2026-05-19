@@ -187,18 +187,14 @@ set(RV32EMU_FEATURE_DEFS
 # overrides HAVE_MMAP back to 0.  Using one force-include avoids cmake
 # deduplicating two -include flags with the same name.
 #
-# rv32emu's demand-paging (PROT_NONE + SIGSEGV handler) causes LLDB to intercept
-# every first memory touch as EXC_BAD_ACCESS before the program's handler can
-# respond.  The malloc-based fallback (HAVE_MMAP=0) is functionally equivalent
-# for blyt.
+# rv32emu uses PROT_NONE demand-paging (HAVE_MMAP=1) on all platforms, which
+# gives the OS freedom to place the 256 MiB guest region at a safe address. On
+# macOS Tahoe+, malloc(256 MiB) returns addresses in the 0x200000000 range that
+# overlap __OBJC_RO, causing SIGBUS; mmap does not have this problem. LLDB
+# intercepts the initial demand-paging faults as EXC_BAD_ACCESS — handled via a
+# signal mask in launch.json ("process handle SIGSEGV -n false -p false").
 set(RV32EMU_CONFIG_H "${CMAKE_BINARY_DIR}/rv32emu_config.h")
-if(APPLE)
-  file(WRITE "${RV32EMU_CONFIG_H}"
-       "#include \"${RV32EMU_DIR}/common.h\"\n" "#undef HAVE_MMAP\n"
-       "#define HAVE_MMAP 0 /* macOS/LLDB: avoid demand-paging */\n")
-else()
-  file(WRITE "${RV32EMU_CONFIG_H}" "#include \"${RV32EMU_DIR}/common.h\"\n")
-endif()
+file(WRITE "${RV32EMU_CONFIG_H}" "#include \"${RV32EMU_DIR}/common.h\"\n")
 
 target_compile_definitions(libblytemu PRIVATE ${RV32EMU_FEATURE_DEFS})
 target_compile_options(libblytemu PRIVATE -include "${RV32EMU_CONFIG_H}")
@@ -208,12 +204,12 @@ target_link_libraries(libblytemu PRIVATE libsoftfloat)
 # -------------------------------------------------------------------------
 # Guest-side RV32IMAFC shared libraries
 #
-# libblytcommon.so — variant-portable shared API (blyt.h); ECALL stubs for
-#   all functions declared in blyt.h.
-# libblytc.so — runtime-provided C library (ADR-0120): trimmed musl subset
-#   (malloc, string, math, printf, fmemopen).  Requires third_party/musl.
-# libblyt32.so — Blyt32 variant library; DT_NEEDED: libblytcommon.so,
-#   libblytc.so.  Carts link against this and get the C library transitively.
+# libblytcommon.so — variant-portable shared API (blyt.h); ECALL stubs for all
+# functions declared in blyt.h. libblytc.so — runtime-provided C library
+# (ADR-0120): trimmed musl subset (malloc, string, math, printf, fmemopen).
+# Requires third_party/musl. libblyt32.so — Blyt32 variant library; DT_NEEDED:
+# libblytcommon.so, libblytc.so.  Carts link against this and get the C library
+# transitively.
 #
 # Requires clang with riscv32 target support and lld.
 # -------------------------------------------------------------------------
@@ -259,17 +255,17 @@ if(CLANG_RV32
 
   # ---- libblytc.so — runtime-provided C library (ADR-0120) ----
   #
-  # Built from a curated subset of musl 1.2 sources (third_party/musl) plus
-  # our own arena allocator and internal stubs.  Requires the musl submodule.
+  # Built from a curated subset of musl 1.2 sources (third_party/musl) plus our
+  # own arena allocator and internal stubs.  Requires the musl submodule.
   set(MUSL_DIR "${CMAKE_SOURCE_DIR}/third_party/musl")
   set(LIBBLYTC_BITS_DIR "${CMAKE_BINARY_DIR}/libblytc/bits")
   set(LIBBLYTC_ALLTYPES_H "${LIBBLYTC_BITS_DIR}/alltypes.h")
   set(LIBBLYTC_OUT "${CMAKE_BINARY_DIR}/libblytc.so")
 
   if(EXISTS "${MUSL_DIR}/include/stdio.h")
-    # Generate bits/alltypes.h from the musl arch + generic templates.
-    # Set up bits/ directory: copy all arch/riscv32/bits/*.h, then generate
-    # the two that need processing.  Runs at configure time.
+    # Generate bits/alltypes.h from the musl arch + generic templates. Set up
+    # bits/ directory: copy all arch/riscv32/bits/*.h, then generate the two
+    # that need processing.  Runs at configure time.
     file(MAKE_DIRECTORY "${LIBBLYTC_BITS_DIR}")
     file(GLOB _BITS_HDRS "${MUSL_DIR}/arch/riscv32/bits/*.h")
     foreach(_H ${_BITS_HDRS})
@@ -277,9 +273,7 @@ if(CLANG_RV32
     endforeach()
 
     execute_process(
-      COMMAND
-        sh -c
-        "cat '${MUSL_DIR}/arch/riscv32/bits/alltypes.h.in' \
+      COMMAND sh -c "cat '${MUSL_DIR}/arch/riscv32/bits/alltypes.h.in' \
               '${MUSL_DIR}/include/alltypes.h.in' \
          | sed -f '${MUSL_DIR}/tools/mkalltypes.sed'"
       OUTPUT_FILE "${LIBBLYTC_ALLTYPES_H}"
@@ -297,8 +291,7 @@ if(CLANG_RV32
     if(MUSL_DIR)
       execute_process(
         COMMAND
-          sh -c
-          "cp '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
+          sh -c "cp '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
               '${LIBBLYTC_BITS_DIR}/syscall.h' \
            && sed -n -e 's/__NR_/SYS_/p' \
                '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
@@ -311,9 +304,7 @@ if(CLANG_RV32
       endif()
     endif()
   else()
-    message(
-      STATUS
-        "libblytc.so: third_party/musl not initialised — skipping \
+    message(STATUS "libblytc.so: third_party/musl not initialised — skipping \
 (run: git submodule update --init third_party/musl)")
     set(MUSL_DIR "")
   endif()
@@ -370,15 +361,21 @@ if(CLANG_RV32
         ${LIBBLYTC_STDIO_SRCS}
         ${LIBBLYTC_OWN_SRCS})
 
-    # Include paths for musl internal compilation.
-    # LIBBLYTC_BITS_DIR provides the generated bits/alltypes.h.
+    # Include paths for musl internal compilation. LIBBLYTC_BITS_DIR provides
+    # the generated bits/alltypes.h.
     set(LIBBLYTC_INCLUDES
-        -I "${MUSL_DIR}/src/include" # defines `hidden` and other internal macros
-        -I "${MUSL_DIR}/include"
-        -I "${MUSL_DIR}/arch/riscv32"
-        -I "${MUSL_DIR}/arch/generic"
-        -I "${MUSL_DIR}/src/internal"
-        -I "${CMAKE_BINARY_DIR}/libblytc") # bits/alltypes.h lives here
+        -I
+        "${MUSL_DIR}/src/include" # defines `hidden` and other internal macros
+        -I
+        "${MUSL_DIR}/include"
+        -I
+        "${MUSL_DIR}/arch/riscv32"
+        -I
+        "${MUSL_DIR}/arch/generic"
+        -I
+        "${MUSL_DIR}/src/internal"
+        -I
+        "${CMAKE_BINARY_DIR}/libblytc") # bits/alltypes.h lives here
 
     # Determinism and musl-compatibility compile flags.
     set(LIBBLYTC_CFLAGS
@@ -403,10 +400,9 @@ if(CLANG_RV32
     message(STATUS "libblytc.so: will be built (musl at ${MUSL_DIR})")
   endif()
 
-  # libblyt32.so — Blyt32 variant.
-  # DT_NEEDED: libblytcommon.so, libblytc.so (the latter via --no-as-needed so
-  # the entry is added even though libblyt32.so's own code doesn't reference
-  # libblytc symbols directly).
+  # libblyt32.so — Blyt32 variant. DT_NEEDED: libblytcommon.so, libblytc.so (the
+  # latter via --no-as-needed so the entry is added even though libblyt32.so's
+  # own code doesn't reference libblytc symbols directly).
   set(LIBBLYT32_SRC "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c")
   set(LIBBLYT32_OUT "${CMAKE_BINARY_DIR}/libblyt32.so")
 
@@ -415,14 +411,18 @@ if(CLANG_RV32
     set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}"
                        "${LIBBLYTC_OUT}")
     set(LIBBLYT32_LINK
-        -L "${CMAKE_BINARY_DIR}" -lblytcommon -Wl,--no-as-needed -lblytc
-        -Wl,--as-needed -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
+        -L
+        "${CMAKE_BINARY_DIR}"
+        -lblytcommon
+        -Wl,--no-as-needed
+        -lblytc
+        -Wl,--as-needed
+        -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
   else()
     # musl unavailable: build without libblytc.so dependency.
     set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}")
-    set(LIBBLYT32_LINK
-        -L "${CMAKE_BINARY_DIR}" -lblytcommon
-        -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
+    set(LIBBLYT32_LINK -L "${CMAKE_BINARY_DIR}" -lblytcommon
+                       -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
   endif()
 
   add_custom_command(
@@ -436,11 +436,10 @@ if(CLANG_RV32
 
   if(MUSL_DIR)
     add_custom_target(
-      libblyt32_so ALL
-      DEPENDS "${LIBBLYT32_OUT}" "${LIBBLYTCOMMON_OUT}" "${LIBBLYTC_OUT}")
+      libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}" "${LIBBLYTCOMMON_OUT}"
+                               "${LIBBLYTC_OUT}")
     message(
-      STATUS
-        "libblytcommon.so + libblytc.so + libblyt32.so: will be built \
+      STATUS "libblytcommon.so + libblytc.so + libblyt32.so: will be built \
 (${CLANG_RV32})")
   else()
     add_custom_target(libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}"
@@ -449,9 +448,7 @@ if(CLANG_RV32
       STATUS "libblytcommon.so + libblyt32.so: will be built (${CLANG_RV32})")
   endif()
 else()
-  message(
-    STATUS
-      "libblytcommon.so + libblyt32.so + libblytc.so: skipping \
+  message(STATUS "libblytcommon.so + libblyt32.so + libblytc.so: skipping \
 (need clang riscv32 + ld.lld)")
 endif()
 
@@ -525,8 +522,41 @@ else()
   endif()
 endif()
 
-# Frontend stub — libretro (not yet implemented)
-add_library(blyt_libretro INTERFACE)
+# -------------------------------------------------------------------------
+# blyt_libretro — libretro core (Phase 4)
+#
+# Embeds libblytcommon.so, libblytc.so, and libblyt32.so as compiled-in data so
+# the core is self-contained.  Only built when all three guest libs are
+# available (clang + lld + musl all found above).
+# -------------------------------------------------------------------------
+if(LIBBLYTC_OUT)
+  set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blyt_embedded_libs.c")
+  add_custom_command(
+    OUTPUT "${EMBEDDED_LIBS_C}"
+    COMMAND
+      python3 "${CMAKE_SOURCE_DIR}/cmake/bin2c.py" blytcommon_so
+      "${LIBBLYTCOMMON_OUT}" blytc_so "${LIBBLYTC_OUT}" blyt32_so
+      "${LIBBLYT32_OUT}" "${EMBEDDED_LIBS_C}"
+    DEPENDS "${LIBBLYTCOMMON_OUT}" "${LIBBLYTC_OUT}" "${LIBBLYT32_OUT}"
+    COMMENT "Embedding guest libs into blyt_libretro"
+    VERBATIM)
+
+  add_library(blyt_libretro MODULE frontends/libretro/blyt_libretro.c
+                                   "${EMBEDDED_LIBS_C}")
+  target_link_libraries(blyt_libretro PRIVATE libblyt)
+  target_include_directories(
+    blyt_libretro
+    PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
+            "${CMAKE_SOURCE_DIR}/runtime/host/include")
+  target_compile_definitions(
+    blyt_libretro PRIVATE BLYT_VERSION="${BLYT_VERSION}" BLYT_EMBED_LIBS)
+  set_target_properties(blyt_libretro PROPERTIES PREFIX "" SUFFIX ".so")
+  add_dependencies(blyt_libretro libblyt32_so)
+  message(STATUS "blyt_libretro: will be built")
+else()
+  add_library(blyt_libretro INTERFACE)
+  message(STATUS "blyt_libretro: skipping (need clang riscv32 + lld + musl)")
+endif()
 
 # -------------------------------------------------------------------------
 # Tests
@@ -581,6 +611,14 @@ add_test(NAME test_cart_run COMMAND test_cart_run)
 add_executable(verify_cart tests/tools/verify_cart.c)
 target_link_libraries(verify_cart PRIVATE libblyt)
 
+# test_session_api: exercises blyt_session_t and blyt_register_lib directly. Not
+# a ctest test (requires the SDK to be assembled first for the guest libs and a
+# real cart); invoked from Rust integration tests after `cmake --build build
+# --target sdk`.
+add_executable(test_session_api tests/unit/test_session_api.c)
+target_include_directories(test_session_api PRIVATE runtime/host/include)
+target_link_libraries(test_session_api PRIVATE libblyt)
+
 # -------------------------------------------------------------------------
 # SDK assembly target
 #
@@ -597,7 +635,7 @@ add_custom_target(
   sdk
   COMMAND
     ${CMAKE_COMMAND} -DBLYT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
-    -DBLYT_BINARY_DIR=${CMAKE_BINARY_DIR}
+    -DBLYT_BINARY_DIR=${CMAKE_BINARY_DIR} -DBLYT_VERSION=${BLYT_VERSION}
     -DCMAKE_HOST_SYSTEM_NAME=${CMAKE_HOST_SYSTEM_NAME}
     -DCMAKE_HOST_SYSTEM_PROCESSOR=${CMAKE_HOST_SYSTEM_PROCESSOR} -P
     ${CMAKE_SOURCE_DIR}/cmake/blyt_sdk.cmake

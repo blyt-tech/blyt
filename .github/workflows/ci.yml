@@ -33,7 +33,9 @@ jobs:
             tests/unit/*.c \
             tests/tools/*.c \
             tests/game/hello/src/game/c/*.c \
-            frontends/sdl/main.c
+            frontends/sdl/main.c \
+            frontends/libretro/blyt_libretro.c \
+            tests/unit/test_session_api.c
           cmake-format --check CMakeLists.txt
           yamllint .github/workflows/ci.yml
 
@@ -42,7 +44,8 @@ jobs:
           git submodule update --init --depth 1 \
             third_party/flatcc \
             third_party/rv32emu \
-            third_party/musl
+            third_party/musl \
+            third_party/libretro-common
           git -C third_party/rv32emu submodule update --init --depth 1 \
             src/softfloat
 

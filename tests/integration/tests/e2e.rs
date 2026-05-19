@@ -547,3 +547,111 @@ void blyt_cart_draw(void)   {}
         cart.display()
     );
 }
+
+/// Path to the test_session_api binary produced by the CMake build.
+fn test_session_api() -> std::path::PathBuf {
+    build_dir().join("test_session_api")
+}
+
+/// Session API: drives a cart via blyt_session_create/run_frame/destroy directly
+/// (not via the blyt_cart_run wrapper).  Verifies BLYT_RUN_FRAME_DONE is returned
+/// at least once before the cart exits cleanly.
+#[test]
+fn session_api_run_frame() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        test_session_api().exists(),
+        "test_session_api not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("session_cart");
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+static int s_frame = 0;
+void blyt_cart_init(void)   { blyt_console_debug("session-init"); }
+void blyt_cart_update(void) { if (++s_frame >= 2) blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let out = Command::new(test_session_api())
+        .args([
+            "session",
+            cart.to_str().unwrap(),
+            sdk_dir().join("lib").to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&out).contains("session-init"),
+        "expected 'session-init' in output, got: {}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// Registry: loads the guest .so files into memory, registers them with
+/// blyt_register_lib, then runs a cart without BLYT_LIB_DIR — exercising the
+/// in-memory registry path through dynlink.
+#[test]
+fn registry_replaces_blyt_lib_dir() {
+    assert!(
+        sdk_dir().join("lib/libblyt32.so").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        test_session_api().exists(),
+        "test_session_api not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("registry_cart");
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+void blyt_cart_init(void)   { blyt_console_debug("registry-ok"); }
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let out = Command::new(test_session_api())
+        .args([
+            "registry",
+            cart.to_str().unwrap(),
+            sdk_dir().join("lib").to_str().unwrap(),
+        ])
+        // Explicitly clear BLYT_LIB_DIR to ensure the registry is the only source
+        .env_remove("BLYT_LIB_DIR")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&out).contains("registry-ok"),
+        "expected 'registry-ok' in output, got: {}",
+        String::from_utf8_lossy(&out)
+    );
+}
