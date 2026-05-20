@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(blyt_wasm C)
+project(blytrun C)
 
 # -------------------------------------------------------------------------
 # Guard: this project must be configured with Emscripten. Usage: emcmake cmake
@@ -8,7 +8,7 @@ project(blyt_wasm C)
 if(NOT EMSCRIPTEN)
   message(
     FATAL_ERROR
-      "blyt_wasm must be built with Emscripten.\n" "Configure with:\n"
+      "blytrun (WASM) must be built with Emscripten.\n" "Configure with:\n"
       "  emcmake cmake -B build-wasm -S frontends/wasm\n"
       "  cmake --build build-wasm")
 endif()
@@ -85,7 +85,7 @@ message(STATUS "blyt WASM: guest libs from ${BLYT_GUEST_LIB_DIR}")
 # -------------------------------------------------------------------------
 # Embed guest libraries as C byte arrays (same approach as blyt_libretro)
 # -------------------------------------------------------------------------
-set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blyt_wasm_embedded_libs.c")
+set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blytrun_embedded_libs.c")
 set(LIBBLYTCOMMON "${BLYT_GUEST_LIB_DIR}/libblytcommon.so")
 set(LIBBLYTC "${BLYT_GUEST_LIB_DIR}/libblytc.so")
 set(LIBBLYT32 "${BLYT_GUEST_LIB_DIR}/libblyt32.so")
@@ -95,7 +95,7 @@ add_custom_command(
   COMMAND python3 "${BLYT_ROOT}/cmake/bin2c.py" blytcommon_so "${LIBBLYTCOMMON}"
           blytc_so "${LIBBLYTC}" blyt32_so "${LIBBLYT32}" "${EMBEDDED_LIBS_C}"
   DEPENDS "${LIBBLYTCOMMON}" "${LIBBLYTC}" "${LIBBLYT32}"
-  COMMENT "Embedding guest libs for blyt_wasm"
+  COMMENT "Embedding guest libs for blytrun (WASM)"
   VERBATIM)
 
 # -------------------------------------------------------------------------
@@ -201,10 +201,10 @@ set(RV32EMU_FEATURE_DEFS
 file(GLOB FLATCCRT_SOURCES "${BLYT_ROOT}/third_party/flatcc/src/runtime/*.c")
 
 # -------------------------------------------------------------------------
-# blyt_wasm executable
+# blytrun executable
 # -------------------------------------------------------------------------
 add_executable(
-  blyt_wasm
+  blytrun
   "${CMAKE_CURRENT_SOURCE_DIR}/wasm_main.c"
   "${EMBEDDED_LIBS_C}"
   ${RV32EMU_SOURCES}
@@ -214,16 +214,16 @@ add_executable(
   "${BLYT_ROOT}/runtime/host/src/libblyt/cart_run.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c")
 
-# Produce blyt_wasm.html + blyt_wasm.js + blyt_wasm.wasm
-set_target_properties(blyt_wasm PROPERTIES SUFFIX ".html")
+# Produce blytrun.html + blytrun.js + blytrun.wasm
+set_target_properties(blytrun PROPERTIES SUFFIX ".html")
 
-target_compile_definitions(blyt_wasm PRIVATE ${RV32EMU_FEATURE_DEFS}
-                                             BLYT_EMBED_LIBS)
+target_compile_definitions(blytrun PRIVATE ${RV32EMU_FEATURE_DEFS}
+                                           BLYT_EMBED_LIBS)
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
 # (not a cmake definition) to avoid quoting issues.
 target_compile_options(
-  blyt_wasm
+  blytrun
   PRIVATE -DBLYT_VERSION="${BLYT_VERSION}"
           # Softfloat
           -DLITTLEENDIAN=1
@@ -243,7 +243,7 @@ target_compile_options(
           "${RV32EMU_CONFIG_H}")
 
 target_include_directories(
-  blyt_wasm
+  blytrun
   PRIVATE "${RV32EMU_DIR}"
           "${SOFTFLOAT_SRC}/include"
           "${SOFTFLOAT_SRC}/RISCV"
@@ -255,7 +255,7 @@ target_include_directories(
 
 # Emscripten link options
 target_link_options(
-  blyt_wasm
+  blytrun
   PRIVATE
   # Allow WASM linear memory to grow to accommodate the 256 MiB guest region.
   "-sALLOW_MEMORY_GROWTH=1"
@@ -285,8 +285,8 @@ target_link_options(
 # -------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------
-message(STATUS "blyt_wasm configured")
-message(STATUS "  Output:    ${CMAKE_BINARY_DIR}/blyt_wasm.html")
+message(STATUS "blytrun (WASM) configured")
+message(STATUS "  Output:    ${CMAKE_BINARY_DIR}/blytrun.js + blytrun.wasm")
 message(STATUS "  WASM dir:  ${CMAKE_BINARY_DIR}")
 message(
   STATUS

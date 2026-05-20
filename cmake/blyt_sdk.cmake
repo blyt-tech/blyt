@@ -518,20 +518,20 @@ endif()
 # -------------------------------------------------------------------------
 # Step 7: WASM runtime (optional — requires Emscripten)
 #
-# Builds blyt_wasm.html + blyt_wasm.js + blyt_wasm.wasm using the guest
-# libraries assembled in Step 2.  The outputs are placed in build/sdk/wasm/ so
-# `blyt run` can locate them via the SDK layout.
+# Builds blytrun.js + blytrun.wasm using the guest libraries from Step 2.
+# Outputs land in sdk/share/wasm/ so `blyt run` can locate them and
+# developers can embed them directly without any build commands.
 #
 # Skipped silently when emcc is not on PATH.
 # -------------------------------------------------------------------------
 
-set(SDK_WASM "${SDK_DIR}/wasm")
+set(SDK_SHARE_WASM "${SDK_DIR}/share/wasm")
 
 find_program(EMCC emcc)
 if(EMCC)
-  message(STATUS "Building WASM runtime (emcc found at ${EMCC})…")
+  message(STATUS "Building blytrun WASM runtime (emcc found at ${EMCC})…")
 
-  file(MAKE_DIRECTORY "${SDK_WASM}")
+  file(MAKE_DIRECTORY "${SDK_SHARE_WASM}")
 
   # Configure the WASM cmake project pointing at the SDK guest libs.
   execute_process(
@@ -543,7 +543,8 @@ if(EMCC)
     OUTPUT_QUIET)
   if(NOT R EQUAL 0)
     message(
-      WARNING "blyt_wasm: emcmake cmake configure failed — skipping WASM step")
+      WARNING "blytrun WASM: emcmake cmake configure failed — skipping WASM step"
+    )
     set(EMCC "")
   endif()
 endif()
@@ -552,23 +553,88 @@ if(EMCC)
   execute_process(COMMAND ${CMAKE_COMMAND} --build
                           "${BLYT_BINARY_DIR}/build-wasm" RESULT_VARIABLE R)
   if(NOT R EQUAL 0)
-    message(WARNING "blyt_wasm: build failed — skipping WASM step")
+    message(WARNING "blytrun WASM: build failed — skipping WASM step")
     set(EMCC "")
   endif()
 endif()
 
 if(EMCC)
-  foreach(_F blyt_wasm.html blyt_wasm.js blyt_wasm.wasm)
+  # Ship blytrun.js + blytrun.wasm.  The dev shell (blytrun.html) is kept
+  # internal to `blyt run`; developers write their own page using the README.
+  foreach(_F blytrun.js blytrun.wasm blytrun.html)
     if(EXISTS "${BLYT_BINARY_DIR}/build-wasm/${_F}")
-      file(COPY "${BLYT_BINARY_DIR}/build-wasm/${_F}" DESTINATION "${SDK_WASM}")
+      file(COPY "${BLYT_BINARY_DIR}/build-wasm/${_F}"
+           DESTINATION "${SDK_SHARE_WASM}")
     endif()
   endforeach()
-  message(STATUS "blyt WASM runtime assembled at ${SDK_WASM}")
-  message(STATUS "  Run a cart:  ${SDK_BIN}/blyt run <cart.blyt>")
+
+  # Write the embedding README alongside the runtime files.
+  file(
+    WRITE "${SDK_SHARE_WASM}/README.md"
+    "# blytrun WASM runtime\n\
+\n\
+`blytrun.js` and `blytrun.wasm` are the blyt emulator compiled to WebAssembly\n\
+via Emscripten.  Drop them on any HTTP server alongside your cart and a page\n\
+that wires up the canvas — no build tools required.\n\
+\n\
+## Requirements\n\
+\n\
+- Files must be served over HTTP (not `file://`) — browsers block WASM loading\n\
+  from the local filesystem.\n\
+- The server must send `Content-Type: application/wasm` for `.wasm` files;\n\
+  most web servers do this automatically.\n\
+- A `<canvas id=\"canvas\" width=\"320\" height=\"240\">` element must exist\n\
+  before the script runs.\n\
+\n\
+## Minimal page\n\
+\n\
+```html\n\
+<!doctype html>\n\
+<html>\n\
+<head><meta charset=\"utf-8\"><title>My Game</title></head>\n\
+<body style=\"background:#111;display:flex;justify-content:center\">\n\
+  <canvas id=\"canvas\" width=\"320\" height=\"240\"\n\
+          style=\"width:640px;height:480px;image-rendering:pixelated\"></canvas>\n\
+  <script>\n\
+    var Module = {\n\
+      canvas: document.getElementById(\"canvas\"),\n\
+      preRun: [function() {\n\
+        /* Fetch the cart and write it into the WASM virtual filesystem\n\
+         * before main() starts.  addRunDependency delays startup until\n\
+         * the fetch completes. */\n\
+        Module.addRunDependency(\"cart\");\n\
+        fetch(\"my-game.blyt\")\n\
+          .then(function(r) { return r.arrayBuffer(); })\n\
+          .then(function(buf) {\n\
+            FS.writeFile(\"/cart.blyt\", new Uint8Array(buf));\n\
+            Module.removeRunDependency(\"cart\");\n\
+          });\n\
+      }],\n\
+      print:    function(s) { console.log(s); },\n\
+      printErr: function(s) { console.error(s); },\n\
+    };\n\
+  </script>\n\
+  <script src=\"blytrun.js\"></script>\n\
+</body>\n\
+</html>\n\
+```\n\
+\n\
+Replace `my-game.blyt` with the path to your cart relative to the page.\n\
+\n\
+## Development server\n\
+\n\
+`blyt run <cart.blyt>` serves the runtime and cart together on a local port\n\
+and opens the correct URL.  It uses an internal shell page; for a\n\
+production-ready page use the template above as a starting point.\n\
+")
+
+  message(STATUS "blytrun WASM runtime assembled at ${SDK_SHARE_WASM}")
+  message(STATUS "  Embed in a page: see ${SDK_SHARE_WASM}/README.md")
+  message(STATUS "  Run a cart:      ${SDK_BIN}/blyt run <cart.blyt>")
 else()
   message(
     STATUS
-      "blyt_wasm: skipped (emcc not found — install Emscripten to build WASM runtime)"
+      "blytrun WASM: skipped (emcc not found — install Emscripten to build WASM runtime)"
   )
 endif()
 
@@ -580,6 +646,7 @@ message(STATUS "blyt SDK assembled at ${SDK_DIR}")
 message(STATUS "  bin:       ${SDK_BIN}")
 message(STATUS "  include:   ${SDK_INC}")
 message(STATUS "  lib:       ${SDK_LIB}")
+message(STATUS "  share:     ${SDK_DIR}/share/")
 if(EXISTS "${SDK_TOOLCHAIN}")
   message(STATUS "  toolchain: ${SDK_TOOLCHAIN}")
 endif()

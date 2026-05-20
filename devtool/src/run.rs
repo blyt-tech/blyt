@@ -41,7 +41,7 @@ pub fn run(cart_path: &Path) -> Result<(), RunError> {
     let wasm_dir = find_wasm_dir()?;
 
     // Validate that required WASM files are present.
-    for name in &["blyt_wasm.js", "blyt_wasm.wasm", "blyt_wasm.html"] {
+    for name in &["blytrun.js", "blytrun.wasm", "blytrun.html"] {
         if !wasm_dir.join(name).exists() {
             return Err(err(format!(
                 "WASM runtime file missing: {}/{}\n\
@@ -83,26 +83,26 @@ pub fn run(cart_path: &Path) -> Result<(), RunError> {
  * WASM directory discovery
  *
  * Resolution order:
- *   1. $BLYT_WASM_DIR          — explicit override
- *   2. <sdk>/wasm/             — SDK layout (blyt_sdk.cmake Step 7)
- *   3. <repo>/build-wasm/      — manual emcmake cmake invocation
+ *   1. $BLYT_WASM_DIR            — explicit override
+ *   2. <sdk>/share/wasm/         — SDK layout (blyt_sdk.cmake Step 7)
+ *   3. <repo>/build-wasm/        — manual emcmake cmake invocation
  * ------------------------------------------------------------------------- */
 
 fn find_wasm_dir() -> Result<PathBuf, RunError> {
     if let Ok(d) = std::env::var("BLYT_WASM_DIR") {
         let p = PathBuf::from(&d);
-        if p.join("blyt_wasm.js").exists() {
+        if p.join("blytrun.js").exists() {
             return Ok(p);
         }
         return Err(err(format!(
-            "BLYT_WASM_DIR={d} does not contain blyt_wasm.js"
+            "BLYT_WASM_DIR={d} does not contain blytrun.js"
         )));
     }
 
-    // SDK layout: <sdk>/wasm/blyt_wasm.js  (binary lives in <sdk>/bin/blyt)
+    // SDK layout: <sdk>/share/wasm/blytrun.js  (binary lives in <sdk>/bin/blyt)
     if let Some(sdk) = sdk_root_from_exe() {
-        let p = sdk.join("wasm");
-        if p.join("blyt_wasm.js").exists() {
+        let p = sdk.join("share").join("wasm");
+        if p.join("blytrun.js").exists() {
             return Ok(p);
         }
     }
@@ -111,17 +111,17 @@ fn find_wasm_dir() -> Result<PathBuf, RunError> {
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().skip(1) {
             let candidate = ancestor.join("build-wasm");
-            if candidate.join("blyt_wasm.js").exists() {
+            if candidate.join("blytrun.js").exists() {
                 return Ok(candidate);
             }
         }
     }
 
     Err(err(
-        "cannot find blyt_wasm.js — build the WASM runtime first:\n\
+        "cannot find blytrun.js — build the WASM runtime first:\n\
          \x20 emcmake cmake -B build-wasm -S frontends/wasm\n\
          \x20 cmake --build build-wasm\n\
-         Or set BLYT_WASM_DIR to point to the directory containing blyt_wasm.js.",
+         or set BLYT_WASM_DIR to the directory containing blytrun.js.",
     ))
 }
 
@@ -158,9 +158,9 @@ fn handle_connection(mut stream: TcpStream, wasm_dir: &Path, cart_path: &Path) {
     let path = request_path(request);
 
     let (file_path, content_type): (PathBuf, &str) = match path {
-        "/" | "/index.html" => (wasm_dir.join("blyt_wasm.html"), "text/html; charset=utf-8"),
-        "/blyt_wasm.js" => (wasm_dir.join("blyt_wasm.js"), "application/javascript"),
-        "/blyt_wasm.wasm" => (wasm_dir.join("blyt_wasm.wasm"), "application/wasm"),
+        "/" | "/index.html" => (wasm_dir.join("blytrun.html"), "text/html; charset=utf-8"),
+        "/blytrun.js" => (wasm_dir.join("blytrun.js"), "application/javascript"),
+        "/blytrun.wasm" => (wasm_dir.join("blytrun.wasm"), "application/wasm"),
         "/cart.blyt" => (cart_path.to_path_buf(), "application/octet-stream"),
         _ => {
             respond(&mut stream, 404, "text/plain", b"Not Found");

@@ -708,7 +708,7 @@ void blyt_cart_draw(void)   {}
     );
 }
 
-/// WASM gate test: run an idle cart inside blyt_wasm.js under Node.js and
+/// WASM gate test: run an idle cart inside blytrun.js under Node.js and
 /// compare the first rendered XRGB8888 frame byte-for-byte against the same
 /// golden file used by testcard_frame0_matches_golden.
 ///
@@ -716,13 +716,13 @@ void blyt_cart_draw(void)   {}
 ///   emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm
 /// (or cmake --build build --target sdk when emcc is present).
 ///
-/// Silently skipped when blyt_wasm.js is not found.
+/// Silently skipped when blytrun.js is not found.
 #[test]
 fn wasm_testcard_frame0_matches_golden() {
     let wasm_dir = find_wasm_dir();
-    if !wasm_dir.join("blyt_wasm.js").exists() {
+    if !wasm_dir.join("blytrun.js").exists() {
         eprintln!(
-            "wasm_testcard_frame0_matches_golden: blyt_wasm.js not found — \
+            "wasm_testcard_frame0_matches_golden: blytrun.js not found — \
              build with: emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm"
         );
         return;
@@ -777,10 +777,10 @@ void blyt_cart_draw(void)   {}
 }
 
 fn find_wasm_dir() -> std::path::PathBuf {
-    // Prefer direct emcmake build output; fall back to SDK wasm/ directory.
+    // Prefer direct emcmake build output; fall back to SDK share/wasm/ directory.
     let direct = repo_root().join("build-wasm");
-    if direct.join("blyt_wasm.js").exists() {
+    if direct.join("blytrun.js").exists() {
         return direct;
     }
-    build_dir().join("sdk/wasm")
+    build_dir().join("sdk/share/wasm")
 }

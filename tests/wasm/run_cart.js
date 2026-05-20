@@ -6,7 +6,7 @@
  *   node run_cart.js <wasm_dir> <cart_path> [<frame0_output_path>]
  *
  * Sets up globals read by frontends/wasm/module_pre.js (injected into the
- * Emscripten IIFE via --pre-js), then requires blyt_wasm.js.
+ * Emscripten IIFE via --pre-js), then requires blytrun.js.
  *
  * Without <frame0_output_path>: runs until the cart exits naturally.
  *   blyt_console_debug output goes to stdout.  Exit code mirrors the cart.
@@ -33,9 +33,9 @@ if (!wasmDir || !cartPath) {
   process.exit(1);
 }
 
-var wasmJsPath = path.join(wasmDir, "blyt_wasm.js");
+var wasmJsPath = path.join(wasmDir, "blytrun.js");
 if (!nodefs.existsSync(wasmJsPath)) {
-  process.stderr.write("blyt_wasm.js not found at: " + wasmJsPath + "\n");
+  process.stderr.write("blytrun.js not found at: " + wasmJsPath + "\n");
   process.exit(1);
 }
 
