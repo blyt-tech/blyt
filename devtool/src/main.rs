@@ -27,7 +27,7 @@ enum Commands {
 
 #[derive(Args)]
 struct BuildArgs {
-    /// Build subcommand (e.g. wasm); omit to compile a cart from source
+    /// Build subcommand (e.g. wasm, all); omit to compile a cart from source
     #[command(subcommand)]
     sub: Option<BuildSubcommand>,
 
@@ -50,6 +50,16 @@ enum BuildSubcommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Compile a cart from source and package it as a self-contained HTML page
+    All {
+        /// Path to the cart project directory (default: current directory)
+        project_dir: Option<PathBuf>,
+
+        /// Output path for the .blyt cart (default: <project-dir-name>.blyt)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -62,12 +72,28 @@ fn main() {
         }) => export::run(&cart, output.as_deref()).map_err(|e| e.to_string()),
 
         Commands::Build(BuildArgs {
+            sub:
+                Some(BuildSubcommand::All {
+                    project_dir,
+                    output,
+                }),
+            ..
+        }) => {
+            let dir = project_dir.as_deref().unwrap_or(Path::new("."));
+            build::run(dir, output.as_deref())
+                .map_err(|e| e.to_string())
+                .and_then(|cart| export::run(&cart, None).map_err(|e| e.to_string()))
+        }
+
+        Commands::Build(BuildArgs {
             sub: None,
             project_dir,
             output,
         }) => {
             let dir = project_dir.as_deref().unwrap_or(Path::new("."));
-            build::run(dir, output.as_deref()).map_err(|e| e.to_string())
+            build::run(dir, output.as_deref())
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }
 
         Commands::Run { cart } => run::run(&cart).map_err(|e| e.to_string()),

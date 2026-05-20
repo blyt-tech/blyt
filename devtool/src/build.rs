@@ -72,7 +72,7 @@ fn err(msg: impl Into<String>) -> BuildError {
  * Public entry point
  * ------------------------------------------------------------------------- */
 
-pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<(), BuildError> {
+pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildError> {
     let clang = find_clang();
     let objcopy = find_objcopy();
 
@@ -153,7 +153,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<(), BuildError> 
     finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path)?;
 
     println!("built: {}", output_path.display());
-    Ok(())
+    Ok(output_path)
 }
 
 fn default_output(project_dir: &Path) -> PathBuf {
