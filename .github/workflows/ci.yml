@@ -17,7 +17,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libsdl2-dev lld llvm
+          sudo apt-get install -y cmake ninja-build libsdl2-dev lld llvm \
+            qemu-system-misc gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross libgcc-s1-riscv64-cross
           pip3 install clang-format==22.1.5 cmakelang yamllint
 
       - name: Check formatting
@@ -78,6 +80,42 @@ jobs:
 
       - name: Build SDK
         run: cmake --build build --target sdk
+
+      - name: Cross-compile blyt_native for riscv64
+        run: |
+          cmake -B build-riscv64 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/riscv64-linux-gnu.cmake \
+            "-DBLYT_PREGENERATED_DIR=$PWD/build/generated/flatbuffers"
+          cmake --build build-riscv64 --target blyt_native
+
+      - name: Download QEMU ILP32 test image
+        env:
+          QEMU_IMAGE_URL: ${{ vars.BLYT_QEMU_IMAGE_URL }}
+        run: |
+          if [ -z "$QEMU_IMAGE_URL" ]; then
+            echo "::warning::BLYT_QEMU_IMAGE_URL not set — native QEMU gate will be skipped"
+            exit 0
+          fi
+          mkdir -p /tmp/blyt-qemu
+          curl -fsSL "$QEMU_IMAGE_URL/kernel"       -o /tmp/blyt-qemu/Image
+          curl -fsSL "$QEMU_IMAGE_URL/rootfs.qcow2" -o /tmp/blyt-qemu/rootfs.qcow2
+          curl -fsSL "$QEMU_IMAGE_URL/id_ed25519"   -o /tmp/blyt-qemu/id_ed25519
+          chmod 600 /tmp/blyt-qemu/id_ed25519
+
+      - name: Native RISC-V ILP32 gate
+        if: vars.BLYT_QEMU_IMAGE_URL != ''
+        timeout-minutes: 10
+        env:
+          BLYT_QEMU_KERNEL: /tmp/blyt-qemu/Image
+          BLYT_QEMU_ROOTFS: /tmp/blyt-qemu/rootfs.qcow2
+          BLYT_QEMU_SSH_KEY: /tmp/blyt-qemu/id_ed25519
+          BLYT_BUILD_DIR: ${{ github.workspace }}/build
+          BLYT_SDK_DIR: ${{ github.workspace }}/build/sdk
+          BLYT_OBJCOPY: llvm-objcopy
+        run: |
+          cargo test \
+            --manifest-path tests/integration/Cargo.toml \
+            -- native_riscv_qemu_gate --nocapture
 
       - name: Rust tests (unit + integration)
         env:

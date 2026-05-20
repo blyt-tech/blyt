@@ -669,6 +669,72 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# blyt_native_riscv64 — convenience target: cross-compile blyt_native for
+# riscv64-linux from the host (macOS or non-riscv64 Linux).
+#
+# On macOS: runs inside an ubuntu:24.04 Docker container where
+# gcc-riscv64-linux-gnu is available.  Docker must be running. On Linux
+# (non-riscv64): runs cmake directly, relying on gcc-riscv64-linux-gnu being
+# installed (e.g. sudo apt install gcc-riscv64-linux-gnu).
+#
+# Output: ${CMAKE_BINARY_DIR}/../build-riscv64/blyt_native
+# -------------------------------------------------------------------------
+if(NOT CMAKE_CROSSCOMPILING
+   AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR
+                                                   MATCHES "riscv64"))
+  set(_riscv64_build_dir "${CMAKE_SOURCE_DIR}/build-riscv64")
+  set(_toolchain "${CMAKE_SOURCE_DIR}/cmake/riscv64-linux-gnu.cmake")
+  set(_pregen_dir "${CMAKE_BINARY_DIR}/generated/flatbuffers")
+  set(_cmake_cmd
+      ${CMAKE_COMMAND}
+      -B
+      "${_riscv64_build_dir}"
+      -G
+      Ninja
+      -DCMAKE_TOOLCHAIN_FILE=${_toolchain}
+      -DBLYT_PREGENERATED_DIR=${_pregen_dir}
+      COMMAND
+      ${CMAKE_COMMAND}
+      --build
+      "${_riscv64_build_dir}"
+      --target
+      blyt_native)
+
+  if(APPLE)
+    find_program(DOCKER_EXECUTABLE docker HINTS /usr/local/bin
+                                                /opt/homebrew/bin NO_CACHE)
+    if(DOCKER_EXECUTABLE)
+      # Docker: install gcc-riscv64-linux-gnu in ubuntu:24.04 and cross-compile.
+      # The cmake invocations are passed as separate arguments to avoid shell
+      # quoting issues with inline heredocs.
+      add_custom_target(
+        blyt_native_riscv64
+        COMMAND
+          ${DOCKER_EXECUTABLE} run --platform linux/arm64 --rm --env
+          DEBIAN_FRONTEND=noninteractive -v "${CMAKE_SOURCE_DIR}:/repo"
+          ubuntu:24.04 bash -c
+          [=[apt-get update -q 2>/dev/null && apt-get install -y --no-install-recommends cmake ninja-build gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu libc6-dev-riscv64-cross libgcc-s1-riscv64-cross 2>&1 | tail -2 && cd /repo && cmake -B build-riscv64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/riscv64-linux-gnu.cmake -DBLYT_PREGENERATED_DIR=build/generated/flatbuffers && cmake --build build-riscv64 --target blyt_native && chown -R $(id -u):$(id -g) build-riscv64 2>/dev/null || true]=]
+        COMMENT "Cross-compiling blyt_native for riscv64-linux (via Docker)"
+        USES_TERMINAL VERBATIM)
+    else()
+      add_custom_target(
+        blyt_native_riscv64
+        COMMAND
+          ${CMAKE_COMMAND} -E echo
+          "Docker not found — install Docker Desktop to cross-compile blyt_native"
+        COMMENT "blyt_native_riscv64 requires Docker on macOS")
+    endif()
+  else()
+    # Non-riscv64 Linux: gcc-riscv64-linux-gnu expected on PATH.
+    add_custom_target(
+      blyt_native_riscv64
+      COMMAND ${_cmake_cmd}
+      COMMENT "Cross-compiling blyt_native for riscv64-linux"
+      USES_TERMINAL VERBATIM)
+  endif()
+endif()
+
+# -------------------------------------------------------------------------
 # Tests
 # -------------------------------------------------------------------------
 enable_testing()
