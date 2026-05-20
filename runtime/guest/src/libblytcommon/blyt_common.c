@@ -1,44 +1,16 @@
 /*
- * libblytcommon — shared RV32IMAFC library for variant-portable blyt_* API.
+ * libblytcommon — shared RV32IMAFC library, cross-platform cart runtime.
  *
- * Symbols here are declared in blyt.h and work identically on every console
- * variant.  Variant libraries link against this library and declare it as
- * DT_NEEDED; carts see the symbols through the variant library's DT_NEEDED
- * chain without listing libblytcommon.so directly.
+ * Contains only truly platform-independent logic: the cart lifecycle driver,
+ * state management, and other code that is identical across all execution
+ * targets (emulated, native, WASM, libretro).
  *
- * On emulated platforms ECALL stubs forward to the host runtime (ADR-0085).
- * On native RISC-V hardware these are real implementations.
+ * Platform-specific API implementations (blyt_console_debug, blyt_frame_done,
+ * graphics, audio, input) live in the variant library (libblyt32.so) which
+ * has separate source trees for emulated and native paths.
  */
 
 #include "blyt.h"
-
-/* -------------------------------------------------------------------------
- * ECALL numbers (ADR-0085, range 1–49: lifecycle)
- * ------------------------------------------------------------------------- */
-
-#define ECALL_CONSOLE_DEBUG 1
-
-/* -------------------------------------------------------------------------
- * Internal helpers
- * ------------------------------------------------------------------------- */
-
-static unsigned int blytcommon_strlen(const char *s) {
-    const char *p = s;
-    while (*p)
-        p++;
-    return (unsigned int)(p - s);
-}
-
-/* -------------------------------------------------------------------------
- * blyt_console_debug — ADR-0085 ECALL stub (a0=ptr, a1=len)
- * ------------------------------------------------------------------------- */
-
-void blyt_console_debug(const char *s) {
-    register const char *a0 __asm__("a0") = s;
-    register unsigned int a1 __asm__("a1") = blytcommon_strlen(s);
-    register long a7 __asm__("a7") = ECALL_CONSOLE_DEBUG;
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
-}
 
 /* -------------------------------------------------------------------------
  * blyt_quit_ready — set the quit flag; blyt_main exits its loop next tick

@@ -30,32 +30,43 @@ add_subdirectory(third_party/flatcc EXCLUDE_FROM_ALL)
 
 # FlatBuffers codegen — generates pure C reader headers for the runtime
 # (ADR-0126)
+#
+# Cross-compilation: set BLYT_PREGENERATED_DIR to the flatbuffers/ directory
+# from a prior host build.  The code-generation step (which would try to execute
+# a target-arch flatcc_cli on the host) is skipped; the host-generated headers
+# are reused instead (they are architecture-independent).
 set(SCHEMAS_DIR "${CMAKE_SOURCE_DIR}/schemas")
-set(GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/flatbuffers")
-file(MAKE_DIRECTORY "${GENERATED_DIR}")
 
-add_custom_command(
-  OUTPUT "${GENERATED_DIR}/cart_info_reader.h"
-         "${GENERATED_DIR}/cart_info_verifier.h"
-         "${GENERATED_DIR}/cart_config_reader.h"
-         "${GENERATED_DIR}/cart_config_verifier.h"
-         "${GENERATED_DIR}/flatbuffers_common_reader.h"
-  COMMAND
-    "$<TARGET_FILE:flatcc_cli>" --common_reader --reader --verifier -o
-    "${GENERATED_DIR}" "${SCHEMAS_DIR}/cart_info.fbs"
-    "${SCHEMAS_DIR}/cart_config.fbs"
-  DEPENDS flatcc_cli "${SCHEMAS_DIR}/cart_info.fbs"
-          "${SCHEMAS_DIR}/cart_config.fbs"
-  COMMENT "Generating FlatBuffers C headers"
-  VERBATIM)
-
-add_custom_target(
-  flatbuffers_generated ALL
-  DEPENDS "${GENERATED_DIR}/cart_info_reader.h"
-          "${GENERATED_DIR}/cart_info_verifier.h"
-          "${GENERATED_DIR}/cart_config_reader.h"
-          "${GENERATED_DIR}/cart_config_verifier.h"
-          "${GENERATED_DIR}/flatbuffers_common_reader.h")
+if(DEFINED BLYT_PREGENERATED_DIR)
+  set(GENERATED_DIR "${BLYT_PREGENERATED_DIR}")
+  add_custom_target(flatbuffers_generated)
+  message(
+    STATUS "FlatBuffers: reusing pre-generated headers from ${GENERATED_DIR}")
+else()
+  set(GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/flatbuffers")
+  file(MAKE_DIRECTORY "${GENERATED_DIR}")
+  add_custom_command(
+    OUTPUT "${GENERATED_DIR}/cart_info_reader.h"
+           "${GENERATED_DIR}/cart_info_verifier.h"
+           "${GENERATED_DIR}/cart_config_reader.h"
+           "${GENERATED_DIR}/cart_config_verifier.h"
+           "${GENERATED_DIR}/flatbuffers_common_reader.h"
+    COMMAND
+      "$<TARGET_FILE:flatcc_cli>" --common_reader --reader --verifier -o
+      "${GENERATED_DIR}" "${SCHEMAS_DIR}/cart_info.fbs"
+      "${SCHEMAS_DIR}/cart_config.fbs"
+    DEPENDS flatcc_cli "${SCHEMAS_DIR}/cart_info.fbs"
+            "${SCHEMAS_DIR}/cart_config.fbs"
+    COMMENT "Generating FlatBuffers C headers"
+    VERBATIM)
+  add_custom_target(
+    flatbuffers_generated ALL
+    DEPENDS "${GENERATED_DIR}/cart_info_reader.h"
+            "${GENERATED_DIR}/cart_info_verifier.h"
+            "${GENERATED_DIR}/cart_config_reader.h"
+            "${GENERATED_DIR}/cart_config_verifier.h"
+            "${GENERATED_DIR}/flatbuffers_common_reader.h")
+endif()
 
 # -------------------------------------------------------------------------
 # Berkeley SoftFloat — IEEE 754 software FP for the F extension. rv32emu's
@@ -447,6 +458,64 @@ if(CLANG_RV32
     message(
       STATUS "libblytcommon.so + libblyt32.so: will be built (${CLANG_RV32})")
   endif()
+
+  # -------------------------------------------------------------------------
+  # Native-path libblyt32.so (frontends/native/src/libblyt32/)
+  #
+  # Real API implementations for trusted native exec on RISC-V:
+  # blyt_console_debug → write(2,...), seccomp constructor, and future API
+  # functions. Placed in build/native/ alongside libblytcommon.so + libblytc.so
+  # so the launcher can use a single LD_LIBRARY_PATH=build/native.
+  # -------------------------------------------------------------------------
+  set(LIBBLYT32_NATIVE_SRC
+      "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c")
+  set(LIBBLYT32_NATIVE_INC "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32")
+  set(LIBBLYT32_NATIVE_OUT "${CMAKE_BINARY_DIR}/native/libblyt32.so")
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/native")
+
+  set(LIBBLYT32_NATIVE_DEPS
+      "${LIBBLYT32_NATIVE_SRC}" "${LIBBLYT32_NATIVE_INC}/seccomp_restricted.h"
+      "${BLYT_H}" "${LIBBLYTCOMMON_OUT}")
+
+  # Native link flags: --no-as-needed forces libblytcommon.so into DT_NEEDED.
+  # Without it, --as-needed (the default) would silently drop libblytcommon.so
+  # because native blyt32.c uses no symbols from it directly; blyt_main and
+  # other libblytcommon exports would then be unresolvable at cart load time,
+  # causing a crash before any constructor fires.  libblytc.so is intentionally
+  # omitted — the native process C library comes from the musl ld.so
+  # interpreter.
+  set(LIBBLYT32_NATIVE_LINK
+      -L "${CMAKE_BINARY_DIR}" -Wl,--no-as-needed -lblytcommon -Wl,--as-needed
+      -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
+
+  add_custom_command(
+    OUTPUT "${LIBBLYT32_NATIVE_OUT}"
+    COMMAND
+      "${CLANG_RV32}" ${RV32_FLAGS} -Wl,-soname,libblyt32.so ${RV32_INCLUDE} -I
+      "${LIBBLYT32_NATIVE_INC}" ${LIBBLYT32_NATIVE_LINK} -o
+      "${LIBBLYT32_NATIVE_OUT}" "${LIBBLYT32_NATIVE_SRC}"
+    DEPENDS ${LIBBLYT32_NATIVE_DEPS}
+    COMMENT "Cross-compiling libblyt32.so (RV32IMAFC, native build)"
+    VERBATIM)
+
+  # Stage libblytcommon.so alongside native libblyt32.so. libblytc.so is
+  # intentionally NOT staged: the native cart process gets its C library from
+  # the musl ld.so interpreter; staging libblytc.so (our musl subset) would load
+  # a second musl instance, conflicting with the interpreter.
+  add_custom_command(
+    OUTPUT "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${LIBBLYTCOMMON_OUT}"
+            "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
+    DEPENDS "${LIBBLYTCOMMON_OUT}"
+    COMMENT "Staging libblytcommon.so to native/"
+    VERBATIM)
+
+  add_custom_target(
+    libblyt32_native_so ALL
+    DEPENDS "${LIBBLYT32_NATIVE_OUT}"
+            "${CMAKE_BINARY_DIR}/native/libblytcommon.so")
+  message(STATUS "libblyt32.so (native build): will be built → build/native/")
+
 else()
   message(STATUS "libblytcommon.so + libblyt32.so + libblytc.so: skipping \
 (need clang riscv32 + ld.lld)")
@@ -465,6 +534,10 @@ add_library(
   runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
   runtime/host/src/libblyt/testcard.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
+# blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
+# same static library is usable in both executables and shared objects.
+set_target_properties(libblyt libblytemu libsoftfloat
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
   libblyt
   PUBLIC runtime/host/include
@@ -535,7 +608,7 @@ if(TARGET blytrun)
 endif()
 
 # -------------------------------------------------------------------------
-# blyt_libretro — libretro core (Phase 4)
+# blyt_libretro — libretro core
 #
 # Embeds libblytcommon.so, libblytc.so, and libblyt32.so as compiled-in data so
 # the core is self-contained.  Only built when all three guest libs are
@@ -571,34 +644,65 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# blyt_native — LP64 RISC-V launcher for trusted native cart execution
+#
+# Installs the arch-dispatch seccomp filter then execs the ILP32 cart. Only
+# built on Linux RISC-V 64-bit (the target host for native execution).
+# -------------------------------------------------------------------------
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES
+                                          "riscv64")
+  add_executable(blyt_native frontends/native/launcher.c)
+  target_include_directories(blyt_native PRIVATE frontends/native
+                                                 runtime/host/include)
+  target_compile_definitions(blyt_native PRIVATE BLYT_VERSION="${BLYT_VERSION}"
+                                                 BLYT_WITH_CART_VALIDATE)
+  target_link_libraries(blyt_native PRIVATE libblyt)
+  # Cross-compilation: link statically so the binary runs on any riscv64 Linux
+  # regardless of which C library (glibc, musl, …) the target system uses.
+  if(CMAKE_CROSSCOMPILING)
+    target_link_options(blyt_native PRIVATE -static)
+  endif()
+  message(STATUS "blyt_native (LP64 launcher): will be built")
+else()
+  message(
+    STATUS "blyt_native (LP64 launcher): skipping (requires Linux riscv64)")
+endif()
+
+# -------------------------------------------------------------------------
 # Tests
 # -------------------------------------------------------------------------
 enable_testing()
 
-# Test-only FlatBuffers builder headers (runtime only generates readers)
-set(TEST_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/test")
-file(MAKE_DIRECTORY "${TEST_GENERATED_DIR}")
+# Test-only FlatBuffers builder headers (runtime only generates readers) Skipped
+# when cross-compiling (blyt_native doesn't need them, and the test binaries
+# won't run on the host when targeting a different architecture).
+if(NOT DEFINED BLYT_PREGENERATED_DIR)
+  set(TEST_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/test")
+  file(MAKE_DIRECTORY "${TEST_GENERATED_DIR}")
 
-add_custom_command(
-  OUTPUT "${TEST_GENERATED_DIR}/cart_info_builder.h"
-         "${TEST_GENERATED_DIR}/cart_config_builder.h"
-         "${TEST_GENERATED_DIR}/flatbuffers_common_builder.h"
-         "${TEST_GENERATED_DIR}/flatbuffers_common_reader.h"
-         "${TEST_GENERATED_DIR}/cart_info_reader.h"
-         "${TEST_GENERATED_DIR}/cart_config_reader.h"
-  COMMAND
-    "$<TARGET_FILE:flatcc_cli>" --common --reader --builder -o
-    "${TEST_GENERATED_DIR}" "${SCHEMAS_DIR}/cart_info.fbs"
-    "${SCHEMAS_DIR}/cart_config.fbs"
-  DEPENDS flatcc_cli "${SCHEMAS_DIR}/cart_info.fbs"
-          "${SCHEMAS_DIR}/cart_config.fbs"
-  COMMENT "Generating FlatBuffers test builder headers"
-  VERBATIM)
+  add_custom_command(
+    OUTPUT "${TEST_GENERATED_DIR}/cart_info_builder.h"
+           "${TEST_GENERATED_DIR}/cart_config_builder.h"
+           "${TEST_GENERATED_DIR}/flatbuffers_common_builder.h"
+           "${TEST_GENERATED_DIR}/flatbuffers_common_reader.h"
+           "${TEST_GENERATED_DIR}/cart_info_reader.h"
+           "${TEST_GENERATED_DIR}/cart_config_reader.h"
+    COMMAND
+      "$<TARGET_FILE:flatcc_cli>" --common --reader --builder -o
+      "${TEST_GENERATED_DIR}" "${SCHEMAS_DIR}/cart_info.fbs"
+      "${SCHEMAS_DIR}/cart_config.fbs"
+    DEPENDS flatcc_cli "${SCHEMAS_DIR}/cart_info.fbs"
+            "${SCHEMAS_DIR}/cart_config.fbs"
+    COMMENT "Generating FlatBuffers test builder headers"
+    VERBATIM)
 
-add_custom_target(
-  flatbuffers_test_generated
-  DEPENDS "${TEST_GENERATED_DIR}/cart_info_builder.h"
-          "${TEST_GENERATED_DIR}/cart_config_builder.h")
+  add_custom_target(
+    flatbuffers_test_generated
+    DEPENDS "${TEST_GENERATED_DIR}/cart_info_builder.h"
+            "${TEST_GENERATED_DIR}/cart_config_builder.h")
+else()
+  add_custom_target(flatbuffers_test_generated)
+endif()
 
 add_executable(test_cart_load tests/unit/test_cart_load.c)
 target_include_directories(

@@ -92,16 +92,30 @@ static size_t align4(size_t n) {
  * e_entry = LOAD_VADDR (within the PF_X segment)
  * ------------------------------------------------------------------------- */
 
-#define SHSTR "\0.shstrtab\0.cart.info\0.cart.config\0"
-#define SHSTR_LEN (sizeof(SHSTR) - 1)
-#define SHSTR_IDX_SHSTRTAB 1
-#define SHSTR_IDX_CART_INFO 11
-#define SHSTR_IDX_CART_CONFIG 22
+/* Interpreter path required in every valid cart (must match BLYT_INTERP_PATH
+ * in cart_load.c; kept in sync by test_interp_path_exact). */
+#define TEST_INTERP_PATH "/lib/ld-blyt.so.1"
+#define TEST_INTERP_LEN sizeof(TEST_INTERP_PATH) /* includes NUL */
 
-#define PHNUM 3u
-#define PH_CODE 0 /* PT_LOAD PF_R|PF_X */
-#define PH_RELRO 1 /* PT_GNU_RELRO */
-#define PH_SPARE 2 /* PT_NULL spare slot for overlap/etc. tests */
+/* Section name string table:
+ *   offset 0:  ""           (null)
+ *   offset 1:  ".interp"
+ *   offset 9:  ".shstrtab"
+ *   offset 19: ".cart.info"
+ *   offset 30: ".cart.config"
+ */
+#define SHSTR "\0.interp\0.shstrtab\0.cart.info\0.cart.config\0"
+#define SHSTR_LEN (sizeof(SHSTR) - 1)
+#define SHSTR_IDX_INTERP 1
+#define SHSTR_IDX_SHSTRTAB 9
+#define SHSTR_IDX_CART_INFO 19
+#define SHSTR_IDX_CART_CONFIG 30
+
+#define PHNUM 4u
+#define PH_INTERP 0 /* PT_INTERP — /lib/ld-blyt.so.1 */
+#define PH_CODE 1 /* PT_LOAD PF_R|PF_X */
+#define PH_RELRO 2 /* PT_GNU_RELRO */
+#define PH_SPARE 3 /* PT_NULL spare slot for overlap/etc. tests */
 
 #define CODE_SIZE 4u /* 4 zero bytes — not ecall/ebreak */
 #define LOAD_VADDR 0x10000u /* arbitrary virtual address for the code LOAD */
@@ -114,17 +128,19 @@ typedef struct {
 static Blob build_valid_elf(const CartSections *sects) {
     size_t ehdr_sz = sizeof(Elf32_Ehdr);
     size_t phdrs_sz = PHNUM * sizeof(Elf32_Phdr);
+    size_t interp_sz = TEST_INTERP_LEN; /* "/lib/ld-blyt.so.1\0" */
     size_t shstr_sz = SHSTR_LEN;
     size_t ci_sz = sects->cart_info_sect.size;
     size_t cc_sz = sects->cart_config_sect.size;
 
     size_t off_phdrs = ehdr_sz;
-    size_t off_shstrtab = off_phdrs + phdrs_sz;
+    size_t off_interp = off_phdrs + phdrs_sz;
+    size_t off_shstrtab = align4(off_interp + interp_sz);
     size_t off_ci = align4(off_shstrtab + shstr_sz);
     size_t off_cc = align4(off_ci + ci_sz);
     size_t off_code = align4(off_cc + cc_sz);
     size_t off_shdrs = align4(off_code + CODE_SIZE);
-    size_t shnum = 4; /* null, shstrtab, cart.info, cart.config */
+    size_t shnum = 5; /* null, interp, shstrtab, cart.info, cart.config */
     size_t total = off_shdrs + shnum * sizeof(Elf32_Shdr);
 
     Blob b = {calloc(1, total), total};
@@ -146,12 +162,20 @@ static Blob build_valid_elf(const CartSections *sects) {
     eh->e_phoff = (Elf32_Off)off_phdrs;
     eh->e_shentsize = (Elf32_Half)sizeof(Elf32_Shdr);
     eh->e_shnum = (Elf32_Half)shnum;
-    eh->e_shstrndx = 1;
+    eh->e_shstrndx = 2; /* .shstrtab is section 2 */
     eh->e_shoff = (Elf32_Off)off_shdrs;
     eh->e_entry = LOAD_VADDR;
 
     /* Program headers */
     Elf32_Phdr *ph = (Elf32_Phdr *)(b.buf + off_phdrs);
+
+    /* PT_INTERP — /lib/ld-blyt.so.1 */
+    ph[PH_INTERP].p_type = PT_INTERP;
+    ph[PH_INTERP].p_offset = (Elf32_Off)off_interp;
+    ph[PH_INTERP].p_filesz = (Elf32_Word)interp_sz;
+    ph[PH_INTERP].p_memsz = (Elf32_Word)interp_sz;
+    ph[PH_INTERP].p_flags = PF_R;
+    ph[PH_INTERP].p_align = 1;
 
     /* PT_LOAD PF_R|PF_X — covers the code stub */
     ph[PH_CODE].p_type = PT_LOAD;
@@ -168,25 +192,31 @@ static Blob build_valid_elf(const CartSections *sects) {
     ph[PH_RELRO].p_flags = PF_R;
 
     /* Section data */
+    memcpy(b.buf + off_interp, TEST_INTERP_PATH, interp_sz);
     memcpy(b.buf + off_shstrtab, SHSTR, shstr_sz);
     memcpy(b.buf + off_ci, sects->cart_info_sect.buf, ci_sz);
     memcpy(b.buf + off_cc, sects->cart_config_sect.buf, cc_sz);
     /* code stub: zero bytes — not ecall (0x73...) so opcode scan passes */
 
-    /* Section headers */
+    /* Section headers: sh[0]=null, sh[1]=.interp, sh[2]=.shstrtab,
+     *                  sh[3]=.cart.info, sh[4]=.cart.config */
     Elf32_Shdr *sh = (Elf32_Shdr *)(b.buf + off_shdrs);
-    sh[1].sh_name = SHSTR_IDX_SHSTRTAB;
-    sh[1].sh_type = SHT_STRTAB;
-    sh[1].sh_offset = (Elf32_Off)off_shstrtab;
-    sh[1].sh_size = (Elf32_Word)shstr_sz;
-    sh[2].sh_name = SHSTR_IDX_CART_INFO;
-    sh[2].sh_type = SHT_PROGBITS;
-    sh[2].sh_offset = (Elf32_Off)off_ci;
-    sh[2].sh_size = (Elf32_Word)ci_sz;
-    sh[3].sh_name = SHSTR_IDX_CART_CONFIG;
+    sh[1].sh_name = SHSTR_IDX_INTERP;
+    sh[1].sh_type = SHT_PROGBITS;
+    sh[1].sh_offset = (Elf32_Off)off_interp;
+    sh[1].sh_size = (Elf32_Word)interp_sz;
+    sh[2].sh_name = SHSTR_IDX_SHSTRTAB;
+    sh[2].sh_type = SHT_STRTAB;
+    sh[2].sh_offset = (Elf32_Off)off_shstrtab;
+    sh[2].sh_size = (Elf32_Word)shstr_sz;
+    sh[3].sh_name = SHSTR_IDX_CART_INFO;
     sh[3].sh_type = SHT_PROGBITS;
-    sh[3].sh_offset = (Elf32_Off)off_cc;
-    sh[3].sh_size = (Elf32_Word)cc_sz;
+    sh[3].sh_offset = (Elf32_Off)off_ci;
+    sh[3].sh_size = (Elf32_Word)ci_sz;
+    sh[4].sh_name = SHSTR_IDX_CART_CONFIG;
+    sh[4].sh_type = SHT_PROGBITS;
+    sh[4].sh_offset = (Elf32_Off)off_cc;
+    sh[4].sh_size = (Elf32_Word)cc_sz;
 
     return b;
 }
@@ -284,9 +314,15 @@ static void mut_wx_segment(Blob *b) {
 static void mut_no_relro(Blob *b) {
     get_ph(b, PH_RELRO)->p_type = PT_NULL;
 }
-static void mut_has_interp(Blob *b) {
-    /* Repurpose the RELRO slot as PT_INTERP */
-    get_ph(b, PH_RELRO)->p_type = PT_INTERP;
+static void mut_no_interp(Blob *b) {
+    /* Remove PT_INTERP — validator requires it */
+    get_ph(b, PH_INTERP)->p_type = PT_NULL;
+}
+static void mut_wrong_interp(Blob *b) {
+    /* Corrupt the interpreter path to a non-blyt value */
+    Elf32_Phdr *ph = get_ph(b, PH_INTERP);
+    uint8_t *interp = b->buf + ph->p_offset;
+    interp[0] = 'X'; /* "/lib/ld-blyt.so.1" → "Xlib/ld-blyt.so.1" */
 }
 static void mut_entry_not_in_exec(Blob *b) {
     /* Move entry point outside the PF_X LOAD segment */
@@ -340,14 +376,16 @@ static void mut_ebreak_in_code(Blob *b) {
 
 static void mut_unknown_section(Blob *b) {
     Elf32_Ehdr *eh = (Elf32_Ehdr *)b->buf;
-    size_t shstrtab_off = (size_t)((Elf32_Shdr *)(b->buf + eh->e_shoff))[1].sh_offset;
+    /* Use e_shstrndx so this stays correct regardless of section ordering */
+    size_t shstrtab_off = (size_t)((Elf32_Shdr *)(b->buf + eh->e_shoff))[eh->e_shstrndx].sh_offset;
     /* Replace ".cart.config\0" (13 bytes at index SHSTR_IDX_CART_CONFIG) */
     memcpy(b->buf + shstrtab_off + SHSTR_IDX_CART_CONFIG, ".unknown_sec", 13);
 }
 static void mut_bad_ci_preamble(Blob *b) {
     Elf32_Ehdr *eh = (Elf32_Ehdr *)b->buf;
     Elf32_Shdr *sh = (Elf32_Shdr *)(b->buf + eh->e_shoff);
-    b->buf[sh[2].sh_offset] = 'X';
+    /* sh[3] = .cart.info (sh[0]=null, sh[1]=.interp, sh[2]=.shstrtab) */
+    b->buf[sh[3].sh_offset] = 'X';
 }
 /* build_elf_bad_api_version: valid ELF but api_version_major = 9 */
 static Blob build_elf_bad_api_version(void) {
@@ -389,7 +427,8 @@ static Blob build_elf_bad_needed(void) {
     size_t phsz = PHNUM * sizeof(Elf32_Phdr);
 
     size_t off_ph = sizeof(Elf32_Ehdr);
-    size_t off_shstr = off_ph + phsz;
+    size_t off_interp = off_ph + phsz;
+    size_t off_shstr = align4(off_interp + TEST_INTERP_LEN);
     size_t off_ci = align4(off_shstr + shstr2_sz);
     size_t off_dyn = align4(off_ci + ci.size);
     size_t off_dynstr = align4(off_dyn + dyn_sz);
@@ -420,6 +459,12 @@ static Blob build_elf_bad_needed(void) {
     eh->e_entry = LOAD_VADDR;
 
     Elf32_Phdr *ph = (Elf32_Phdr *)(b.buf + off_ph);
+    ph[PH_INTERP].p_type = PT_INTERP;
+    ph[PH_INTERP].p_offset = (Elf32_Off)off_interp;
+    ph[PH_INTERP].p_filesz = (Elf32_Word)TEST_INTERP_LEN;
+    ph[PH_INTERP].p_memsz = (Elf32_Word)TEST_INTERP_LEN;
+    ph[PH_INTERP].p_flags = PF_R;
+    ph[PH_INTERP].p_align = 1;
     ph[PH_CODE].p_type = PT_LOAD;
     ph[PH_CODE].p_offset = (Elf32_Off)off_code;
     ph[PH_CODE].p_vaddr = LOAD_VADDR;
@@ -431,6 +476,7 @@ static Blob build_elf_bad_needed(void) {
     ph[PH_RELRO].p_type = PT_GNU_RELRO;
     ph[PH_RELRO].p_flags = PF_R;
 
+    memcpy(b.buf + off_interp, TEST_INTERP_PATH, TEST_INTERP_LEN);
     memcpy(b.buf + off_shstr, SHSTR2, shstr2_sz);
     memcpy(b.buf + off_ci, ci.buf, ci.size);
     memcpy(b.buf + off_dyn, dyn, dyn_sz);
@@ -487,7 +533,8 @@ static Blob build_elf_bad_import(void) {
     size_t shnum = 5;
     size_t phsz = PHNUM * sizeof(Elf32_Phdr);
     size_t off_ph = sizeof(Elf32_Ehdr);
-    size_t off_shstr = off_ph + phsz;
+    size_t off_interp2 = off_ph + phsz;
+    size_t off_shstr = align4(off_interp2 + TEST_INTERP_LEN);
     size_t off_ci = align4(off_shstr + shstr3_sz);
     size_t off_syms = align4(off_ci + ci.size);
     size_t off_symstr = align4(off_syms + sizeof(syms));
@@ -518,6 +565,12 @@ static Blob build_elf_bad_import(void) {
     eh->e_entry = LOAD_VADDR;
 
     Elf32_Phdr *ph = (Elf32_Phdr *)(b.buf + off_ph);
+    ph[PH_INTERP].p_type = PT_INTERP;
+    ph[PH_INTERP].p_offset = (Elf32_Off)off_interp2;
+    ph[PH_INTERP].p_filesz = (Elf32_Word)TEST_INTERP_LEN;
+    ph[PH_INTERP].p_memsz = (Elf32_Word)TEST_INTERP_LEN;
+    ph[PH_INTERP].p_flags = PF_R;
+    ph[PH_INTERP].p_align = 1;
     ph[PH_CODE].p_type = PT_LOAD;
     ph[PH_CODE].p_offset = (Elf32_Off)off_code;
     ph[PH_CODE].p_vaddr = LOAD_VADDR;
@@ -529,6 +582,7 @@ static Blob build_elf_bad_import(void) {
     ph[PH_RELRO].p_type = PT_GNU_RELRO;
     ph[PH_RELRO].p_flags = PF_R;
 
+    memcpy(b.buf + off_interp2, TEST_INTERP_PATH, TEST_INTERP_LEN);
     memcpy(b.buf + off_shstr, SHSTR3, shstr3_sz);
     memcpy(b.buf + off_ci, ci.buf, ci.size);
     memcpy(b.buf + off_syms, syms, sizeof(syms));
@@ -578,7 +632,8 @@ int main(void) {
     /* Segment layout */
     check_mutated("W+X segment", BLYT_CART_ERR_BAD_SEGMENT, mut_wx_segment);
     check_mutated("no PT_GNU_RELRO", BLYT_CART_ERR_NO_RELRO, mut_no_relro);
-    check_mutated("PT_INTERP present", BLYT_CART_ERR_BAD_INTERP, mut_has_interp);
+    check_mutated("PT_INTERP missing", BLYT_CART_ERR_BAD_INTERP, mut_no_interp);
+    check_mutated("PT_INTERP wrong path", BLYT_CART_ERR_BAD_INTERP, mut_wrong_interp);
     check_mutated("entry not in exec", BLYT_CART_ERR_BAD_SEGMENT, mut_entry_not_in_exec);
     check_mutated("segment past EOF", BLYT_CART_ERR_BAD_SEGMENT, mut_segment_past_eof);
     check_mutated("overlapping segments", BLYT_CART_ERR_BAD_SEGMENT, mut_overlapping_segments);

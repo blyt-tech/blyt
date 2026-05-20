@@ -16,8 +16,14 @@
  * Section name allowlist (ADR-0112: reject unknown ELF sections)
  * ------------------------------------------------------------------------- */
 
+/* Interpreter path required in every cart (ADR-0112, ADR-0119).
+ * The emulated-path dynlinker ignores this; the native launcher uses it.
+ * Carts with a different PT_INTERP are rejected — unknown interpreter. */
+#define BLYT_INTERP_PATH "/lib/ld-blyt.so.1"
+
 static const char *const KNOWN_SECTIONS_EXACT[] = {
     "",
+    ".interp",
     ".text",
     ".data",
     ".bss",
@@ -428,15 +434,27 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         const Elf32_Phdr *loads[MAX_LOAD];
         int nloads = 0;
         int has_relro = 0;
+        int has_interp = 0;
         int entry_ok = (eh->e_entry == 0); /* e_entry == 0 means no entry point */
 
         for (uint16_t i = 0; i < eh->e_phnum; i++) {
             const Elf32_Phdr *ph = (const Elf32_Phdr *)(phdr_base + (size_t)i * eh->e_phentsize);
 
             if (ph->p_type == PT_INTERP) {
-                /* Custom-loader path: PT_INTERP must be absent (ADR-0119) */
-                err = BLYT_CART_ERR_BAD_INTERP;
-                goto fail;
+                /* PT_INTERP must equal BLYT_INTERP_PATH exactly (ADR-0119).
+                 * The emulated-path dynlinker ignores it; the native launcher
+                 * uses it.  Any other interpreter path is rejected. */
+                if (!u32_add_le(ph->p_offset, ph->p_filesz, map_size)) {
+                    err = BLYT_CART_ERR_BAD_INTERP;
+                    goto fail;
+                }
+                const char *interp = (const char *)map + ph->p_offset;
+                if (ph->p_filesz != sizeof(BLYT_INTERP_PATH) ||
+                    memcmp(interp, BLYT_INTERP_PATH, sizeof(BLYT_INTERP_PATH)) != 0) {
+                    err = BLYT_CART_ERR_BAD_INTERP;
+                    goto fail;
+                }
+                has_interp = 1;
             }
 
             if (ph->p_type == PT_GNU_RELRO) {
@@ -476,6 +494,12 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         /* e_entry must be in an executable LOAD segment */
         if (!entry_ok) {
             err = BLYT_CART_ERR_BAD_SEGMENT;
+            goto fail;
+        }
+
+        /* PT_INTERP = /lib/ld-blyt.so.1 required (ADR-0112, ADR-0119) */
+        if (!has_interp) {
+            err = BLYT_CART_ERR_BAD_INTERP;
             goto fail;
         }
 
@@ -885,7 +909,7 @@ const char *blyt_cart_err_str(blyt_cart_err_t err) {
     case BLYT_CART_ERR_BAD_SEGMENT:
         return "segment layout violation";
     case BLYT_CART_ERR_BAD_INTERP:
-        return "PT_INTERP forbidden on custom-loader path";
+        return "PT_INTERP must be /lib/ld-blyt.so.1";
     case BLYT_CART_ERR_NO_RELRO:
         return "PT_GNU_RELRO required but absent";
     case BLYT_CART_ERR_BAD_OPCODE:

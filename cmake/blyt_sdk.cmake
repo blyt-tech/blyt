@@ -280,9 +280,9 @@ if(NOT R EQUAL 0)
 endif()
 
 message(STATUS "Building libblyt32.so…")
-# libblyt32.so — Blyt32 variant.
+# libblyt32.so (emulated path) — Blyt32 ECALL stubs.
 #
-# Self-contained for cart LINK TIME: absorbs both libblytcommon sources and ALL
+# Self-contained for cart LINK TIME: absorbs libblytcommon sources and ALL
 # libblytc sources so carts need only -lblyt32 at build time.  Exporting
 # malloc/free/string/math functions directly from libblyt32.so's .dynsym lets
 # lld resolve them without adding libblytc.so to the cart's DT_NEEDED.
@@ -305,6 +305,33 @@ execute_process(
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblyt32.so")
 endif()
+
+message(STATUS "Building libblyt32.so (native build)…")
+# libblyt32.so (native path) — real API implementations for trusted native exec.
+#
+# Compiled from frontends/native/src/libblyt32/blyt32.c.  Provides real Linux
+# syscall implementations (blyt_console_debug → write(2,...)) and the restricted
+# seccomp constructor.  Placed in sdk/lib/native/ so the launcher can set
+# LD_LIBRARY_PATH=<sdk>/lib/native to load this over the emulated version.
+set(SDK_LIB_NATIVE "${SDK_LIB}/native")
+file(MAKE_DIRECTORY "${SDK_LIB_NATIVE}")
+execute_process(
+  COMMAND
+    "${FOUND_CLANG}" ${RV32_BASE} -I
+    "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32" -Wl,-soname,libblyt32.so
+    -L "${SDK_LIB}" -Wl,--no-as-needed -lblytcommon -Wl,--as-needed
+    -Wl,-rpath-link,"${SDK_LIB}" -o "${SDK_LIB_NATIVE}/libblyt32.so"
+    "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c"
+  RESULT_VARIABLE R)
+# Note: libblytc.so is intentionally NOT linked here.  On native execution the
+# cart process already has musl from the ld.so interpreter; loading libblytc.so
+# (our musl subset) would create two conflicting musl instances → SIGSEGV.
+if(NOT R EQUAL 0)
+  message(FATAL_ERROR "Failed to build libblyt32.so (native build)")
+endif()
+# Stage libblytcommon.so into native/ so one LD_LIBRARY_PATH covers it.
+# libblytc.so is NOT staged: it must not be loaded on the native path.
+file(COPY "${SDK_LIB}/libblytcommon.so" DESTINATION "${SDK_LIB_NATIVE}")
 
 # -------------------------------------------------------------------------
 # Step 3: SDK headers

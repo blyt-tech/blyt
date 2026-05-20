@@ -30,7 +30,7 @@ typedef enum blyt_cart_err {
     BLYT_CART_ERR_BAD_CART_CONFIG = 15, /* .cart.config FlatBuffers parse error */
     BLYT_CART_ERR_API_VERSION = 16, /* api_version unsupported */
     BLYT_CART_ERR_BAD_SEGMENT = 17, /* segment layout violation */
-    BLYT_CART_ERR_BAD_INTERP = 18, /* PT_INTERP present (forbidden on custom-loader path) */
+    BLYT_CART_ERR_BAD_INTERP = 18, /* PT_INTERP absent or != /lib/ld-blyt.so.1 */
     BLYT_CART_ERR_NO_RELRO = 19, /* PT_GNU_RELRO absent */
     BLYT_CART_ERR_BAD_OPCODE = 20, /* ecall or ebreak found in executable segment */
     BLYT_CART_ERR_BAD_IMPORT = 21, /* imported symbol not on allowlist */
