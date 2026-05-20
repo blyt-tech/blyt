@@ -396,21 +396,29 @@ fn link_cart(
 ) -> Result<(), BuildError> {
     let mut cmd = Command::new(clang);
 
-    // -B sdk/bin/ prepends the SDK bin directory to clang's program search
-    // path before clang's own installation directory.  Combined with
-    // -fuse-ld=lld, this means sdk/bin/ld.lld (→ the lld validated at SDK
-    // assembly time) is used in preference to whatever ld.lld lives alongside
-    // the system clang.  PATH manipulation is not sufficient here because
-    // clang searches its own directory before PATH.
-    if let Some(sdk_bin) = sdk_root_from_exe().map(|s| s.join("bin")) {
-        cmd.arg("-B").arg(sdk_bin);
-    }
+    // Use the SDK's own lld via absolute path when available.  -fuse-ld=<abs>
+    // is accepted by clang unconditionally and is unambiguous regardless of
+    // PATH or clang's own-directory lookup order.  The blyt-ld.lld symlink
+    // name avoids clashing with any system ld.lld when sdk/bin/ is on PATH
+    // or installed into a shared directory.
+    //
+    // Fallback to -fuse-ld=lld when blyt-ld.lld is not present: outside the
+    // SDK (e.g. target/debug/ during development), or on Windows where the
+    // binary would be blyt-ld.lld.exe and the install-conflict concern does
+    // not apply anyway (no shared /usr/bin convention).
+    let fuse_ld = sdk_root_from_exe()
+        .map(|sdk| sdk.join("bin").join("blyt-ld.lld"))
+        .filter(|p| p.exists())
+        .map(|p| format!("-fuse-ld={}", p.display()))
+        .unwrap_or_else(|| "-fuse-ld=lld".to_string());
     cmd.args([
         "--target=riscv32",
         "-march=rv32imafc",
         "-mabi=ilp32f",
         "-nostdlib",
-        "-fuse-ld=lld",
+    ])
+    .arg(&fuse_ld)
+    .args([
         "-Wl,--pic-executable",
         "-Wl,-Bdynamic",
         // PT_INTERP is set via the explicit _blyt_interp.c .interp section.

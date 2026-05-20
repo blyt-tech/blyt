@@ -406,23 +406,26 @@ file(COPY "${BLYT_SOURCE_DIR}/target/debug/blyt" DESTINATION "${SDK_BIN}")
 
 # Expose toolchain binaries under blyt-prefixed names in bin/.
 #
-# blyt build passes -B sdk/bin/ to clang, which prepends sdk/bin/ before
-# clang's own installation directory in the program search path.  Combined
-# with -fuse-ld=lld, sdk/bin/ld.lld (→ FOUND_LLD) is therefore used in
-# preference to whatever ld.lld lives alongside the system clang.  FOUND_*
+# blyt build uses -fuse-ld=<absolute-path-to-blyt-ld.lld> when the SDK lld
+# is available, so the exact binary validated at SDK assembly time is always
+# used — no dependency on PATH ordering or clang's own-directory lookup.
+# The blyt- prefix keeps the name distinct from system ld.lld when sdk/bin/
+# is on PATH or installed into a shared directory like /usr/bin.  FOUND_*
 # may point into a downloaded SDK_TOOLCHAIN (macOS) or to system tools
 # (Linux); we create the symlinks in both cases.
 #
 # Remove any stale symlinks from prior builds so no dead entries linger.
-foreach(_stale blyt-clang blyt-lld blyt-objcopy ld.lld llvm-objcopy)
+foreach(_stale blyt-clang blyt-ld.lld blyt-lld blyt-objcopy ld.lld llvm-objcopy)
   file(REMOVE "${SDK_BIN}/${_stale}")
 endforeach()
 if(FOUND_CLANG)
   file(CREATE_LINK "${FOUND_CLANG}" "${SDK_BIN}/blyt-clang" SYMBOLIC)
 endif()
 if(FOUND_LLD)
-  # ld.lld: the name clang resolves when -fuse-ld=lld is used with -B sdk/bin/.
-  file(CREATE_LINK "${FOUND_LLD}" "${SDK_BIN}/ld.lld" SYMBOLIC)
+  # blyt-ld.lld: the SDK's private lld, referenced via absolute path in
+  # blyt build (-fuse-ld=<abs-path>).  The blyt- prefix avoids any clash with
+  # system ld.lld when sdk/bin/ is on PATH or installed into /usr/bin.
+  file(CREATE_LINK "${FOUND_LLD}" "${SDK_BIN}/blyt-ld.lld" SYMBOLIC)
 endif()
 if(FOUND_OBJCOPY)
   file(CREATE_LINK "${FOUND_OBJCOPY}" "${SDK_BIN}/blyt-objcopy" SYMBOLIC)
