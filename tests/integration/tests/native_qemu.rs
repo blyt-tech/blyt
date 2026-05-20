@@ -2,7 +2,7 @@
 ///
 /// Skipped unless the following are set:
 ///   BLYT_QEMU_KERNEL — path to patched c-sky 6.5-rc1 kernel Image
-///   BLYT_QEMU_ROOTFS — path to Fedora 42 rootfs qcow2
+///   BLYT_QEMU_ROOTFS — path to blyt-qemu-images rootfs qcow2 (Alpine + ILP32F musl)
 ///                      (must have /lib/ld-blyt.so.1 symlink + blyt SSH key)
 ///   BLYT_QEMU_SSH_KEY (optional) — SSH key; default: tests/native/.ssh/id_ed25519
 ///

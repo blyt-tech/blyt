@@ -42,7 +42,6 @@ jobs:
             frontends/wasm/wasm_main.c \
             frontends/native/launcher.c \
             frontends/native/src/libblyt32/blyt32.c \
-            tests/unit/test_session_api.c \
             runtime/host/src/libblyt/testcard.c
           cmake-format --check CMakeLists.txt frontends/wasm/CMakeLists.txt
           yamllint .github/workflows/ci.yml

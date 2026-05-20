@@ -6,8 +6,6 @@ Native RISC-V gate tests for trusted native cart execution on RISC-V ILP32.
 
 | File | Description |
 |------|-------------|
-| `drive_qemu.sh` | Host-side script: starts QEMU, copies artifacts, runs tests |
-| `run_gate_tests.sh` | In-QEMU test harness: asserts on output and exit codes |
 | `seccomp_restricted_test.c` | ILP32 binary: installs restricted seccomp filter, attempts socket() → expects SIGSYS |
 
 ## Gate 1 — blyt_console_debug via write(2)
@@ -32,7 +30,7 @@ export BLYT_QEMU_ROOTFS=/path/to/rootfs.qcow2
 export BLYT_QEMU_SSH_KEY=tests/native/.ssh/id_ed25519
 export BLYT_BUILD_DIR=build
 
-bash tests/native/drive_qemu.sh
+cargo test -p blyt-integration-tests -- native_riscv_qemu_gate --nocapture
 ```
 
 ## QEMU image setup (one-time)
@@ -42,10 +40,10 @@ The test image requires:
 1. **Kernel**: c-sky/csky-linux `sg2042-master-qspinlock-64ilp32_v4` (Linux
    6.5-rc1) with 3 patches applied (see `docs/design/spike-s-results.md`).
 
-2. **Rootfs**: Fedora 42 Cloud qcow2 with:
-   - `/lib/ld-blyt.so.1` → `ld-musl-riscv32-ilp32d.so.1` (symlink)
+2. **Rootfs**: Alpine Linux riscv64 qcow2 with a custom ILP32F musl dynamic
+   linker, built for `rv32imafc` + `ilp32f` using LLVM 18:
+   - `/lib/ld-blyt.so.1` → `ld-musl-riscv32-sp.so.1` (symlink)
    - SSH key authorized for root (see `.ssh/` directory)
-   - `cmake` and `ninja-build` installed (or `dnf install -y cmake ninja-build`)
    - Optional: `riscv32-linux-musl-gcc` for building `seccomp_restricted_test`
 
 3. **SSH key**: a dedicated test key pair in `tests/native/.ssh/`.
