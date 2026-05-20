@@ -4,7 +4,7 @@
 #
 # build/sdk/ bin/        blyt (devtool), blytrun (SDL2 runtime) include/ blyt.h,
 # blyt32.h, blyt_runtime.h lib/        libblytcommon.so, libblyt32.so
-# (RV32IMAFC) toolchain/  clang, ld.lld, llvm-objcopy, …
+# (RV32IMAFC) toolchain/  clang, ld.lld, llvm-objcopy, … (downloaded LLVM)
 #
 # Invoked via `cmake --build build --target sdk`. Required variables (injected
 # by the sdk target in CMakeLists.txt): BLYT_SOURCE_DIR, BLYT_BINARY_DIR,
@@ -404,22 +404,28 @@ if(NOT R EQUAL 0)
 endif()
 file(COPY "${BLYT_SOURCE_DIR}/target/debug/blyt" DESTINATION "${SDK_BIN}")
 
-# Expose toolchain binaries under blyt-prefixed names in bin/. Using blyt-lld /
-# blyt-objcopy avoids any collision with host tools and lets blyt build use
-# -fuse-ld=blyt-lld reliably across platforms. FOUND_* may point into a
-# downloaded SDK_TOOLCHAIN (macOS) or to system tools (Linux); we create the
-# symlinks in both cases.
+# Expose toolchain binaries under blyt-prefixed names in bin/.
+#
+# blyt build passes -B sdk/bin/ to clang, which prepends sdk/bin/ before
+# clang's own installation directory in the program search path.  Combined
+# with -fuse-ld=lld, sdk/bin/ld.lld (→ FOUND_LLD) is therefore used in
+# preference to whatever ld.lld lives alongside the system clang.  FOUND_*
+# may point into a downloaded SDK_TOOLCHAIN (macOS) or to system tools
+# (Linux); we create the symlinks in both cases.
+#
+# Remove any stale symlinks from prior builds so no dead entries linger.
+foreach(_stale blyt-clang blyt-lld blyt-objcopy ld.lld llvm-objcopy)
+  file(REMOVE "${SDK_BIN}/${_stale}")
+endforeach()
 if(FOUND_CLANG)
   file(CREATE_LINK "${FOUND_CLANG}" "${SDK_BIN}/blyt-clang" SYMBOLIC)
 endif()
 if(FOUND_LLD)
-  file(CREATE_LINK "${FOUND_LLD}" "${SDK_BIN}/blyt-lld" SYMBOLIC)
-  # Also keep ld.lld for direct invocation
+  # ld.lld: the name clang resolves when -fuse-ld=lld is used with -B sdk/bin/.
   file(CREATE_LINK "${FOUND_LLD}" "${SDK_BIN}/ld.lld" SYMBOLIC)
 endif()
 if(FOUND_OBJCOPY)
   file(CREATE_LINK "${FOUND_OBJCOPY}" "${SDK_BIN}/blyt-objcopy" SYMBOLIC)
-  file(CREATE_LINK "${FOUND_OBJCOPY}" "${SDK_BIN}/llvm-objcopy" SYMBOLIC)
 endif()
 
 # -------------------------------------------------------------------------

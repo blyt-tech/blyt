@@ -396,20 +396,20 @@ fn link_cart(
 ) -> Result<(), BuildError> {
     let mut cmd = Command::new(clang);
 
-    // Prepend the SDK bin/ (or toolchain bin/) to PATH so -fuse-ld=lld
-    // resolves to the SDK's own linker rather than whatever the host has.
+    // -B sdk/bin/ prepends the SDK bin directory to clang's program search
+    // path before clang's own installation directory.  Combined with
+    // -fuse-ld=lld, this means sdk/bin/ld.lld (→ the lld validated at SDK
+    // assembly time) is used in preference to whatever ld.lld lives alongside
+    // the system clang.  PATH manipulation is not sufficient here because
+    // clang searches its own directory before PATH.
     if let Some(sdk_bin) = sdk_root_from_exe().map(|s| s.join("bin")) {
-        let existing = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{}", sdk_bin.display(), existing);
-        cmd.env("PATH", new_path);
+        cmd.arg("-B").arg(sdk_bin);
     }
     cmd.args([
         "--target=riscv32",
         "-march=rv32imafc",
         "-mabi=ilp32f",
         "-nostdlib",
-        // The SDK's clang finds ld.lld alongside itself in toolchain/bin/;
-        // blyt-lld in bin/ is a convenience symlink for direct invocation.
         "-fuse-ld=lld",
         "-Wl,--pic-executable",
         "-Wl,-Bdynamic",
