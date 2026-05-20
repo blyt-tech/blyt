@@ -88,7 +88,7 @@ pub fn run(cart_path: &Path) -> Result<(), RunError> {
  *   3. <repo>/build-wasm/        — manual emcmake cmake invocation
  * ------------------------------------------------------------------------- */
 
-fn find_wasm_dir() -> Result<PathBuf, RunError> {
+pub(crate) fn find_wasm_dir() -> Result<PathBuf, RunError> {
     if let Ok(d) = std::env::var("BLYT_WASM_DIR") {
         let p = PathBuf::from(&d);
         if p.join("blytrun.js").exists() {

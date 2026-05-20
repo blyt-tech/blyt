@@ -1,8 +1,9 @@
 mod build;
+mod export;
 mod run;
 
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use clap::{Args, Parser, Subcommand};
+use std::path::{Path, PathBuf};
 use std::process;
 
 #[derive(Parser)]
@@ -14,16 +15,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Compile and link a cart project into a .blyt cart file
-    Build {
-        /// Path to the cart project directory (default: current directory)
-        #[arg(default_value = ".")]
-        project_dir: PathBuf,
-
-        /// Output path for the .blyt cart (default: <project-dir-name>.blyt)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
+    /// Compile a cart project or package it for a specific target
+    Build(BuildArgs),
 
     /// Serve a .blyt cart in the browser via the WASM runtime
     Run {
@@ -32,14 +25,51 @@ enum Commands {
     },
 }
 
+#[derive(Args)]
+struct BuildArgs {
+    /// Build subcommand (e.g. wasm); omit to compile a cart from source
+    #[command(subcommand)]
+    sub: Option<BuildSubcommand>,
+
+    /// Path to the cart project directory (default: current directory)
+    project_dir: Option<PathBuf>,
+
+    /// Output path (default: <project-dir-name>.blyt)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum BuildSubcommand {
+    /// Package a .blyt cart as a self-contained HTML page
+    Wasm {
+        /// Path to the .blyt cart file to package
+        cart: PathBuf,
+
+        /// Output path for the HTML file (default: <cart-name>.html)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Build {
+        Commands::Build(BuildArgs {
+            sub: Some(BuildSubcommand::Wasm { cart, output }),
+            ..
+        }) => export::run(&cart, output.as_deref()).map_err(|e| e.to_string()),
+
+        Commands::Build(BuildArgs {
+            sub: None,
             project_dir,
             output,
-        } => build::run(&project_dir, output.as_deref()).map_err(|e| e.to_string()),
+        }) => {
+            let dir = project_dir.as_deref().unwrap_or(Path::new("."));
+            build::run(dir, output.as_deref()).map_err(|e| e.to_string())
+        }
+
         Commands::Run { cart } => run::run(&cart).map_err(|e| e.to_string()),
     };
 
