@@ -188,6 +188,13 @@ static void blyt_ecall_handler(riscv_t *rv) {
             g_run_ctx->frame_done = true;
         return;
 
+    case 93: /* SYS_exit (Linux NR 93) — blyt_exit on emulated path */
+    case 94: /* SYS_exit_group (Linux NR 94) — blyt_exit on emulated path */
+        rv_halt(rv);
+        if (rv_get_reg(rv, rv_reg_a0) != 0 && g_run_ctx)
+            g_run_ctx->ecall_aborted = true;
+        return;
+
     default:
         rv_halt(rv);
         if (g_run_ctx)

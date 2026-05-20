@@ -62,6 +62,19 @@ static unsigned int blyt32_native_strlen(const char *s) {
 void blyt_frame_done(void) {
 }
 
+/* blyt_exit — clean process exit after cart main loop.
+ *
+ * Called by _blyt_entry (the ELF entry point stub) after blyt_main() returns.
+ * Bypasses musl's exit() cleanup path, which calls munmap and other syscalls
+ * blocked by the restricted seccomp filter.  exit_group(0) is in the allowlist.
+ *
+ * Declared __attribute__((noreturn)) so the compiler can omit the return path
+ * in _blyt_entry and avoid generating a dead-code epilogue.
+ */
+__attribute__((noreturn)) void blyt_exit(int code) {
+    blyt_rs_exit_group(code);
+}
+
 /* blyt_console_debug — SYS_write(fd=2, s, len).
  * write(2) is NR 64, in the restricted allowlist. */
 void blyt_console_debug(const char *s) {

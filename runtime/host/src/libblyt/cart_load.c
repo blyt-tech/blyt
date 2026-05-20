@@ -43,6 +43,7 @@ static const char *const KNOWN_SECTIONS_EXACT[] = {
     ".hash",
     ".eh_frame",
     ".eh_frame_hdr",
+    ".relro_padding", /* lld page-alignment pad between RELRO and data */
     ".comment",
     ".gnu.version",
     ".gnu.version_r",
@@ -100,6 +101,7 @@ static int needed_name_allowed(const char *name) {
 static const char *const SYMBOL_ALLOWLIST[] = {
     /* blyt lifecycle (blyt.h / libblytcommon.so) */
     "blyt_main", /* imported by _blyt_entry */
+    "blyt_exit", /* imported by _blyt_entry; calls exit_group on native path */
     "blyt_console_debug",
     "blyt_quit_ready",
     "blyt_frame_done",
