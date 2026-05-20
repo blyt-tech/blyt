@@ -784,3 +784,138 @@ fn find_wasm_dir() -> std::path::PathBuf {
     }
     build_dir().join("sdk/share/wasm")
 }
+
+/// blyt build wasm: exporting a pre-built cart produces a self-contained HTML
+/// page with the WASM runtime and cart embedded as base64.
+///
+/// Silently skipped when blytrun.js is not found.
+#[test]
+fn build_wasm_produces_html() {
+    let wasm_dir = find_wasm_dir();
+    if !wasm_dir.join("blytrun.js").exists() {
+        eprintln!("build_wasm_produces_html: blytrun.js not found — skipping");
+        return;
+    }
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_export");
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+void blyt_cart_init(void)   { blyt_console_debug("wasm-export"); }
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let html_path = tmp.path().join("wasm_export.html");
+    Command::cargo_bin("blyt")
+        .unwrap()
+        .args([
+            "build",
+            "wasm",
+            cart.to_str().unwrap(),
+            "--output",
+            html_path.to_str().unwrap(),
+        ])
+        .env("BLYT_SDK_DIR", sdk_dir())
+        .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
+        .env("BLYT_WASM_DIR", &wasm_dir)
+        .assert()
+        .success();
+
+    assert!(
+        html_path.exists(),
+        "HTML not written to {}",
+        html_path.display()
+    );
+    let html = fs::read_to_string(&html_path).unwrap();
+    assert!(
+        html.contains("<canvas id=\"canvas\""),
+        "HTML missing canvas element"
+    );
+    assert!(html.contains("wasmBinary"), "HTML missing wasmBinary setup");
+    assert!(
+        html.contains("FS.writeFile(\"/cart.blyt\""),
+        "HTML missing cart preRun hook"
+    );
+    assert!(
+        html.contains("<title>wasm_export</title>"),
+        "HTML has wrong or missing title"
+    );
+    // Both the WASM runtime and cart are base64-embedded; the file must be large.
+    assert!(
+        html.len() > 512 * 1024,
+        "HTML is suspiciously small ({} bytes) — WASM may not be embedded",
+        html.len()
+    );
+}
+
+/// blyt build all: compiling and exporting in one step produces both a .blyt
+/// cart and a .html page, with the HTML containing the embedded runtime.
+///
+/// Silently skipped when blytrun.js is not found.
+#[test]
+fn build_all_produces_cart_and_html() {
+    let wasm_dir = find_wasm_dir();
+    if !wasm_dir.join("blytrun.js").exists() {
+        eprintln!("build_all_produces_cart_and_html: blytrun.js not found — skipping");
+        return;
+    }
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("all_cart");
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+void blyt_cart_init(void)   { blyt_console_debug("build-all"); }
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#,
+    );
+
+    let sdk = sdk_dir();
+    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    cmd.args(["build", "all", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_WASM_DIR", &wasm_dir);
+    if sdk.join("bin/blyt-clang").exists() {
+        cmd.env("BLYT_CLANG", sdk.join("bin/blyt-clang"));
+    }
+    cmd.assert().success();
+
+    let cart = project.parent().unwrap().join("all_cart.blyt");
+    let html_path = project.parent().unwrap().join("all_cart.html");
+
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    assert!(
+        html_path.exists(),
+        "HTML not found at {}",
+        html_path.display()
+    );
+
+    let html = fs::read_to_string(&html_path).unwrap();
+    assert!(
+        html.contains("<canvas id=\"canvas\""),
+        "HTML missing canvas element"
+    );
+    assert!(html.contains("wasmBinary"), "HTML missing wasmBinary setup");
+    assert!(
+        html.len() > 512 * 1024,
+        "HTML is suspiciously small ({} bytes) — WASM may not be embedded",
+        html.len()
+    );
+}
