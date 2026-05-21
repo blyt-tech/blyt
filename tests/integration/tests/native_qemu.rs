@@ -288,8 +288,12 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
 static int s_frame = 0;
 void blyt_cart_init(void)   { }
 void blyt_cart_update(void) {
-    /* Leave frm=3 (round toward +infinity) dirty at frame boundary. */
-    __asm__ volatile("csrwi frm, 3");
+    /* Leave frm=3 (round toward +infinity) dirty at frame boundary.
+     * Write to fcsr (CSR 0x003) not frm (CSR 0x002): rv32emu maps CSR_FCSR
+     * but not CSR_FRM, so csrwi frm,3 is a silent no-op on the emulated path.
+     * 3u<<5 = 0x60 sets FCSR.frm=3 while leaving FCSR.fflags=0. */
+    unsigned int fcsr_val = 3u << 5;
+    __asm__ volatile("csrw fcsr, %0" : : "r"(fcsr_val));
     if (++s_frame >= 2) blyt_quit_ready();
 }
 void blyt_cart_draw(void)   { }
