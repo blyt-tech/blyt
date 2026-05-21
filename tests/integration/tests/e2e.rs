@@ -1172,6 +1172,83 @@ fn build_lib_subcommand_produces_archive() {
     assert!(archive.exists(), "lib.a not found at {}", archive.display());
 }
 
+/// Rust game code calls a C library function via extern "C".
+///
+/// Validates the cross-language path: C library compiled to lib.a, Rust game
+/// code declares the symbol via extern "C", final clang link resolves it.
+///
+/// Skipped when the SDK or riscv32imafc Rust target is not available.
+#[test]
+fn rust_cart_calls_c_lib_function() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() || !sdk.join("lib/libblyt32.so").exists() {
+        eprintln!("skipping rust_cart_calls_c_lib_function: SDK not assembled");
+        return;
+    }
+    if !has_rust_riscv_target() {
+        eprintln!(
+            "skipping rust_cart_calls_c_lib_function: riscv32imafc-unknown-none-elf not installed"
+        );
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_c_lib");
+
+    CartProject::new()
+        .lib_file("mathlib", "include/mathlib.h", "int add(int a, int b);")
+        .lib_file(
+            "mathlib",
+            "mathlib.c",
+            "#include \"mathlib.h\"\nint add(int a, int b) { return a + b; }\n",
+        )
+        .rust(
+            r#"#![no_std]
+
+extern "C" {
+    fn add(a: i32, b: i32) -> i32;
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {
+    let result = unsafe { add(3, 4) };
+    if result == 7 {
+        blyt::console_debug("rust+c ok");
+    } else {
+        blyt::console_debug("rust+c wrong");
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    blyt::quit_ready();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("rust+c ok"),
+        "expected 'rust+c ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 // -------------------------------------------------------------------------
 // Rust cart tests
 // -------------------------------------------------------------------------
