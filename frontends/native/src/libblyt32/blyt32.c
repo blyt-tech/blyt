@@ -55,11 +55,46 @@ static unsigned int blyt32_native_strlen(const char *s) {
     return (unsigned int)(p - s);
 }
 
-/* blyt_frame_done — no-op on the native path.
- * Shadows libblytcommon.so's ECALL stub (a7=2 = io_submit on Linux, blocked
- * by the restricted seccomp filter).  Frame pacing via clock_nanosleep is
- * deferred. */
+/* blyt_frame_done — frame-boundary housekeeping on the native path.
+ *
+ * Called by the cart at the end of each logical frame.  Enforces FP
+ * determinism (ADR-0007) by checking and resetting the RISC-V FCSR:
+ *
+ *   frm (bits 7:5) — rounding mode.  Must be 0 (round-to-nearest-even,
+ *   the IEEE 754 default) at every frame boundary.  A non-zero frm means
+ *   the cart or one of its libraries called fesetround() or modified frm
+ *   directly, which would cause FP results to diverge across runs.
+ *
+ *   fflags (bits 4:0) — accumulated FP exception flags (NX/UF/OF/DZ/NV).
+ *   These are set by normal FP arithmetic and do not affect determinism;
+ *   they are cleared here to give each frame a clean starting state.
+ *
+ * Debug builds emit a warning and continue; release builds abort because
+ * a dirty frm means results from this frame are already non-deterministic
+ * and allowing the cart to continue would compound the divergence. */
 void blyt_frame_done(void) {
+    unsigned int fcsr;
+    __asm__ volatile("csrr %0, fcsr" : "=r"(fcsr));
+    unsigned int frm = (fcsr >> 5) & 0x7u;
+    if (frm != 0u) {
+#ifndef NDEBUG
+        static const char pfx[] = "blyt: WARNING: cart set non-default FP rounding mode (frm=";
+        static const char sfx[] = "); results may be non-deterministic\n";
+        char digit = (char)('0' + frm);
+        blyt_rs_write(2, pfx, sizeof(pfx) - 1);
+        blyt_rs_write(2, &digit, 1);
+        blyt_rs_write(2, sfx, sizeof(sfx) - 1);
+#else
+        static const char msg[] = "blyt: cart set non-default FP rounding mode; "
+                                  "aborting for determinism\n";
+        blyt_rs_write(2, msg, sizeof(msg) - 1);
+        blyt_rs_exit_group(1);
+#endif
+    }
+    /* Reset frm to RNE (0) and clear accumulated fflags for the next frame.
+     * The memory clobber prevents the compiler from reordering FP operations
+     * across this boundary. */
+    __asm__ volatile("csrw fcsr, zero" ::: "memory");
 }
 
 /* blyt_exit — clean process exit after cart main loop.

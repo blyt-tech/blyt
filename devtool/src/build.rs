@@ -356,6 +356,17 @@ fn compile_c(
             "-nostdlib",
             "-fno-exceptions",
             "-fpie",
+            // Determinism flags (ADR-0007): IEEE 754 strict mode.
+            // -ffp-contract=off  — no implicit FMA fusion (changes rounding)
+            // -fno-fast-math     — no IEEE-breaking optimisations
+            // -fwrapv            — signed integer overflow wraps (no UB)
+            // -frounding-math    — compiler must not assume RNE is fixed
+            // -fsignaling-nans   — NaN operations may signal; no elision
+            "-ffp-contract=off",
+            "-fno-fast-math",
+            "-fwrapv",
+            "-frounding-math",
+            "-fsignaling-nans",
             "-c",
         ])
         .arg("-I")
