@@ -35,8 +35,6 @@ jobs:
             tests/unit/*.c \
             tests/tools/*.c \
             tests/game/hello/src/game/c/*.c \
-            tests/game/native_hello/native_hello.c \
-            tests/game/native_adversary/native_adversary.c \
             frontends/sdl/main.c \
             frontends/libretro/blyt_libretro.c \
             frontends/wasm/wasm_main.c \

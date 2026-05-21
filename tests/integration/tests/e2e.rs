@@ -1,7 +1,10 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{blytrun, build_dir, has_rust_riscv_target, repo_root, sdk_dir, write_c_cart_project};
+use common::{
+    CartProject, blytrun, build_dir, has_rust_riscv_target, repo_root, sdk_dir,
+    write_c_cart_project,
+};
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
@@ -13,7 +16,9 @@ fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     let mut cmd = Command::cargo_bin("blyt").unwrap();
     cmd.args(["build", project_dir.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)
-        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        // Always set the Rust SDK path; ignored by blyt build for C projects.
+        .env("BLYT_RUST_SDK", repo_root().join("sdk/rust/blyt"));
     // Use the SDK's riscv32-capable clang if available; system clang on macOS
     // cannot target riscv32 so the test is skipped when the SDK is absent.
     let sdk_clang = sdk.join("bin/blyt-clang");
@@ -980,7 +985,7 @@ void blyt_cart_draw(void)   { }
 // Rust cart tests
 // -------------------------------------------------------------------------
 
-/// Build and run the hello_rust test game.  Verifies that a pure Rust cart
+/// Build and run a minimal Rust cart.  Verifies that a pure Rust cart
 /// compiled with `language: rust` produces the expected debug output.
 ///
 /// Skipped when:
@@ -999,29 +1004,31 @@ fn rust_cart_debug_output() {
         return;
     }
 
-    let project = repo_root().join("tests/game/hello_rust");
-    assert!(
-        project.join("cart.build.yaml").exists(),
-        "hello_rust/cart.build.yaml missing"
-    );
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_hello");
 
-    // Build the Rust cart via `blyt build`.  BLYT_RUST_SDK points to the SDK
-    // crate in the repo; at Phase 10 it will live inside the assembled SDK.
-    let rust_sdk = repo_root().join("sdk/rust/blyt");
-    let mut cmd = Command::cargo_bin("blyt").unwrap();
-    cmd.args(["build", project.to_str().unwrap()])
-        .env("BLYT_SDK_DIR", &sdk)
-        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
-        .env("BLYT_CLANG", sdk.join("bin/blyt-clang"))
-        .env("BLYT_RUST_SDK", &rust_sdk);
-    cmd.assert().success();
+    CartProject::new()
+        .rust(
+            r#"#![no_std]
 
-    let cart = project.parent().unwrap().join("hello_rust.blyt");
-    assert!(
-        cart.exists(),
-        "hello_rust.blyt not found at {}",
-        cart.display()
-    );
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {
+    blyt::console_debug("hello from rust");
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    blyt::quit_ready();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
 
     let output = Command::new(blytrun())
         .args(["--headless", cart.to_str().unwrap()])
