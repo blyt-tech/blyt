@@ -79,6 +79,7 @@ fn err(msg: impl Into<String>) -> BuildError {
 #[derive(Debug, PartialEq)]
 enum CartLanguage {
     C,
+    Cpp,
     Rust,
 }
 
@@ -86,13 +87,17 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
     let manifest_path = project_dir.join("cart.build.yaml");
     if !manifest_path.exists() {
         return Err(err(format!(
-            "{} not found — Lua is the default; add `language: c` or \
-             `language: rust` to cart.build.yaml for a native cart",
+            "{} not found — Lua is the default; add `language: c`, \
+             `language: \"c++\"`, or `language: rust` to cart.build.yaml \
+             for a native cart",
             manifest_path.display()
         )));
     }
     let text = fs::read_to_string(&manifest_path)?;
     // Minimal parse: find first non-comment `language: <value>` line.
+    // YAML allows quoting special characters: `language: "c++"` and
+    // `language: c++` both parse to the string `c++`; we strip surrounding
+    // double-quotes before matching.
     // TODO(phase-9): replace with serde_yaml once cart.build.yaml grows more fields.
     for line in text.lines() {
         let line = line.trim();
@@ -100,17 +105,20 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("language:") {
-            return match rest.trim() {
+            let val = rest.trim().trim_matches('"');
+            return match val {
                 "c" => Ok(CartLanguage::C),
+                "c++" => Ok(CartLanguage::Cpp),
                 "rust" => Ok(CartLanguage::Rust),
                 other => Err(err(format!(
-                    "cart.build.yaml: unknown language {other:?} — expected `c` or `rust`"
+                    "cart.build.yaml: unknown language {other:?} — \
+                     expected `c`, `\"c++\"`, or `rust`"
                 ))),
             };
         }
     }
     Err(err("cart.build.yaml has no `language:` field — \
-         add e.g. `language: c` or `language: rust`"))
+         add e.g. `language: c`, `language: \"c++\"`, or `language: rust`"))
 }
 
 /* -------------------------------------------------------------------------
@@ -135,7 +143,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
     }
     let lib_include_paths: Vec<PathBuf> =
         built_libs.iter().map(|l| l.include_path.clone()).collect();
-    let lib_archives: Vec<PathBuf> = built_libs.into_iter().map(|l| l.archive).collect();
+    let mut lib_archives: Vec<PathBuf> = built_libs.into_iter().map(|l| l.archive).collect();
     let lib_include_refs: Vec<&Path> = lib_include_paths.iter().map(PathBuf::as_path).collect();
 
     let build_dir = project_dir.join("build/game/c");
@@ -197,7 +205,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
         &[],
     )?);
 
-    // Language-specific compilation.  C game files receive lib include paths.
+    // Language-specific compilation.  C/C++ game files receive lib include paths.
     let rust_archive = match language {
         CartLanguage::C => {
             let c_src_dir = project_dir.join("src/game/c");
@@ -214,6 +222,51 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                     src,
                     &build_dir,
                     &sdk_include,
+                    &lib_include_refs,
+                )?);
+            }
+            None
+        }
+        CartLanguage::Cpp => {
+            let clangpp = find_clangpp();
+            let cpp_src_dir = project_dir.join("src/game/c++");
+            let cpp_files = collect_cpp_files(&cpp_src_dir)?;
+            if cpp_files.is_empty() {
+                return Err(err(format!(
+                    "no .cpp/.cxx/.cc files found under {}",
+                    cpp_src_dir.display()
+                )));
+            }
+            // libc++ headers live at <sdk>/include/c++/v1/ (put there by cmake sdk step)
+            let libcxx_include = sdk_include.join("c++/v1");
+            if !libcxx_include.exists() {
+                return Err(err(
+                    "libc++ headers not found — run `cmake --build build --target sdk` \
+                     to build C++ support",
+                ));
+            }
+            // Add libc++ static archives to the link step (before -lblyt32).
+            // libc++abi is optional — link it only when present.
+            let libc_a = lib_dir.join("libc++.a");
+            if !libc_a.exists() {
+                return Err(err(
+                    "libc++.a not found — run `cmake --build build --target sdk` \
+                     to build C++ support",
+                ));
+            }
+            lib_archives.push(libc_a);
+            let libcxxabi_a = lib_dir.join("libc++abi.a");
+            if libcxxabi_a.exists() {
+                lib_archives.push(libcxxabi_a);
+            }
+
+            for src in &cpp_files {
+                obj_files.push(compile_cpp(
+                    &clangpp,
+                    src,
+                    &build_dir,
+                    &sdk_include,
+                    &libcxx_include,
                     &lib_include_refs,
                 )?);
             }
@@ -347,6 +400,19 @@ fn find_ar() -> String {
         }
     }
     "llvm-ar".to_string()
+}
+
+fn find_clangpp() -> String {
+    if let Ok(c) = std::env::var("BLYT_CLANGPP") {
+        return c;
+    }
+    if let Some(sdk) = sdk_root_from_exe() {
+        let p = sdk.join("bin/blyt-clang++");
+        if p.exists() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    "clang++".to_string()
 }
 
 /* -------------------------------------------------------------------------
@@ -739,6 +805,92 @@ fn compile_c(
         .arg(src)
         .status()
         .map_err(|e| err(format!("failed to run {clang}: {e}")))?;
+
+    if !status.success() {
+        return Err(err(format!("compilation failed: {}", src.display())));
+    }
+    Ok(obj)
+}
+
+/* -------------------------------------------------------------------------
+ * C++ compilation
+ *
+ * Source files: src/game/c++/ — .cpp, .cxx, .cc extensions.
+ * Uses clang++ with -fno-exceptions -fno-rtti (ADR-0121) in addition to the
+ * standard determinism flags.  Library headers are added as -isystem to
+ * suppress warnings from standard library internals.
+ * ------------------------------------------------------------------------- */
+
+fn collect_cpp_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    collect_cpp_recursive(dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_cpp_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), BuildError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_cpp_recursive(&path, out)?;
+        } else if matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("cpp" | "cxx" | "cc")
+        ) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn compile_cpp(
+    clangpp: &str,
+    src: &Path,
+    build_dir: &Path,
+    sdk_include: &Path,
+    libcxx_include: &Path,
+    extra_includes: &[&Path],
+) -> Result<PathBuf, BuildError> {
+    let stem = src.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
+    let obj = build_dir.join(format!("{stem}.o"));
+
+    let mut cmd = Command::new(clangpp);
+    cmd.args([
+        "--target=riscv32",
+        "-march=rv32imafc",
+        "-mabi=ilp32f",
+        "-nostdlib",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-fpie",
+        // Determinism flags (ADR-0007)
+        "-ffp-contract=off",
+        "-fno-fast-math",
+        "-fwrapv",
+        "-frounding-math",
+        "-fsignaling-nans",
+        "-c",
+    ])
+    .arg("-I")
+    .arg(sdk_include)
+    // libc++ headers as -isystem to suppress warnings from standard library internals
+    .arg("-isystem")
+    .arg(libcxx_include);
+
+    for inc in extra_includes {
+        cmd.arg("-I").arg(inc);
+    }
+
+    let status = cmd
+        .arg("-o")
+        .arg(&obj)
+        .arg(src)
+        .status()
+        .map_err(|e| err(format!("failed to run {clangpp}: {e}")))?;
 
     if !status.success() {
         return Err(err(format!("compilation failed: {}", src.display())));

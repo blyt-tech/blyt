@@ -65,6 +65,8 @@ blyt = \"0.1\"\n";
 pub struct CartProject {
     /// (filename, source) pairs for src/game/c/
     c_files: Vec<(String, String)>,
+    /// (filename, source) pairs for src/game/c++/
+    cpp_files: Vec<(String, String)>,
     /// Contents of src/game/rust/src/lib.rs
     rust_lib_rs: Option<String>,
     /// (lib_name, relative_path_within_lib, content) — files for src/lib/<name>/
@@ -75,6 +77,7 @@ impl CartProject {
     pub fn new() -> Self {
         CartProject {
             c_files: Vec::new(),
+            cpp_files: Vec::new(),
             rust_lib_rs: None,
             lib_files: Vec::new(),
         }
@@ -88,6 +91,17 @@ impl CartProject {
     /// Add `source` as `src/game/c/<name>`.
     pub fn c_file(mut self, name: &str, source: &str) -> Self {
         self.c_files.push((name.into(), source.into()));
+        self
+    }
+
+    /// Add `source` as `src/game/c++/main.cpp`.
+    pub fn cpp(self, source: &str) -> Self {
+        self.cpp_file("main.cpp", source)
+    }
+
+    /// Add `source` as `src/game/c++/<name>`.
+    pub fn cpp_file(mut self, name: &str, source: &str) -> Self {
+        self.cpp_files.push((name.into(), source.into()));
         self
     }
 
@@ -112,24 +126,39 @@ impl CartProject {
 
     /// Write the project layout under `dir` and panic on any I/O error.
     pub fn write(self, dir: &std::path::Path) {
+        let has_c = !self.c_files.is_empty();
+        let has_cpp = !self.cpp_files.is_empty();
+        let has_rust = self.rust_lib_rs.is_some();
         assert!(
-            !self.c_files.is_empty() || self.rust_lib_rs.is_some(),
-            "CartProject::write: no languages declared"
+            has_c || has_cpp || has_rust,
+            "CartProject::write: no game language declared"
         );
 
-        // cart.build.yaml — single or multi-language declaration (ADR-0073).
-        let manifest = match (self.c_files.is_empty(), self.rust_lib_rs.is_none()) {
-            (false, true) => "language: c\n".into(),
-            (true, false) => "language: rust\n".into(),
-            _ => "languages:\n  - c\n  - rust\n".into(),
+        // cart.build.yaml — language declaration (ADR-0073).
+        // Mixed-language game code is not yet supported in blyt build; for now
+        // each project has exactly one game language.
+        let manifest = if has_c {
+            "language: c\n"
+        } else if has_cpp {
+            "language: \"c++\"\n"
+        } else {
+            "language: rust\n"
         };
         fs::write(dir.join("cart.build.yaml"), manifest).unwrap();
 
-        if !self.c_files.is_empty() {
+        if has_c {
             let c_dir = dir.join("src/game/c");
             fs::create_dir_all(&c_dir).unwrap();
             for (name, source) in &self.c_files {
                 fs::write(c_dir.join(name), source).unwrap();
+            }
+        }
+
+        if has_cpp {
+            let cpp_dir = dir.join("src/game/c++");
+            fs::create_dir_all(&cpp_dir).unwrap();
+            for (name, source) in &self.cpp_files {
+                fs::write(cpp_dir.join(name), source).unwrap();
             }
         }
 

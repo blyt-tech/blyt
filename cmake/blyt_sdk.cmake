@@ -33,6 +33,7 @@ set(CANDIDATE_PAIRS
     "/usr/local/bin/ld.lld")
 
 set(FOUND_CLANG "")
+set(FOUND_CLANGPP "")
 set(FOUND_LLD "")
 set(FOUND_OBJCOPY "")
 set(FOUND_AR "")
@@ -59,6 +60,9 @@ foreach(IDX RANGE ${PAIR_LAST})
     set(FOUND_CLANG "${CAND_CLANG}")
     set(FOUND_LLD "${CAND_LLD}")
     get_filename_component(TOOL_DIR "${CAND_CLANG}" DIRECTORY)
+    if(EXISTS "${TOOL_DIR}/clang++")
+      set(FOUND_CLANGPP "${TOOL_DIR}/clang++")
+    endif()
     if(EXISTS "${TOOL_DIR}/llvm-objcopy")
       set(FOUND_OBJCOPY "${TOOL_DIR}/llvm-objcopy")
     endif()
@@ -130,6 +134,7 @@ if(NOT FOUND_CLANG)
   endif()
 
   set(FOUND_CLANG "${SDK_TOOLCHAIN}/bin/clang")
+  set(FOUND_CLANGPP "${SDK_TOOLCHAIN}/bin/clang++")
   set(FOUND_LLD "${SDK_TOOLCHAIN}/bin/ld.lld")
   set(FOUND_OBJCOPY "${SDK_TOOLCHAIN}/bin/llvm-objcopy")
   set(FOUND_AR "${SDK_TOOLCHAIN}/bin/llvm-ar")
@@ -339,6 +344,111 @@ endif()
 file(COPY "${SDK_LIB}/libblytcommon.so" DESTINATION "${SDK_LIB_NATIVE}")
 
 # -------------------------------------------------------------------------
+# Step 2b: Build libc++ and libc++abi for RV32IMAFC (C++ cart support)
+#
+# Builds a static libc++.a + libc++abi.a from third_party/libcxx (the LLVM
+# monorepo fork) targeting riscv32imafc / ilp32f.  Configured with:
+#   -fno-exceptions -fno-rtti   (mandatory for cart C++ code)
+#   LIBCXX_ENABLE_THREADS=OFF   (carts are single-threaded)
+#   LIBCXX_ENABLE_FILESYSTEM=OFF (no filesystem access in sandboxed carts)
+#   LIBCXX_ENABLE_LOCALIZATION=OFF (locale state is not serialisable)
+#   LIBCXX_HAS_MUSL_LIBC=ON    (libblytc is our musl-derived C library)
+#
+# The step is skipped with a warning when:
+#   - third_party/libcxx is not initialised (the submodule is absent)
+#   - clang++ is not available (FOUND_CLANGPP is empty)
+# -------------------------------------------------------------------------
+
+set(LIBCXX_SOURCE_DIR "${BLYT_SOURCE_DIR}/third_party/libcxx")
+set(LIBCXX_BUILD_DIR "${BLYT_BINARY_DIR}/build-libcxx-rv32")
+set(SDK_INC_LIBCXX "${SDK_INC}/c++/v1")
+
+if(NOT EXISTS "${LIBCXX_SOURCE_DIR}/runtimes/CMakeLists.txt")
+  message(
+    WARNING "third_party/libcxx not initialised — C++ cart support will not be built.\n"
+            "Run: git submodule update --init third_party/libcxx")
+elseif(NOT FOUND_CLANGPP)
+  message(WARNING "clang++ not found — C++ cart support will not be built.")
+elseif(EXISTS "${SDK_LIB}/libc++.a" AND EXISTS "${SDK_INC_LIBCXX}/__config_site")
+  message(STATUS "libc++ already built — skipping (delete ${SDK_LIB}/libc++.a to rebuild)")
+else()
+  message(STATUS "Building libc++ for RV32IMAFC…")
+
+  set(_LXX_C_FLAGS "--target=riscv32 -march=rv32imafc -mabi=ilp32f -nostdlib")
+  set(_LXX_CXX_FLAGS
+      "--target=riscv32 -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti")
+
+  if(FOUND_LLD)
+    string(APPEND _LXX_C_FLAGS " -fuse-ld=${FOUND_LLD}")
+    string(APPEND _LXX_CXX_FLAGS " -fuse-ld=${FOUND_LLD}")
+  endif()
+
+  # Configure
+  execute_process(
+    COMMAND
+      ${CMAKE_COMMAND} -S "${LIBCXX_SOURCE_DIR}/runtimes" -B "${LIBCXX_BUILD_DIR}" -G Ninja
+      "-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi"
+      "-DCMAKE_C_COMPILER=${FOUND_CLANG}"
+      "-DCMAKE_CXX_COMPILER=${FOUND_CLANGPP}"
+      "-DCMAKE_C_FLAGS=${_LXX_C_FLAGS}"
+      "-DCMAKE_CXX_FLAGS=${_LXX_CXX_FLAGS}"
+      -DCMAKE_BUILD_TYPE=MinSizeRel
+      -DLIBCXX_ENABLE_SHARED=OFF
+      -DLIBCXX_ENABLE_EXCEPTIONS=OFF
+      -DLIBCXX_ENABLE_RTTI=OFF
+      -DLIBCXX_ENABLE_THREADS=OFF
+      -DLIBCXX_ENABLE_FILESYSTEM=OFF
+      -DLIBCXX_ENABLE_LOCALIZATION=OFF
+      -DLIBCXX_HAS_MUSL_LIBC=ON
+      -DLIBCXX_USE_COMPILER_RT=ON
+      -DLIBCXX_CXX_ABI=libcxxabi
+      -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON
+      -DLIBCXXABI_ENABLE_SHARED=OFF
+      -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF
+      -DLIBCXXABI_ENABLE_THREADS=OFF
+      -DLIBCXXABI_USE_COMPILER_RT=ON
+    RESULT_VARIABLE _LXX_CFG_R
+    OUTPUT_QUIET)
+
+  if(NOT _LXX_CFG_R EQUAL 0)
+    message(FATAL_ERROR "libc++ cmake configure failed (exit ${_LXX_CFG_R})")
+  endif()
+
+  # Build — only the static libraries, not tests
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} --build "${LIBCXX_BUILD_DIR}" --target cxx cxxabi
+    RESULT_VARIABLE _LXX_BUILD_R)
+
+  if(NOT _LXX_BUILD_R EQUAL 0)
+    message(FATAL_ERROR "libc++ build failed (exit ${_LXX_BUILD_R})")
+  endif()
+
+  # Copy static libraries to SDK lib/
+  foreach(_lib libc++.a libc++abi.a)
+    if(EXISTS "${LIBCXX_BUILD_DIR}/lib/${_lib}")
+      file(COPY "${LIBCXX_BUILD_DIR}/lib/${_lib}" DESTINATION "${SDK_LIB}")
+    else()
+      message(FATAL_ERROR "libc++ build succeeded but ${_lib} not found in ${LIBCXX_BUILD_DIR}/lib/")
+    endif()
+  endforeach()
+
+  # Copy libc++ headers to SDK include/c++/v1/.
+  # The source headers come from the libcxx include/ tree; the cmake-generated
+  # __config_site (which records which features are enabled) comes from the
+  # build tree.  Both must be present for cart C++ compilation to succeed.
+  file(MAKE_DIRECTORY "${SDK_INC_LIBCXX}")
+  file(COPY "${LIBCXX_SOURCE_DIR}/libcxx/include/"
+       DESTINATION "${SDK_INC_LIBCXX}"
+       PATTERN "*.in" EXCLUDE)  # exclude cmake template files
+  if(EXISTS "${LIBCXX_BUILD_DIR}/include/c++/v1/__config_site")
+    file(COPY "${LIBCXX_BUILD_DIR}/include/c++/v1/__config_site"
+         DESTINATION "${SDK_INC_LIBCXX}")
+  endif()
+
+  message(STATUS "libc++ built: ${SDK_LIB}/libc++.a + headers at ${SDK_INC_LIBCXX}")
+endif()
+
+# -------------------------------------------------------------------------
 # Step 3: SDK headers
 # -------------------------------------------------------------------------
 
@@ -420,11 +530,15 @@ file(COPY "${BLYT_SOURCE_DIR}/target/debug/blyt" DESTINATION "${SDK_BIN}")
 # (Linux); we create the symlinks in both cases.
 #
 # Remove any stale symlinks from prior builds so no dead entries linger.
-foreach(_stale blyt-clang blyt-ld.lld blyt-lld blyt-objcopy blyt-llvm-ar ld.lld llvm-objcopy)
+foreach(_stale blyt-clang blyt-clang++ blyt-ld.lld blyt-lld blyt-objcopy blyt-llvm-ar ld.lld
+               llvm-objcopy)
   file(REMOVE "${SDK_BIN}/${_stale}")
 endforeach()
 if(FOUND_CLANG)
   file(CREATE_LINK "${FOUND_CLANG}" "${SDK_BIN}/blyt-clang" SYMBOLIC)
+endif()
+if(FOUND_CLANGPP)
+  file(CREATE_LINK "${FOUND_CLANGPP}" "${SDK_BIN}/blyt-clang++" SYMBOLIC)
 endif()
 if(FOUND_LLD)
   # blyt-ld.lld: the SDK's private lld, referenced via absolute path in
