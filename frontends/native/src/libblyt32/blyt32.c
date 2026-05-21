@@ -39,6 +39,8 @@ __attribute__((constructor)) static void libblyt32_install_seccomp(void) {
     }
     static const char dbg_b[] = "CTOR_DONE\n";
     blyt_rs_write(2, dbg_b, sizeof(dbg_b) - 1);
+    /* Explicitly reset FCSR to RNE+no-flags regardless of OS/ld.so state. */
+    __asm__ volatile("csrw fcsr, zero" ::: "memory");
 }
 
 /* ── Native API implementations ──────────────────────────────────────────

@@ -919,3 +919,88 @@ void blyt_cart_draw(void)   {}
         html.len()
     );
 }
+
+/// Emulator FCSR gate: a cart that leaves frm dirty at every frame boundary
+/// must trigger the frame-boundary check in blyt_ecall_handler.
+///
+/// In a debug build of the runtime (NDEBUG not defined) the check emits a
+/// warning to stderr and lets the session continue — the cart runs to
+/// completion and test_session_api exits 0.
+///
+/// In a release build (NDEBUG defined) the check halts the emulator and
+/// returns BLYT_RUN_ERR_ABORT — test_session_api exits 1.
+///
+/// Both outcomes are accepted so the test is valid for debug and release CI.
+///
+/// Skipped if the SDK or the test_session_api binary has not been built.
+#[test]
+fn emulator_fcsr_dirty_frm_detected() {
+    let sdk = sdk_dir();
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if !sdk_clang.exists() {
+        eprintln!("emulator_fcsr_dirty_frm_detected: SDK not assembled — skip");
+        return;
+    }
+    let test_binary = build_dir().join("test_session_api");
+    if !test_binary.exists() {
+        eprintln!(
+            "emulator_fcsr_dirty_frm_detected: test_session_api not built — skip \
+             (run: cmake --build build --target test_session_api)"
+        );
+        return;
+    }
+    let lib_dir = sdk.join("lib");
+    if !lib_dir.join("libblyt32.so").exists() {
+        eprintln!("emulator_fcsr_dirty_frm_detected: sdk/lib/libblyt32.so not found — skip");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("dirty_frm");
+    write_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+static int s_frame = 0;
+void blyt_cart_init(void)   { }
+void blyt_cart_update(void) {
+    /* Leave frm=3 (round toward +infinity) dirty at each frame boundary. */
+    __asm__ volatile("csrwi frm, 3");
+    if (++s_frame >= 2) blyt_quit_ready();
+}
+void blyt_cart_draw(void)   { }
+"#,
+    );
+    let cart = build_cart(&project);
+    assert!(
+        cart.exists(),
+        "dirty_frm.blyt not built: {}",
+        cart.display()
+    );
+
+    let out = std::process::Command::new(&test_binary)
+        .args(["session", cart.to_str().unwrap(), lib_dir.to_str().unwrap()])
+        .output()
+        .expect("test_session_api failed to spawn");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let rc = out.status.code().unwrap_or(-1);
+
+    match rc {
+        0 => {
+            // Debug runtime: warning emitted, session continued to completion.
+            assert!(
+                stderr.contains("non-default FP rounding mode"),
+                "exit 0 but no FCSR warning found in stderr\nstderr: {stderr}"
+            );
+        }
+        1 => {
+            // Release runtime: session aborted on first dirty-frm frame.
+            assert!(
+                stderr.contains("aborting for determinism"),
+                "exit 1 but expected abort message not found in stderr\nstderr: {stderr}"
+            );
+        }
+        _ => panic!("unexpected exit code {rc} from test_session_api\nstderr: {stderr}"),
+    }
+}

@@ -302,6 +302,29 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
         hello_cart.display()
     );
 
+    // ── Build the dirty-frm cart (FCSR gate 4) ────────────────────────
+    let dirty_project = tmp.path().join("dirty_frm");
+    write_cart_project(
+        &dirty_project,
+        r#"
+#include "blyt.h"
+static int s_frame = 0;
+void blyt_cart_init(void)   { }
+void blyt_cart_update(void) {
+    /* Leave frm=3 (round toward +infinity) dirty at frame boundary. */
+    __asm__ volatile("csrwi frm, 3");
+    if (++s_frame >= 2) blyt_quit_ready();
+}
+void blyt_cart_draw(void)   { }
+"#,
+    );
+    let dirty_cart = build_cart(&dirty_project);
+    assert!(
+        dirty_cart.exists(),
+        "dirty_frm.blyt not built: {}",
+        dirty_cart.display()
+    );
+
     // ── Start QEMU ────────────────────────────────────────────────────
     let ssh_port = free_port();
     println!("Starting QEMU (SSH port {ssh_port})...");
@@ -351,6 +374,16 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
     assert!(
         qemu.scp_to(&hello_cart, "/tmp/blyt_gate/"),
         "scp hello.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&dirty_cart, "/tmp/blyt_gate/"),
+        "scp dirty_frm.blyt failed"
+    );
+
+    // fcsr_frame_test.c — staged for FCSR gates 5 & 6.
+    qemu.scp_to(
+        &repo_root().join("tests/native/fcsr_frame_test.c"),
+        "/tmp/blyt_gate/",
     );
 
     // ── Seccomp test binary (optional) ───────────────────────────────
@@ -458,6 +491,114 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
         println!("  PASS: exit {rc} (SIGSYS)");
     } else {
         println!("Gate 2: SKIP (riscv32-linux-musl-gcc not available in QEMU VM)");
+    }
+
+    // ── Gate 3: FCSR clean — no spurious warning ──────────────────────
+    //
+    // The hello cart does not touch frm; blyt_frame_done() must not emit
+    // a rounding-mode warning when the cart leaves FCSR clean.
+    println!("Gate 3: FCSR clean — no spurious warning...");
+    {
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/hello.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "hello.blyt exited non-zero\noutput: {output}"
+        );
+        assert!(
+            !output.contains("non-default FP rounding mode"),
+            "unexpected FCSR warning from clean cart\noutput: {output}"
+        );
+        println!("  PASS: no FCSR warning in clean-cart output");
+    }
+
+    // ── Gate 4: FCSR dirty frm — debug warning via libblyt32.so ──────
+    //
+    // The dirty-frm cart leaves frm=3 at every frame boundary.  The debug
+    // build of libblyt32.so must emit a warning and still exit cleanly.
+    println!("Gate 4: FCSR dirty frm — debug warning (via libblyt32.so)...");
+    {
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/dirty_frm.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "dirty_frm.blyt exited non-zero in debug mode ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("non-default FP rounding mode"),
+            "expected FCSR warning in debug output\noutput: {output}"
+        );
+        println!("  PASS: warning present, exit 0");
+    }
+
+    // ── Gates 5 & 6: FCSR standalone binary (debug + release) ────────
+    //
+    // fcsr_frame_test.c contains the check logic inlined so -DNDEBUG at
+    // compile time independently selects the debug (warn+continue) or
+    // release (abort) path, regardless of how libblyt32.so was built.
+    let have_gcc = qemu.ssh_ok("command -v riscv32-linux-musl-gcc");
+    if have_gcc {
+        // Gate 5: debug build — warns, exits 0.
+        println!("Gate 5: FCSR standalone — debug warn (no NDEBUG)...");
+        let build5 = qemu.ssh(
+            "riscv32-linux-musl-gcc \
+             -o /tmp/blyt_gate/fcsr_debug_test \
+             /tmp/blyt_gate/fcsr_frame_test.c 2>&1",
+        );
+        assert!(
+            build5.status.success(),
+            "fcsr_debug_test build failed: {}",
+            String::from_utf8_lossy(&build5.stdout)
+        );
+        let out5 = qemu.ssh("/tmp/blyt_gate/fcsr_debug_test 2>&1");
+        let output5 = String::from_utf8_lossy(&out5.stdout);
+        assert!(
+            out5.status.success(),
+            "fcsr_debug_test exited non-zero ({:?})\noutput: {output5}",
+            out5.status.code()
+        );
+        assert!(
+            output5.contains("non-default FP rounding mode"),
+            "expected FCSR warning in debug standalone output\noutput: {output5}"
+        );
+        println!("  PASS: warning present, exit 0");
+
+        // Gate 6: release build — aborts, exits 1.
+        println!("Gate 6: FCSR standalone — release abort (-DNDEBUG)...");
+        let build6 = qemu.ssh(
+            "riscv32-linux-musl-gcc -DNDEBUG \
+             -o /tmp/blyt_gate/fcsr_release_test \
+             /tmp/blyt_gate/fcsr_frame_test.c 2>&1",
+        );
+        assert!(
+            build6.status.success(),
+            "fcsr_release_test build failed: {}",
+            String::from_utf8_lossy(&build6.stdout)
+        );
+        let out6 = qemu.ssh("/tmp/blyt_gate/fcsr_release_test 2>&1");
+        let output6 = String::from_utf8_lossy(&out6.stdout);
+        assert_eq!(
+            out6.status.code().unwrap_or(-1),
+            1,
+            "expected exit 1 from fcsr_release_test, got {:?}\noutput: {output6}",
+            out6.status.code()
+        );
+        assert!(
+            output6.contains("aborting for determinism"),
+            "expected abort message in release standalone output\noutput: {output6}"
+        );
+        println!("  PASS: abort message present, exit 1");
+    } else {
+        println!("Gates 5 & 6: SKIP (riscv32-linux-musl-gcc not available in QEMU VM)");
     }
 
     println!("Gate tests passed.");

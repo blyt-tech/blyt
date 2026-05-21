@@ -182,11 +182,34 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 
-    case BLYT_ECALL_FRAME_DONE:
+    case BLYT_ECALL_FRAME_DONE: {
         rv->PC += 4;
+        /* Enforce FP determinism (ADR-0007): frm must be RNE (0) at every
+         * frame boundary.  A non-zero frm means cart/library code called
+         * fesetround() or modified frm and did not restore it, which would
+         * cause FP results to diverge across emulator runs and native. */
+        uint32_t frm = (rv->csr_fcsr >> 5) & 0x7u;
+        if (frm != 0u) {
+#ifndef NDEBUG
+            fprintf(stderr,
+                    "blyt: WARNING: cart set non-default FP rounding mode "
+                    "(frm=%u); results may be non-deterministic\n",
+                    (unsigned)frm);
+#else
+            fprintf(stderr, "blyt: cart set non-default FP rounding mode; "
+                            "aborting for determinism\n");
+            if (g_run_ctx)
+                g_run_ctx->ecall_aborted = true;
+            rv_halt(rv);
+            return;
+#endif
+        }
+        /* Reset frm to RNE and clear accumulated fflags for the next frame. */
+        rv->csr_fcsr = 0;
         if (g_run_ctx)
             g_run_ctx->frame_done = true;
         return;
+    }
 
     case 93: /* SYS_exit (Linux NR 93) — blyt_exit on emulated path */
     case 94: /* SYS_exit_group (Linux NR 94) — blyt_exit on emulated path */
