@@ -1412,6 +1412,77 @@ pub extern "C" fn blyt_cart_draw() {}
     );
 }
 
+/// Rust game code calls a function from a Rust library in src/lib/.
+///
+/// The lib is compiled as part of the same cargo invocation (via --config
+/// patch injection), so the Rust type system works across the boundary and
+/// there is no fingerprint mismatch.
+///
+/// Skipped when SDK or riscv32imafc Rust target is absent.
+#[test]
+fn rust_cart_calls_rust_lib() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() || !sdk.join("lib/libblyt32.so").exists() {
+        eprintln!("skipping rust_cart_calls_rust_lib: SDK not assembled");
+        return;
+    }
+    if !has_rust_riscv_target() {
+        eprintln!("skipping rust_cart_calls_rust_lib: riscv32imafc-unknown-none-elf not installed");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_lib_test");
+
+    CartProject::new()
+        .rust_lib(
+            "arith",
+            "#![no_std]\npub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+        )
+        .rust(
+            r#"#![no_std]
+
+use arith::add;
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {
+    if add(3, 4) == 7 {
+        blyt::console_debug("rust+rust ok");
+    } else {
+        blyt::console_debug("rust+rust wrong");
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    blyt::quit_ready();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("rust+rust ok"),
+        "expected 'rust+rust ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 // -------------------------------------------------------------------------
 // Rust cart tests
 // -------------------------------------------------------------------------

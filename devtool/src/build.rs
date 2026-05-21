@@ -291,11 +291,13 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
             }
             let rust_build_dir = project_dir.join("build/game/rust");
             fs::create_dir_all(&rust_build_dir)?;
+            let rust_libs = discover_rust_libs(project_dir)?;
             Some(build_rust_archive(
                 &cargo,
                 &rust_manifest,
                 &rust_build_dir,
                 &rust_sdk,
+                &rust_libs,
             )?)
         }
     };
@@ -323,15 +325,13 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
 
 /// Build a single library from `src/lib/<lib_name>/` in isolation.
 ///
-/// Compiles all `.c` files under the library directory and produces
-/// `build/lib/<lib_name>/lib.a`.  Useful for inspecting a library build or
-/// forcing a specific build order without building the full cart.
+/// For Rust libs (Cargo.toml present): runs `cargo build --release` and
+/// returns the cargo target directory.  For C/C++ libs: compiles source files
+/// and produces `build/lib/<lib_name>/lib.a`.
+///
+/// Useful for checking a library compiles or forcing a specific build order
+/// without building the full cart.
 pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, BuildError> {
-    let clang = find_clang();
-    let clangpp = find_clangpp();
-    let ar = find_ar();
-    let sdk_include = find_sdk_include()?;
-
     let src_dir = project_dir.join("src/lib").join(lib_name);
     if !src_dir.exists() {
         return Err(err(format!(
@@ -340,6 +340,35 @@ pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, B
         )));
     }
 
+    // Rust lib: Cargo.toml present → let cargo handle it.
+    let cargo_toml = src_dir.join("Cargo.toml");
+    if cargo_toml.exists() {
+        let cargo = find_cargo();
+        let build_dir = project_dir.join("build/lib").join(lib_name);
+        fs::create_dir_all(&build_dir)?;
+        let status = Command::new(&cargo)
+            .args(["build", "--release"])
+            .arg("--target")
+            .arg(RUST_TARGET)
+            .arg("--manifest-path")
+            .arg(&cargo_toml)
+            .arg("--target-dir")
+            .arg(&build_dir)
+            .env("RUSTFLAGS", "-C relocation-model=pic -C panic=abort")
+            .status()
+            .map_err(|e| err(format!("failed to run {cargo}: {e}")))?;
+        if !status.success() {
+            return Err(err(format!("cargo build failed for lib {lib_name}")));
+        }
+        println!("built: {}", build_dir.display());
+        return Ok(build_dir);
+    }
+
+    // C/C++ lib.
+    let clang = find_clang();
+    let clangpp = find_clangpp();
+    let ar = find_ar();
+    let sdk_include = find_sdk_include()?;
     let built = build_library(&clang, &clangpp, &ar, project_dir, lib_name, &sdk_include)?;
     println!("built: {}", built.archive.display());
     Ok(built.archive)
@@ -597,17 +626,14 @@ fn build_rust_archive(
     rust_manifest: &Path,
     build_dir: &Path,
     rust_sdk_path: &Path,
+    rust_lib_patches: &[(String, PathBuf)],
 ) -> Result<PathBuf, BuildError> {
-    // Inject SDK crate path via --config so the game's Cargo.toml needs only
-    // `blyt = "0.1"` — the version is overridden by the patch at build time.
-    // TOML dotted-key form: patch."crates-io".blyt.path = "<abs-path>"
-    let patch_config = format!(
-        r#"patch."crates-io".blyt.path = "{}""#,
-        rust_sdk_path.display()
-    );
-
-    let status = Command::new(cargo)
-        .args(["build", "--release"])
+    // Inject the SDK crate and any src/lib/ Rust crates via --config patches so
+    // the game's Cargo.toml needs only version constraints and cargo resolves to
+    // the local source at build time.  TOML dotted-key form:
+    //   patch."crates-io".<name>.path = "<abs-path>"
+    let mut cmd = Command::new(cargo);
+    cmd.args(["build", "--release"])
         .arg("--target")
         .arg(RUST_TARGET)
         .arg("--manifest-path")
@@ -615,9 +641,21 @@ fn build_rust_archive(
         .arg("--target-dir")
         .arg(build_dir)
         .arg("--config")
-        .arg(&patch_config)
-        // relocation-model=pic: cart ELF is ET_DYN (PIE); Rust objects must be PIC.
-        // panic=abort: no unwinding runtime; matches profile setting in the SDK crate.
+        .arg(format!(
+            r#"patch."crates-io".blyt.path = "{}""#,
+            rust_sdk_path.display()
+        ));
+
+    for (name, path) in rust_lib_patches {
+        cmd.arg("--config").arg(format!(
+            r#"patch."crates-io".{name}.path = "{}""#,
+            path.display()
+        ));
+    }
+
+    // relocation-model=pic: cart ELF is ET_DYN (PIE); Rust objects must be PIC.
+    // panic=abort: no unwinding runtime; matches profile setting in the SDK crate.
+    let status = cmd
         .env("RUSTFLAGS", "-C relocation-model=pic -C panic=abort")
         .status()
         .map_err(|e| err(format!("failed to run {cargo}: {e}")))?;
@@ -671,18 +709,42 @@ fn discover_libraries(project_dir: &Path) -> Result<Vec<String>, BuildError> {
     for entry in fs::read_dir(&lib_root)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            let has_sources =
-                !collect_c_files(&path)?.is_empty() || !collect_cpp_files(&path)?.is_empty();
-            if has_sources {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    names.push(name.to_string());
-                }
+        // Directories with Cargo.toml are Rust libs; handled by discover_rust_libs.
+        if !path.is_dir() || path.join("Cargo.toml").exists() {
+            continue;
+        }
+        let has_sources =
+            !collect_c_files(&path)?.is_empty() || !collect_cpp_files(&path)?.is_empty();
+        if has_sources {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                names.push(name.to_string());
             }
         }
     }
     names.sort();
     Ok(names)
+}
+
+/// Discover Rust libraries in `src/lib/`: any subdirectory with a `Cargo.toml`
+/// is treated as a Rust crate.  The directory name is used as the crate name
+/// for `--config` patch injection; the `Cargo.toml` [package] name must match.
+fn discover_rust_libs(project_dir: &Path) -> Result<Vec<(String, PathBuf)>, BuildError> {
+    let lib_root = project_dir.join("src/lib");
+    if !lib_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut libs = Vec::new();
+    for entry in fs::read_dir(&lib_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && path.join("Cargo.toml").exists() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                libs.push((name.to_string(), fs::canonicalize(&path)?));
+            }
+        }
+    }
+    libs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(libs)
 }
 
 fn build_library(

@@ -38,7 +38,10 @@ pub fn blytrun() -> PathBuf {
 // Cart project fixture builder
 // -------------------------------------------------------------------------
 
-const RUST_CARGO_TOML: &str = "\
+/// Generate the game crate's Cargo.toml, including any Rust lib dependencies.
+/// `blyt build` injects the actual source paths via --config at build time.
+fn rust_game_cargo_toml(rust_lib_names: &[String]) -> String {
+    let mut s = "\
 [package]\n\
 name = \"cart\"\n\
 version = \"0.1.0\"\n\
@@ -49,7 +52,20 @@ publish = false\n\
 crate-type = [\"staticlib\"]\n\
 \n\
 [dependencies]\n\
-blyt = \"0.1\"\n";
+blyt = \"0.1\"\n"
+        .to_string();
+    for name in rust_lib_names {
+        s.push_str(&format!("{name} = \"0.1\"\n"));
+    }
+    s
+}
+
+/// Generate a minimal Cargo.toml for a Rust library under src/lib/<name>/.
+fn rust_lib_cargo_toml(name: &str) -> String {
+    format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\n"
+    )
+}
 
 /// Builder for an on-disk cart project used in integration tests.
 ///
@@ -71,6 +87,8 @@ pub struct CartProject {
     rust_lib_rs: Option<String>,
     /// (lib_name, relative_path_within_lib, content) — files for src/lib/<name>/
     lib_files: Vec<(String, String, String)>,
+    /// Names of Rust libs declared via rust_lib(); used to generate the game Cargo.toml.
+    rust_lib_names: Vec<String>,
 }
 
 impl CartProject {
@@ -80,6 +98,7 @@ impl CartProject {
             cpp_files: Vec::new(),
             rust_lib_rs: None,
             lib_files: Vec::new(),
+            rust_lib_names: Vec::new(),
         }
     }
 
@@ -110,6 +129,21 @@ impl CartProject {
     /// the `blyt = "0.1"` dependency resolves without a published crate.
     pub fn rust(mut self, lib_rs: &str) -> Self {
         self.rust_lib_rs = Some(lib_rs.into());
+        self
+    }
+
+    /// Add a Rust library crate at `src/lib/<name>/`.
+    ///
+    /// Creates `src/lib/<name>/Cargo.toml` (package name = `<name>`) and
+    /// `src/lib/<name>/src/lib.rs` from `lib_rs`.  The game's Cargo.toml is
+    /// generated to include `<name> = "0.1"` as a dependency; `blyt build`
+    /// injects the source path via `--config` at build time.
+    pub fn rust_lib(mut self, name: &str, lib_rs: &str) -> Self {
+        self.lib_files
+            .push((name.into(), "Cargo.toml".into(), rust_lib_cargo_toml(name)));
+        self.lib_files
+            .push((name.into(), "src/lib.rs".into(), lib_rs.into()));
+        self.rust_lib_names.push(name.into());
         self
     }
 
@@ -166,7 +200,11 @@ impl CartProject {
             let rust_src = dir.join("src/game/rust/src");
             fs::create_dir_all(&rust_src).unwrap();
             fs::write(rust_src.join("lib.rs"), lib_rs).unwrap();
-            fs::write(dir.join("src/game/rust/Cargo.toml"), RUST_CARGO_TOML).unwrap();
+            fs::write(
+                dir.join("src/game/rust/Cargo.toml"),
+                rust_game_cargo_toml(&self.rust_lib_names),
+            )
+            .unwrap();
         }
 
         for (lib_name, rel_path, content) in &self.lib_files {
