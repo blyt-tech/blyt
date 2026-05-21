@@ -127,6 +127,7 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
 
 pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildError> {
     let clang = find_clang();
+    let clangpp = find_clangpp();
     let objcopy = find_objcopy();
     let ar = find_ar();
 
@@ -139,7 +140,14 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
     let lib_names = discover_libraries(project_dir)?;
     let mut built_libs: Vec<BuiltLib> = Vec::new();
     for name in &lib_names {
-        built_libs.push(build_library(&clang, &ar, project_dir, name, &sdk_include)?);
+        built_libs.push(build_library(
+            &clang,
+            &clangpp,
+            &ar,
+            project_dir,
+            name,
+            &sdk_include,
+        )?);
     }
     let lib_include_paths: Vec<PathBuf> =
         built_libs.iter().map(|l| l.include_path.clone()).collect();
@@ -228,7 +236,6 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
             None
         }
         CartLanguage::Cpp => {
-            let clangpp = find_clangpp();
             let cpp_src_dir = project_dir.join("src/game/c++");
             let cpp_files = collect_cpp_files(&cpp_src_dir)?;
             if cpp_files.is_empty() {
@@ -321,6 +328,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
 /// forcing a specific build order without building the full cart.
 pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, BuildError> {
     let clang = find_clang();
+    let clangpp = find_clangpp();
     let ar = find_ar();
     let sdk_include = find_sdk_include()?;
 
@@ -332,7 +340,7 @@ pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, B
         )));
     }
 
-    let built = build_library(&clang, &ar, project_dir, lib_name, &sdk_include)?;
+    let built = build_library(&clang, &clangpp, &ar, project_dir, lib_name, &sdk_include)?;
     println!("built: {}", built.archive.display());
     Ok(built.archive)
 }
@@ -643,10 +651,10 @@ fn find_rust_staticlib(dir: &Path) -> Result<PathBuf, BuildError> {
  * Library support (src/lib/<name>/)
  *
  * Libraries are auto-discovered: every direct subdirectory of src/lib/ that
- * contains at least one .c file is treated as a library.  Each is compiled to
- * build/lib/<name>/lib.a before any game code is compiled.  Game C code
- * receives -I src/lib/<name>/include/ (or src/lib/<name>/ as a fallback) for
- * each discovered library.
+ * contains at least one .c, .cpp, .cxx, or .cc file is treated as a library.
+ * Each is compiled to build/lib/<name>/lib.a before any game code is compiled.
+ * C++ library files are compiled with -fno-exceptions -fno-rtti and expose
+ * their API via extern "C" (ADR-0121: no C++ types at language boundaries).
  * ------------------------------------------------------------------------- */
 
 struct BuiltLib {
@@ -663,9 +671,13 @@ fn discover_libraries(project_dir: &Path) -> Result<Vec<String>, BuildError> {
     for entry in fs::read_dir(&lib_root)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() && !collect_c_files(&path)?.is_empty() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                names.push(name.to_string());
+        if path.is_dir() {
+            let has_sources =
+                !collect_c_files(&path)?.is_empty() || !collect_cpp_files(&path)?.is_empty();
+            if has_sources {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    names.push(name.to_string());
+                }
             }
         }
     }
@@ -675,6 +687,7 @@ fn discover_libraries(project_dir: &Path) -> Result<Vec<String>, BuildError> {
 
 fn build_library(
     clang: &str,
+    clangpp: &str,
     ar: &str,
     project_dir: &Path,
     lib_name: &str,
@@ -694,10 +707,17 @@ fn build_library(
     };
 
     let c_files = collect_c_files(&src_dir)?;
+    let cpp_files = collect_cpp_files(&src_dir)?;
+
+    if c_files.is_empty() && cpp_files.is_empty() {
+        return Err(err(format!(
+            "library {lib_name}: no source files found under {}",
+            src_dir.display()
+        )));
+    }
 
     let mut obj_files = Vec::new();
     for src in &c_files {
-        // Compile with the lib's own include path so its internal headers resolve.
         obj_files.push(compile_c(
             clang,
             src,
@@ -705,6 +725,22 @@ fn build_library(
             sdk_include,
             &[include_path.as_path()],
         )?);
+    }
+
+    if !cpp_files.is_empty() {
+        // libc++ headers are used as -isystem when available; the library may
+        // or may not use them depending on whether it includes standard headers.
+        let libcxx_include = sdk_include.join("c++/v1");
+        for src in &cpp_files {
+            obj_files.push(compile_cpp(
+                clangpp,
+                src,
+                &build_dir,
+                sdk_include,
+                &libcxx_include,
+                &[include_path.as_path()],
+            )?);
+        }
     }
 
     let archive = build_dir.join("lib.a");
