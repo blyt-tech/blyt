@@ -67,6 +67,8 @@ pub struct CartProject {
     c_files: Vec<(String, String)>,
     /// Contents of src/game/rust/src/lib.rs
     rust_lib_rs: Option<String>,
+    /// (lib_name, relative_path_within_lib, content) — files for src/lib/<name>/
+    lib_files: Vec<(String, String, String)>,
 }
 
 impl CartProject {
@@ -74,6 +76,7 @@ impl CartProject {
         CartProject {
             c_files: Vec::new(),
             rust_lib_rs: None,
+            lib_files: Vec::new(),
         }
     }
 
@@ -93,6 +96,17 @@ impl CartProject {
     /// the `blyt = "0.1"` dependency resolves without a published crate.
     pub fn rust(mut self, lib_rs: &str) -> Self {
         self.rust_lib_rs = Some(lib_rs.into());
+        self
+    }
+
+    /// Add a file to a library at `src/lib/<name>/<rel_path>`.
+    ///
+    /// Use `include/<filename>.h` as `rel_path` for public headers; the build
+    /// tool exposes `src/lib/<name>/include/` as the include root when it exists.
+    /// Use a bare filename for source files and headers in flat layouts.
+    pub fn lib_file(mut self, name: &str, rel_path: &str, content: &str) -> Self {
+        self.lib_files
+            .push((name.into(), rel_path.into(), content.into()));
         self
     }
 
@@ -124,6 +138,12 @@ impl CartProject {
             fs::create_dir_all(&rust_src).unwrap();
             fs::write(rust_src.join("lib.rs"), lib_rs).unwrap();
             fs::write(dir.join("src/game/rust/Cargo.toml"), RUST_CARGO_TOML).unwrap();
+        }
+
+        for (lib_name, rel_path, content) in &self.lib_files {
+            let dest = dir.join("src/lib").join(lib_name).join(rel_path);
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(dest, content).unwrap();
         }
     }
 }

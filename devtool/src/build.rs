@@ -120,11 +120,23 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
 pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildError> {
     let clang = find_clang();
     let objcopy = find_objcopy();
+    let ar = find_ar();
 
     let sdk_include = find_sdk_include()?;
     let lib_dir = find_lib_dir(&sdk_include)?;
 
     let language = read_cart_language(project_dir)?;
+
+    // Build all libraries before game code.
+    let lib_names = discover_libraries(project_dir)?;
+    let mut built_libs: Vec<BuiltLib> = Vec::new();
+    for name in &lib_names {
+        built_libs.push(build_library(&clang, &ar, project_dir, name, &sdk_include)?);
+    }
+    let lib_include_paths: Vec<PathBuf> =
+        built_libs.iter().map(|l| l.include_path.clone()).collect();
+    let lib_archives: Vec<PathBuf> = built_libs.into_iter().map(|l| l.archive).collect();
+    let lib_include_refs: Vec<&Path> = lib_include_paths.iter().map(PathBuf::as_path).collect();
 
     let build_dir = project_dir.join("build/game/c");
     fs::create_dir_all(&build_dir)?;
@@ -168,17 +180,24 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
          static const char blyt_interp[] = \"/lib/ld-blyt.so.1\";\n",
     )?;
 
-    // Generated stubs are always compiled regardless of language.
+    // Generated stubs need no lib includes — they only call blyt_main/blyt_exit.
     let mut obj_files = Vec::new();
     obj_files.push(compile_c(
         &clang,
         &entry_stub_src,
         &build_dir,
         &sdk_include,
+        &[],
     )?);
-    obj_files.push(compile_c(&clang, &interp_src, &build_dir, &sdk_include)?);
+    obj_files.push(compile_c(
+        &clang,
+        &interp_src,
+        &build_dir,
+        &sdk_include,
+        &[],
+    )?);
 
-    // Language-specific compilation.
+    // Language-specific compilation.  C game files receive lib include paths.
     let rust_archive = match language {
         CartLanguage::C => {
             let c_src_dir = project_dir.join("src/game/c");
@@ -190,7 +209,13 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                 )));
             }
             for src in &c_files {
-                obj_files.push(compile_c(&clang, src, &build_dir, &sdk_include)?);
+                obj_files.push(compile_c(
+                    &clang,
+                    src,
+                    &build_dir,
+                    &sdk_include,
+                    &lib_include_refs,
+                )?);
             }
             None
         }
@@ -220,6 +245,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
         &clang,
         &obj_files,
         rust_archive.as_deref(),
+        &lib_archives,
         &ld_script,
         &lib_dir,
         &raw_elf,
@@ -233,6 +259,29 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
 
     println!("built: {}", output_path.display());
     Ok(output_path)
+}
+
+/// Build a single library from `src/lib/<lib_name>/` in isolation.
+///
+/// Compiles all `.c` files under the library directory and produces
+/// `build/lib/<lib_name>/lib.a`.  Useful for inspecting a library build or
+/// forcing a specific build order without building the full cart.
+pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, BuildError> {
+    let clang = find_clang();
+    let ar = find_ar();
+    let sdk_include = find_sdk_include()?;
+
+    let src_dir = project_dir.join("src/lib").join(lib_name);
+    if !src_dir.exists() {
+        return Err(err(format!(
+            "library {lib_name}: src/lib/{lib_name}/ not found under {}",
+            project_dir.display()
+        )));
+    }
+
+    let built = build_library(&clang, &ar, project_dir, lib_name, &sdk_include)?;
+    println!("built: {}", built.archive.display());
+    Ok(built.archive)
 }
 
 fn default_output(project_dir: &Path) -> PathBuf {
@@ -285,6 +334,19 @@ fn find_objcopy() -> String {
         }
     }
     "llvm-objcopy".to_string()
+}
+
+fn find_ar() -> String {
+    if let Ok(a) = std::env::var("BLYT_AR") {
+        return a;
+    }
+    if let Some(sdk) = sdk_root_from_exe() {
+        let p = sdk.join("bin/blyt-llvm-ar");
+        if p.exists() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    "llvm-ar".to_string()
 }
 
 /* -------------------------------------------------------------------------
@@ -512,6 +574,97 @@ fn find_rust_staticlib(dir: &Path) -> Result<PathBuf, BuildError> {
 }
 
 /* -------------------------------------------------------------------------
+ * Library support (src/lib/<name>/)
+ *
+ * Libraries are auto-discovered: every direct subdirectory of src/lib/ that
+ * contains at least one .c file is treated as a library.  Each is compiled to
+ * build/lib/<name>/lib.a before any game code is compiled.  Game C code
+ * receives -I src/lib/<name>/include/ (or src/lib/<name>/ as a fallback) for
+ * each discovered library.
+ * ------------------------------------------------------------------------- */
+
+struct BuiltLib {
+    archive: PathBuf,
+    include_path: PathBuf,
+}
+
+fn discover_libraries(project_dir: &Path) -> Result<Vec<String>, BuildError> {
+    let lib_root = project_dir.join("src/lib");
+    if !lib_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&lib_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && !collect_c_files(&path)?.is_empty() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn build_library(
+    clang: &str,
+    ar: &str,
+    project_dir: &Path,
+    lib_name: &str,
+    sdk_include: &Path,
+) -> Result<BuiltLib, BuildError> {
+    let src_dir = project_dir.join("src/lib").join(lib_name);
+    let build_dir = project_dir.join("build/lib").join(lib_name);
+    fs::create_dir_all(&build_dir)?;
+
+    let include_path = {
+        let with_include = src_dir.join("include");
+        if with_include.is_dir() {
+            with_include
+        } else {
+            src_dir.clone()
+        }
+    };
+
+    let c_files = collect_c_files(&src_dir)?;
+
+    let mut obj_files = Vec::new();
+    for src in &c_files {
+        // Compile with the lib's own include path so its internal headers resolve.
+        obj_files.push(compile_c(
+            clang,
+            src,
+            &build_dir,
+            sdk_include,
+            &[include_path.as_path()],
+        )?);
+    }
+
+    let archive = build_dir.join("lib.a");
+    run_archive(ar, &obj_files, &archive)?;
+
+    Ok(BuiltLib {
+        archive,
+        include_path,
+    })
+}
+
+fn run_archive(ar: &str, objs: &[PathBuf], output: &Path) -> Result<(), BuildError> {
+    let status = Command::new(ar)
+        .arg("crs")
+        .arg(output)
+        .args(objs)
+        .status()
+        .map_err(|e| err(format!("failed to run {ar}: {e}")))?;
+
+    if !status.success() {
+        return Err(err(format!("archive failed: {}", output.display())));
+    }
+    Ok(())
+}
+
+/* -------------------------------------------------------------------------
  * Source file discovery — all .c files under dir, recursively
  * ------------------------------------------------------------------------- */
 
@@ -547,33 +700,40 @@ fn compile_c(
     src: &Path,
     build_dir: &Path,
     sdk_include: &Path,
+    extra_includes: &[&Path],
 ) -> Result<PathBuf, BuildError> {
     let stem = src.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
     let obj = build_dir.join(format!("{stem}.o"));
 
-    let status = Command::new(clang)
-        .args([
-            "--target=riscv32",
-            "-march=rv32imafc",
-            "-mabi=ilp32f",
-            "-nostdlib",
-            "-fno-exceptions",
-            "-fpie",
-            // Determinism flags (ADR-0007): IEEE 754 strict mode.
-            // -ffp-contract=off  — no implicit FMA fusion (changes rounding)
-            // -fno-fast-math     — no IEEE-breaking optimisations
-            // -fwrapv            — signed integer overflow wraps (no UB)
-            // -frounding-math    — compiler must not assume RNE is fixed
-            // -fsignaling-nans   — NaN operations may signal; no elision
-            "-ffp-contract=off",
-            "-fno-fast-math",
-            "-fwrapv",
-            "-frounding-math",
-            "-fsignaling-nans",
-            "-c",
-        ])
-        .arg("-I")
-        .arg(sdk_include)
+    let mut cmd = Command::new(clang);
+    cmd.args([
+        "--target=riscv32",
+        "-march=rv32imafc",
+        "-mabi=ilp32f",
+        "-nostdlib",
+        "-fno-exceptions",
+        "-fpie",
+        // Determinism flags (ADR-0007): IEEE 754 strict mode.
+        // -ffp-contract=off  — no implicit FMA fusion (changes rounding)
+        // -fno-fast-math     — no IEEE-breaking optimisations
+        // -fwrapv            — signed integer overflow wraps (no UB)
+        // -frounding-math    — compiler must not assume RNE is fixed
+        // -fsignaling-nans   — NaN operations may signal; no elision
+        "-ffp-contract=off",
+        "-fno-fast-math",
+        "-fwrapv",
+        "-frounding-math",
+        "-fsignaling-nans",
+        "-c",
+    ])
+    .arg("-I")
+    .arg(sdk_include);
+
+    for inc in extra_includes {
+        cmd.arg("-I").arg(inc);
+    }
+
+    let status = cmd
         .arg("-o")
         .arg(&obj)
         .arg(src)
@@ -605,6 +765,7 @@ fn link_cart(
     clang: &str,
     objs: &[PathBuf],
     rust_archive: Option<&Path>,
+    lib_archives: &[PathBuf],
     ld_script: &Path,
     lib_dir: &Path,
     output: &Path,
@@ -660,6 +821,13 @@ fn link_cart(
             .arg("-Wl,-u,blyt_cart_update")
             .arg("-Wl,-u,blyt_cart_draw")
             .arg(archive);
+    }
+
+    // Library archives (src/lib/*/lib.a): linked before -lblyt32 so game code
+    // symbols resolve against them first.  No --whole-archive: game code calls
+    // library functions explicitly, so the linker pulls in only used members.
+    for archive in lib_archives {
+        cmd.arg(archive);
     }
 
     // Link against libblyt32.so only; the cart's DT_NEEDED is {libblyt32.so}.

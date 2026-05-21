@@ -60,6 +60,15 @@ enum BuildSubcommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Build a single library from src/lib/<name>/ in isolation
+    Lib {
+        /// Library name (subdirectory under src/lib/)
+        name: String,
+
+        /// Path to the cart project directory (default: current directory)
+        project_dir: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -92,6 +101,16 @@ fn main() {
         }) => {
             let dir = project_dir.as_deref().unwrap_or(Path::new("."));
             build::run(dir, output.as_deref())
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+
+        Commands::Build(BuildArgs {
+            sub: Some(BuildSubcommand::Lib { name, project_dir }),
+            ..
+        }) => {
+            let dir = project_dir.as_deref().unwrap_or(Path::new("."));
+            build::build_single_lib(dir, &name)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }

@@ -982,6 +982,197 @@ void blyt_cart_draw(void)   { }
 }
 
 // -------------------------------------------------------------------------
+// Library (src/lib/) tests
+// -------------------------------------------------------------------------
+
+/// A C cart calls a function defined in a src/lib/ library.
+///
+/// Validates: library is discovered, compiled to lib.a, and its symbols are
+/// available to game C code via the -I include path and archive link.
+#[test]
+fn c_cart_calls_lib_function() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lib_test");
+
+    CartProject::new()
+        .lib_file("mathlib", "include/mathlib.h", "int add(int a, int b);")
+        .lib_file(
+            "mathlib",
+            "mathlib.c",
+            "#include \"mathlib.h\"\nint add(int a, int b) { return a + b; }\n",
+        )
+        .c(r#"
+#include "blyt.h"
+#include "mathlib.h"
+
+void blyt_cart_init(void) {
+    int result = add(3, 4);
+    if (result == 7)
+        blyt_console_debug("lib ok");
+    else
+        blyt_console_debug("lib wrong");
+}
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lib ok"),
+        "expected 'lib ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// A library with headers at the root (no include/ subdirectory) still compiles.
+#[test]
+fn lib_flat_layout_no_include_subdir() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("flat_lib");
+
+    CartProject::new()
+        .lib_file("flat", "flat.h", "int flat_double(int x);")
+        .lib_file(
+            "flat",
+            "flat.c",
+            "#include \"flat.h\"\nint flat_double(int x) { return x * 2; }\n",
+        )
+        .c(r#"
+#include "blyt.h"
+#include "flat.h"
+
+void blyt_cart_init(void) { blyt_console_debug(flat_double(5) == 10 ? "flat ok" : "flat wrong"); }
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("flat ok"),
+        "expected 'flat ok', got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// A cart with two libraries can call functions from both.
+#[test]
+fn c_cart_calls_multiple_libs() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("multi_lib");
+
+    CartProject::new()
+        .lib_file("alib", "include/alib.h", "int a_fn(void);")
+        .lib_file(
+            "alib",
+            "alib.c",
+            "#include \"alib.h\"\nint a_fn(void) { return 1; }\n",
+        )
+        .lib_file("blib", "include/blib.h", "int b_fn(void);")
+        .lib_file(
+            "blib",
+            "blib.c",
+            "#include \"blib.h\"\nint b_fn(void) { return 2; }\n",
+        )
+        .c(r#"
+#include "blyt.h"
+#include "alib.h"
+#include "blib.h"
+
+void blyt_cart_init(void) { blyt_console_debug(a_fn() + b_fn() == 3 ? "multi ok" : "multi wrong"); }
+void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_draw(void)   {}
+"#)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("multi ok"),
+        "expected 'multi ok', got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// `blyt build lib <name>` builds a library in isolation without building the cart.
+#[test]
+fn build_lib_subcommand_produces_archive() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lib_subcmd");
+
+    // Write a project with a library but no game code.
+    CartProject::new()
+        .lib_file("mylib", "include/mylib.h", "int mylib_fn(void);")
+        .lib_file("mylib", "mylib.c", "int mylib_fn(void) { return 42; }\n")
+        // A minimal cart.build.yaml is still required for SDK discovery,
+        // even when only building a library.
+        .c("#include \"blyt.h\"\nvoid blyt_cart_init(void){} void blyt_cart_update(void){blyt_quit_ready();} void blyt_cart_draw(void){}")
+        .write(&project);
+
+    Command::cargo_bin("blyt")
+        .unwrap()
+        .args(["build", "lib", "mylib", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", sdk_dir())
+        .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
+        .env("BLYT_RUST_SDK", repo_root().join("sdk/rust/blyt"))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("built:"));
+
+    let archive = project.join("build/lib/mylib/lib.a");
+    assert!(archive.exists(), "lib.a not found at {}", archive.display());
+}
+
+// -------------------------------------------------------------------------
 // Rust cart tests
 // -------------------------------------------------------------------------
 
