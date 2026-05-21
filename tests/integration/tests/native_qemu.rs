@@ -9,32 +9,15 @@
 /// Run with:
 ///   BLYT_QEMU_KERNEL=... BLYT_QEMU_ROOTFS=... cargo test \
 ///       -- native_riscv_qemu_gate --nocapture
-use std::fs;
+mod common;
+
+use common::{build_dir, repo_root, sdk_dir, write_c_cart_project};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 // ── Helpers ───────────────────────────────────────────────────────────────
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-fn build_dir() -> PathBuf {
-    std::env::var("BLYT_BUILD_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root().join("build"))
-}
-
-fn sdk_dir() -> PathBuf {
-    build_dir().join("sdk")
-}
 
 /// Bind to port 0, record the assigned port, then drop the listener so QEMU
 /// can use it.  There is a small TOCTOU window but it is acceptable for tests.
@@ -178,13 +161,7 @@ impl Drop for Qemu {
     }
 }
 
-// ── Cart builder (mirrors e2e.rs) ─────────────────────────────────────────
-
-fn write_cart_project(dir: &Path, source: &str) {
-    let c_dir = dir.join("src/game/c");
-    fs::create_dir_all(&c_dir).unwrap();
-    fs::write(c_dir.join("main.c"), source).unwrap();
-}
+// ── Cart builder ─────────────────────────────────────────────────────────
 
 fn build_cart(project_dir: &Path) -> PathBuf {
     let sdk = sdk_dir();
@@ -282,7 +259,7 @@ fn native_riscv_qemu_gate() {
     // ── Build the hello cart ───────────────────────────────────────────
     let tmp = tempfile::TempDir::new().unwrap();
     let project = tmp.path().join("hello");
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -304,7 +281,7 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
 
     // ── Build the dirty-frm cart (FCSR gate 4) ────────────────────────
     let dirty_project = tmp.path().join("dirty_frm");
-    write_cart_project(
+    write_c_cart_project(
         &dirty_project,
         r#"
 #include "blyt.h"

@@ -1,0 +1,17 @@
+[package]
+name = "blyt"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+# abort on panic in all profiles — there is no unwinding runtime in a cart,
+# and catching panics is not part of the cart API contract.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

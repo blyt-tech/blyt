@@ -1,36 +1,11 @@
+mod common;
+
 use assert_cmd::Command;
+use common::{blytrun, build_dir, has_rust_riscv_target, repo_root, sdk_dir, write_c_cart_project};
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
-
-/// Returns the repository root (two levels above this crate's manifest dir).
-fn repo_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR = <repo>/devtool/integration
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent() // devtool/
-        .unwrap()
-        .parent() // repo root
-        .unwrap()
-        .to_path_buf()
-}
-
-/// Path to the CMake build directory (contains blytrun and the runtime libraries).
-fn build_dir() -> PathBuf {
-    repo_root().join("build")
-}
-
-/// Path to the blytrun binary produced by the CMake build.
-fn blytrun() -> PathBuf {
-    build_dir().join("blytrun")
-}
-
-/// Create a minimal cart project in `dir` with a single C source file.
-fn write_cart_project(dir: &std::path::Path, source: &str) {
-    let c_dir = dir.join("src/game/c");
-    fs::create_dir_all(&c_dir).unwrap();
-    fs::write(c_dir.join("main.c"), source).unwrap();
-}
 
 /// Run `blyt build <project_dir>` and return the expected cart output path.
 fn build_cart(project_dir: &std::path::Path) -> PathBuf {
@@ -52,11 +27,6 @@ fn build_cart(project_dir: &std::path::Path) -> PathBuf {
         "{}.blyt",
         project_dir.file_name().unwrap().to_str().unwrap()
     ))
-}
-
-/// Path to the assembled SDK directory (build/sdk/).
-fn sdk_dir() -> PathBuf {
-    build_dir().join("sdk")
 }
 
 // -------------------------------------------------------------------------
@@ -85,7 +55,7 @@ fn sdk_e2e_build_and_run() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hello");
 
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -146,7 +116,7 @@ fn hello_cart_lifecycle_output() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hello");
 
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -186,12 +156,13 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
     assert!(init_pos < update_pos, "init must precede first update");
 }
 
-/// blyt build with no source files produces a clear error and non-zero exit.
+/// blyt build with a C manifest but no source files produces a clear error.
 #[test]
-fn build_empty_project_fails_with_error() {
+fn build_empty_c_project_fails_with_error() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("empty");
     fs::create_dir_all(project.join("src/game/c")).unwrap();
+    fs::write(project.join("cart.build.yaml"), "language: c\n").unwrap();
 
     Command::cargo_bin("blyt")
         .unwrap()
@@ -215,7 +186,7 @@ fn cart_abort_surfaces_as_error() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("abort_cart");
 
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -273,7 +244,7 @@ fn hello_cart_malloc_debug() {
     // to double, which requires compiler-rt soft-double builtins not yet
     // bundled in the SDK.  The integer approach exercises malloc, snprintf,
     // and free without triggering those dependencies.
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -342,7 +313,7 @@ fn arena_boundary_tests() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("arena_boundary");
 
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -474,7 +445,7 @@ fn libblytc_symbol_probe() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("symbol_probe");
 
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 /* Symbol-presence probe for libblytc.so (ADR-0120).
@@ -569,7 +540,7 @@ fn session_api_run_frame() {
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("session_cart");
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -622,7 +593,7 @@ fn registry_replaces_blyt_lib_dir() {
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("registry_cart");
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -675,7 +646,7 @@ fn testcard_frame0_matches_golden() {
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("testcard");
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -741,7 +712,7 @@ fn wasm_testcard_frame0_matches_golden() {
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("wasm_testcard");
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -803,7 +774,7 @@ fn build_wasm_produces_html() {
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("wasm_export");
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -876,7 +847,7 @@ fn build_all_produces_cart_and_html() {
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("all_cart");
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -957,7 +928,7 @@ fn emulator_fcsr_dirty_frm_detected() {
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("dirty_frm");
-    write_cart_project(
+    write_c_cart_project(
         &project,
         r#"
 #include "blyt.h"
@@ -1003,4 +974,84 @@ void blyt_cart_draw(void)   { }
         }
         _ => panic!("unexpected exit code {rc} from test_session_api\nstderr: {stderr}"),
     }
+}
+
+// -------------------------------------------------------------------------
+// Rust cart tests
+// -------------------------------------------------------------------------
+
+/// Build and run the hello_rust test game.  Verifies that a pure Rust cart
+/// compiled with `language: rust` produces the expected debug output.
+///
+/// Skipped when:
+/// - The SDK is not assembled (no blyt-clang or libblyt32.so)
+/// - The riscv32imafc-unknown-none-elf Rust target is not installed
+///   (`rustup target add riscv32imafc-unknown-none-elf` to enable)
+#[test]
+fn rust_cart_debug_output() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() || !sdk.join("lib/libblyt32.so").exists() {
+        eprintln!("skipping rust_cart_debug_output: SDK not assembled");
+        return;
+    }
+    if !has_rust_riscv_target() {
+        eprintln!("skipping rust_cart_debug_output: riscv32imafc-unknown-none-elf not installed");
+        return;
+    }
+
+    let project = repo_root().join("tests/game/hello_rust");
+    assert!(
+        project.join("cart.build.yaml").exists(),
+        "hello_rust/cart.build.yaml missing"
+    );
+
+    // Build the Rust cart via `blyt build`.  BLYT_RUST_SDK points to the SDK
+    // crate in the repo; at Phase 10 it will live inside the assembled SDK.
+    let rust_sdk = repo_root().join("sdk/rust/blyt");
+    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    cmd.args(["build", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_CLANG", sdk.join("bin/blyt-clang"))
+        .env("BLYT_RUST_SDK", &rust_sdk);
+    cmd.assert().success();
+
+    let cart = project.parent().unwrap().join("hello_rust.blyt");
+    assert!(
+        cart.exists(),
+        "hello_rust.blyt not found at {}",
+        cart.display()
+    );
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("hello from rust"),
+        "expected 'hello from rust' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// `blyt build` with no cart.build.yaml produces a clear error.
+#[test]
+fn build_missing_manifest_fails_with_error() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path().join("no_manifest");
+    fs::create_dir_all(project.join("src/game/c")).unwrap();
+
+    Command::cargo_bin("blyt")
+        .unwrap()
+        .args(["build", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", sdk_dir())
+        .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cart.build.yaml"));
 }

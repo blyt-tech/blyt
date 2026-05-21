@@ -69,6 +69,51 @@ fn err(msg: impl Into<String>) -> BuildError {
 }
 
 /* -------------------------------------------------------------------------
+ * Build manifest (cart.build.yaml)
+ *
+ * ADR-0073: Lua is the default cart language and does not need to be declared.
+ * Native languages (C, Rust) require explicit declaration via `language: <lang>`
+ * in cart.build.yaml.  Future: `languages: [c, rust]` for hybrid carts.
+ * ------------------------------------------------------------------------- */
+
+#[derive(Debug, PartialEq)]
+enum CartLanguage {
+    C,
+    Rust,
+}
+
+fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
+    let manifest_path = project_dir.join("cart.build.yaml");
+    if !manifest_path.exists() {
+        return Err(err(format!(
+            "{} not found — Lua is the default; add `language: c` or \
+             `language: rust` to cart.build.yaml for a native cart",
+            manifest_path.display()
+        )));
+    }
+    let text = fs::read_to_string(&manifest_path)?;
+    // Minimal parse: find first non-comment `language: <value>` line.
+    // TODO(phase-9): replace with serde_yaml once cart.build.yaml grows more fields.
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("language:") {
+            return match rest.trim() {
+                "c" => Ok(CartLanguage::C),
+                "rust" => Ok(CartLanguage::Rust),
+                other => Err(err(format!(
+                    "cart.build.yaml: unknown language {other:?} — expected `c` or `rust`"
+                ))),
+            };
+        }
+    }
+    Err(err("cart.build.yaml has no `language:` field — \
+         add e.g. `language: c` or `language: rust`"))
+}
+
+/* -------------------------------------------------------------------------
  * Public entry point
  * ------------------------------------------------------------------------- */
 
@@ -79,14 +124,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
     let sdk_include = find_sdk_include()?;
     let lib_dir = find_lib_dir(&sdk_include)?;
 
-    let c_src_dir = project_dir.join("src/game/c");
-    let c_files = collect_c_files(&c_src_dir)?;
-    if c_files.is_empty() {
-        return Err(err(format!(
-            "no .c files found under {}",
-            c_src_dir.display()
-        )));
-    }
+    let language = read_cart_language(project_dir)?;
 
     let build_dir = project_dir.join("build/game/c");
     fs::create_dir_all(&build_dir)?;
@@ -130,6 +168,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
          static const char blyt_interp[] = \"/lib/ld-blyt.so.1\";\n",
     )?;
 
+    // Generated stubs are always compiled regardless of language.
     let mut obj_files = Vec::new();
     obj_files.push(compile_c(
         &clang,
@@ -138,13 +177,53 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
         &sdk_include,
     )?);
     obj_files.push(compile_c(&clang, &interp_src, &build_dir, &sdk_include)?);
-    for src in &c_files {
-        let obj = compile_c(&clang, src, &build_dir, &sdk_include)?;
-        obj_files.push(obj);
-    }
+
+    // Language-specific compilation.
+    let rust_archive = match language {
+        CartLanguage::C => {
+            let c_src_dir = project_dir.join("src/game/c");
+            let c_files = collect_c_files(&c_src_dir)?;
+            if c_files.is_empty() {
+                return Err(err(format!(
+                    "no .c files found under {}",
+                    c_src_dir.display()
+                )));
+            }
+            for src in &c_files {
+                obj_files.push(compile_c(&clang, src, &build_dir, &sdk_include)?);
+            }
+            None
+        }
+        CartLanguage::Rust => {
+            let cargo = find_cargo();
+            let rust_sdk = find_rust_sdk(&sdk_include)?;
+            let rust_manifest = project_dir.join("src/game/rust/Cargo.toml");
+            if !rust_manifest.exists() {
+                return Err(err(format!(
+                    "language: rust but no Cargo.toml found at {}",
+                    rust_manifest.display()
+                )));
+            }
+            let rust_build_dir = project_dir.join("build/game/rust");
+            fs::create_dir_all(&rust_build_dir)?;
+            Some(build_rust_archive(
+                &cargo,
+                &rust_manifest,
+                &rust_build_dir,
+                &rust_sdk,
+            )?)
+        }
+    };
 
     let raw_elf = build_dir.join("cart.elf");
-    link_cart(&clang, &obj_files, &ld_script, &lib_dir, &raw_elf)?;
+    link_cart(
+        &clang,
+        &obj_files,
+        rust_archive.as_deref(),
+        &ld_script,
+        &lib_dir,
+        &raw_elf,
+    )?;
 
     let output_path = output
         .map(PathBuf::from)
@@ -309,6 +388,130 @@ fn find_lib_dir(sdk_include: &Path) -> Result<PathBuf, BuildError> {
 }
 
 /* -------------------------------------------------------------------------
+ * Rust toolchain discovery
+ * ------------------------------------------------------------------------- */
+
+fn find_cargo() -> String {
+    if let Ok(c) = std::env::var("BLYT_CARGO") {
+        return c;
+    }
+    "cargo".to_string()
+}
+
+/* -------------------------------------------------------------------------
+ * Rust SDK crate discovery
+ *
+ * Finds the `blyt` SDK crate (sdk/rust/blyt/) that game Rust code depends on.
+ * Resolution order:
+ *   1. $BLYT_RUST_SDK — explicit override
+ *   2. <sdk>/rust/blyt/ — SDK install layout (build/sdk/rust/blyt/)
+ *   3. Walk up from sdk_include looking for sdk/rust/blyt/ in the repo tree
+ * ------------------------------------------------------------------------- */
+
+fn find_rust_sdk(sdk_include: &Path) -> Result<PathBuf, BuildError> {
+    if let Ok(p) = std::env::var("BLYT_RUST_SDK") {
+        let p = PathBuf::from(p);
+        if p.join("Cargo.toml").exists() {
+            return Ok(p);
+        }
+        return Err(err(format!(
+            "BLYT_RUST_SDK={} does not contain Cargo.toml",
+            p.display()
+        )));
+    }
+
+    // SDK install layout: <sdk>/rust/blyt/
+    if let Some(sdk) = sdk_root_from_exe() {
+        let p = sdk.join("rust/blyt");
+        if p.join("Cargo.toml").exists() {
+            return Ok(p);
+        }
+    }
+
+    // Repo layout: walk up from sdk_include looking for sdk/rust/blyt/
+    let mut dir = sdk_include.to_path_buf();
+    while let Some(parent) = dir.parent() {
+        dir = parent.to_path_buf();
+        let candidate = dir.join("sdk/rust/blyt");
+        if candidate.join("Cargo.toml").exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(err("cannot find Rust SDK crate (sdk/rust/blyt/) — \
+         set BLYT_RUST_SDK to its path, or run \
+         `cmake --build build --target sdk` to assemble the SDK"))
+}
+
+/* -------------------------------------------------------------------------
+ * Rust staticlib build
+ *
+ * Invokes `cargo build --release` targeting riscv32imafc-unknown-none-elf
+ * (ADR-0108, spike-o-results: corrected target string).  The SDK crate is
+ * injected via --config so game code declares `blyt = "0.1"` and cargo
+ * resolves to the SDK path at build time without hard-coding it.
+ *
+ * Returns the path to the produced .a file.
+ * ------------------------------------------------------------------------- */
+
+const RUST_TARGET: &str = "riscv32imafc-unknown-none-elf";
+
+fn build_rust_archive(
+    cargo: &str,
+    rust_manifest: &Path,
+    build_dir: &Path,
+    rust_sdk_path: &Path,
+) -> Result<PathBuf, BuildError> {
+    // Inject SDK crate path via --config so the game's Cargo.toml needs only
+    // `blyt = "0.1"` — the version is overridden by the patch at build time.
+    // TOML dotted-key form: patch."crates-io".blyt.path = "<abs-path>"
+    let patch_config = format!(
+        r#"patch."crates-io".blyt.path = "{}""#,
+        rust_sdk_path.display()
+    );
+
+    let status = Command::new(cargo)
+        .args(["build", "--release"])
+        .arg("--target")
+        .arg(RUST_TARGET)
+        .arg("--manifest-path")
+        .arg(rust_manifest)
+        .arg("--target-dir")
+        .arg(build_dir)
+        .arg("--config")
+        .arg(&patch_config)
+        // relocation-model=pic: cart ELF is ET_DYN (PIE); Rust objects must be PIC.
+        // panic=abort: no unwinding runtime; matches profile setting in the SDK crate.
+        .env("RUSTFLAGS", "-C relocation-model=pic -C panic=abort")
+        .status()
+        .map_err(|e| err(format!("failed to run {cargo}: {e}")))?;
+
+    if !status.success() {
+        return Err(err("cargo build failed"));
+    }
+
+    // Locate the produced .a in <build_dir>/<target>/release/
+    let out_dir = build_dir.join(RUST_TARGET).join("release");
+    find_rust_staticlib(&out_dir)
+}
+
+fn find_rust_staticlib(dir: &Path) -> Result<PathBuf, BuildError> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| err(format!("cannot read {}: {e}", dir.display())))?;
+    for entry in entries {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("lib") && name.ends_with(".a") {
+            return Ok(path);
+        }
+    }
+    Err(err(format!(
+        "cargo build did not produce a .a file in {}",
+        dir.display()
+    )))
+}
+
+/* -------------------------------------------------------------------------
  * Source file discovery — all .c files under dir, recursively
  * ------------------------------------------------------------------------- */
 
@@ -401,6 +604,7 @@ fn compile_c(
 fn link_cart(
     clang: &str,
     objs: &[PathBuf],
+    rust_archive: Option<&Path>,
     ld_script: &Path,
     lib_dir: &Path,
     output: &Path,
@@ -445,6 +649,17 @@ fn link_cart(
 
     for obj in objs {
         cmd.arg(obj);
+    }
+
+    // Rust staticlib: force-include the cart lifecycle symbols that libblytcommon.so
+    // calls at runtime via PLT (not visible to the static linker as dependencies).
+    // -u <sym> marks each symbol as "needed" so lld retains the archive member
+    // that defines it (ADR-0073 / spike-o-results: -Wl,-u,<cart_sym>).
+    if let Some(archive) = rust_archive {
+        cmd.arg("-Wl,-u,blyt_cart_init")
+            .arg("-Wl,-u,blyt_cart_update")
+            .arg("-Wl,-u,blyt_cart_draw")
+            .arg(archive);
     }
 
     // Link against libblyt32.so only; the cart's DT_NEEDED is {libblyt32.so}.
