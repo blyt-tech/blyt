@@ -973,11 +973,14 @@ fn compile_cpp(
         "-fsignaling-nans",
         "-c",
     ])
-    .arg("-I")
-    .arg(sdk_include)
-    // libc++ headers as -isystem to suppress warnings from standard library internals
+    // Both paths must be -isystem so they are in the same search group; within
+    // that group, command-line order applies.  Mixing -I (user) and -isystem
+    // (system) puts all -I paths first regardless of position, so libcxx headers
+    // would always lose to the musl headers if the musl path uses -I.
     .arg("-isystem")
-    .arg(libcxx_include);
+    .arg(libcxx_include)
+    .arg("-isystem")
+    .arg(sdk_include);
 
     for inc in extra_includes {
         cmd.arg("-I").arg(inc);
