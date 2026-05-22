@@ -23,10 +23,15 @@ set(DOWNLOADS "${BLYT_BINARY_DIR}/downloads")
 
 # Check known locations for an existing riscv32-capable clang + lld pair.
 set(CANDIDATE_PAIRS
+    # macOS: Homebrew llvm + Homebrew lld (separate formulae on macOS)
+    "/opt/homebrew/opt/llvm/bin/clang"
+    "/opt/homebrew/opt/lld/bin/ld.lld"
     "/opt/homebrew/opt/llvm/bin/clang"
     "/opt/homebrew/opt/llvm/bin/ld.lld"
     "/opt/homebrew/opt/llvm/bin/clang"
     "/opt/homebrew/opt/llvm/bin/lld"
+    "/usr/bin/clang-22"
+    "/usr/bin/ld.lld-22"
     "/usr/bin/clang"
     "/usr/bin/ld.lld"
     "/usr/local/bin/clang"
@@ -60,13 +65,23 @@ foreach(IDX RANGE ${PAIR_LAST})
     set(FOUND_CLANG "${CAND_CLANG}")
     set(FOUND_LLD "${CAND_LLD}")
     get_filename_component(TOOL_DIR "${CAND_CLANG}" DIRECTORY)
-    if(EXISTS "${TOOL_DIR}/clang++")
+    get_filename_component(_CLANG_NAME "${CAND_CLANG}" NAME)
+    # Prefer the versioned companion tools (e.g. clang++-22 for clang-22) so
+    # we don't accidentally pick up a different version via the generic symlink.
+    string(REGEX MATCH "-[0-9]+$" _VER_SUFFIX "${_CLANG_NAME}")
+    if(_VER_SUFFIX AND EXISTS "${TOOL_DIR}/clang++${_VER_SUFFIX}")
+      set(FOUND_CLANGPP "${TOOL_DIR}/clang++${_VER_SUFFIX}")
+    elseif(EXISTS "${TOOL_DIR}/clang++")
       set(FOUND_CLANGPP "${TOOL_DIR}/clang++")
     endif()
-    if(EXISTS "${TOOL_DIR}/llvm-objcopy")
+    if(_VER_SUFFIX AND EXISTS "${TOOL_DIR}/llvm-objcopy${_VER_SUFFIX}")
+      set(FOUND_OBJCOPY "${TOOL_DIR}/llvm-objcopy${_VER_SUFFIX}")
+    elseif(EXISTS "${TOOL_DIR}/llvm-objcopy")
       set(FOUND_OBJCOPY "${TOOL_DIR}/llvm-objcopy")
     endif()
-    if(EXISTS "${TOOL_DIR}/llvm-ar")
+    if(_VER_SUFFIX AND EXISTS "${TOOL_DIR}/llvm-ar${_VER_SUFFIX}")
+      set(FOUND_AR "${TOOL_DIR}/llvm-ar${_VER_SUFFIX}")
+    elseif(EXISTS "${TOOL_DIR}/llvm-ar")
       set(FOUND_AR "${TOOL_DIR}/llvm-ar")
     endif()
     break()
@@ -75,7 +90,7 @@ endforeach()
 
 if(NOT FOUND_CLANG)
   # Download a pre-built LLVM release.
-  set(LLVM_VER "18.1.8")
+  set(LLVM_VER "22.1.5")
   if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
     if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
       set(LLVM_TRIPLE "arm64-apple-macos11")
@@ -86,7 +101,7 @@ if(NOT FOUND_CLANG)
     if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
       set(LLVM_TRIPLE "aarch64-linux-gnu")
     else()
-      set(LLVM_TRIPLE "x86_64-linux-gnu-ubuntu-22.04")
+      set(LLVM_TRIPLE "x86_64-linux-gnu-ubuntu-24.04")
     endif()
   else()
     message(
@@ -407,6 +422,7 @@ else()
       -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF
       -DLIBCXXABI_ENABLE_THREADS=OFF
       -DLIBCXXABI_USE_COMPILER_RT=ON
+      -DLIBCXXABI_USE_LLVM_UNWINDER=OFF
     RESULT_VARIABLE _LXX_CFG_R
     OUTPUT_QUIET)
 

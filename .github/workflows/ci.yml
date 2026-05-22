@@ -16,10 +16,22 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # Add LLVM 22 apt repo (ubuntu-24.04 ships clang-18 by default)
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/apt.llvm.org.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] \
+            https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libsdl2-dev lld llvm \
+          sudo apt-get install -y cmake ninja-build libsdl2-dev \
+            clang-22 lld-22 llvm-22 \
             qemu-system-misc gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
             libc6-dev-riscv64-cross libgcc-s1-riscv64-cross
+          sudo update-alternatives --install /usr/bin/clang        clang        /usr/bin/clang-22        100
+          sudo update-alternatives --install /usr/bin/clang++       clang++       /usr/bin/clang++-22       100
+          sudo update-alternatives --install /usr/bin/ld.lld        ld.lld        /usr/bin/ld.lld-22        100
+          sudo update-alternatives --install /usr/bin/llvm-objcopy  llvm-objcopy  /usr/bin/llvm-objcopy-22  100
+          sudo update-alternatives --install /usr/bin/llvm-ar       llvm-ar       /usr/bin/llvm-ar-22       100
           pip3 install clang-format==22.1.5 cmakelang yamllint
 
       - name: Check formatting
