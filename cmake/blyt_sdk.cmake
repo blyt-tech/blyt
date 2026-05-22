@@ -164,14 +164,15 @@ message(STATUS "blyt SDK: toolchain clang = ${FOUND_CLANG}")
 file(MAKE_DIRECTORY "${SDK_LIB}")
 
 set(RV32_BASE
-    --target=riscv32
+    # riscv32-linux-gnu (not bare-metal riscv32): lld injects -static for
+    # bare-metal targets which rejects .so inputs; using a Linux triple keeps
+    # shared-library semantics.  -nostdlib suppresses the sysroot linkage.
+    --target=riscv32-linux-gnu
     -march=rv32imafc
     -mabi=ilp32f
     -shared
     -fPIC
     -nostdlib
-    # -Wl,--shared explicitly tells lld to produce ET_DYN; clang may inject
-    # -Bstatic for bare-metal riscv targets which overrides -shared otherwise.
     -Wl,--shared
     -I
     "${BLYT_SOURCE_DIR}/runtime/guest/include")
@@ -321,8 +322,8 @@ message(STATUS "Building libblyt32.so…")
 execute_process(
   COMMAND
     "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-    -Wl,-soname,libblyt32.so -L "${SDK_LIB}" -Wl,--no-as-needed -lblytc
-    -Wl,--as-needed -Wl,-rpath-link,"${SDK_LIB}" -o "${SDK_LIB}/libblyt32.so"
+    -Wl,-soname,libblyt32.so -Wl,--no-as-needed "${SDK_LIB}/libblytc.so"
+    -Wl,--as-needed -o "${SDK_LIB}/libblyt32.so"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     ${LIBBLYTC_SRCS}
@@ -344,8 +345,8 @@ execute_process(
   COMMAND
     "${FOUND_CLANG}" ${RV32_BASE} -I
     "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32" -Wl,-soname,libblyt32.so
-    -L "${SDK_LIB}" -Wl,--no-as-needed -lblytcommon -Wl,--as-needed
-    -Wl,-rpath-link,"${SDK_LIB}" -o "${SDK_LIB_NATIVE}/libblyt32.so"
+    -Wl,--no-as-needed "${SDK_LIB}/libblytcommon.so" -Wl,--as-needed
+    -o "${SDK_LIB_NATIVE}/libblyt32.so"
     "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c"
   RESULT_VARIABLE R)
 # Note: libblytc.so is intentionally NOT linked here.  On native execution the
@@ -389,9 +390,18 @@ elseif(EXISTS "${SDK_LIB}/libc++.a" AND EXISTS "${SDK_INC_LIBCXX}/__config_site"
 else()
   message(STATUS "Building libc++ for RV32IMAFC…")
 
-  set(_LXX_C_FLAGS "--target=riscv32 -march=rv32imafc -mabi=ilp32f -nostdlib")
+  # Musl include paths: libcxxabi sources include <stdlib.h> via libcxx's
+  # wrapper, which does #include_next <stdlib.h>.  Without these paths the
+  # cross build can't find ldiv_t, lldiv_t, FP_NAN, etc.
+  set(_LXX_MUSL_FLAGS
+      "-isystem ${MUSL_DIR}/include -isystem ${MUSL_DIR}/arch/riscv32 -isystem ${MUSL_DIR}/arch/generic -isystem ${MUSL_DIR}/src/internal -isystem ${LIBBLYTC_BITS_DIR}/.."
+  )
+
+  set(_LXX_C_FLAGS
+      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib ${_LXX_MUSL_FLAGS}")
   set(_LXX_CXX_FLAGS
-      "--target=riscv32 -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti")
+      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti ${_LXX_MUSL_FLAGS}"
+  )
 
   if(FOUND_LLD)
     string(APPEND _LXX_C_FLAGS " -fuse-ld=${FOUND_LLD}")
@@ -423,6 +433,14 @@ else()
       -DLIBCXXABI_ENABLE_THREADS=OFF
       -DLIBCXXABI_USE_COMPILER_RT=ON
       -DLIBCXXABI_USE_LLVM_UNWINDER=OFF
+      -DLIBCXX_INCLUDE_TESTS=OFF
+      -DLIBCXXABI_INCLUDE_TESTS=OFF
+      # On macOS, cmake injects -arch arm64 / -isysroot into every build even
+      # when cross-compiling.  Setting CMAKE_SYSTEM_NAME=Linux tells cmake this
+      # is a Linux cross-compile so it suppresses all Apple toolchain defaults.
+      # No-op on Linux (CMAKE_SYSTEM_NAME is already Linux).
+      -DCMAKE_SYSTEM_NAME=Linux
+      -DCMAKE_SYSTEM_PROCESSOR=riscv32
     RESULT_VARIABLE _LXX_CFG_R
     OUTPUT_QUIET)
 
@@ -449,15 +467,16 @@ else()
   endforeach()
 
   # Copy libc++ headers to SDK include/c++/v1/.
-  # The source headers come from the libcxx include/ tree; the cmake-generated
-  # __config_site (which records which features are enabled) comes from the
-  # build tree.  Both must be present for cart C++ compilation to succeed.
+  # Source headers come from the libcxx include/ tree; cmake-generated files
+  # (__config_site, __assertion_handler, etc.) come from the build tree.
+  # Copy the build tree's generated include dir on top so all generated files
+  # are captured, not just __config_site.
   file(MAKE_DIRECTORY "${SDK_INC_LIBCXX}")
   file(COPY "${LIBCXX_SOURCE_DIR}/libcxx/include/"
        DESTINATION "${SDK_INC_LIBCXX}"
        PATTERN "*.in" EXCLUDE)  # exclude cmake template files
-  if(EXISTS "${LIBCXX_BUILD_DIR}/include/c++/v1/__config_site")
-    file(COPY "${LIBCXX_BUILD_DIR}/include/c++/v1/__config_site"
+  if(EXISTS "${LIBCXX_BUILD_DIR}/include/c++/v1")
+    file(COPY "${LIBCXX_BUILD_DIR}/include/c++/v1/"
          DESTINATION "${SDK_INC_LIBCXX}")
   endif()
 
