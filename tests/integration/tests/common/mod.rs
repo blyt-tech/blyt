@@ -168,6 +168,9 @@ impl CartProject {
             "CartProject::write: no game language declared"
         );
 
+        // Ensure the project root exists before writing any files into it.
+        fs::create_dir_all(dir).unwrap();
+
         // cart.build.yaml — language declaration (ADR-0073).
         // Mixed-language game code is not yet supported in blyt build; for now
         // each project has exactly one game language.
