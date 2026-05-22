@@ -538,8 +538,26 @@ endforeach()
 # subdirectory headers needed by the above
 file(COPY "${MUSL_DIR}/include/sys/types.h" DESTINATION "${SDK_INC}/sys")
 
-# bits/ (generated): alltypes.h, syscall.h, and arch-specific headers
+# bits/ (generated): alltypes.h, syscall.h, and arch-specific headers.
+# Also copy arch/generic/bits/ which has stdint.h (fast integer types)
+# included unconditionally by musl's <stdint.h>.
+file(COPY "${MUSL_DIR}/arch/generic/bits/" DESTINATION "${SDK_INC}/bits")
 file(COPY "${LIBBLYTC_BITS_DIR}/" DESTINATION "${SDK_INC}/bits")
+
+# Restore libc++ headers after the REMOVE_RECURSE above wiped SDK_INC.
+# Step 2b installs them into SDK_INC/c++/v1/ but Step 3 cleans the whole
+# directory; re-copy them here so cart C++ builds find their headers.
+if(EXISTS "${SDK_LIB}/libc++.a")
+  set(SDK_INC_LIBCXX "${SDK_INC}/c++/v1")
+  file(MAKE_DIRECTORY "${SDK_INC_LIBCXX}")
+  file(COPY "${LIBCXX_SOURCE_DIR}/libcxx/include/"
+       DESTINATION "${SDK_INC_LIBCXX}"
+       PATTERN "*.in" EXCLUDE)
+  if(EXISTS "${LIBCXX_BUILD_DIR}/include/c++/v1")
+    file(COPY "${LIBCXX_BUILD_DIR}/include/c++/v1/"
+         DESTINATION "${SDK_INC_LIBCXX}")
+  endif()
+endif()
 
 # -------------------------------------------------------------------------
 # Step 4: blyt devtool
