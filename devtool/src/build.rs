@@ -196,6 +196,35 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
     let mut lib_archives: Vec<PathBuf> = built_libs.into_iter().map(|l| l.archive).collect();
     let lib_include_refs: Vec<&Path> = lib_include_paths.iter().map(PathBuf::as_path).collect();
 
+    // Lua carts may have standalone Rust libs in src/lib/ (Cargo.toml present).
+    // Build each independently; the resulting archives are appended to lib_archives
+    // and linked before -lblyt32lua so cart_lua_modules overrides the weak symbol.
+    if language == CartLanguage::Lua {
+        let cargo = find_cargo();
+        for (lib_name, lib_path) in discover_rust_libs(project_dir)? {
+            let lib_build_dir = project_dir.join("build/lib").join(&lib_name);
+            fs::create_dir_all(&lib_build_dir)?;
+            let status = Command::new(&cargo)
+                .args(["build", "--release"])
+                .arg("--target")
+                .arg(RUST_TARGET)
+                .arg("--manifest-path")
+                .arg(lib_path.join("Cargo.toml"))
+                .arg("--target-dir")
+                .arg(&lib_build_dir)
+                .env("RUSTFLAGS", "-C relocation-model=pic -C panic=abort")
+                .status()
+                .map_err(|e| err(format!("failed to run cargo for Rust lib {lib_name}: {e}")))?;
+            if !status.success() {
+                return Err(err(format!("cargo build failed for Rust lib {lib_name}")));
+            }
+            let archive_dir = lib_build_dir.join(RUST_TARGET).join("release");
+            let archive = find_rust_staticlib(&archive_dir)?;
+            strip_compiler_builtins(&ar, &archive)?;
+            lib_archives.push(archive);
+        }
+    }
+
     let build_dir = match language {
         CartLanguage::Lua => project_dir.join("build/game/lua"),
         _ => project_dir.join("build/game/c"),
@@ -799,7 +828,56 @@ fn build_rust_archive(
 
     // Locate the produced .a in <build_dir>/<target>/release/
     let out_dir = build_dir.join(RUST_TARGET).join("release");
-    find_rust_staticlib(&out_dir)
+    let archive = find_rust_staticlib(&out_dir)?;
+
+    // Strip compiler_builtins CGU objects from the archive.  These objects are
+    // compiled without -C relocation-model=pic (from the prebuilt rust-std
+    // component) and contain non-PIC relocations in libm math implementations.
+    // The runtime already provides memcpy/memset via libblyt32.so, and the
+    // RISC-V imafc hardware handles 32-bit integer and float operations natively.
+    let ar = find_ar();
+    strip_compiler_builtins(&ar, &archive)?;
+
+    Ok(archive)
+}
+
+/// Remove `compiler_builtins` codegen-unit objects from a Rust staticlib archive.
+///
+/// The prebuilt `rust-std` component compiles `compiler_builtins` without
+/// `-C relocation-model=pic`.  Its libm math implementations use absolute
+/// addressing for constant pools and jump tables (R_RISCV_HI20, R_RISCV_32),
+/// which lld rejects when linking a PIC cart ELF.
+///
+/// All functions those objects provide are either:
+///   - supplied by `libblyt32.so` at runtime (memcpy, memset, memmove), or
+///   - handled by RISC-V imafc hardware (32-bit int/float), or
+///   - not used by blyt Rust carts (double-precision libm math).
+fn strip_compiler_builtins(ar: &str, archive: &Path) -> Result<(), BuildError> {
+    let list_out = Command::new(ar)
+        .arg("t")
+        .arg(archive)
+        .output()
+        .map_err(|e| err(format!("failed to run {ar} t: {e}")))?;
+    let members_to_remove: Vec<String> = String::from_utf8_lossy(&list_out.stdout)
+        .lines()
+        .filter(|name| name.starts_with("compiler_builtins-"))
+        .map(String::from)
+        .collect();
+    if members_to_remove.is_empty() {
+        return Ok(());
+    }
+    let mut del_cmd = Command::new(ar);
+    del_cmd.arg("d").arg(archive);
+    for member in &members_to_remove {
+        del_cmd.arg(member);
+    }
+    let status = del_cmd
+        .status()
+        .map_err(|e| err(format!("failed to run {ar} d: {e}")))?;
+    if !status.success() {
+        return Err(err("failed to remove compiler_builtins objects from Rust archive"));
+    }
+    Ok(())
 }
 
 fn find_rust_staticlib(dir: &Path) -> Result<PathBuf, BuildError> {

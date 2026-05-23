@@ -1598,10 +1598,14 @@ fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
         .env("BLYT_SDK_DIR", &sdk)
         .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
 
-    // Use SDK's riscv32-capable clang if available.
+    // Use SDK's riscv32-capable clang/clang++ if available.
     let sdk_clang = sdk.join("bin/blyt-clang");
     if sdk_clang.exists() {
         cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    let sdk_clangpp = sdk.join("bin/blyt-clang++");
+    if sdk_clangpp.exists() {
+        cmd.env("BLYT_CLANGPP", &sdk_clangpp);
     }
     // Use SDK's llvm-ar if available (needed for src/lib/ C libraries).
     let sdk_ar = sdk.join("bin/blyt-llvm-ar");
@@ -1782,6 +1786,370 @@ function draw() end
     assert!(
         String::from_utf8_lossy(&output).contains("lua+c ok"),
         "expected 'lua+c ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// A Lua cart calls a Rust library function via the cart_lua_modules mechanism.
+///
+/// The Rust library defines `cart_lua_modules` using raw Lua C FFI, registering
+/// a "rustlib" module.  The Lua cart requires("rustlib") and calls
+/// rustlib.multiply().
+///
+/// Skipped when SDK, libblyt32lua.so, luac, or the riscv32 Rust target are
+/// unavailable.
+#[test]
+fn lua_cart_calls_rust_lib() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() {
+        eprintln!("skipping lua_cart_calls_rust_lib: SDK not assembled");
+        return;
+    }
+    if !sdk.join("lib/libblyt32lua.so").exists() {
+        eprintln!("skipping lua_cart_calls_rust_lib: libblyt32lua.so not in SDK");
+        return;
+    }
+    if !has_luac() {
+        eprintln!("skipping lua_cart_calls_rust_lib: luac not available");
+        return;
+    }
+    if !has_rust_riscv_target() {
+        eprintln!(
+            "skipping lua_cart_calls_rust_lib: riscv32imafc-unknown-none-elf not installed"
+        );
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_rust_lib");
+
+    // The Rust lib defines cart_lua_modules using raw Lua C FFI.  It registers
+    // a "rustlib" Lua module with a single multiply() function implemented in Rust.
+    // No blyt SDK dependency: the lib only calls lua_* symbols exported by
+    // libblyt32lua.so and resolved by the cart dynlinker at runtime.
+    let rust_lib_src = r#"#![no_std]
+
+// staticlib requires a panic handler even with panic=abort (the symbol must
+// exist; it is never called because -C panic=abort generates abort instead).
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use core::ffi::{c_int, c_void};
+
+type LuaState = c_void;
+
+extern "C" {
+    fn lua_createtable(L: *mut LuaState, narr: c_int, nrec: c_int);
+    fn lua_pushcclosure(
+        L: *mut LuaState,
+        f: unsafe extern "C" fn(*mut LuaState) -> c_int,
+        n: c_int,
+    );
+    fn lua_setfield(L: *mut LuaState, idx: c_int, k: *const u8);
+    fn lua_pushinteger(L: *mut LuaState, n: c_int);
+    fn luaL_checkinteger(L: *mut LuaState, arg: c_int) -> c_int;
+    fn luaL_requiref(
+        L: *mut LuaState,
+        modname: *const u8,
+        openf: unsafe extern "C" fn(*mut LuaState) -> c_int,
+        glb: c_int,
+    );
+    fn lua_settop(L: *mut LuaState, idx: c_int);
+}
+
+unsafe extern "C" fn l_multiply(L: *mut LuaState) -> c_int {
+    let a = luaL_checkinteger(L, 1);
+    let b = luaL_checkinteger(L, 2);
+    lua_pushinteger(L, a * b);
+    1
+}
+
+unsafe extern "C" fn luaopen_rustlib(L: *mut LuaState) -> c_int {
+    lua_createtable(L, 0, 1);
+    lua_pushcclosure(L, l_multiply, 0);
+    lua_setfield(L, -2, b"multiply\0".as_ptr());
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
+    luaL_requiref(L, b"rustlib\0".as_ptr(), luaopen_rustlib, 1);
+    lua_settop(L, -2); // lua_pop(L, 1)
+}
+"#;
+
+    // Use lib_file to write the Cargo.toml with crate-type = ["staticlib"] so
+    // blyt build can compile the Rust lib to a .a and link it into the cart.
+    // (rust_lib() generates crate-type-less Cargo.toml suitable only for
+    // --config injection into a parent Rust game crate.)
+    CartProject::new()
+        .lib_file(
+            "rustlib",
+            "Cargo.toml",
+            "[package]\nname = \"rustlib\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\ncrate-type = [\"staticlib\"]\n",
+        )
+        .lib_file("rustlib", "src/lib.rs", rust_lib_src)
+        .lua(
+            r#"
+function init()
+    local m = require("rustlib")
+    local result = m.multiply(6, 7)
+    if result == 42 then
+        blyt32.debug.print("lua+rust ok")
+    else
+        blyt32.debug.print("lua+rust wrong")
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lua+rust ok"),
+        "expected 'lua+rust ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// A Lua cart calls a C++ library function via the cart_lua_modules mechanism.
+///
+/// The C++ library defines `extern "C" void cart_lua_modules(lua_State *L)`
+/// which registers a "cpplib" Lua module backed by a C++ function.  The Lua
+/// cart requires("cpplib") and calls cpplib.square().
+///
+/// Skipped when SDK, blyt-clang++, libblyt32lua.so, or luac are unavailable.
+#[test]
+fn lua_cart_calls_cpp_lib() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() {
+        eprintln!("skipping lua_cart_calls_cpp_lib: SDK not assembled");
+        return;
+    }
+    if !sdk.join("bin/blyt-clang++").exists() {
+        eprintln!("skipping lua_cart_calls_cpp_lib: blyt-clang++ not in SDK");
+        return;
+    }
+    if !sdk.join("lib/libblyt32lua.so").exists() {
+        eprintln!("skipping lua_cart_calls_cpp_lib: libblyt32lua.so not in SDK");
+        return;
+    }
+    if !has_luac() {
+        eprintln!("skipping lua_cart_calls_cpp_lib: luac not available");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_cpp_lib");
+
+    CartProject::new()
+        // C++ library: defines cart_lua_modules with extern "C" so the cart
+        // dynlinker finds it as a plain C symbol; uses a C++ function internally.
+        .lib_file(
+            "cpplib",
+            "cpplib.cpp",
+            // Lua headers have no extern "C" guards, so wrap them explicitly to
+            // prevent C++ name mangling of lua_* / luaL_* symbols.
+            r#"
+extern "C" {
+#include "lua.h"
+#include "lauxlib.h"
+}
+
+// C++ implementation (unguarded — purely internal, no Lua API exposure).
+static int cpp_square(int x) { return x * x; }
+
+extern "C" {
+
+static int l_square(lua_State *L) {
+    int x = (int)luaL_checkinteger(L, 1);
+    lua_pushinteger(L, cpp_square(x));
+    return 1;
+}
+
+static const luaL_Reg cpplib_funcs[] = {
+    {"square", l_square},
+    {NULL, NULL}
+};
+
+int luaopen_cpplib(lua_State *L) {
+    luaL_newlib(L, cpplib_funcs);
+    return 1;
+}
+
+void cart_lua_modules(lua_State *L) {
+    luaL_requiref(L, "cpplib", luaopen_cpplib, 1);
+    lua_pop(L, 1);
+}
+
+} // extern "C"
+"#,
+        )
+        .lua(
+            r#"
+function init()
+    local m = require("cpplib")
+    local result = m.square(9)
+    if result == 81 then
+        blyt32.debug.print("lua+cpp ok")
+    else
+        blyt32.debug.print("lua+cpp wrong")
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lua+cpp ok"),
+        "expected 'lua+cpp ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// Cart C library code drives the Lua VM: calls back into Lua from within a
+/// C function registered as a Lua module entry point.
+///
+/// This distinguishes cart-native code using the Lua API from the runtime
+/// (libblyt32lua.so) doing so.  The C lib registers a Lua module; that module's
+/// function retrieves a Lua global (set by the Lua cart) and returns it
+/// incremented, exercising lua_getglobal / lua_tointegerx / lua_pushinteger
+/// from within cart C code.
+///
+/// Skipped when SDK, libblyt32lua.so, or luac are unavailable.
+#[test]
+fn c_lib_drives_lua_vm() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() {
+        eprintln!("skipping c_lib_drives_lua_vm: SDK not assembled");
+        return;
+    }
+    if !sdk.join("lib/libblyt32lua.so").exists() {
+        eprintln!("skipping c_lib_drives_lua_vm: libblyt32lua.so not in SDK");
+        return;
+    }
+    if !has_luac() {
+        eprintln!("skipping c_lib_drives_lua_vm: luac not available");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("c_drives_lua");
+
+    CartProject::new()
+        .lib_file(
+            "cdrivelib",
+            "cdrivelib.c",
+            r#"
+#include "lua.h"
+#include "lauxlib.h"
+
+/* l_get_base: reads the Lua global "base_value" set by the cart and returns
+ * it incremented by 1.  Exercises lua_getglobal and lua_tointegerx from
+ * cart C code rather than from the runtime. */
+static int l_get_base(lua_State *L) {
+    lua_getglobal(L, "base_value");
+    int ok = 0;
+    int val = (int)lua_tointegerx(L, -1, &ok);
+    lua_pop(L, 1);
+    if (!ok) {
+        return luaL_error(L, "base_value is not an integer");
+    }
+    lua_pushinteger(L, val + 1);
+    return 1;
+}
+
+static const luaL_Reg cdrivelib_funcs[] = {
+    {"get_base", l_get_base},
+    {NULL, NULL}
+};
+
+int luaopen_cdrivelib(lua_State *L) {
+    luaL_newlib(L, cdrivelib_funcs);
+    return 1;
+}
+
+void cart_lua_modules(lua_State *L) {
+    luaL_requiref(L, "cdrivelib", luaopen_cdrivelib, 1);
+    lua_pop(L, 1);
+}
+"#,
+        )
+        .lua(
+            r#"
+base_value = 41
+
+function init()
+    local m = require("cdrivelib")
+    local result = m.get_base()
+    if result == 42 then
+        blyt32.debug.print("c-drives-lua ok")
+    else
+        blyt32.debug.print("c-drives-lua wrong")
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("c-drives-lua ok"),
+        "expected 'c-drives-lua ok' in output, got: {}",
         String::from_utf8_lossy(&output)
     );
 }
