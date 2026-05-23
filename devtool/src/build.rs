@@ -132,9 +132,54 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
 
     let language = read_cart_language(project_dir)?;
 
+    // Early validation: check source files exist before doing any build work.
+    match language {
+        CartLanguage::Lua => {
+            let lua_src_dir = project_dir.join("src/game/lua");
+            if collect_lua_files(&lua_src_dir)?.is_empty() {
+                return Err(err(format!(
+                    "no .lua files found under {} — \
+                     for a C or Rust cart add `language: c` or `language: rust` \
+                     to cart.build.yaml",
+                    lua_src_dir.display()
+                )));
+            }
+        }
+        CartLanguage::C => {
+            let c_src_dir = project_dir.join("src/game/c");
+            if collect_c_files(&c_src_dir)?.is_empty() {
+                return Err(err(format!(
+                    "no .c files found under {}",
+                    c_src_dir.display()
+                )));
+            }
+        }
+        CartLanguage::Cpp => {
+            let cpp_src_dir = project_dir.join("src/game/c++");
+            if collect_cpp_files(&cpp_src_dir)?.is_empty() {
+                return Err(err(format!(
+                    "no .cpp/.cxx/.cc files found under {}",
+                    cpp_src_dir.display()
+                )));
+            }
+        }
+        CartLanguage::Rust => {}
+    }
+
     // Build all libraries before game code.
     let lib_names = discover_libraries(project_dir)?;
     let mut built_libs: Vec<BuiltLib> = Vec::new();
+    // Lua carts: pass LUA_32BITS=1 and LUA_USE_LONGJMP=1 so that src/lib/ C
+    // code calling the Lua C API uses the same numeric types and error-handling
+    // path as the blyt Lua VM compiled with these flags.
+    let lua_lib_defines: Vec<String> = if language == CartLanguage::Lua {
+        vec![
+            "-DLUA_32BITS=1".to_string(),
+            "-DLUA_USE_LONGJMP=1".to_string(),
+        ]
+    } else {
+        vec![]
+    };
     for name in &lib_names {
         built_libs.push(build_library(
             &clang,
@@ -220,12 +265,6 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
         CartLanguage::C => {
             let c_src_dir = project_dir.join("src/game/c");
             let c_files = collect_c_files(&c_src_dir)?;
-            if c_files.is_empty() {
-                return Err(err(format!(
-                    "no .c files found under {}",
-                    c_src_dir.display()
-                )));
-            }
             for src in &c_files {
                 obj_files.push(compile_c(
                     &clang,

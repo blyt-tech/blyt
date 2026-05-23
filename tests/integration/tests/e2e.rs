@@ -28,6 +28,10 @@ fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     if sdk_clangpp.exists() {
         cmd.env("BLYT_CLANGPP", &sdk_clangpp);
     }
+    let sdk_ar = sdk.join("bin/blyt-llvm-ar");
+    if sdk_ar.exists() {
+        cmd.env("BLYT_AR", &sdk_ar);
+    }
     cmd.assert().success();
 
     // Default output: <parent>/<project_dir_name>.blyt
@@ -1162,15 +1166,26 @@ fn build_lib_subcommand_produces_archive() {
         .lib_file("mylib", "mylib.c", "int mylib_fn(void) { return 42; }\n")
         // A minimal cart.build.yaml is still required for SDK discovery,
         // even when only building a library.
-        .c("#include \"blyt.h\"\nvoid blyt_cart_init(void){} void blyt_cart_update(void){blyt_quit_ready();} void blyt_cart_draw(void){}")
+        .c("#include \"blyt.h\"\nvoid blyt_cart_init(void){} void blyt_cart_update(void){blyt_quit();} void blyt_cart_draw(void){}")
         .write(&project);
 
-    Command::cargo_bin("blyt")
-        .unwrap()
+    let sdk = sdk_dir();
+    let mut lib_cmd = Command::cargo_bin("blyt").unwrap();
+    lib_cmd
         .args(["build", "lib", "mylib", project.to_str().unwrap()])
-        .env("BLYT_SDK_DIR", sdk_dir())
-        .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
-        .env("BLYT_RUST_SDK", repo_root().join("sdk/rust/blyt"))
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_RUST_SDK", repo_root().join("sdk/rust/blyt"));
+    if sdk.join("bin/blyt-clang").exists() {
+        lib_cmd.env("BLYT_CLANG", sdk.join("bin/blyt-clang"));
+    }
+    if sdk.join("bin/blyt-clang++").exists() {
+        lib_cmd.env("BLYT_CLANGPP", sdk.join("bin/blyt-clang++"));
+    }
+    if sdk.join("bin/blyt-llvm-ar").exists() {
+        lib_cmd.env("BLYT_AR", sdk.join("bin/blyt-llvm-ar"));
+    }
+    lib_cmd
         .assert()
         .success()
         .stdout(predicates::str::contains("built:"));
