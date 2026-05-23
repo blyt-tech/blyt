@@ -7,8 +7,10 @@
  * accepts them from this library (via DT_NEEDED: libblyt32lua.so).
  *
  * Registers:
- *   blyt.quit()           → blyt_quit()  (blyt and blyt32 are the same table)
- *   blyt.debug.print(s)   → blyt_console_debug(s)
+ *   blyt.quit()      → blyt_quit()
+ *   blyt.debug.print(s)    → blyt_console_debug(s)
+ *   blyt32.quit()    → blyt_quit()
+ *   blyt32.debug.print(s)  → blyt_console_debug(s)
  *
  * cart_lua_modules(L) is a weak symbol; C/Rust src/lib/ libraries define it
  * to register additional Lua modules before the cart bytecode is loaded.
@@ -62,17 +64,42 @@ static int lua_blyt_quit(lua_State *L) {
     return 0;
 }
 
+/*
+ * register_blyt32 — create the blyt and blyt32 globals.
+ *
+ * Per ADR-0086:
+ *   blyt.*   — canonical home for shared modules (audio, state, input, quit …)
+ *   blyt32.* — variant-specific (gfx, color, spatial) PLUS aliases to every
+ *              shared module so that blyt32.foo == blyt.foo is always true.
+ *
+ * Pattern: build each shared subtable/function once, then copy the reference
+ * into both tables so the Lua equality check holds.
+ */
 static void register_blyt32(lua_State *L) {
-    lua_newtable(L);                             /* blyt / blyt32 (same table) */
-    lua_pushcfunction(L, lua_blyt_quit);
-    lua_setfield(L, -2, "quit");
-    lua_newtable(L);                             /* .debug */
+    /* --- shared: blyt.debug subtable --- */
+    lua_newtable(L);                        /* idx A: blyt.debug */
     lua_pushcfunction(L, lua_blyt_debug_print);
     lua_setfield(L, -2, "print");
+
+    /* --- blyt table --- */
+    lua_newtable(L);                        /* blyt */
+    lua_pushvalue(L, -2);                   /* copy ref to blyt.debug */
     lua_setfield(L, -2, "debug");
-    lua_pushvalue(L, -1);
-    lua_setglobal(L, "blyt32");
-    lua_setglobal(L, "blyt");
+    lua_pushcfunction(L, lua_blyt_quit);    /* shared: blyt.quit */
+    lua_setfield(L, -2, "quit");
+    lua_setglobal(L, "blyt");              /* pops blyt */
+
+    /* --- blyt32 table — distinct table; shared entries alias blyt.* --- */
+    lua_newtable(L);                        /* blyt32 */
+    lua_pushvalue(L, -2);                   /* copy ref to blyt.debug (idx A still on stack) */
+    lua_setfield(L, -2, "debug");
+    lua_getglobal(L, "blyt");
+    lua_getfield(L, -1, "quit");            /* blyt.quit */
+    lua_setfield(L, -3, "quit");            /* blyt32.quit = blyt.quit */
+    lua_pop(L, 1);                          /* pop blyt */
+    lua_setglobal(L, "blyt32");            /* pops blyt32 */
+
+    lua_pop(L, 1);                          /* pop blyt.debug (idx A) */
 
     lua_pushcfunction(L, lua_blyt_require);
     lua_setglobal(L, "require");
