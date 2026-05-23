@@ -49,7 +49,7 @@
 #define BLYT_ARENA_SIZE (16u * 1024u * 1024u) /* 16 MiB */
 
 /* Maximum exported symbols tracked across all loaded runtime libraries. */
-#define MAX_SYMS 512
+#define MAX_SYMS 2048
 
 /* -------------------------------------------------------------------------
  * In-memory library registry
@@ -500,7 +500,8 @@ static void resolve_elf_plt(const uint8_t *map, size_t map_size, memory_t *mem, 
         for (size_t j = 0; j < rcount; j++) {
             const Elf32_Rela *r = (const Elf32_Rela *)(map + sh->sh_offset + j * sh->sh_entsize);
             uint32_t type = ELF32_R_TYPE(r->r_info);
-            if (type != R_RISCV_JUMP_SLOT && type != R_RISCV_GLOB_DAT)
+            if (type != R_RISCV_JUMP_SLOT && type != R_RISCV_GLOB_DAT &&
+                type != R_RISCV_32)
                 continue;
 
             uint32_t sym_idx = ELF32_R_SYM(r->r_info);
@@ -513,9 +514,20 @@ static void resolve_elf_plt(const uint8_t *map, size_t map_size, memory_t *mem, 
                 continue;
 
             const char *sym_name = sym_strtab + sym->st_name;
-            uint32_t resolved = symtab_lookup(syms, sym_name);
-            if (resolved == 0)
+            /* R_RISCV_32 for locally-defined symbols is handled by apply_lib_rela;
+             * only cross-module UNDEF references need resolution here. */
+            if (type == R_RISCV_32 && sym->st_shndx != SHN_UNDEF)
                 continue;
+            uint32_t resolved = symtab_lookup(syms, sym_name);
+            if (resolved == 0) {
+                if (ELF32_ST_BIND(sym->st_info) == STB_WEAK) {
+                    uint8_t zero[4] = {0};
+                    memory_write(mem, elf_bias + r->r_offset, zero, 4);
+                } else {
+                    fprintf(stderr, "[dynlink] UNRESOLVED STRONG: %s\n", sym_name);
+                }
+                continue;
+            }
 
             uint8_t v[4];
             write_u32_le(v, resolved);
@@ -589,8 +601,10 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     blyt_lib_t libs[MAX_RUNTIME_LIBS];
     int nlibs = 0;
 
-    /* blyt_symtab_t holds 512 × 132-byte entries (~66 KiB).  Heap-allocate
-     * so it does not overflow small stacks (e.g. Emscripten's 64 KiB default). */
+    /* blyt_symtab_t holds 2048 × 132-byte entries (~264 KiB).  Heap-allocate
+     * so it does not overflow small stacks (e.g. Emscripten's 64 KiB default).
+     * Lua carts add ~450 exported symbols from libblytcommonlua.so; 512 was
+     * too small once the Lua VM library is included in the symbol table. */
     blyt_symtab_t *all_syms = calloc(1, sizeof(*all_syms));
     if (!all_syms)
         return BLYT_RUN_ERR_EMU;
@@ -702,6 +716,17 @@ static blyt_cart_run_err_t dynlink(riscv_t *rv, const blyt_cart_t *cart) {
     }
 
     if (ok) {
+        /* Apply cart's own R_RISCV_RELATIVE relocations (e.g. static arrays of
+         * function pointers in src/lib/ C libraries, like luaL_Reg tables).
+         * Libraries get this in the BFS loop above; the cart needs it too. */
+        blyt_lib_t cart_lib = {
+            .map = (const uint8_t *)cart->map,
+            .size = cart->map_size,
+            .bias = 0,
+            .mmapped = false,
+        };
+        apply_lib_rela(&cart_lib, mem);
+
         for (int i = 0; i < nlibs; i++) {
             resolve_elf_plt(libs[i].map, libs[i].size, mem, libs[i].bias, all_syms);
         }

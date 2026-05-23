@@ -28,7 +28,7 @@ void blyt_cart_cleanup(void);
 /* Signal that the cart is ready to exit the update/draw loop.
  * Call from blyt_cart_on_quit, or directly from blyt_cart_update when the
  * cart decides it is finished (e.g. after showing a credits sequence). */
-void blyt_quit_ready(void);
+void blyt_quit(void);
 
 /* Signal the end of one update+draw frame to the host runtime.
  * Called automatically by blyt_main after each blyt_cart_draw(); cart code

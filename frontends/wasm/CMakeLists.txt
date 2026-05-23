@@ -83,6 +83,36 @@ endforeach()
 message(STATUS "blyt WASM: guest libs from ${BLYT_GUEST_LIB_DIR}")
 
 # -------------------------------------------------------------------------
+# Optional Lua-direct support
+#
+# When third_party/lua is initialised, compile the Lua VM sources and the
+# blyt32lua bindings directly into the WASM module so Lua carts run without
+# going through rv32emu.  Enabled automatically when the submodule is present.
+# -------------------------------------------------------------------------
+set(LUA_DIR "${BLYT_ROOT}/third_party/lua")
+set(BLYT_LUA_SOURCES "")
+if(EXISTS "${LUA_DIR}/lvm.c")
+  file(GLOB LUA_ALL_SRCS "${LUA_DIR}/*.c")
+  foreach(
+    _EXCL
+    "${LUA_DIR}/lua.c"
+    "${LUA_DIR}/luac.c"
+    "${LUA_DIR}/onelua.c"
+    "${LUA_DIR}/liolib.c"
+    "${LUA_DIR}/loslib.c"
+    "${LUA_DIR}/loadlib.c"
+    "${LUA_DIR}/ldblib.c"
+    "${LUA_DIR}/lutf8lib.c"
+  )
+    list(REMOVE_ITEM LUA_ALL_SRCS "${_EXCL}")
+  endforeach()
+  set(BLYT_LUA_SOURCES ${LUA_ALL_SRCS})
+  message(STATUS "blyt WASM: Lua-direct support enabled (${LUA_DIR})")
+else()
+  message(STATUS "blyt WASM: Lua-direct support disabled (third_party/lua not initialised)")
+endif()
+
+# -------------------------------------------------------------------------
 # Embed guest libraries as C byte arrays (same approach as blyt_libretro)
 # -------------------------------------------------------------------------
 set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blytrun_embedded_libs.c")
@@ -212,13 +242,20 @@ add_executable(
   ${FLATCCRT_SOURCES}
   "${BLYT_ROOT}/runtime/host/src/libblyt/cart_load.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/cart_run.c"
-  "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c")
+  "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c"
+  ${BLYT_LUA_SOURCES})
 
 # Produce blytrun.html + blytrun.js + blytrun.wasm
 set_target_properties(blytrun PROPERTIES SUFFIX ".html")
 
+set(_BLYT_LUA_DEFS "")
+if(BLYT_LUA_SOURCES)
+  list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 LUA_32BITS=1 LUA_USE_LONGJMP=1)
+endif()
+
 target_compile_definitions(blytrun PRIVATE ${RV32EMU_FEATURE_DEFS}
-                                           BLYT_EMBED_LIBS)
+                                           BLYT_EMBED_LIBS
+                                           ${_BLYT_LUA_DEFS})
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
 # (not a cmake definition) to avoid quoting issues.
@@ -242,6 +279,11 @@ target_compile_options(
           -include
           "${RV32EMU_CONFIG_H}")
 
+set(_BLYT_LUA_INCLUDES "")
+if(BLYT_LUA_SOURCES)
+  list(APPEND _BLYT_LUA_INCLUDES "${LUA_DIR}")
+endif()
+
 target_include_directories(
   blytrun
   PRIVATE "${RV32EMU_DIR}"
@@ -251,7 +293,8 @@ target_include_directories(
           "${BLYT_ROOT}/third_party/flatcc/include"
           "${GENERATED_DIR}"
           "${BLYT_ROOT}/runtime/host/include"
-          "${BLYT_ROOT}/runtime/host/src/libblyt")
+          "${BLYT_ROOT}/runtime/host/src/libblyt"
+          ${_BLYT_LUA_INCLUDES})
 
 # Emscripten link options
 target_link_options(

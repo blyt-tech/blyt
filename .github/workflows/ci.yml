@@ -64,7 +64,8 @@ jobs:
             third_party/rv32emu \
             third_party/musl \
             third_party/libretro-common \
-            third_party/libcxx
+            third_party/libcxx \
+            third_party/lua
           git -C third_party/rv32emu submodule update --init --depth 1 \
             src/softfloat
 

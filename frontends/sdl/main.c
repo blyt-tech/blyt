@@ -43,6 +43,7 @@ static void RETRO_CALLCONV sdl_log(enum retro_log_level level, const char *fmt, 
     va_start(args, fmt);
     vfprintf(out, fmt, args);
     va_end(args);
+    fflush(out);
 }
 
 /* -------------------------------------------------------------------------

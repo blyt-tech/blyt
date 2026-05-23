@@ -360,6 +360,211 @@ endif()
 file(COPY "${SDK_LIB}/libblytcommon.so" DESTINATION "${SDK_LIB_NATIVE}")
 
 # -------------------------------------------------------------------------
+# Step 2c: Build Lua libraries for RV32IMAFC (Lua cart support)
+#
+# libblytcommonlua.so — Lua 5.4 VM (sandboxed: base/math/string/table/coroutine)
+# libblyt32lua.so     — blyt API bindings + blyt_cart_init/update/draw lifecycle
+#
+# Skipped with a warning when third_party/lua is not initialised.
+# -------------------------------------------------------------------------
+
+set(LUA_DIR "${BLYT_SOURCE_DIR}/third_party/lua")
+
+if(NOT EXISTS "${LUA_DIR}/lvm.c")
+  message(
+    WARNING "third_party/lua not initialised — Lua cart support will not be built.\n"
+            "Run: git submodule update --init third_party/lua")
+else()
+  file(GLOB LUA_ALL_SRCS "${LUA_DIR}/*.c")
+  # Remove standalone interpreter, bytecode compiler, and excluded sandboxed libs.
+  foreach(
+    _EXCL
+    "${LUA_DIR}/lua.c"      # standalone interpreter binary
+    "${LUA_DIR}/luac.c"     # bytecode compiler binary
+    "${LUA_DIR}/onelua.c"   # amalgamation (includes all others — causes duplicates)
+    "${LUA_DIR}/liolib.c"   # I/O library (no filesystem)
+    "${LUA_DIR}/loslib.c"   # OS library (no OS access)
+    "${LUA_DIR}/loadlib.c"  # dynamic loading (no dlopen)
+    "${LUA_DIR}/ldblib.c"   # debug library (no debug hooks)
+    "${LUA_DIR}/lutf8lib.c" # utf8 library (not needed; saves space)
+  )
+    list(REMOVE_ITEM LUA_ALL_SRCS "${_EXCL}")
+  endforeach()
+
+  # Public musl headers for Lua: the standard include paths minus musl's
+  # internal src/include/ directory, which defines `weak` as an attribute
+  # macro that collides with Lua's `GCObject *weak` field in lstate.h.
+  set(LUA_MUSL_INCLUDES
+      -I "${MUSL_DIR}/include"
+      -I "${MUSL_DIR}/arch/riscv32"
+      -I "${MUSL_DIR}/arch/generic"
+      -I "${LIBBLYTC_BITS_DIR}/..")
+
+  message(STATUS "Building libblytcommonlua.so…")
+  execute_process(
+    COMMAND
+      "${FOUND_CLANG}" ${RV32_BASE} ${LUA_MUSL_INCLUDES} ${LIBBLYTC_CFLAGS}
+      -DLUA_32BITS=1
+      -DLUA_USE_LONGJMP=1
+      -I "${LUA_DIR}"
+      -Wl,-soname,libblytcommonlua.so
+      -o "${SDK_LIB}/libblytcommonlua.so"
+      ${LUA_ALL_SRCS}
+    RESULT_VARIABLE R)
+  if(NOT R EQUAL 0)
+    message(FATAL_ERROR "Failed to build libblytcommonlua.so")
+  endif()
+
+  # libblyt32lua.so — blyt32 Lua bindings + symbols missing from the chain.
+  #
+  # libblyt32.so (always DT_NEEDED by Lua carts) already exports malloc,
+  # free, memcpy, string ops, and math via its absorbed libblytc sources.
+  # libblyt32lua.so adds only what libblytc does NOT provide:
+  #   - setjmp / longjmp (musl riscv32 asm)
+  #   - soft-float ops __extendsfdf2 / __truncdfsf2 / __floatdisf
+  #   - errno, missing string/locale stubs, time, stdio stubs
+  #   - stub openers for excluded Lua standard libraries
+  #   - blyt32 API Lua bindings and blyt_cart_init/update/draw lifecycle
+  #
+  # Uses LUA_MUSL_INCLUDES (not LIBBLYTC_INCLUDES) to avoid the
+  # `#define weak __attribute__((__weak__))` macro in musl/src/include/
+  # clashing with Lua's `GCObject *weak` field in lstate.h.
+  # Cross-compile Berkeley SoftFloat for RV32.
+  #
+  # All floating-point ops needed by the compiler-rt ABI (f64_add, f128_add,
+  # etc.) are implemented in SoftFloat using pure integer arithmetic.  We use
+  # the same RISCV/ NaN-propagation specialisation that rv32emu uses on the
+  # host so the behaviour is identical to what the emulator simulates.
+  set(SF_SRC "${BLYT_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
+  set(SF_INC "${SF_SRC}/include")
+  set(SF_PLATFORM_DIR "${BLYT_BINARY_DIR}/softfloat-rv32")
+  file(MAKE_DIRECTORY "${SF_PLATFORM_DIR}")
+  # Minimal platform.h: disable thread-local so softfloat_roundingMode is global.
+  file(WRITE "${SF_PLATFORM_DIR}/platform.h"
+       "#define THREAD_LOCAL\n")
+
+  # Core SoftFloat: all s_*.c and f32/f64/f128/conversion files.
+  # Exclude: extF80 (80-bit), M-variant (multi-word array), bf16, f16.
+  file(GLOB SF_ALL "${SF_SRC}/*.c")
+  foreach(_EXCL_PATTERN
+      "${SF_SRC}/extF80*"
+      "${SF_SRC}/*M_*"   "${SF_SRC}/*M.*"
+      "${SF_SRC}/bf16*"  "${SF_SRC}/f16*"
+      "${SF_SRC}/f32_to_extF80*"  "${SF_SRC}/f64_to_extF80*"
+      "${SF_SRC}/f128_to_extF80*"
+  )
+    file(GLOB _EXCL_FILES "${_EXCL_PATTERN}")
+    list(REMOVE_ITEM SF_ALL ${_EXCL_FILES})
+  endforeach()
+  # RISC-V NaN propagation specialisations (all variants; specialize.h declares them all)
+  file(GLOB SF_RISCV
+    "${SF_SRC}/RISCV/s_propagateNaNF16UI.c"
+    "${SF_SRC}/RISCV/s_propagateNaNF32UI.c"
+    "${SF_SRC}/RISCV/s_propagateNaNF64UI.c"
+    "${SF_SRC}/RISCV/s_propagateNaNF128UI.c"
+    "${SF_SRC}/RISCV/s_propagateNaNExtF80UI.c"
+    "${SF_SRC}/RISCV/s_f16UIToCommonNaN.c"
+    "${SF_SRC}/RISCV/s_f32UIToCommonNaN.c"
+    "${SF_SRC}/RISCV/s_f64UIToCommonNaN.c"
+    "${SF_SRC}/RISCV/s_f128UIToCommonNaN.c"
+    "${SF_SRC}/RISCV/s_extF80UIToCommonNaN.c"
+    "${SF_SRC}/RISCV/s_commonNaNToF16UI.c"
+    "${SF_SRC}/RISCV/s_commonNaNToF32UI.c"
+    "${SF_SRC}/RISCV/s_commonNaNToF64UI.c"
+    "${SF_SRC}/RISCV/s_commonNaNToF128UI.c"
+    "${SF_SRC}/RISCV/s_commonNaNToExtF80UI.c"
+    "${SF_SRC}/RISCV/softfloat_raiseFlags.c"
+  )
+  # Multi-word-array helpers needed by f128_mul even with SOFTFLOAT_FAST_INT64
+  set(SF_MWORD
+    "${SF_SRC}/s_add256M.c"
+    "${SF_SRC}/s_sub256M.c"
+    "${SF_SRC}/s_mul128To256M.c"
+    "${SF_SRC}/s_shiftRightJam256M.c"
+  )
+
+  # libblyt32lua.so embeds the Lua VM sources directly (analogous to how
+  # libblyt32.so embeds blyt_common.c), so its .dynsym exports all Lua C API
+  # symbols (lua_*, luaL_*).  Carts with src/lib/ C code that call Lua APIs
+  # resolve them through libblyt32lua.so; no DT_NEEDED: libblytcommonlua.so
+  # is added to the cart.  libblytcommonlua.so is still built above for
+  # standalone / tooling use.
+  message(STATUS "Building libblyt32lua.so…")
+  execute_process(
+    COMMAND
+      "${FOUND_CLANG}" ${RV32_BASE} ${LUA_MUSL_INCLUDES} ${LIBBLYTC_CFLAGS}
+      -DLUA_32BITS=1
+      -DLUA_USE_LONGJMP=1
+      -I "${LUA_DIR}"
+      -I "${SF_INC}"
+      -I "${SF_SRC}/RISCV"
+      -I "${SF_PLATFORM_DIR}"
+      -DSOFTFLOAT_FAST_INT64=1
+      -DSOFTFLOAT_ROUND_ODD=1
+      -Wl,-soname,libblyt32lua.so
+      -Wl,--as-needed "${SDK_LIB}/libblyt32.so"
+      -o "${SDK_LIB}/libblyt32lua.so"
+      # Lua VM sources embedded directly (exports lua_*/luaL_* in .dynsym)
+      ${LUA_ALL_SRCS}
+      # musl riscv32 setjmp/longjmp (not in libblytc)
+      "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
+      "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S"
+      # SoftFloat for RV32: provides f64/f128 arithmetic
+      ${SF_ALL}
+      ${SF_RISCV}
+      ${SF_MWORD}
+      # compiler-rt ABI wrappers + fenv/stdio/stdlib stubs
+      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/softfloat_builtins.c"
+      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/lua_runtime_stubs.c"
+      # blyt32 API Lua bindings + cart lifecycle
+      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.c"
+    RESULT_VARIABLE R)
+  if(NOT R EQUAL 0)
+    message(FATAL_ERROR "Failed to build libblyt32lua.so")
+  endif()
+
+  message(STATUS "Lua libraries built: libblytcommonlua.so + libblyt32lua.so")
+
+  # Build host-native blyt-luac with -DLUA_32BITS=1.
+  #
+  # The RV32 and WASM Lua VMs are both compiled -DLUA_32BITS=1, so they
+  # expect bytecode with 4-byte lua_Integer and 4-byte lua_Number.
+  # Using FOUND_CLANG without --target=riscv32 compiles for the host.
+  # All Lua VM sources are compiled in so the parser and bytecode writer
+  # are available; lua.c (has main()) and onelua.c (amalgamation) are
+  # excluded.
+  file(GLOB LUA_HOST_SRCS "${LUA_DIR}/*.c")
+  foreach(_EXCL
+      "${LUA_DIR}/lua.c"     # standalone interpreter (defines main())
+      "${LUA_DIR}/onelua.c"  # amalgamation
+      "${LUA_DIR}/ltests.c"  # internal debug tests
+  )
+    list(REMOVE_ITEM LUA_HOST_SRCS "${_EXCL}")
+  endforeach()
+
+  message(STATUS "Building blyt-luac (host-native, LUA_32BITS=1)…")
+  execute_process(
+    COMMAND
+      "${FOUND_CLANG}"
+      -DLUA_32BITS=1
+      -O2
+      -I "${LUA_DIR}"
+      -Wno-unused-parameter
+      -Wno-sign-compare
+      -Wno-implicit-fallthrough
+      -Wno-deprecated-non-prototype
+      -o "${SDK_BIN}/blyt-luac"
+      ${LUA_HOST_SRCS}
+      "${BLYT_SOURCE_DIR}/runtime/tools/blyt-luac.c"
+      -lm
+    RESULT_VARIABLE R)
+  if(NOT R EQUAL 0)
+    message(FATAL_ERROR "Failed to build blyt-luac")
+  endif()
+  message(STATUS "blyt-luac built at ${SDK_BIN}/blyt-luac")
+endif()
+
+# -------------------------------------------------------------------------
 # Step 2b: Build libc++ and libc++abi for RV32IMAFC (C++ cart support)
 #
 # Builds a static libc++.a + libc++abi.a from third_party/libcxx (the LLVM
@@ -559,6 +764,31 @@ if(EXISTS "${SDK_LIB}/libc++.a")
   endif()
 endif()
 
+# Install Lua public headers into SDK_INC so C/C++ libs can #include
+# lua.h, lauxlib.h, and lualib.h via the standard SDK include path.
+# Patch the installed luaconf.h to enable LUA_32BITS=1 and LUA_USE_LONGJMP=1
+# so that C/C++ libraries calling the Lua C API compile with the same numeric
+# types as the blyt Lua VM (lua_Integer=int, lua_Number=float).
+if(EXISTS "${LUA_DIR}/lua.h")
+  foreach(_LUA_H lua.h luaconf.h lualib.h lauxlib.h lua.hpp)
+    if(EXISTS "${LUA_DIR}/${_LUA_H}")
+      file(COPY "${LUA_DIR}/${_LUA_H}" DESTINATION "${SDK_INC}")
+    endif()
+  endforeach()
+  # Activate LUA_32BITS and LUA_USE_LONGJMP in the installed luaconf.h so
+  # that src/lib/ C code using the Lua C API compiles with the same numeric
+  # types as the blyt Lua VM (lua_Integer=int, lua_Number=float).
+  # LUA_32BITS must be defined BEFORE the type-selection conditionals, so we
+  # replace the commented-out placeholder line in place rather than appending.
+  file(READ "${SDK_INC}/luaconf.h" _LUACONF_CONTENT)
+  if(NOT _LUACONF_CONTENT MATCHES "blyt-sdk-patch")
+    string(REPLACE "/* #define LUA_32BITS */"
+                   "#define LUA_32BITS 1 /* blyt-sdk-patch */"
+                   _LUACONF_CONTENT "${_LUACONF_CONTENT}")
+    file(WRITE "${SDK_INC}/luaconf.h" "${_LUACONF_CONTENT}")
+  endif()
+endif()
+
 # -------------------------------------------------------------------------
 # Step 4: blyt devtool
 # -------------------------------------------------------------------------
@@ -583,8 +813,8 @@ file(COPY "${BLYT_SOURCE_DIR}/target/debug/blyt" DESTINATION "${SDK_BIN}")
 # (Linux); we create the symlinks in both cases.
 #
 # Remove any stale symlinks from prior builds so no dead entries linger.
-foreach(_stale blyt-clang blyt-clang++ blyt-ld.lld blyt-lld blyt-objcopy blyt-llvm-ar ld.lld
-               llvm-objcopy)
+foreach(_stale blyt-clang blyt-clang++ blyt-ld.lld blyt-lld blyt-objcopy blyt-llvm-ar
+               ld.lld llvm-objcopy)
   file(REMOVE "${SDK_BIN}/${_stale}")
 endforeach()
 if(FOUND_CLANG)
@@ -605,7 +835,6 @@ endif()
 if(FOUND_AR)
   file(CREATE_LINK "${FOUND_AR}" "${SDK_BIN}/blyt-llvm-ar" SYMBOLIC)
 endif()
-
 # -------------------------------------------------------------------------
 # Step 5: blytrun (if built)
 # -------------------------------------------------------------------------

@@ -13,12 +13,12 @@
 #include "blyt.h"
 
 /* -------------------------------------------------------------------------
- * blyt_quit_ready — set the quit flag; blyt_main exits its loop next tick
+ * blyt_quit — set the quit flag; blyt_main exits its loop next tick
  * ------------------------------------------------------------------------- */
 
 static int g_quit_requested = 0;
 
-void blyt_quit_ready(void) {
+void blyt_quit(void) {
     g_quit_requested = 1;
 }
 
@@ -44,7 +44,7 @@ void blyt_frame_done(void) {
  * definitions before execution begins.
  *
  * Optional callbacks also have weak no-op defaults; carts override only
- * what they need.  on_quit calls blyt_quit_ready() so unhandled quit
+ * what they need.  on_quit calls blyt_quit() so unhandled quit
  * requests exit the update/draw loop cleanly.
  * ------------------------------------------------------------------------- */
 
@@ -60,7 +60,7 @@ __attribute__((weak)) void blyt_cart_on_new_state(void) {
 __attribute__((weak)) void blyt_cart_on_save_state(void) {
 }
 __attribute__((weak)) void blyt_cart_on_quit(void) {
-    blyt_quit_ready();
+    blyt_quit();
 }
 __attribute__((weak)) void blyt_cart_cleanup(void) {
 }

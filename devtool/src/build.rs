@@ -76,28 +76,23 @@ fn err(msg: impl Into<String>) -> BuildError {
  * in cart.build.yaml.  Future: `languages: [c, rust]` for hybrid carts.
  * ------------------------------------------------------------------------- */
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum CartLanguage {
     C,
     Cpp,
     Rust,
+    Lua,
 }
 
 fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
     let manifest_path = project_dir.join("cart.build.yaml");
     if !manifest_path.exists() {
-        return Err(err(format!(
-            "{} not found — Lua is the default; add `language: c`, \
-             `language: \"c++\"`, or `language: rust` to cart.build.yaml \
-             for a native cart",
-            manifest_path.display()
-        )));
+        // Absent manifest → Lua default (ADR-0073).
+        return Ok(CartLanguage::Lua);
     }
     let text = fs::read_to_string(&manifest_path)?;
     // Minimal parse: find first non-comment `language: <value>` line.
-    // YAML allows quoting special characters: `language: "c++"` and
-    // `language: c++` both parse to the string `c++`; we strip surrounding
-    // double-quotes before matching.
+    // YAML allows quoting: `language: "c++"` and `language: c++` both work.
     // TODO(phase-9): replace with serde_yaml once cart.build.yaml grows more fields.
     for line in text.lines() {
         let line = line.trim();
@@ -110,15 +105,16 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
                 "c" => Ok(CartLanguage::C),
                 "c++" => Ok(CartLanguage::Cpp),
                 "rust" => Ok(CartLanguage::Rust),
+                "lua" => Ok(CartLanguage::Lua),
                 other => Err(err(format!(
                     "cart.build.yaml: unknown language {other:?} — \
-                     expected `c`, `\"c++\"`, or `rust`"
+                     expected `c`, `\"c++\"`, `rust`, or `lua`"
                 ))),
             };
         }
     }
-    Err(err("cart.build.yaml has no `language:` field — \
-         add e.g. `language: c`, `language: \"c++\"`, or `language: rust`"))
+    // No language field → Lua default.
+    Ok(CartLanguage::Lua)
 }
 
 /* -------------------------------------------------------------------------
@@ -147,6 +143,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
             project_dir,
             name,
             &sdk_include,
+            &lua_lib_defines,
         )?);
     }
     let lib_include_paths: Vec<PathBuf> =
@@ -154,7 +151,10 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
     let mut lib_archives: Vec<PathBuf> = built_libs.into_iter().map(|l| l.archive).collect();
     let lib_include_refs: Vec<&Path> = lib_include_paths.iter().map(PathBuf::as_path).collect();
 
-    let build_dir = project_dir.join("build/game/c");
+    let build_dir = match language {
+        CartLanguage::Lua => project_dir.join("build/game/lua"),
+        _ => project_dir.join("build/game/c"),
+    };
     fs::create_dir_all(&build_dir)?;
 
     let ld_script = build_dir.join("blyt_cart.ld");
@@ -204,12 +204,14 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
         &build_dir,
         &sdk_include,
         &[],
+        &[],
     )?);
     obj_files.push(compile_c(
         &clang,
         &interp_src,
         &build_dir,
         &sdk_include,
+        &[],
         &[],
     )?);
 
@@ -231,6 +233,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                     &build_dir,
                     &sdk_include,
                     &lib_include_refs,
+                    &[],
                 )?);
             }
             None
@@ -300,6 +303,30 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                 &rust_libs,
             )?)
         }
+        CartLanguage::Lua => {
+            let luac = find_luac();
+            // Files already validated non-empty by the early check above.
+            let lua_files = collect_lua_files(&project_dir.join("src/game/lua"))?;
+
+            let bytecode_path = build_dir.join("bytecode.luac");
+            let mut luac_cmd = Command::new(&luac);
+            luac_cmd.arg("-o").arg(&bytecode_path);
+            for f in &lua_files {
+                luac_cmd.arg(f);
+            }
+            let status = luac_cmd
+                .status()
+                .map_err(|e| err(format!("failed to run {luac}: {e}")))?;
+            if !status.success() {
+                return Err(err("luac compilation failed"));
+            }
+
+            let data_c = build_dir.join("cart_lua_data.c");
+            generate_lua_data_c(&bytecode_path, &data_c)?;
+            obj_files.push(compile_c(&clang, &data_c, &build_dir, &sdk_include, &[], &[])?);
+
+            None
+        }
     };
 
     let raw_elf = build_dir.join("cart.elf");
@@ -311,13 +338,25 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
         &ld_script,
         &lib_dir,
         &raw_elf,
+        language == CartLanguage::Lua,
     )?;
 
     let output_path = output
         .map(PathBuf::from)
         .unwrap_or_else(|| default_output(project_dir));
 
-    finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path)?;
+    let lua_bytecode_path = if language == CartLanguage::Lua {
+        Some(build_dir.join("bytecode.luac"))
+    } else {
+        None
+    };
+
+    if let Some(ref bytecode) = lua_bytecode_path {
+        finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path,
+                      &[(".cart.lua", bytecode.as_path())])?;
+    } else {
+        finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path, &[])?;
+    }
 
     println!("built: {}", output_path.display());
     Ok(output_path)
@@ -369,7 +408,7 @@ pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, B
     let clangpp = find_clangpp();
     let ar = find_ar();
     let sdk_include = find_sdk_include()?;
-    let built = build_library(&clang, &clangpp, &ar, project_dir, lib_name, &sdk_include)?;
+    let built = build_library(&clang, &clangpp, &ar, project_dir, lib_name, &sdk_include, &[])?;
     println!("built: {}", built.archive.display());
     Ok(built.archive)
 }
@@ -450,6 +489,61 @@ fn find_clangpp() -> String {
         }
     }
     "clang++".to_string()
+}
+
+fn find_luac() -> String {
+    if let Ok(c) = std::env::var("BLYT_LUAC") {
+        return c;
+    }
+    if let Some(sdk) = sdk_root_from_exe() {
+        let p = sdk.join("bin/blyt-luac");
+        if p.exists() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    "luac".to_string()
+}
+
+fn collect_lua_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(OsStr::to_str) == Some("lua") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn generate_lua_data_c(bytecode_path: &Path, output_c: &Path) -> Result<(), BuildError> {
+    let bytecode = fs::read(bytecode_path)?;
+    let mut src = String::with_capacity(bytecode.len() * 5 + 128);
+    src.push_str("/* Generated by blyt build — do not edit. */\n");
+    src.push_str("const unsigned char cart_lua_bytecode[] = {\n");
+    for (i, b) in bytecode.iter().enumerate() {
+        if i % 16 == 0 {
+            src.push_str("    ");
+        }
+        src.push_str(&format!("0x{b:02x},"));
+        if i % 16 == 15 {
+            src.push('\n');
+        }
+    }
+    if !bytecode.is_empty() && bytecode.len() % 16 != 0 {
+        src.push('\n');
+    }
+    src.push_str("};\n");
+    src.push_str(&format!(
+        "const unsigned int cart_lua_bytecode_size = {}u;\n",
+        bytecode.len()
+    ));
+    fs::write(output_c, src)?;
+    Ok(())
 }
 
 /* -------------------------------------------------------------------------
@@ -754,6 +848,7 @@ fn build_library(
     project_dir: &Path,
     lib_name: &str,
     sdk_include: &Path,
+    extra_defines: &[String],
 ) -> Result<BuiltLib, BuildError> {
     let src_dir = project_dir.join("src/lib").join(lib_name);
     let build_dir = project_dir.join("build/lib").join(lib_name);
@@ -786,6 +881,7 @@ fn build_library(
             &build_dir,
             sdk_include,
             &[include_path.as_path()],
+            extra_defines,
         )?);
     }
 
@@ -865,6 +961,7 @@ fn compile_c(
     build_dir: &Path,
     sdk_include: &Path,
     extra_includes: &[&Path],
+    extra_defines: &[String],
 ) -> Result<PathBuf, BuildError> {
     let stem = src.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
     let obj = build_dir.join(format!("{stem}.o"));
@@ -895,6 +992,9 @@ fn compile_c(
 
     for inc in extra_includes {
         cmd.arg("-I").arg(inc);
+    }
+    for def in extra_defines {
+        cmd.arg(def);
     }
 
     let status = cmd
@@ -1022,6 +1122,7 @@ fn link_cart(
     ld_script: &Path,
     lib_dir: &Path,
     output: &Path,
+    lua_cart: bool,
 ) -> Result<(), BuildError> {
     let mut cmd = Command::new(clang);
 
@@ -1076,6 +1177,15 @@ fn link_cart(
             .arg(archive);
     }
 
+    // Lua carts with src/lib/ C libraries: force lld to pull in the archive
+    // member that defines cart_lua_modules and export it in .dynsym so the
+    // host dynlink can patch libblyt32lua.so's GOT slot for this weak symbol.
+    // Without -u, lld sees only the weak reference in libblyt32lua.so and
+    // never queries the archives for a strong definition.
+    if lua_cart && !lib_archives.is_empty() {
+        cmd.arg("-Wl,-u,cart_lua_modules");
+    }
+
     // Library archives (src/lib/*/lib.a): linked before -lblyt32 so game code
     // symbols resolve against them first.  No --whole-archive: game code calls
     // library functions explicitly, so the linker pulls in only used members.
@@ -1083,10 +1193,19 @@ fn link_cart(
         cmd.arg(archive);
     }
 
-    // Link against libblyt32.so only; the cart's DT_NEEDED is {libblyt32.so}.
-    // The SDK's libblyt32.so absorbs all libblytc sources (malloc, string,
-    // math, etc.) so lld resolves them directly from libblyt32.so's .dynsym.
-    // libblytc.so is loaded at runtime via libblyt32.so's DT_NEEDED entry.
+    // Lua carts: libblyt32lua.so provides blyt_cart_init/update/draw.
+    // --no-as-needed forces DT_NEEDED: libblyt32lua.so even though nothing in
+    // the cart object files directly calls those symbols.
+    if lua_cart {
+        cmd.arg("-Wl,--no-as-needed")
+            .arg("-L")
+            .arg(lib_dir)
+            .arg("-lblyt32lua")
+            .arg("-Wl,--as-needed");
+    }
+    // Link against libblyt32.so; the SDK's libblyt32.so absorbs all libblytc
+    // sources so lld resolves malloc/string/math directly from libblyt32.so's
+    // .dynsym.  libblytc.so is loaded at runtime via libblyt32.so's DT_NEEDED.
     cmd.arg("-L").arg(lib_dir).arg("-lblyt32");
 
     let status = cmd
@@ -1110,12 +1229,22 @@ fn finalise_cart(
     raw_elf: &Path,
     cart_info_file: &Path,
     output: &Path,
+    extra_sections: &[(&str, &Path)],
 ) -> Result<(), BuildError> {
-    let status = Command::new(objcopy)
-        .arg("--add-section")
+    let mut cmd = Command::new(objcopy);
+    cmd.arg("--add-section")
         .arg(format!(".cart.info={}", cart_info_file.display()))
         .arg("--set-section-flags")
-        .arg(".cart.info=alloc,readonly")
+        .arg(".cart.info=alloc,readonly");
+
+    for (name, path) in extra_sections {
+        cmd.arg("--add-section")
+            .arg(format!("{name}={}", path.display()))
+            .arg("--set-section-flags")
+            .arg(format!("{name}=alloc,readonly"));
+    }
+
+    let status = cmd
         .arg("--remove-section=.riscv.attributes")
         .arg("--remove-section=.comment")
         .arg(raw_elf)

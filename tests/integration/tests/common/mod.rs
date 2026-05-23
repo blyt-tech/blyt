@@ -76,7 +76,7 @@ fn rust_lib_cargo_toml(name: &str) -> String {
 /// ```
 /// CartProject::new().c(r#"..."#).write(&project_dir);
 /// CartProject::new().rust(r#"..."#).write(&project_dir);
-/// CartProject::new().c(r#"..."#).rust(r#"..."#).write(&project_dir); // hybrid
+/// CartProject::new().lua(r#"..."#).write(&project_dir);
 /// ```
 pub struct CartProject {
     /// (filename, source) pairs for src/game/c/
@@ -85,6 +85,8 @@ pub struct CartProject {
     cpp_files: Vec<(String, String)>,
     /// Contents of src/game/rust/src/lib.rs
     rust_lib_rs: Option<String>,
+    /// (filename, source) pairs for src/game/lua/
+    lua_files: Vec<(String, String)>,
     /// (lib_name, relative_path_within_lib, content) — files for src/lib/<name>/
     lib_files: Vec<(String, String, String)>,
     /// Names of Rust libs declared via rust_lib(); used to generate the game Cargo.toml.
@@ -97,6 +99,7 @@ impl CartProject {
             c_files: Vec::new(),
             cpp_files: Vec::new(),
             rust_lib_rs: None,
+            lua_files: Vec::new(),
             lib_files: Vec::new(),
             rust_lib_names: Vec::new(),
         }
@@ -121,6 +124,17 @@ impl CartProject {
     /// Add `source` as `src/game/c++/<name>`.
     pub fn cpp_file(mut self, name: &str, source: &str) -> Self {
         self.cpp_files.push((name.into(), source.into()));
+        self
+    }
+
+    /// Add `source` as `src/game/lua/main.lua`.
+    pub fn lua(self, source: &str) -> Self {
+        self.lua_file("main.lua", source)
+    }
+
+    /// Add `source` as `src/game/lua/<name>`.
+    pub fn lua_file(mut self, name: &str, source: &str) -> Self {
+        self.lua_files.push((name.into(), source.into()));
         self
     }
 
@@ -163,8 +177,9 @@ impl CartProject {
         let has_c = !self.c_files.is_empty();
         let has_cpp = !self.cpp_files.is_empty();
         let has_rust = self.rust_lib_rs.is_some();
+        let has_lua = !self.lua_files.is_empty();
         assert!(
-            has_c || has_cpp || has_rust,
+            has_c || has_cpp || has_rust || has_lua,
             "CartProject::write: no game language declared"
         );
 
@@ -172,16 +187,17 @@ impl CartProject {
         fs::create_dir_all(dir).unwrap();
 
         // cart.build.yaml — language declaration (ADR-0073).
-        // Mixed-language game code is not yet supported in blyt build; for now
-        // each project has exactly one game language.
-        let manifest = if has_c {
-            "language: c\n"
-        } else if has_cpp {
-            "language: \"c++\"\n"
-        } else {
-            "language: rust\n"
-        };
-        fs::write(dir.join("cart.build.yaml"), manifest).unwrap();
+        // Lua carts omit the file; the absent manifest signals Lua to blyt build.
+        if !has_lua {
+            let manifest = if has_c {
+                "language: c\n"
+            } else if has_cpp {
+                "language: \"c++\"\n"
+            } else {
+                "language: rust\n"
+            };
+            fs::write(dir.join("cart.build.yaml"), manifest).unwrap();
+        }
 
         if has_c {
             let c_dir = dir.join("src/game/c");
@@ -208,6 +224,14 @@ impl CartProject {
                 rust_game_cargo_toml(&self.rust_lib_names),
             )
             .unwrap();
+        }
+
+        if has_lua {
+            let lua_dir = dir.join("src/game/lua");
+            fs::create_dir_all(&lua_dir).unwrap();
+            for (name, source) in &self.lua_files {
+                fs::write(lua_dir.join(name), source).unwrap();
+            }
         }
 
         for (lib_name, rel_path, content) in &self.lib_files {
@@ -244,4 +268,21 @@ pub fn has_rust_riscv_target() -> bool {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("riscv32imafc-unknown-none-elf"))
         .unwrap_or(false)
+}
+
+/// Returns true if a usable `luac` is available (SDK blyt-luac, $BLYT_LUAC, or system luac).
+pub fn has_luac() -> bool {
+    // Check $BLYT_LUAC override first.
+    if let Ok(c) = std::env::var("BLYT_LUAC") {
+        return std::path::Path::new(&c).exists();
+    }
+    // SDK symlink.
+    if sdk_dir().join("bin/blyt-luac").exists() {
+        return true;
+    }
+    // System luac.
+    std::process::Command::new("luac")
+        .arg("-v")
+        .output()
+        .is_ok()
 }

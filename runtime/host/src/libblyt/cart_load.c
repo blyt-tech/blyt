@@ -103,7 +103,7 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_main", /* imported by _blyt_entry */
     "blyt_exit", /* imported by _blyt_entry; calls exit_group on native path */
     "blyt_console_debug",
-    "blyt_quit_ready",
+    "blyt_quit",
     "blyt_frame_done",
 
     /* libblytc.so — allocator (ADR-0120) */
@@ -283,6 +283,35 @@ static const char *const SYMBOL_ALLOWLIST[] = {
 
     /* libblytc.so — locale (localeconv; C locale only) */
     "localeconv",
+
+    /* compiler-rt ABI — floating-point and 64-bit integer helpers emitted by
+     * the compiler for f32/f64/f128 arithmetic, conversions, and comparisons.
+     * Provided by libblyt32.so (libblytc sources) and libblyt32lua.so
+     * (SoftFloat).  Carts using double/float128 arithmetic import these. */
+    /* f32 ↔ f64 ↔ f128 conversions */
+    "__extendsfdf2", "__truncdfsf2",
+    "__extendsftf2", "__extenddftf2",
+    "__trunctfsf2",  "__trunctfdf2",
+    /* int → float */
+    "__floatsidf",  "__floatdidf",  "__floatdisf",  "__floatditf",
+    "__floatsitf",  "__floatunsidf","__floatunsitf",
+    /* float → int */
+    "__fixdfsi",    "__fixdfdi",    "__fixsfdi",
+    "__fixtfsi",    "__fixtfdi",    "__fixunstfsi",
+    /* f64 arithmetic */
+    "__adddf3",  "__subdf3",  "__muldf3",  "__divdf3",
+    /* f128 arithmetic */
+    "__addtf3",  "__subtf3",  "__multf3",  "__divtf3",
+    /* f64 comparisons */
+    "__eqdf2",  "__nedf2",  "__ltdf2",  "__ledf2",  "__gtdf2",  "__gedf2",
+    /* f128 comparisons */
+    "__eqtf2",  "__netf2",  "__lttf2",  "__letf2",  "__gttf2",  "__getf2",
+    "__unordtf2",
+    /* 64-bit integer arithmetic */
+    "__udivdi3",  "__umoddi3",
+    /* classification helpers (isnan, isinf, signbit) */
+    "__fpclassify",  "__fpclassifyf",  "__fpclassifyl",
+    "__signbit",     "__signbitf",     "__signbitl",
 
     NULL,
 };
@@ -590,6 +619,7 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
 
     const Elf32_Shdr *sect_cart_info = NULL;
     const Elf32_Shdr *sect_cart_config = NULL;
+    const Elf32_Shdr *sect_cart_lua = NULL;
     const Elf32_Shdr *sect_dynamic = NULL;
     const Elf32_Shdr *sect_dynsym = NULL;
     const Elf32_Shdr *sect_dynstr_sh = NULL;
@@ -619,6 +649,8 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
             sect_cart_info = sh;
         if (strcmp(name, ".cart.config") == 0)
             sect_cart_config = sh;
+        if (strcmp(name, ".cart.lua") == 0)
+            sect_cart_lua = sh;
         if (strcmp(name, ".dynamic") == 0)
             sect_dynamic = sh;
         if (strcmp(name, ".dynstr") == 0)
@@ -630,6 +662,8 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
     /* -----------------------------------------------------------------------
      * DT_NEEDED allowlist (ADR-0024 + ADR-0120)
      * --------------------------------------------------------------------- */
+
+    int has_blyt32lua = 0;
 
     if (sect_dynamic) {
         if (sect_dynamic->sh_entsize < sizeof(Elf32_Dyn)) {
@@ -674,6 +708,8 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
                 err = BLYT_CART_ERR_BAD_NEEDED;
                 goto fail;
             }
+            if (strcmp(dynstr + d->d_un.d_val, "libblyt32lua.so") == 0)
+                has_blyt32lua = 1;
         }
     }
 
@@ -715,7 +751,14 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
                 err = BLYT_CART_ERR_BAD_IMPORT;
                 goto fail;
             }
-            if (!symbol_name_allowed(symstr + sym->st_name)) {
+            const char *sym_name = symstr + sym->st_name;
+            /* Lua carts may import any Lua C API symbol (lua_* / luaL_*)
+             * when src/lib/ C code calls the Lua API directly.  These
+             * symbols are pure VM operations with no host-side side effects. */
+            int lua_api_sym = has_blyt32lua &&
+                              (strncmp(sym_name, "lua_", 4) == 0 ||
+                               strncmp(sym_name, "luaL_", 5) == 0);
+            if (!lua_api_sym && !symbol_name_allowed(sym_name)) {
                 err = BLYT_CART_ERR_BAD_IMPORT;
                 goto fail;
             }
@@ -806,6 +849,12 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
      * as defined (non-UNDEF, STB_GLOBAL) symbols in the cart's .dynsym.
      * --------------------------------------------------------------------- */
 
+    /* Lua carts: blyt_cart_init/update/draw are provided by libblyt32lua.so
+     * (a DT_NEEDED library).  Skip the defined-symbol check when both the
+     * .cart.lua section and the libblyt32lua.so DT_NEEDED entry are present. */
+    if (sect_cart_lua && has_blyt32lua)
+        goto success;
+
     if (sect_dynsym && sect_dynstr_sh) {
         const char *symstr = (const char *)((const uint8_t *)map + sect_dynstr_sh->sh_offset);
         size_t symstr_size = sect_dynstr_sh->sh_size;
@@ -838,6 +887,7 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
      * Success
      * --------------------------------------------------------------------- */
 
+success:
     {
         blyt_cart_t *cart = malloc(sizeof(*cart));
         if (!cart) {
@@ -861,6 +911,25 @@ fail:
     munmap(map, map_size);
     close(fd);
     return err;
+}
+
+const void *blyt_cart_find_section(const blyt_cart_t *cart, const char *name,
+                                    size_t *size_out) {
+    const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
+    const Elf32_Shdr *shdrs =
+        (const Elf32_Shdr *)((const uint8_t *)cart->map + eh->e_shoff);
+    const Elf32_Shdr *shstrtab_hdr = &shdrs[eh->e_shstrndx];
+    const char *shstrtab =
+        (const char *)((const uint8_t *)cart->map + shstrtab_hdr->sh_offset);
+
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        const Elf32_Shdr *sh = &shdrs[i];
+        if (strcmp(shstrtab + sh->sh_name, name) == 0) {
+            *size_out = sh->sh_size;
+            return (const uint8_t *)cart->map + sh->sh_offset;
+        }
+    }
+    return NULL;
 }
 
 void blyt_cart_close(blyt_cart_t *cart) {

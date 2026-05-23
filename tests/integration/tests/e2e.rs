@@ -2,7 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_dir, has_rust_riscv_target, repo_root, sdk_dir,
+    CartProject, blytrun, build_dir, has_luac, has_rust_riscv_target, repo_root, sdk_dir,
     write_c_cart_project,
 };
 use predicates::prelude::*;
@@ -71,7 +71,7 @@ fn sdk_e2e_build_and_run() {
 static int s_frame = 0;
 
 void blyt_cart_init(void)   { blyt_console_debug("hello from sdk"); }
-void blyt_cart_update(void) { if (++s_frame >= 1) blyt_quit_ready(); }
+void blyt_cart_update(void) { if (++s_frame >= 1) blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -134,7 +134,7 @@ static int s_frame = 0;
 void blyt_cart_init(void)   { blyt_console_debug("init"); }
 void blyt_cart_update(void) {
     blyt_console_debug("update");
-    if (++s_frame >= 2) blyt_quit_ready();
+    if (++s_frame >= 2) blyt_quit();
 }
 void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
 "#,
@@ -201,7 +201,7 @@ fn cart_abort_surfaces_as_error() {
 #include <stdlib.h>
 
 void blyt_cart_init(void)   { abort(); }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -272,7 +272,7 @@ void blyt_cart_init(void) {
     blyt_console_debug(buf);
     free(buf);
 }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -403,7 +403,7 @@ void blyt_cart_init(void) {
 
     if (g_ok) blyt_console_debug("arena tests passed");
 }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -513,7 +513,7 @@ static void *const blytc_probe[] = {
 };
 
 void blyt_cart_init(void)   { (void)blytc_probe; }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -554,7 +554,7 @@ fn session_api_run_frame() {
 #include "blyt.h"
 static int s_frame = 0;
 void blyt_cart_init(void)   { blyt_console_debug("session-init"); }
-void blyt_cart_update(void) { if (++s_frame >= 2) blyt_quit_ready(); }
+void blyt_cart_update(void) { if (++s_frame >= 2) blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -606,7 +606,7 @@ fn registry_replaces_blyt_lib_dir() {
         r#"
 #include "blyt.h"
 void blyt_cart_init(void)   { blyt_console_debug("registry-ok"); }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -787,7 +787,7 @@ fn build_wasm_produces_html() {
         r#"
 #include "blyt.h"
 void blyt_cart_init(void)   { blyt_console_debug("wasm-export"); }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -860,7 +860,7 @@ fn build_all_produces_cart_and_html() {
         r#"
 #include "blyt.h"
 void blyt_cart_init(void)   { blyt_console_debug("build-all"); }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#,
     );
@@ -949,7 +949,7 @@ void blyt_cart_update(void) {
      * 3u<<5 = 0x60 sets FCSR.frm=3 while leaving FCSR.fflags=0. */
     unsigned int fcsr_val = 3u << 5;
     __asm__ volatile("csrw fcsr, %0" : : "r"(fcsr_val));
-    if (++s_frame >= 2) blyt_quit_ready();
+    if (++s_frame >= 2) blyt_quit();
 }
 void blyt_cart_draw(void)   { }
 "#,
@@ -1024,7 +1024,7 @@ void blyt_cart_init(void) {
     else
         blyt_console_debug("lib wrong");
 }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#)
         .write(&project);
@@ -1071,7 +1071,7 @@ fn lib_flat_layout_no_include_subdir() {
 #include "flat.h"
 
 void blyt_cart_init(void) { blyt_console_debug(flat_double(5) == 10 ? "flat ok" : "flat wrong"); }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#)
         .write(&project);
@@ -1123,7 +1123,7 @@ fn c_cart_calls_multiple_libs() {
 #include "blib.h"
 
 void blyt_cart_init(void) { blyt_console_debug(a_fn() + b_fn() == 3 ? "multi ok" : "multi wrong"); }
-void blyt_cart_update(void) { blyt_quit_ready(); }
+void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void)   {}
 "#)
         .write(&project);
@@ -1228,7 +1228,7 @@ pub extern "C" fn blyt_cart_init() {
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_update() {
-    blyt::quit_ready();
+    blyt::quit();
 }
 
 #[no_mangle]
@@ -1298,7 +1298,7 @@ extern "C" void blyt_cart_init() {
         blyt_console_debug("c++ wrong");
 }
 
-extern "C" void blyt_cart_update() { blyt_quit_ready(); }
+extern "C" void blyt_cart_update() { blyt_quit(); }
 extern "C" void blyt_cart_draw()   {}
 "#,
         )
@@ -1388,7 +1388,7 @@ pub extern "C" fn blyt_cart_init() {
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_update() {
-    blyt::quit_ready();
+    blyt::quit();
 }
 
 #[no_mangle]
@@ -1459,7 +1459,7 @@ pub extern "C" fn blyt_cart_init() {
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_update() {
-    blyt::quit_ready();
+    blyt::quit();
 }
 
 #[no_mangle]
@@ -1524,7 +1524,7 @@ pub extern "C" fn blyt_cart_init() {
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_update() {
-    blyt::quit_ready();
+    blyt::quit();
 }
 
 #[no_mangle]
@@ -1552,12 +1552,14 @@ pub extern "C" fn blyt_cart_draw() {}
     );
 }
 
-/// `blyt build` with no cart.build.yaml produces a clear error.
+/// `blyt build` with no cart.build.yaml defaults to Lua; without Lua source
+/// files it fails with a clear "no .lua files" error.
 #[test]
-fn build_missing_manifest_fails_with_error() {
+fn build_lua_no_source_fails_with_error() {
     let tmp = tempfile::TempDir::new().unwrap();
     let project = tmp.path().join("no_manifest");
-    fs::create_dir_all(project.join("src/game/c")).unwrap();
+    // Create the project root but no src/game/lua/ directory.
+    fs::create_dir_all(&project).unwrap();
 
     Command::cargo_bin("blyt")
         .unwrap()
@@ -1566,5 +1568,205 @@ fn build_missing_manifest_fails_with_error() {
         .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
         .assert()
         .failure()
-        .stderr(predicates::str::contains("cart.build.yaml"));
+        .stderr(predicates::str::contains("no .lua files"));
+}
+
+// -------------------------------------------------------------------------
+// Lua cart tests
+// -------------------------------------------------------------------------
+
+/// Helper: set up a Lua cart build command with required env vars.
+fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
+    let sdk = sdk_dir();
+    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    cmd.args(["build", project_dir.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
+
+    // Use SDK's riscv32-capable clang if available.
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if sdk_clang.exists() {
+        cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    // Use SDK's llvm-ar if available (needed for src/lib/ C libraries).
+    let sdk_ar = sdk.join("bin/blyt-llvm-ar");
+    if sdk_ar.exists() {
+        cmd.env("BLYT_AR", &sdk_ar);
+    }
+    // Pass blyt-luac if present; otherwise fall back to $BLYT_LUAC from caller.
+    let sdk_luac = sdk.join("bin/blyt-luac");
+    if sdk_luac.exists() {
+        cmd.env("BLYT_LUAC", &sdk_luac);
+    }
+
+    cmd.assert().success();
+
+    project_dir.parent().unwrap().join(format!(
+        "{}.blyt",
+        project_dir.file_name().unwrap().to_str().unwrap()
+    ))
+}
+
+/// A minimal Lua cart calls blyt32.debug.print in init() and produces the
+/// expected output.
+///
+/// Skipped when the SDK is not assembled, libblyt32lua.so is missing, or luac
+/// is unavailable.
+#[test]
+fn lua_cart_debug_output() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() {
+        eprintln!("skipping lua_cart_debug_output: SDK not assembled");
+        return;
+    }
+    if !sdk.join("lib/libblyt32lua.so").exists() {
+        eprintln!("skipping lua_cart_debug_output: libblyt32lua.so not in SDK");
+        return;
+    }
+    if !has_luac() {
+        eprintln!("skipping lua_cart_debug_output: luac not available");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_hello");
+
+    CartProject::new()
+        .lua(
+            r#"
+function init()
+    blyt32.debug.print("hello from lua")
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("hello from lua"),
+        "expected 'hello from lua' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// A Lua cart calls a C library function via the cart_lua_modules mechanism.
+///
+/// The C library defines `cart_lua_modules` which registers a "mathlib" Lua
+/// module.  The Lua cart requires("mathlib") and calls mathlib.add().
+///
+/// Skipped when SDK, libblyt32lua.so, or luac are unavailable.
+#[test]
+fn lua_cart_calls_c_lib() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() {
+        eprintln!("skipping lua_cart_calls_c_lib: SDK not assembled");
+        return;
+    }
+    if !sdk.join("lib/libblyt32lua.so").exists() {
+        eprintln!("skipping lua_cart_calls_c_lib: libblyt32lua.so not in SDK");
+        return;
+    }
+    if !has_luac() {
+        eprintln!("skipping lua_cart_calls_c_lib: luac not available");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_c_lib");
+
+    CartProject::new()
+        // C library with cart_lua_modules registration
+        .lib_file(
+            "mathlib",
+            "include/mathlib.h",
+            "#ifndef MATHLIB_H\n#define MATHLIB_H\n\
+             #ifdef __cplusplus\nextern \"C\" {\n#endif\n\
+             void mathlib_lua_register(void *L);\n\
+             #ifdef __cplusplus\n}\n#endif\n#endif\n",
+        )
+        .lib_file(
+            "mathlib",
+            "mathlib.c",
+            r#"
+#include "lua.h"
+#include "lauxlib.h"
+
+static int l_add(lua_State *L) {
+    int a = (int)luaL_checkinteger(L, 1);
+    int b = (int)luaL_checkinteger(L, 2);
+    lua_pushinteger(L, a + b);
+    return 1;
+}
+
+static const luaL_Reg mathlib_funcs[] = {
+    {"add", l_add},
+    {NULL, NULL}
+};
+
+int luaopen_mathlib(lua_State *L) {
+    luaL_newlib(L, mathlib_funcs);
+    return 1;
+}
+
+void cart_lua_modules(lua_State *L) {
+    luaL_requiref(L, "mathlib", luaopen_mathlib, 1);
+    lua_pop(L, 1);
+}
+"#,
+        )
+        .lua(
+            r#"
+function init()
+    local m = require("mathlib")
+    local result = m.add(3, 4)
+    if result == 7 then
+        blyt32.debug.print("lua+c ok")
+    else
+        blyt32.debug.print("lua+c wrong")
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lua+c ok"),
+        "expected 'lua+c ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
 }

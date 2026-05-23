@@ -18,7 +18,7 @@ use core::ffi::c_char;
 
 extern "C" {
     fn blyt_console_debug(s: *const c_char);
-    fn blyt_quit_ready();
+    fn blyt_quit();
     fn blyt_frame_done();
     // libblytc allocator
     fn malloc(size: usize) -> *mut core::ffi::c_void;
@@ -48,8 +48,8 @@ pub fn console_debug(s: &str) {
 /// Call from `blyt_cart_update` when the cart decides it has finished.
 /// The runtime will stop calling `blyt_cart_update` and `blyt_cart_draw`
 /// after the current frame and proceed with teardown.
-pub fn quit_ready() {
-    unsafe { blyt_quit_ready() }
+pub fn quit() {
+    unsafe { blyt_quit() }
 }
 
 /// Signal the end of one update+draw frame.

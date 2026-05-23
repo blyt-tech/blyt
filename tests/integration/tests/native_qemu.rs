@@ -267,7 +267,7 @@ static int s_frame = 0;
 void blyt_cart_init(void)   { blyt_console_debug("init"); }
 void blyt_cart_update(void) {
     blyt_console_debug("update");
-    if (++s_frame >= 2) blyt_quit_ready();
+    if (++s_frame >= 2) blyt_quit();
 }
 void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
 "#,
@@ -294,7 +294,7 @@ void blyt_cart_update(void) {
      * 3u<<5 = 0x60 sets FCSR.frm=3 while leaving FCSR.fflags=0. */
     unsigned int fcsr_val = 3u << 5;
     __asm__ volatile("csrw fcsr, %0" : : "r"(fcsr_val));
-    if (++s_frame >= 2) blyt_quit_ready();
+    if (++s_frame >= 2) blyt_quit();
 }
 void blyt_cart_draw(void)   { }
 "#,
