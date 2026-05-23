@@ -2153,3 +2153,323 @@ function draw() end
         String::from_utf8_lossy(&output)
     );
 }
+
+// -------------------------------------------------------------------------
+// Lua + src/game/ native code tests
+//
+// These verify that a Lua cart can ship C, C++, or Rust game code under
+// src/game/ (not src/lib/).  The native code defines cart_lua_modules and
+// is compiled/linked alongside the Lua bytecode.
+// -------------------------------------------------------------------------
+
+/// A Lua cart with C game code under src/game/c/ that registers a Lua module.
+///
+/// This is distinct from lua_cart_calls_c_lib (which uses src/lib/): game-level
+/// C code is compiled as plain object files and linked directly, so no archive
+/// step is involved.
+///
+/// Skipped when SDK, libblyt32lua.so, or luac are unavailable.
+#[test]
+fn lua_cart_with_c_game_code() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() {
+        eprintln!("skipping lua_cart_with_c_game_code: SDK not assembled");
+        return;
+    }
+    if !sdk.join("lib/libblyt32lua.so").exists() {
+        eprintln!("skipping lua_cart_with_c_game_code: libblyt32lua.so not in SDK");
+        return;
+    }
+    if !has_luac() {
+        eprintln!("skipping lua_cart_with_c_game_code: luac not available");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_c_game");
+
+    CartProject::new()
+        .c(r#"
+#include "lua.h"
+#include "lauxlib.h"
+
+static int l_negate(lua_State *L) {
+    int x = (int)luaL_checkinteger(L, 1);
+    lua_pushinteger(L, -x);
+    return 1;
+}
+
+static const luaL_Reg gamelib_funcs[] = {
+    {"negate", l_negate},
+    {NULL, NULL}
+};
+
+int luaopen_gamelib(lua_State *L) {
+    luaL_newlib(L, gamelib_funcs);
+    return 1;
+}
+
+void cart_lua_modules(lua_State *L) {
+    luaL_requiref(L, "gamelib", luaopen_gamelib, 1);
+    lua_pop(L, 1);
+}
+"#)
+        .lua(r#"
+function init()
+    local m = require("gamelib")
+    local result = m.negate(42)
+    if result == -42 then
+        blyt32.debug.print("lua+c-game ok")
+    else
+        blyt32.debug.print("lua+c-game wrong")
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lua+c-game ok"),
+        "expected 'lua+c-game ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// A Lua cart with C++ game code under src/game/c++/ that registers a Lua module.
+///
+/// Skipped when SDK, blyt-clang++, libblyt32lua.so, or luac are unavailable.
+#[test]
+fn lua_cart_with_cpp_game_code() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() {
+        eprintln!("skipping lua_cart_with_cpp_game_code: SDK not assembled");
+        return;
+    }
+    if !sdk.join("bin/blyt-clang++").exists() {
+        eprintln!("skipping lua_cart_with_cpp_game_code: blyt-clang++ not in SDK");
+        return;
+    }
+    if !sdk.join("lib/libblyt32lua.so").exists() {
+        eprintln!("skipping lua_cart_with_cpp_game_code: libblyt32lua.so not in SDK");
+        return;
+    }
+    if !has_luac() {
+        eprintln!("skipping lua_cart_with_cpp_game_code: luac not available");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_cpp_game");
+
+    CartProject::new()
+        // Lua headers have no extern "C" guards — wrap includes explicitly.
+        .cpp(r#"
+extern "C" {
+#include "lua.h"
+#include "lauxlib.h"
+}
+
+static int cpp_square(int x) { return x * x; }
+
+extern "C" {
+
+static int l_square(lua_State *L) {
+    int x = (int)luaL_checkinteger(L, 1);
+    lua_pushinteger(L, cpp_square(x));
+    return 1;
+}
+
+static const luaL_Reg gamelib_funcs[] = {
+    {"square", l_square},
+    {NULL, NULL}
+};
+
+int luaopen_cppgamelib(lua_State *L) {
+    luaL_newlib(L, gamelib_funcs);
+    return 1;
+}
+
+void cart_lua_modules(lua_State *L) {
+    luaL_requiref(L, "cppgamelib", luaopen_cppgamelib, 1);
+    lua_pop(L, 1);
+}
+
+} // extern "C"
+"#)
+        .lua(r#"
+function init()
+    local m = require("cppgamelib")
+    local result = m.square(7)
+    if result == 49 then
+        blyt32.debug.print("lua+cpp-game ok")
+    else
+        blyt32.debug.print("lua+cpp-game wrong")
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lua+cpp-game ok"),
+        "expected 'lua+cpp-game ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// A Lua cart with Rust game code under src/game/rust/ that registers a Lua module.
+///
+/// The Rust game crate defines cart_lua_modules using raw Lua C FFI.  The blyt
+/// SDK crate (auto-injected as a dependency) provides the #[panic_handler] and
+/// #[global_allocator] so the Rust game code integrates cleanly with the cart.
+///
+/// Skipped when SDK, libblyt32lua.so, luac, or the riscv32 Rust target are
+/// unavailable.
+#[test]
+fn lua_cart_with_rust_game_code() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang").exists() {
+        eprintln!("skipping lua_cart_with_rust_game_code: SDK not assembled");
+        return;
+    }
+    if !sdk.join("lib/libblyt32lua.so").exists() {
+        eprintln!("skipping lua_cart_with_rust_game_code: libblyt32lua.so not in SDK");
+        return;
+    }
+    if !has_luac() {
+        eprintln!("skipping lua_cart_with_rust_game_code: luac not available");
+        return;
+    }
+    if !has_rust_riscv_target() {
+        eprintln!(
+            "skipping lua_cart_with_rust_game_code: riscv32imafc-unknown-none-elf not installed"
+        );
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_rust_game");
+
+    // The blyt SDK crate (injected via --config at build time) provides
+    // #[panic_handler] and #[global_allocator].  `extern crate blyt` forces the
+    // crate into the compilation graph even though no blyt items are directly
+    // called — without this the panic handler from blyt is not discovered.
+    let rust_game_src = r#"#![no_std]
+extern crate blyt;
+
+use core::ffi::{c_int, c_void};
+
+type LuaState = c_void;
+
+extern "C" {
+    fn lua_createtable(L: *mut LuaState, narr: c_int, nrec: c_int);
+    fn lua_pushcclosure(
+        L: *mut LuaState,
+        f: unsafe extern "C" fn(*mut LuaState) -> c_int,
+        n: c_int,
+    );
+    fn lua_setfield(L: *mut LuaState, idx: c_int, k: *const u8);
+    fn lua_pushinteger(L: *mut LuaState, n: c_int);
+    fn luaL_checkinteger(L: *mut LuaState, arg: c_int) -> c_int;
+    fn luaL_requiref(
+        L: *mut LuaState,
+        modname: *const u8,
+        openf: unsafe extern "C" fn(*mut LuaState) -> c_int,
+        glb: c_int,
+    );
+    fn lua_settop(L: *mut LuaState, idx: c_int);
+}
+
+unsafe extern "C" fn l_double(L: *mut LuaState) -> c_int {
+    let x = luaL_checkinteger(L, 1);
+    lua_pushinteger(L, x * 2);
+    1
+}
+
+unsafe extern "C" fn luaopen_rustgamelib(L: *mut LuaState) -> c_int {
+    lua_createtable(L, 0, 1);
+    lua_pushcclosure(L, l_double, 0);
+    lua_setfield(L, -2, b"double\0".as_ptr());
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
+    luaL_requiref(L, b"rustgamelib\0".as_ptr(), luaopen_rustgamelib, 1);
+    lua_settop(L, -2); // lua_pop(L, 1)
+}
+"#;
+
+    CartProject::new()
+        .rust(rust_game_src)
+        .lua(r#"
+function init()
+    local m = require("rustgamelib")
+    local result = m.double(21)
+    if result == 42 then
+        blyt32.debug.print("lua+rust-game ok")
+    else
+        blyt32.debug.print("lua+rust-game wrong")
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lua+rust-game ok"),
+        "expected 'lua+rust-game ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}

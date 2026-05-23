@@ -393,6 +393,74 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
             generate_lua_data_c(&bytecode_path, &data_c)?;
             obj_files.push(compile_c(&clang, &data_c, &build_dir, &sdk_include, &[], &[])?);
 
+            // Compile game-level C files alongside the Lua bytecode.  These can
+            // define cart_lua_modules to register Lua modules from game C code,
+            // providing a flatter layout than the src/lib/ library system.
+            let game_c_dir = project_dir.join("src/game/c");
+            if game_c_dir.exists() {
+                for src in collect_c_files(&game_c_dir)? {
+                    obj_files.push(compile_c(
+                        &clang,
+                        &src,
+                        &build_dir,
+                        &sdk_include,
+                        &lib_include_refs,
+                        &lua_lib_defines,
+                    )?);
+                }
+            }
+
+            // Compile game-level C++ files.  Lua headers have no extern "C" guards
+            // so callers must wrap includes manually (same constraint as src/lib/ C++).
+            let game_cpp_dir = project_dir.join("src/game/c++");
+            if game_cpp_dir.exists() {
+                let cpp_files = collect_cpp_files(&game_cpp_dir)?;
+                if !cpp_files.is_empty() {
+                    let libcxx_include = sdk_include.join("c++/v1");
+                    // Add libc++ when present; harmless if code does not use the STL.
+                    let libc_a = lib_dir.join("libc++.a");
+                    if libc_a.exists() {
+                        lib_archives.push(libc_a);
+                    }
+                    let libcxxabi_a = lib_dir.join("libc++abi.a");
+                    if libcxxabi_a.exists() {
+                        lib_archives.push(libcxxabi_a);
+                    }
+                    for src in &cpp_files {
+                        obj_files.push(compile_cpp(
+                            &clangpp,
+                            src,
+                            &build_dir,
+                            &sdk_include,
+                            &libcxx_include,
+                            &lib_include_refs,
+                        )?);
+                    }
+                }
+            }
+
+            // Build Rust game code in src/game/rust/ when a Cargo.toml is present.
+            // The resulting archive is added to lib_archives (not rust_archive) so
+            // the linker does not inject -u,blyt_cart_init — those symbols come from
+            // libblyt32lua.so.  -u,cart_lua_modules is added by link_cart when
+            // lib_archives is non-empty.
+            let rust_game_manifest = project_dir.join("src/game/rust/Cargo.toml");
+            if rust_game_manifest.exists() {
+                let cargo = find_cargo();
+                let rust_sdk = find_rust_sdk(&sdk_include)?;
+                let rust_build_dir = project_dir.join("build/game/rust");
+                fs::create_dir_all(&rust_build_dir)?;
+                let rust_libs = discover_rust_libs(project_dir)?;
+                let archive = build_rust_archive(
+                    &cargo,
+                    &rust_game_manifest,
+                    &rust_build_dir,
+                    &rust_sdk,
+                    &rust_libs,
+                )?;
+                lib_archives.push(archive);
+            }
+
             None
         }
     };
