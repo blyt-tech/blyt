@@ -500,8 +500,7 @@ static void resolve_elf_plt(const uint8_t *map, size_t map_size, memory_t *mem, 
         for (size_t j = 0; j < rcount; j++) {
             const Elf32_Rela *r = (const Elf32_Rela *)(map + sh->sh_offset + j * sh->sh_entsize);
             uint32_t type = ELF32_R_TYPE(r->r_info);
-            if (type != R_RISCV_JUMP_SLOT && type != R_RISCV_GLOB_DAT &&
-                type != R_RISCV_32)
+            if (type != R_RISCV_JUMP_SLOT && type != R_RISCV_GLOB_DAT && type != R_RISCV_32)
                 continue;
 
             uint32_t sym_idx = ELF32_R_SYM(r->r_info);

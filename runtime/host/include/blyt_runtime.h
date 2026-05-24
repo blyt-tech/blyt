@@ -58,8 +58,7 @@ const char *blyt_cart_err_str(blyt_cart_err_t err);
  * size.  Returns NULL when the section is absent.  Valid while the cart
  * is open.
  */
-const void *blyt_cart_find_section(const blyt_cart_t *cart, const char *name,
-                                   size_t *size_out);
+const void *blyt_cart_find_section(const blyt_cart_t *cart, const char *name, size_t *size_out);
 
 /* --- In-memory library registry ----------------------------------------- */
 

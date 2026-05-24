@@ -533,7 +533,8 @@ void cart_lua_modules(lua_State *L) {
     lua_pop(L, 1);
 }
 "#)
-        .lua(r#"
+        .lua(
+            r#"
 function init()
     local m = require("gamelib")
     local result = m.negate(42)
@@ -549,7 +550,8 @@ function update()
 end
 
 function draw() end
-"#)
+"#,
+        )
         .write(&project);
 
     let cart = build_lua_cart(&project);
@@ -584,7 +586,8 @@ fn lua_cart_with_cpp_game_code() {
 
     CartProject::new()
         // Lua headers have no extern "C" guards — wrap includes explicitly.
-        .cpp(r#"
+        .cpp(
+            r#"
 extern "C" {
 #include "lua.h"
 #include "lauxlib.h"
@@ -616,8 +619,10 @@ void cart_lua_modules(lua_State *L) {
 }
 
 } // extern "C"
-"#)
-        .lua(r#"
+"#,
+        )
+        .lua(
+            r#"
 function init()
     local m = require("cppgamelib")
     local result = m.square(7)
@@ -633,7 +638,8 @@ function update()
 end
 
 function draw() end
-"#)
+"#,
+        )
         .write(&project);
 
     let cart = build_lua_cart(&project);
@@ -722,7 +728,8 @@ pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
 
     CartProject::new()
         .rust(rust_game_src)
-        .lua(r#"
+        .lua(
+            r#"
 function init()
     local m = require("rustgamelib")
     local result = m.double(21)
@@ -738,7 +745,8 @@ function update()
 end
 
 function draw() end
-"#)
+"#,
+        )
         .write(&project);
 
     let cart = build_lua_cart(&project);

@@ -289,29 +289,62 @@ static const char *const SYMBOL_ALLOWLIST[] = {
      * Provided by libblyt32.so (libblytc sources) and libblyt32lua.so
      * (SoftFloat).  Carts using double/float128 arithmetic import these. */
     /* f32 ↔ f64 ↔ f128 conversions */
-    "__extendsfdf2", "__truncdfsf2",
-    "__extendsftf2", "__extenddftf2",
-    "__trunctfsf2",  "__trunctfdf2",
+    "__extendsfdf2",
+    "__truncdfsf2",
+    "__extendsftf2",
+    "__extenddftf2",
+    "__trunctfsf2",
+    "__trunctfdf2",
     /* int → float */
-    "__floatsidf",  "__floatdidf",  "__floatdisf",  "__floatditf",
-    "__floatsitf",  "__floatunsidf","__floatunsitf",
+    "__floatsidf",
+    "__floatdidf",
+    "__floatdisf",
+    "__floatditf",
+    "__floatsitf",
+    "__floatunsidf",
+    "__floatunsitf",
     /* float → int */
-    "__fixdfsi",    "__fixdfdi",    "__fixsfdi",
-    "__fixtfsi",    "__fixtfdi",    "__fixunstfsi",
+    "__fixdfsi",
+    "__fixdfdi",
+    "__fixsfdi",
+    "__fixtfsi",
+    "__fixtfdi",
+    "__fixunstfsi",
     /* f64 arithmetic */
-    "__adddf3",  "__subdf3",  "__muldf3",  "__divdf3",
+    "__adddf3",
+    "__subdf3",
+    "__muldf3",
+    "__divdf3",
     /* f128 arithmetic */
-    "__addtf3",  "__subtf3",  "__multf3",  "__divtf3",
+    "__addtf3",
+    "__subtf3",
+    "__multf3",
+    "__divtf3",
     /* f64 comparisons */
-    "__eqdf2",  "__nedf2",  "__ltdf2",  "__ledf2",  "__gtdf2",  "__gedf2",
+    "__eqdf2",
+    "__nedf2",
+    "__ltdf2",
+    "__ledf2",
+    "__gtdf2",
+    "__gedf2",
     /* f128 comparisons */
-    "__eqtf2",  "__netf2",  "__lttf2",  "__letf2",  "__gttf2",  "__getf2",
+    "__eqtf2",
+    "__netf2",
+    "__lttf2",
+    "__letf2",
+    "__gttf2",
+    "__getf2",
     "__unordtf2",
     /* 64-bit integer arithmetic */
-    "__udivdi3",  "__umoddi3",
+    "__udivdi3",
+    "__umoddi3",
     /* classification helpers (isnan, isinf, signbit) */
-    "__fpclassify",  "__fpclassifyf",  "__fpclassifyl",
-    "__signbit",     "__signbitf",     "__signbitl",
+    "__fpclassify",
+    "__fpclassifyf",
+    "__fpclassifyl",
+    "__signbit",
+    "__signbitf",
+    "__signbitl",
 
     NULL,
 };
@@ -755,9 +788,8 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
             /* Lua carts may import any Lua C API symbol (lua_* / luaL_*)
              * when src/lib/ C code calls the Lua API directly.  These
              * symbols are pure VM operations with no host-side side effects. */
-            int lua_api_sym = has_blyt32lua &&
-                              (strncmp(sym_name, "lua_", 4) == 0 ||
-                               strncmp(sym_name, "luaL_", 5) == 0);
+            int lua_api_sym = has_blyt32lua && (strncmp(sym_name, "lua_", 4) == 0 ||
+                                                strncmp(sym_name, "luaL_", 5) == 0);
             if (!lua_api_sym && !symbol_name_allowed(sym_name)) {
                 err = BLYT_CART_ERR_BAD_IMPORT;
                 goto fail;
@@ -887,25 +919,24 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
      * Success
      * --------------------------------------------------------------------- */
 
-success:
-    {
-        blyt_cart_t *cart = malloc(sizeof(*cart));
-        if (!cart) {
-            err = BLYT_CART_ERR_IO;
-            goto fail;
-        }
-        cart->fd = fd;
-        cart->map = map;
-        cart->map_size = map_size;
-        cart->path = strdup(path);
-        if (!cart->path) {
-            free(cart);
-            err = BLYT_CART_ERR_IO;
-            goto fail;
-        }
-        *out = cart;
-        return BLYT_CART_OK;
+success: {
+    blyt_cart_t *cart = malloc(sizeof(*cart));
+    if (!cart) {
+        err = BLYT_CART_ERR_IO;
+        goto fail;
     }
+    cart->fd = fd;
+    cart->map = map;
+    cart->map_size = map_size;
+    cart->path = strdup(path);
+    if (!cart->path) {
+        free(cart);
+        err = BLYT_CART_ERR_IO;
+        goto fail;
+    }
+    *out = cart;
+    return BLYT_CART_OK;
+}
 
 fail:
     munmap(map, map_size);
@@ -913,14 +944,11 @@ fail:
     return err;
 }
 
-const void *blyt_cart_find_section(const blyt_cart_t *cart, const char *name,
-                                    size_t *size_out) {
+const void *blyt_cart_find_section(const blyt_cart_t *cart, const char *name, size_t *size_out) {
     const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
-    const Elf32_Shdr *shdrs =
-        (const Elf32_Shdr *)((const uint8_t *)cart->map + eh->e_shoff);
+    const Elf32_Shdr *shdrs = (const Elf32_Shdr *)((const uint8_t *)cart->map + eh->e_shoff);
     const Elf32_Shdr *shstrtab_hdr = &shdrs[eh->e_shstrndx];
-    const char *shstrtab =
-        (const char *)((const uint8_t *)cart->map + shstrtab_hdr->sh_offset);
+    const char *shstrtab = (const char *)((const uint8_t *)cart->map + shstrtab_hdr->sh_offset);
 
     for (uint16_t i = 0; i < eh->e_shnum; i++) {
         const Elf32_Shdr *sh = &shdrs[i];

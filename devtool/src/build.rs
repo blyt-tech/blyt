@@ -391,7 +391,14 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
 
             let data_c = build_dir.join("cart_lua_data.c");
             generate_lua_data_c(&bytecode_path, &data_c)?;
-            obj_files.push(compile_c(&clang, &data_c, &build_dir, &sdk_include, &[], &[])?);
+            obj_files.push(compile_c(
+                &clang,
+                &data_c,
+                &build_dir,
+                &sdk_include,
+                &[],
+                &[],
+            )?);
 
             // Compile game-level C files alongside the Lua bytecode.  These can
             // define cart_lua_modules to register Lua modules from game C code,
@@ -488,8 +495,13 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
     };
 
     if let Some(ref bytecode) = lua_bytecode_path {
-        finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path,
-                      &[(".cart.lua", bytecode.as_path())])?;
+        finalise_cart(
+            &objcopy,
+            &raw_elf,
+            &cart_info_file,
+            &output_path,
+            &[(".cart.lua", bytecode.as_path())],
+        )?;
     } else {
         finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path, &[])?;
     }
@@ -544,7 +556,15 @@ pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, B
     let clangpp = find_clangpp();
     let ar = find_ar();
     let sdk_include = find_sdk_include()?;
-    let built = build_library(&clang, &clangpp, &ar, project_dir, lib_name, &sdk_include, &[])?;
+    let built = build_library(
+        &clang,
+        &clangpp,
+        &ar,
+        project_dir,
+        lib_name,
+        &sdk_include,
+        &[],
+    )?;
     println!("built: {}", built.archive.display());
     Ok(built.archive)
 }
@@ -943,7 +963,9 @@ fn strip_compiler_builtins(ar: &str, archive: &Path) -> Result<(), BuildError> {
         .status()
         .map_err(|e| err(format!("failed to run {ar} d: {e}")))?;
     if !status.success() {
-        return Err(err("failed to remove compiler_builtins objects from Rust archive"));
+        return Err(err(
+            "failed to remove compiler_builtins objects from Rust archive",
+        ));
     }
     Ok(())
 }

@@ -210,11 +210,16 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         return 1;
     }
 
-    luaL_requiref(g_lua, "_G",        luaopen_base,      1); lua_pop(g_lua, 1);
-    luaL_requiref(g_lua, "math",      luaopen_math,      1); lua_pop(g_lua, 1);
-    luaL_requiref(g_lua, "string",    luaopen_string,    1); lua_pop(g_lua, 1);
-    luaL_requiref(g_lua, "table",     luaopen_table,     1); lua_pop(g_lua, 1);
-    luaL_requiref(g_lua, "coroutine", luaopen_coroutine, 1); lua_pop(g_lua, 1);
+    luaL_requiref(g_lua, "_G", luaopen_base, 1);
+    lua_pop(g_lua, 1);
+    luaL_requiref(g_lua, "math", luaopen_math, 1);
+    lua_pop(g_lua, 1);
+    luaL_requiref(g_lua, "string", luaopen_string, 1);
+    lua_pop(g_lua, 1);
+    luaL_requiref(g_lua, "table", luaopen_table, 1);
+    lua_pop(g_lua, 1);
+    luaL_requiref(g_lua, "coroutine", luaopen_coroutine, 1);
+    lua_pop(g_lua, 1);
 
     /* Register blyt32 API */
     lua_newtable(g_lua);
@@ -313,8 +318,7 @@ int main(void) {
     /* Lua-direct path: if the cart has a .cart.lua section, run it directly
      * in a host-side Lua state rather than through rv32emu. */
     size_t lua_bytecode_size = 0;
-    const void *lua_bytecode =
-        blyt_cart_find_section(g_cart, ".cart.lua", &lua_bytecode_size);
+    const void *lua_bytecode = blyt_cart_find_section(g_cart, ".cart.lua", &lua_bytecode_size);
     if (lua_bytecode) {
         return run_lua_cart(lua_bytecode, lua_bytecode_size);
     }

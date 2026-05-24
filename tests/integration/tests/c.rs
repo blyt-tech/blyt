@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_cart, repo_root, require_sdk, require_test_session_api,
-    sdk_dir, test_session_api, write_c_cart_project,
+    CartProject, blytrun, build_cart, repo_root, require_sdk, require_test_session_api, sdk_dir,
+    test_session_api, write_c_cart_project,
 };
 use predicates::prelude::*;
 use std::fs;
