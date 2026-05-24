@@ -33,6 +33,7 @@ jobs:
           sudo update-alternatives --install /usr/bin/llvm-objcopy  llvm-objcopy  /usr/bin/llvm-objcopy-22  100
           sudo update-alternatives --install /usr/bin/llvm-ar       llvm-ar       /usr/bin/llvm-ar-22       100
           pip3 install clang-format==22.1.5 cmakelang yamllint
+          rustup target add riscv32imafc-unknown-none-elf
 
       - name: Check formatting
         run: |
@@ -130,6 +131,5 @@ jobs:
 
       - name: Rust tests (unit + integration)
         env:
-          BLYT_SDK_DIR: ${{ github.workspace }}/build/sdk
-          BLYT_OBJCOPY: llvm-objcopy
+          BLYT_BUILD_DIR: ${{ github.workspace }}/build
         run: cargo test --workspace
