@@ -26,7 +26,8 @@ jobs:
           sudo apt-get install -y cmake ninja-build libsdl2-dev \
             clang-22 lld-22 llvm-22 \
             qemu-system-misc gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
-            libc6-dev-riscv64-cross libgcc-s1-riscv64-cross
+            libc6-dev-riscv64-cross libgcc-s1-riscv64-cross \
+            emscripten
           sudo update-alternatives --install /usr/bin/clang        clang        /usr/bin/clang-22        100
           sudo update-alternatives --install /usr/bin/clang++       clang++       /usr/bin/clang++-22       100
           sudo update-alternatives --install /usr/bin/ld.lld        ld.lld        /usr/bin/ld.lld-22        100

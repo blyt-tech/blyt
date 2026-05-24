@@ -343,6 +343,15 @@ pub fn require_test_session_api() {
     );
 }
 
+pub fn require_wasm() {
+    assert!(
+        find_wasm_dir().join("blytrun.js").exists(),
+        "WASM runtime not built — install emscripten and run \
+         `cmake --build build --target sdk` (or \
+         `emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm`)"
+    );
+}
+
 // -------------------------------------------------------------------------
 // Cart build helpers
 // -------------------------------------------------------------------------

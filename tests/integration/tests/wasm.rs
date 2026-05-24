@@ -1,7 +1,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{blytrun, build_cart, find_wasm_dir, repo_root, sdk_dir, write_c_cart_project};
+use common::{build_cart, find_wasm_dir, repo_root, require_wasm, sdk_dir, write_c_cart_project};
 use std::fs;
 use tempfile::TempDir;
 
@@ -16,14 +16,8 @@ use tempfile::TempDir;
 /// Silently skipped when blytrun.js is not found.
 #[test]
 fn wasm_testcard_frame0_matches_golden() {
+    require_wasm();
     let wasm_dir = find_wasm_dir();
-    if !wasm_dir.join("blytrun.js").exists() {
-        eprintln!(
-            "wasm_testcard_frame0_matches_golden: blytrun.js not found — \
-             build with: emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm"
-        );
-        return;
-    }
     assert!(
         sdk_dir().join("bin/blyt-clang").exists(),
         "SDK not assembled — run `cmake --build build --target sdk` first"
@@ -79,11 +73,8 @@ void blyt_cart_draw(void)   {}
 /// Silently skipped when blytrun.js is not found.
 #[test]
 fn build_wasm_produces_html() {
+    require_wasm();
     let wasm_dir = find_wasm_dir();
-    if !wasm_dir.join("blytrun.js").exists() {
-        eprintln!("build_wasm_produces_html: blytrun.js not found — skipping");
-        return;
-    }
     assert!(
         sdk_dir().join("bin/blyt-clang").exists(),
         "SDK not assembled — run `cmake --build build --target sdk` first"
@@ -152,11 +143,8 @@ void blyt_cart_draw(void)   {}
 /// Silently skipped when blytrun.js is not found.
 #[test]
 fn build_all_produces_cart_and_html() {
+    require_wasm();
     let wasm_dir = find_wasm_dir();
-    if !wasm_dir.join("blytrun.js").exists() {
-        eprintln!("build_all_produces_cart_and_html: blytrun.js not found — skipping");
-        return;
-    }
     assert!(
         sdk_dir().join("bin/blyt-clang").exists(),
         "SDK not assembled — run `cmake --build build --target sdk` first"
