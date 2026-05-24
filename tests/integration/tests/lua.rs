@@ -2,7 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_lua_cart, has_luac, has_rust_riscv_target, sdk_dir,
+    CartProject, blytrun, build_lua_cart, require_cpp_sdk, require_lua_sdk,
+    require_rust_riscv_target, require_sdk, sdk_dir,
 };
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -28,24 +29,11 @@ fn build_lua_no_source_fails_with_error() {
 
 /// A minimal Lua cart calls blyt32.debug.print in init() and produces the
 /// expected output.
-///
-/// Skipped when the SDK is not assembled, libblyt32lua.so is missing, or luac
-/// is unavailable.
 #[test]
 fn lua_cart_debug_output() {
+    require_sdk();
+    require_lua_sdk();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() {
-        eprintln!("skipping lua_cart_debug_output: SDK not assembled");
-        return;
-    }
-    if !sdk.join("lib/libblyt32lua.so").exists() {
-        eprintln!("skipping lua_cart_debug_output: libblyt32lua.so not in SDK");
-        return;
-    }
-    if !has_luac() {
-        eprintln!("skipping lua_cart_debug_output: luac not available");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_hello");
@@ -89,23 +77,11 @@ function draw() end
 ///
 /// The C library defines `cart_lua_modules` which registers a "mathlib" Lua
 /// module.  The Lua cart requires("mathlib") and calls mathlib.add().
-///
-/// Skipped when SDK, libblyt32lua.so, or luac are unavailable.
 #[test]
 fn lua_cart_calls_c_lib() {
+    require_sdk();
+    require_lua_sdk();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() {
-        eprintln!("skipping lua_cart_calls_c_lib: SDK not assembled");
-        return;
-    }
-    if !sdk.join("lib/libblyt32lua.so").exists() {
-        eprintln!("skipping lua_cart_calls_c_lib: libblyt32lua.so not in SDK");
-        return;
-    }
-    if !has_luac() {
-        eprintln!("skipping lua_cart_calls_c_lib: luac not available");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_c_lib");
@@ -195,30 +171,12 @@ function draw() end
 /// The Rust library defines `cart_lua_modules` using raw Lua C FFI, registering
 /// a "rustlib" module.  The Lua cart requires("rustlib") and calls
 /// rustlib.multiply().
-///
-/// Skipped when SDK, libblyt32lua.so, luac, or the riscv32 Rust target are
-/// unavailable.
 #[test]
 fn lua_cart_calls_rust_lib() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() {
-        eprintln!("skipping lua_cart_calls_rust_lib: SDK not assembled");
-        return;
-    }
-    if !sdk.join("lib/libblyt32lua.so").exists() {
-        eprintln!("skipping lua_cart_calls_rust_lib: libblyt32lua.so not in SDK");
-        return;
-    }
-    if !has_luac() {
-        eprintln!("skipping lua_cart_calls_rust_lib: luac not available");
-        return;
-    }
-    if !has_rust_riscv_target() {
-        eprintln!(
-            "skipping lua_cart_calls_rust_lib: riscv32imafc-unknown-none-elf not installed"
-        );
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_rust_lib");
@@ -336,27 +294,12 @@ function draw() end
 /// The C++ library defines `extern "C" void cart_lua_modules(lua_State *L)`
 /// which registers a "cpplib" Lua module backed by a C++ function.  The Lua
 /// cart requires("cpplib") and calls cpplib.square().
-///
-/// Skipped when SDK, blyt-clang++, libblyt32lua.so, or luac are unavailable.
 #[test]
 fn lua_cart_calls_cpp_lib() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() {
-        eprintln!("skipping lua_cart_calls_cpp_lib: SDK not assembled");
-        return;
-    }
-    if !sdk.join("bin/blyt-clang++").exists() {
-        eprintln!("skipping lua_cart_calls_cpp_lib: blyt-clang++ not in SDK");
-        return;
-    }
-    if !sdk.join("lib/libblyt32lua.so").exists() {
-        eprintln!("skipping lua_cart_calls_cpp_lib: libblyt32lua.so not in SDK");
-        return;
-    }
-    if !has_luac() {
-        eprintln!("skipping lua_cart_calls_cpp_lib: luac not available");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_cpp_lib");
@@ -452,23 +395,11 @@ function draw() end
 /// function retrieves a Lua global (set by the Lua cart) and returns it
 /// incremented, exercising lua_getglobal / lua_tointegerx / lua_pushinteger
 /// from within cart C code.
-///
-/// Skipped when SDK, libblyt32lua.so, or luac are unavailable.
 #[test]
 fn c_lib_drives_lua_vm() {
+    require_sdk();
+    require_lua_sdk();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() {
-        eprintln!("skipping c_lib_drives_lua_vm: SDK not assembled");
-        return;
-    }
-    if !sdk.join("lib/libblyt32lua.so").exists() {
-        eprintln!("skipping c_lib_drives_lua_vm: libblyt32lua.so not in SDK");
-        return;
-    }
-    if !has_luac() {
-        eprintln!("skipping c_lib_drives_lua_vm: luac not available");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("c_drives_lua");
@@ -567,23 +498,11 @@ function draw() end
 /// This is distinct from lua_cart_calls_c_lib (which uses src/lib/): game-level
 /// C code is compiled as plain object files and linked directly, so no archive
 /// step is involved.
-///
-/// Skipped when SDK, libblyt32lua.so, or luac are unavailable.
 #[test]
 fn lua_cart_with_c_game_code() {
+    require_sdk();
+    require_lua_sdk();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() {
-        eprintln!("skipping lua_cart_with_c_game_code: SDK not assembled");
-        return;
-    }
-    if !sdk.join("lib/libblyt32lua.so").exists() {
-        eprintln!("skipping lua_cart_with_c_game_code: libblyt32lua.so not in SDK");
-        return;
-    }
-    if !has_luac() {
-        eprintln!("skipping lua_cart_with_c_game_code: luac not available");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_c_game");
@@ -653,27 +572,12 @@ function draw() end
 }
 
 /// A Lua cart with C++ game code under src/game/c++/ that registers a Lua module.
-///
-/// Skipped when SDK, blyt-clang++, libblyt32lua.so, or luac are unavailable.
 #[test]
 fn lua_cart_with_cpp_game_code() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() {
-        eprintln!("skipping lua_cart_with_cpp_game_code: SDK not assembled");
-        return;
-    }
-    if !sdk.join("bin/blyt-clang++").exists() {
-        eprintln!("skipping lua_cart_with_cpp_game_code: blyt-clang++ not in SDK");
-        return;
-    }
-    if !sdk.join("lib/libblyt32lua.so").exists() {
-        eprintln!("skipping lua_cart_with_cpp_game_code: libblyt32lua.so not in SDK");
-        return;
-    }
-    if !has_luac() {
-        eprintln!("skipping lua_cart_with_cpp_game_code: luac not available");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_cpp_game");
@@ -756,30 +660,12 @@ function draw() end
 /// The Rust game crate defines cart_lua_modules using raw Lua C FFI.  The blyt
 /// SDK crate (auto-injected as a dependency) provides the #[panic_handler] and
 /// #[global_allocator] so the Rust game code integrates cleanly with the cart.
-///
-/// Skipped when SDK, libblyt32lua.so, luac, or the riscv32 Rust target are
-/// unavailable.
 #[test]
 fn lua_cart_with_rust_game_code() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() {
-        eprintln!("skipping lua_cart_with_rust_game_code: SDK not assembled");
-        return;
-    }
-    if !sdk.join("lib/libblyt32lua.so").exists() {
-        eprintln!("skipping lua_cart_with_rust_game_code: libblyt32lua.so not in SDK");
-        return;
-    }
-    if !has_luac() {
-        eprintln!("skipping lua_cart_with_rust_game_code: luac not available");
-        return;
-    }
-    if !has_rust_riscv_target() {
-        eprintln!(
-            "skipping lua_cart_with_rust_game_code: riscv32imafc-unknown-none-elf not installed"
-        );
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_rust_game");

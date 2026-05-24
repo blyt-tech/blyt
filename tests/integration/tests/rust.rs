@@ -1,27 +1,19 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{CartProject, blytrun, build_cart, has_rust_riscv_target, sdk_dir};
+use common::{
+    CartProject, blytrun, build_cart, require_cpp_sdk, require_rust_riscv_target, require_sdk,
+    sdk_dir,
+};
 use tempfile::TempDir;
 
 /// Build and run a minimal Rust cart.  Verifies that a pure Rust cart
 /// compiled with `language: rust` produces the expected debug output.
-///
-/// Skipped when:
-/// - The SDK is not assembled (no blyt-clang or libblyt32.so)
-/// - The riscv32imafc-unknown-none-elf Rust target is not installed
-///   (`rustup target add riscv32imafc-unknown-none-elf` to enable)
 #[test]
 fn rust_cart_debug_output() {
+    require_sdk();
+    require_rust_riscv_target();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() || !sdk.join("lib/libblyt32.so").exists() {
-        eprintln!("skipping rust_cart_debug_output: SDK not assembled");
-        return;
-    }
-    if !has_rust_riscv_target() {
-        eprintln!("skipping rust_cart_debug_output: riscv32imafc-unknown-none-elf not installed");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("rust_hello");
@@ -69,21 +61,11 @@ pub extern "C" fn blyt_cart_draw() {}
 ///
 /// Validates the cross-language path: C library compiled to lib.a, Rust game
 /// code declares the symbol via extern "C", final clang link resolves it.
-///
-/// Skipped when the SDK or riscv32imafc Rust target is not available.
 #[test]
 fn rust_cart_calls_c_lib_function() {
+    require_sdk();
+    require_rust_riscv_target();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() || !sdk.join("lib/libblyt32.so").exists() {
-        eprintln!("skipping rust_cart_calls_c_lib_function: SDK not assembled");
-        return;
-    }
-    if !has_rust_riscv_target() {
-        eprintln!(
-            "skipping rust_cart_calls_c_lib_function: riscv32imafc-unknown-none-elf not installed"
-        );
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("rust_c_lib");
@@ -147,25 +129,12 @@ pub extern "C" fn blyt_cart_draw() {}
 /// The library is written in C++ (compiled with clang++) but exposes its API
 /// through a C ABI so Rust can call it without any C++ awareness (ADR-0121).
 /// The library itself uses no STL, so libc++.a is not required at link time.
-///
-/// Skipped when SDK or riscv32imafc Rust target is absent.
 #[test]
 fn rust_cart_calls_cpp_lib_over_c_abi() {
+    require_sdk();
+    require_cpp_sdk();
+    require_rust_riscv_target();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() || !sdk.join("lib/libblyt32.so").exists() {
-        eprintln!("skipping rust_cart_calls_cpp_lib_over_c_abi: SDK not assembled");
-        return;
-    }
-    if !sdk.join("bin/blyt-clang++").exists() {
-        eprintln!("skipping rust_cart_calls_cpp_lib_over_c_abi: blyt-clang++ not in SDK");
-        return;
-    }
-    if !has_rust_riscv_target() {
-        eprintln!(
-            "skipping rust_cart_calls_cpp_lib_over_c_abi: riscv32imafc-unknown-none-elf not installed"
-        );
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("rust_cpp_lib");
@@ -240,19 +209,11 @@ pub extern "C" fn blyt_cart_draw() {}
 /// The lib is compiled as part of the same cargo invocation (via --config
 /// patch injection), so the Rust type system works across the boundary and
 /// there is no fingerprint mismatch.
-///
-/// Skipped when SDK or riscv32imafc Rust target is absent.
 #[test]
 fn rust_cart_calls_rust_lib() {
+    require_sdk();
+    require_rust_riscv_target();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang").exists() || !sdk.join("lib/libblyt32.so").exists() {
-        eprintln!("skipping rust_cart_calls_rust_lib: SDK not assembled");
-        return;
-    }
-    if !has_rust_riscv_target() {
-        eprintln!("skipping rust_cart_calls_rust_lib: riscv32imafc-unknown-none-elf not installed");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("rust_lib_test");

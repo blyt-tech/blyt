@@ -1,7 +1,10 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{CartProject, blytrun, build_cart, repo_root, sdk_dir, test_session_api, write_c_cart_project};
+use common::{
+    CartProject, blytrun, build_cart, repo_root, require_sdk, require_test_session_api,
+    sdk_dir, test_session_api, write_c_cart_project,
+};
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
@@ -336,28 +339,13 @@ void blyt_cart_draw(void)   {}
 ///
 /// Both outcomes are accepted so the test is valid for debug and release CI.
 ///
-/// Skipped if the SDK or the test_session_api binary has not been built.
 #[test]
 fn emulator_fcsr_dirty_frm_detected() {
+    require_sdk();
+    require_test_session_api();
     let sdk = sdk_dir();
-    let sdk_clang = sdk.join("bin/blyt-clang");
-    if !sdk_clang.exists() {
-        eprintln!("emulator_fcsr_dirty_frm_detected: SDK not assembled — skip");
-        return;
-    }
     let test_binary = test_session_api();
-    if !test_binary.exists() {
-        eprintln!(
-            "emulator_fcsr_dirty_frm_detected: test_session_api not built — skip \
-             (run: cmake --build build --target test_session_api)"
-        );
-        return;
-    }
     let lib_dir = sdk.join("lib");
-    if !lib_dir.join("libblyt32.so").exists() {
-        eprintln!("emulator_fcsr_dirty_frm_detected: sdk/lib/libblyt32.so not found — skip");
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("dirty_frm");

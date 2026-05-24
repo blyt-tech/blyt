@@ -1,7 +1,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{CartProject, blytrun, build_cart, sdk_dir};
+use common::{CartProject, blytrun, build_cart, require_cpp_sdk, sdk_dir};
 use tempfile::TempDir;
 
 /// Build and run a minimal C++ cart.
@@ -13,17 +13,8 @@ use tempfile::TempDir;
 /// Skipped when the SDK (blyt-clang++ or libc++.a) is not available.
 #[test]
 fn cpp_cart_debug_output() {
+    require_cpp_sdk();
     let sdk = sdk_dir();
-    if !sdk.join("bin/blyt-clang++").exists() {
-        eprintln!("skipping cpp_cart_debug_output: blyt-clang++ not in SDK");
-        return;
-    }
-    if !sdk.join("lib/libc++.a").exists() {
-        eprintln!(
-            "skipping cpp_cart_debug_output: libc++.a not in SDK — run cmake --build build --target sdk"
-        );
-        return;
-    }
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("cpp_hello");

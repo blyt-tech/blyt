@@ -288,6 +288,62 @@ pub fn has_luac() -> bool {
 }
 
 // -------------------------------------------------------------------------
+// Tooling requirement assertions
+//
+// Call these at the top of tests that need a given tool.  They panic with an
+// actionable message instead of silently returning, so a missing tool is a
+// test failure, not an invisible skip.
+// -------------------------------------------------------------------------
+
+pub fn require_sdk() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        sdk_dir().join("lib/libblyt32.so").exists(),
+        "libblyt32.so not in SDK — run `cmake --build build --target sdk` first"
+    );
+}
+
+pub fn require_cpp_sdk() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang++").exists(),
+        "blyt-clang++ not in SDK — run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        sdk_dir().join("lib/libc++.a").exists(),
+        "libc++.a not in SDK — run `cmake --build build --target sdk` first"
+    );
+}
+
+pub fn require_lua_sdk() {
+    assert!(
+        sdk_dir().join("lib/libblyt32lua.so").exists(),
+        "libblyt32lua.so not in SDK — run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        has_luac(),
+        "luac not available — install luac or set BLYT_LUAC"
+    );
+}
+
+pub fn require_rust_riscv_target() {
+    assert!(
+        has_rust_riscv_target(),
+        "riscv32imafc-unknown-none-elf Rust target not installed — \
+         run `rustup target add riscv32imafc-unknown-none-elf`"
+    );
+}
+
+pub fn require_test_session_api() {
+    assert!(
+        test_session_api().exists(),
+        "test_session_api not built — run `cmake --build build` first"
+    );
+}
+
+// -------------------------------------------------------------------------
 // Cart build helpers
 // -------------------------------------------------------------------------
 
