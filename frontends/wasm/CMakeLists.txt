@@ -259,7 +259,16 @@ target_compile_definitions(blytrun PRIVATE ${RV32EMU_FEATURE_DEFS}
                                            BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS})
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
-# (not a cmake definition) to avoid quoting issues.
+# (not a cmake definition) to avoid quoting issues. Force-include rv32emu
+# common.h for rv32emu and softfloat sources only. Applying it globally
+# conflicts with Lua's UNUSED macro: rv32emu/common.h redefines UNUSED as
+# __attribute__((unused)) (no args), which breaks Lua's UNUSED(x) call-style
+# macro.
+foreach(_SRC ${RV32EMU_SOURCES} ${SOFTFLOAT_SOURCES})
+  set_source_files_properties(
+    "${_SRC}" PROPERTIES COMPILE_OPTIONS "-include;${RV32EMU_CONFIG_H}")
+endforeach()
+
 target_compile_options(
   blytrun
   PRIVATE -DBLYT_VERSION="${BLYT_VERSION}"
@@ -275,10 +284,7 @@ target_compile_options(
           -Wno-unused-variable
           -Wno-sign-compare
           -Wno-implicit-fallthrough
-          -Wno-uninitialized
-          # Force-include rv32emu common.h for rv32emu TUs (harmless for others)
-          -include
-          "${RV32EMU_CONFIG_H}")
+          -Wno-uninitialized)
 
 set(_BLYT_LUA_INCLUDES "")
 if(BLYT_LUA_SOURCES)
