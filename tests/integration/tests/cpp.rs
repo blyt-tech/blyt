@@ -1,0 +1,68 @@
+mod common;
+
+use assert_cmd::Command;
+use common::{CartProject, blytrun, build_cart, sdk_dir};
+use tempfile::TempDir;
+
+/// Build and run a minimal C++ cart.
+///
+/// Verifies that a pure C++ cart compiled with `language: "c++"` produces
+/// the expected debug output.  Requires libc++ to have been built as part of
+/// `cmake --build build --target sdk`.
+///
+/// Skipped when the SDK (blyt-clang++ or libc++.a) is not available.
+#[test]
+fn cpp_cart_debug_output() {
+    let sdk = sdk_dir();
+    if !sdk.join("bin/blyt-clang++").exists() {
+        eprintln!("skipping cpp_cart_debug_output: blyt-clang++ not in SDK");
+        return;
+    }
+    if !sdk.join("lib/libc++.a").exists() {
+        eprintln!(
+            "skipping cpp_cart_debug_output: libc++.a not in SDK — run cmake --build build --target sdk"
+        );
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("cpp_hello");
+
+    CartProject::new()
+        .cpp(
+            r#"
+#include "blyt.h"
+#include <optional>
+
+extern "C" void blyt_cart_init() {
+    std::optional<int> v = 42;
+    if (v.has_value() && *v == 42)
+        blyt_console_debug("hello from c++");
+    else
+        blyt_console_debug("c++ wrong");
+}
+
+extern "C" void blyt_cart_update() { blyt_quit(); }
+extern "C" void blyt_cart_draw()   {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytrun())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("hello from c++"),
+        "expected 'hello from c++' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}

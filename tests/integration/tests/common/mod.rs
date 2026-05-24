@@ -286,3 +286,84 @@ pub fn has_luac() -> bool {
         .output()
         .is_ok()
 }
+
+// -------------------------------------------------------------------------
+// Cart build helpers
+// -------------------------------------------------------------------------
+
+/// Run `blyt build <project_dir>` and return the expected cart output path.
+pub fn build_cart(project_dir: &std::path::Path) -> PathBuf {
+    use assert_cmd::Command;
+    let sdk = sdk_dir();
+    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    cmd.args(["build", project_dir.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_RUST_SDK", repo_root().join("sdk/rust/blyt"));
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if sdk_clang.exists() {
+        cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    let sdk_clangpp = sdk.join("bin/blyt-clang++");
+    if sdk_clangpp.exists() {
+        cmd.env("BLYT_CLANGPP", &sdk_clangpp);
+    }
+    let sdk_ar = sdk.join("bin/blyt-llvm-ar");
+    if sdk_ar.exists() {
+        cmd.env("BLYT_AR", &sdk_ar);
+    }
+    cmd.assert().success();
+
+    project_dir.parent().unwrap().join(format!(
+        "{}.blyt",
+        project_dir.file_name().unwrap().to_str().unwrap()
+    ))
+}
+
+/// Run `blyt build <project_dir>` with Lua-specific env vars and return the cart path.
+pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
+    use assert_cmd::Command;
+    let sdk = sdk_dir();
+    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    cmd.args(["build", project_dir.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if sdk_clang.exists() {
+        cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    let sdk_clangpp = sdk.join("bin/blyt-clang++");
+    if sdk_clangpp.exists() {
+        cmd.env("BLYT_CLANGPP", &sdk_clangpp);
+    }
+    let sdk_ar = sdk.join("bin/blyt-llvm-ar");
+    if sdk_ar.exists() {
+        cmd.env("BLYT_AR", &sdk_ar);
+    }
+    let sdk_luac = sdk.join("bin/blyt-luac");
+    if sdk_luac.exists() {
+        cmd.env("BLYT_LUAC", &sdk_luac);
+    }
+    cmd.assert().success();
+
+    project_dir.parent().unwrap().join(format!(
+        "{}.blyt",
+        project_dir.file_name().unwrap().to_str().unwrap()
+    ))
+}
+
+/// Path to the test_session_api binary produced by the CMake build.
+pub fn test_session_api() -> PathBuf {
+    build_dir().join("test_session_api")
+}
+
+/// Locate the WASM runtime directory.
+///
+/// Prefers a direct emcmake build output; falls back to the SDK's share/wasm/.
+pub fn find_wasm_dir() -> PathBuf {
+    let direct = repo_root().join("build-wasm");
+    if direct.join("blytrun.js").exists() {
+        return direct;
+    }
+    build_dir().join("sdk/share/wasm")
+}
