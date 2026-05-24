@@ -48,7 +48,7 @@ jobs:
             runtime/host/include/*.h \
             tests/unit/*.c \
             tests/tools/*.c \
-            tests/game/hello/src/game/c/*.c \
+            tests/game/hello-c/src/game/c/*.c \
             frontends/sdl/main.c \
             frontends/libretro/blyt_libretro.c \
             frontends/wasm/wasm_main.c \
