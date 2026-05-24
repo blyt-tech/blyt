@@ -102,14 +102,16 @@ if(EXISTS "${LUA_DIR}/lvm.c")
     "${LUA_DIR}/loslib.c"
     "${LUA_DIR}/loadlib.c"
     "${LUA_DIR}/ldblib.c"
-    "${LUA_DIR}/lutf8lib.c"
-  )
+    "${LUA_DIR}/lutf8lib.c")
     list(REMOVE_ITEM LUA_ALL_SRCS "${_EXCL}")
   endforeach()
   set(BLYT_LUA_SOURCES ${LUA_ALL_SRCS})
   message(STATUS "blyt WASM: Lua-direct support enabled (${LUA_DIR})")
 else()
-  message(STATUS "blyt WASM: Lua-direct support disabled (third_party/lua not initialised)")
+  message(
+    STATUS
+      "blyt WASM: Lua-direct support disabled (third_party/lua not initialised)"
+  )
 endif()
 
 # -------------------------------------------------------------------------
@@ -254,8 +256,7 @@ if(BLYT_LUA_SOURCES)
 endif()
 
 target_compile_definitions(blytrun PRIVATE ${RV32EMU_FEATURE_DEFS}
-                                           BLYT_EMBED_LIBS
-                                           ${_BLYT_LUA_DEFS})
+                                           BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS})
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
 # (not a cmake definition) to avoid quoting issues.
