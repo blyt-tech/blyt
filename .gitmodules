@@ -1,6 +1,6 @@
 [submodule "third_party/rv32emu"]
 	path = third_party/rv32emu
-	url = https://github.com/sysprog21/rv32emu
+	url = https://github.com/blyt-tech/rv32emu
 [submodule "third_party/lua"]
 	path = third_party/lua
 	url = https://github.com/lua/lua
