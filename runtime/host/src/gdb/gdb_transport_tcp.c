@@ -166,8 +166,11 @@ void fc_gdb_transport_tcp_shutdown(void) {
     if (!g_tcp.running) return;
     g_tcp.running = 0;
     if (g_tcp.client_fd >= 0) shutdown(g_tcp.client_fd, SHUT_RDWR);
-    /* close() is required to interrupt accept() on macOS; shutdown() alone does not. */
-    if (g_tcp.listen_fd >= 0) { close(g_tcp.listen_fd); g_tcp.listen_fd = -1; }
+    if (g_tcp.listen_fd >= 0) {
+        shutdown(g_tcp.listen_fd, SHUT_RDWR); /* interrupt accept() on Linux */
+        close(g_tcp.listen_fd);               /* required on macOS */
+        g_tcp.listen_fd = -1;
+    }
     pthread_join(g_tcp.thr, NULL);
     if (g_tcp.client_fd >= 0) { close(g_tcp.client_fd); g_tcp.client_fd = -1; }
 }
