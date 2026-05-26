@@ -119,6 +119,7 @@ typedef struct {
     blyt_debug_state_t debug_state;
     bool gdb_enabled; /* set by blyt_session_gdb_listen() */
     bool gdb_single_step; /* set when vCont;s received; cleared after one step */
+    bool gdb_ebreak_pending; /* ebreak fired inside rv_step; cleared by post-step handler */
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -488,6 +489,23 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 }
+
+#ifdef BLYT_GDB
+/* Called by rv32emu when an ebreak instruction executes.  If the PC matches a
+ * registered GDB software breakpoint, flag that the breakpoint fired so the
+ * outer run loop can notify the client after rv_step() returns.  Otherwise
+ * advance PC past the ebreak (same as the rv32emu default). */
+static void blyt_ebreak_handler(riscv_t *rv) {
+    if (g_run_ctx && g_run_ctx->gdb_enabled && fc_gdb_stub_check_break(rv->PC)) {
+        g_run_ctx->gdb_ebreak_pending = true;
+        rv->PC += 4; /* advance past ebreak; outer loop fires T05 */
+        rv->halt = true; /* force rv_step() to exit so outer loop runs promptly */
+        return;
+    }
+    /* Not a GDB breakpoint — skip the ebreak (same as rv32emu default). */
+    rv->PC += rv->compressed ? 2 : 4;
+}
+#endif /* BLYT_GDB */
 
 /* -------------------------------------------------------------------------
  * Combined symbol table across all loaded runtime libraries
@@ -1079,6 +1097,9 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     }
 
     s->rv->io.on_ecall = blyt_ecall_handler;
+#ifdef BLYT_GDB
+    s->rv->io.on_ebreak = blyt_ebreak_handler;
+#endif
     rv_set_reg(s->rv, rv_reg_ra, BLYT_TRAMPOLINE_EXIT_ADDR);
 
     blyt_testcard_init_palette(s->palette);
@@ -1171,6 +1192,35 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
         rv_step(session->rv);
 
 #ifdef BLYT_GDB
+        /* Breakpoint fired inside rv_step() via on_ebreak: rv->halt was set to
+         * force rv_step to return.  Clear halt and handle the GDB pause now. */
+        if (session->ctx.gdb_enabled && session->ctx.gdb_ebreak_pending) {
+            session->ctx.gdb_ebreak_pending = false;
+            session->rv->halt = false; /* restore — cart has not actually halted */
+            session->ctx.debug_state = BLYT_DEBUG_PAUSED_GDB;
+#ifdef __EMSCRIPTEN__
+            if (fc_gdb_transport_wasm_is_connected()) {
+                session->gdb_notified = true;
+                fc_gdb_stub_notify_stopped();
+            }
+            if (session->ctx.frame_done) {
+                if (!session->cart_has_drawn)
+                    blyt_testcard_draw(session->frame_count++, session->pixels);
+            }
+            g_run_ctx = NULL;
+            return BLYT_RUN_GDB_PAUSED;
+#else
+            fc_gdb_stub_notify_stopped();
+            fc_gdb_stub_block_until_resume();
+            int gdb_action = fc_gdb_stub_pending_action();
+            session->ctx.debug_state = BLYT_DEBUG_RUNNING;
+            if (gdb_action == 2) {
+                rv_halt(session->rv);
+                break;
+            }
+            session->ctx.gdb_single_step = (gdb_action == 1);
+#endif
+        }
         /* Post-instruction single-step pause. */
         if (session->ctx.gdb_enabled && session->ctx.gdb_single_step) {
             session->ctx.gdb_single_step = false;

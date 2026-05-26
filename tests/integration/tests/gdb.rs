@@ -235,7 +235,7 @@ fn wasm_gdb_breakpoint_step() {
              void blyt_cart_draw(void)   {}\n")
         .write(&project);
 
-    let cart = build_debug_cart(&project);
+    let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
     let addr = find_symbol_addr(&cart, "blyt_cart_init");
