@@ -419,21 +419,19 @@ if(CLANG_RV32
 
   if(MUSL_DIR)
     # Full build: DT_NEEDED for both libblytcommon.so and libblytc.so.
+    # Use full paths to avoid lld defaulting to -Bstatic on bare-metal targets.
     set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}"
                        "${LIBBLYTC_OUT}")
     set(LIBBLYT32_LINK
-        -L
-        "${CMAKE_BINARY_DIR}"
-        -lblytcommon
+        -Wl,-Bdynamic
+        "${LIBBLYTCOMMON_OUT}"
         -Wl,--no-as-needed
-        -lblytc
-        -Wl,--as-needed
-        -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
+        "${LIBBLYTC_OUT}"
+        -Wl,--as-needed)
   else()
     # musl unavailable: build without libblytc.so dependency.
     set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}")
-    set(LIBBLYT32_LINK -L "${CMAKE_BINARY_DIR}" -lblytcommon
-                       -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
+    set(LIBBLYT32_LINK -Wl,-Bdynamic "${LIBBLYTCOMMON_OUT}")
   endif()
 
   add_custom_command(
@@ -483,10 +481,9 @@ if(CLANG_RV32
   # other libblytcommon exports would then be unresolvable at cart load time,
   # causing a crash before any constructor fires.  libblytc.so is intentionally
   # omitted — the native process C library comes from the musl ld.so
-  # interpreter.
+  # interpreter.  Use full path to avoid lld -Bstatic on bare-metal targets.
   set(LIBBLYT32_NATIVE_LINK
-      -L "${CMAKE_BINARY_DIR}" -Wl,--no-as-needed -lblytcommon -Wl,--as-needed
-      -Wl,-rpath-link,"${CMAKE_BINARY_DIR}")
+      -Wl,-Bdynamic -Wl,--no-as-needed "${LIBBLYTCOMMON_OUT}" -Wl,--as-needed)
 
   add_custom_command(
     OUTPUT "${LIBBLYT32_NATIVE_OUT}"
