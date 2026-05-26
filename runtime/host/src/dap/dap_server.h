@@ -10,12 +10,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Step modes — must match dap_step_mode_t in master_hook.h. */
-#define DAP_STEP_NONE  0
-#define DAP_STEP_OVER  1
-#define DAP_STEP_IN    2
-#define DAP_STEP_OUT   3
-
 #ifdef __cplusplus
 extern "C" {
 #endif

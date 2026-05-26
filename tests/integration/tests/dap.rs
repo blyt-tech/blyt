@@ -126,6 +126,7 @@ fn libretro_dap_listen_and_handshake() {
 
     Command::new(test_libretro_dap())
         .args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success();
 }
