@@ -360,6 +360,35 @@ pub fn require_wasm() {
     );
 }
 
+pub fn require_playwright() {
+    let pkg = repo_root().join("tests/wasm/node_modules/playwright");
+    assert!(
+        pkg.exists(),
+        "playwright not installed — run:\n  \
+         cd tests/wasm && npm install && npx playwright install chromium"
+    );
+}
+
+pub fn libretro_so() -> PathBuf {
+    build_dir().join("blyt_libretro.so")
+}
+
+pub fn test_libretro_dap() -> PathBuf {
+    build_dir().join("test_libretro_dap")
+}
+
+pub fn require_libretro_dap() {
+    assert!(
+        libretro_so().exists(),
+        "blyt_libretro.so not built — run `cmake --build build` first"
+    );
+    assert!(
+        test_libretro_dap().exists(),
+        "test_libretro_dap not built — run `cmake --build build` first \
+         (requires RV32 toolchain for LIBBLYTC_OUT)"
+    );
+}
+
 // -------------------------------------------------------------------------
 // Cart build helpers
 // -------------------------------------------------------------------------

@@ -16,6 +16,7 @@ fn build_lua_no_source_fails_with_error() {
     let project = tmp.path().join("no_manifest");
     // Create the project root but no src/game/lua/ directory.
     std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("cart.info.yaml"), "name: no_manifest\n").unwrap();
 
     Command::cargo_bin("blyt")
         .unwrap()

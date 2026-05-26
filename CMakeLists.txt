@@ -663,8 +663,11 @@ if(LIBBLYTC_OUT)
     blyt_libretro
     PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
             "${CMAKE_SOURCE_DIR}/runtime/host/include")
-  target_compile_definitions(
-    blyt_libretro PRIVATE BLYT_VERSION="${BLYT_VERSION}" BLYT_EMBED_LIBS)
+  set(_blyt_libretro_defs BLYT_VERSION="${BLYT_VERSION}" BLYT_EMBED_LIBS)
+  if(BLYT_DAP)
+    list(APPEND _blyt_libretro_defs BLYT_DAP=1)
+  endif()
+  target_compile_definitions(blyt_libretro PRIVATE ${_blyt_libretro_defs})
   set_target_properties(blyt_libretro PROPERTIES PREFIX "" SUFFIX ".so")
   add_dependencies(blyt_libretro libblyt32_so)
   message(STATUS "blyt_libretro: will be built")
@@ -830,6 +833,16 @@ target_link_libraries(verify_cart PRIVATE libblyt)
 add_executable(test_session_api tests/unit/test_session_api.c)
 target_include_directories(test_session_api PRIVATE runtime/host/include)
 target_link_libraries(test_session_api PRIVATE libblyt)
+
+# test_libretro_dap: dlopens blyt_libretro.so and verifies the DAP TCP server
+# starts and responds to an "initialize" request.  Built only when the libretro
+# core is available (LIBBLYTC_OUT set → blyt_libretro.so will be built).
+if(LIBBLYTC_OUT)
+  add_executable(test_libretro_dap tests/unit/test_libretro_dap.c)
+  target_include_directories(test_libretro_dap PRIVATE
+    third_party/libretro-common/include)
+  target_link_libraries(test_libretro_dap PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 # -------------------------------------------------------------------------
 # SDK assembly target
