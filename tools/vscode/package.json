@@ -1,0 +1,57 @@
+{
+  "name": "blyt",
+  "displayName": "Blyt",
+  "description": "Blyt fantasy console — build, run, and debug carts in VS Code",
+  "version": "0.1.0",
+  "publisher": "blyt",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Debuggers", "Other"],
+  "activationEvents": [
+    "workspaceContains:cart.info.yaml",
+    "onStartupFinished",
+    "onDebugInitialConfigurations",
+    "onDebugResolve:blyt-lua",
+    "onDebugDynamicConfigurations:blyt-lua"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Blyt",
+      "properties": {
+        "blyt.sdkDir": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the blyt SDK directory (contains bin/blyt, bin/blyt-clang, etc.). Also settable via the BLYT_SDK_DIR environment variable."
+        }
+      }
+    },
+    "debuggers": [
+      {
+        "type": "blyt-lua",
+        "label": "Blyt Lua",
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "cart": {
+                "type": "string",
+                "description": "Path to the compiled .blyt cart file."
+              }
+            }
+          }
+        }
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "blyt",
+        "required": ["command"],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The blyt command to run (build, run)"
+          }
+        }
+      }
+    ]
+  }
+}

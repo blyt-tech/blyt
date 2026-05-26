@@ -874,6 +874,32 @@ add_custom_target(
 # automatically; without .dSYM bundles, LLDB falls back to N_OSO stabs which are
 # less reliable and can leave source files unresolvable.
 # -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# VS Code extension: install-vscode-ext target for local development.
+# Creates a symlink in ~/.vscode/extensions/ so edits to tools/vscode/ are
+# reflected immediately on VS Code window reload.
+# -------------------------------------------------------------------------
+file(STRINGS "${CMAKE_SOURCE_DIR}/tools/vscode/package.json" _vscode_pkg_lines)
+foreach(_line IN LISTS _vscode_pkg_lines)
+  if(_line MATCHES "^[ \t]*\"publisher\":[ \t]*\"([^\"]+)\"")
+    set(_vscode_publisher "${CMAKE_MATCH_1}")
+  elseif(_line MATCHES "^[ \t]*\"name\":[ \t]*\"([^\"]+)\"")
+    set(_vscode_name "${CMAKE_MATCH_1}")
+  elseif(_line MATCHES "^[ \t]*\"version\":[ \t]*\"([^\"]+)\"")
+    set(_vscode_version "${CMAKE_MATCH_1}")
+  endif()
+endforeach()
+set(_vscode_ext_dir
+  "$ENV{HOME}/.vscode/extensions/${_vscode_publisher}.${_vscode_name}-${_vscode_version}")
+
+add_custom_target(
+  install-vscode-ext
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vscode_ext_dir}"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink
+    "${CMAKE_SOURCE_DIR}/tools/vscode" "${_vscode_ext_dir}"
+  COMMENT "Installing VS Code extension → ${_vscode_ext_dir}"
+  VERBATIM)
+
 if(APPLE)
   find_program(DSYMUTIL dsymutil)
   if(DSYMUTIL)
