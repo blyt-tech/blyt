@@ -42,6 +42,10 @@
 #include "dap_server.h"
 #include "master_hook.h"
 #endif
+#ifdef BLYT_GDB
+#include "gdb_stub.h"
+#include "gdb_transport_wasm.h"
+#endif
 
 /* -------------------------------------------------------------------------
  * rv32emu no-op stubs
@@ -157,6 +161,18 @@ EM_JS(int, blyt_js_dap_port, (void), {
         return globalThis.__blyt_dap_port | 0;
     if (typeof window !== 'undefined' && window.blyt_dap_port > 0)
         return window.blyt_dap_port | 0;
+    return 0;
+});
+#endif
+
+/* Read the GDB relay port injected by `blyt run --gdb` into shell.html.
+ * Returns 0 when not set. */
+#ifdef BLYT_GDB
+EM_JS(int, blyt_js_gdb_port, (void), {
+    if (typeof globalThis !== 'undefined' && globalThis.__blyt_gdb_port > 0)
+        return globalThis.__blyt_gdb_port | 0;
+    if (typeof window !== 'undefined' && window.blyt_gdb_port > 0)
+        return window.blyt_gdb_port | 0;
     return 0;
 });
 #endif
@@ -428,11 +444,23 @@ static void wasm_loop(void) {
         return;
 
     blyt_cart_run_err_t err = blyt_session_run_frame(g_session);
+
+#ifdef BLYT_GDB
+    /* GDB breakpoint/step pause: session polls for vCont internally each tick.
+     * Re-present the last frame unchanged until the client sends continue/step. */
+    if (err == BLYT_RUN_GDB_PAUSED) {
+        blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+        return;
+    }
+#endif
+
     blyt_session_expand_frame(g_session, g_xrgb);
 
     bool done = (err != BLYT_RUN_FRAME_DONE);
 
-    if (blyt_js_dump_frame0_if_headless(g_xrgb, BLYT_FRAME_W * BLYT_FRAME_H)) {
+    int headless_dump = blyt_js_dump_frame0_if_headless(g_xrgb, BLYT_FRAME_W * BLYT_FRAME_H);
+
+    if (headless_dump) {
         /* Headless dump complete — exit after this frame. */
         done = true;
     } else {
@@ -487,6 +515,14 @@ int main(void) {
         blyt_cart_close(g_cart);
         return 1;
     }
+
+#ifdef BLYT_GDB
+    {
+        int gdb_port = blyt_js_gdb_port();
+        if (gdb_port > 0)
+            blyt_session_gdb_listen(g_session, &gdb_port);
+    }
+#endif
 
     /* 0 fps = use requestAnimationFrame (browser) or setTimeout (Node.js);
      * simulate_infinite_loop=1 makes main() block until the loop is cancelled. */

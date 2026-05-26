@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef BLYT_DAP
+#if defined(BLYT_DAP) || defined(BLYT_GDB)
 #include <unistd.h> /* setenv */
 #endif
 
@@ -37,6 +37,9 @@ bool blyt_libretro_is_done(void);
 blyt_cart_run_err_t blyt_libretro_run_err(void);
 #ifdef BLYT_DAP
 bool blyt_libretro_dap_wait_ready(void);
+#endif
+#ifdef BLYT_GDB
+bool blyt_libretro_gdb_wait_attached(void);
 #endif
 
 /* -------------------------------------------------------------------------
@@ -137,6 +140,7 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index, unsig
  * ------------------------------------------------------------------------- */
 
 static int g_dap_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
+static int g_gdb_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 
 static const char *parse_args(int argc, char *argv[], bool *headless) {
     const char *cart = NULL;
@@ -153,6 +157,12 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
                 g_dap_port = atoi(argv[++i]);
             else
                 g_dap_port = 0;
+        } else if (strcmp(argv[i], "--gdb") == 0) {
+            /* Optional port number; defaults to 0 (OS-assigned) */
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                g_gdb_port = atoi(argv[++i]);
+            else
+                g_gdb_port = 0;
         } else if (argv[i][0] != '-') {
             cart = argv[i];
         } else {
@@ -176,6 +186,13 @@ int main(int argc, char *argv[]) {
         char portbuf[16];
         snprintf(portbuf, sizeof(portbuf), "%d", g_dap_port);
         setenv("BLYT_DAP_PORT", portbuf, 1);
+    }
+#endif
+#ifdef BLYT_GDB
+    if (g_gdb_port >= 0) {
+        char portbuf[16];
+        snprintf(portbuf, sizeof(portbuf), "%d", g_gdb_port);
+        setenv("BLYT_GDB_PORT", portbuf, 1);
     }
 #endif
 
@@ -205,6 +222,12 @@ int main(int argc, char *argv[]) {
      * are registered before init() executes. */
     if (g_dap_port >= 0)
         blyt_libretro_dap_wait_ready();
+#endif
+#ifdef BLYT_GDB
+    /* Wait for a GDB client to connect before running the cart, so that the
+     * client can set breakpoints before blyt_cart_init() executes. */
+    if (g_gdb_port >= 0)
+        blyt_libretro_gdb_wait_attached();
 #endif
 
     SDL_Window *win = NULL;

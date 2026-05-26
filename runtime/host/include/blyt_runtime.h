@@ -98,6 +98,7 @@ typedef enum blyt_cart_run_err {
     BLYT_RUN_ERR_ECALL_TRAP = 2, /* cart issued a non-permitted ecall */
     BLYT_RUN_ERR_ABORT = 3, /* cart called abort() */
     BLYT_RUN_FRAME_DONE = 4, /* one frame complete; call run_frame again */
+    BLYT_RUN_GDB_PAUSED = 5, /* WASM: CPU is paused at a GDB breakpoint; poll GDB */
 } blyt_cart_run_err_t;
 
 /*
@@ -183,6 +184,27 @@ void blyt_session_dap_shutdown(blyt_session_t *s);
  * No-op (returns 0) when BLYT_DAP is not compiled in or DAP is not active.
  */
 int blyt_session_dap_wait_ready(blyt_session_t *s);
+
+/* --- GDB debugging (optional, requires BLYT_GDB compile flag) -------------- */
+
+/*
+ * Start a GDB RSP listener alongside this session.
+ * port=0 lets the OS pick a free port (TCP) or is used as the relay port (WASM).
+ * The actual port is written to *port_out.
+ * Returns the actual port (>0) on success, -1 on failure or when BLYT_GDB is
+ * not compiled in.
+ */
+int blyt_session_gdb_listen(blyt_session_t *s, int *port_out);
+
+/* Stop the GDB server. Idempotent. */
+void blyt_session_gdb_shutdown(blyt_session_t *s);
+
+/*
+ * Block until the GDB client attaches and sends vCont (ready to run).
+ * Optional — callers may skip if they don't want to gate on client attachment.
+ * No-op when BLYT_GDB is not compiled in.
+ */
+int blyt_session_gdb_wait_attached(blyt_session_t *s);
 
 #ifdef __cplusplus
 }

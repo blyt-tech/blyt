@@ -41,6 +41,10 @@ struct BuildArgs {
     /// Output path (default: <project-dir-name>.blyt)
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Build with debug information (-g, -O0, path remapping for GDB/DAP)
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -90,10 +94,11 @@ fn main() {
                     project_dir,
                     output,
                 }),
+            debug,
             ..
         }) => {
             let dir = project_dir.as_deref().unwrap_or(Path::new("."));
-            build::run(dir, output.as_deref())
+            build::run(dir, output.as_deref(), debug)
                 .map_err(|e| e.to_string())
                 .and_then(|cart| export::run(&cart, None).map_err(|e| e.to_string()))
         }
@@ -102,9 +107,10 @@ fn main() {
             sub: None,
             project_dir,
             output,
+            debug,
         }) => {
             let dir = project_dir.as_deref().unwrap_or(Path::new("."));
-            build::run(dir, output.as_deref())
+            build::run(dir, output.as_deref(), debug)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }

@@ -194,6 +194,21 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
         }
     }
 #endif
+#ifdef BLYT_GDB
+    {
+        const char *gdb_port_str = getenv("BLYT_GDB_PORT");
+        if (gdb_port_str) {
+            int gdb_port = atoi(gdb_port_str);
+            int actual_port = gdb_port;
+            if (blyt_session_gdb_listen(g_session, &actual_port) >= 0) {
+                if (g_log_cb)
+                    g_log_cb(RETRO_LOG_INFO, "blyt: GDB listening on port %d\n", actual_port);
+                else
+                    fprintf(stderr, "blyt: GDB listening on port %d\n", actual_port);
+            }
+        }
+    }
+#endif
 
     g_cart_done = false;
     return true;
@@ -211,6 +226,10 @@ RETRO_API void retro_unload_game(void) {
 #ifdef BLYT_DAP
     if (g_session)
         blyt_session_dap_shutdown(g_session);
+#endif
+#ifdef BLYT_GDB
+    if (g_session)
+        blyt_session_gdb_shutdown(g_session);
 #endif
     blyt_session_destroy(g_session);
     g_session = NULL;
@@ -299,6 +318,14 @@ bool blyt_libretro_is_done(void) {
  * server shuts down.  Called by the SDL frontend before starting the game loop. */
 bool blyt_libretro_dap_wait_ready(void) {
     return g_session && blyt_session_dap_wait_ready(g_session) != 0;
+}
+#endif
+
+#ifdef BLYT_GDB
+/* Block until a GDB client connects.  Called by the SDL frontend before
+ * starting the game loop so the cart does not run past any early breakpoints. */
+bool blyt_libretro_gdb_wait_attached(void) {
+    return g_session && blyt_session_gdb_wait_attached(g_session) != 0;
 }
 #endif
 

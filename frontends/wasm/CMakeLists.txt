@@ -146,6 +146,34 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# GDB RSP debugging support (WebSocket transport)
+#
+# When ON: compile gdb_stub.c + gdb_transport_wasm.c into blytrun and define
+# BLYT_GDB=1.  The WebSocket transport is non-blocking; the emulator polls each
+# animation tick via blyt_session_run_frame (no threads needed).
+# -------------------------------------------------------------------------
+set(BLYT_GDB_DIR "${BLYT_ROOT}/runtime/host/src/gdb")
+option(BLYT_GDB "Enable GDB RSP debugger support (WebSocket transport)" ON)
+
+set(BLYT_GDB_SOURCES "")
+set(BLYT_GDB_DEFS "")
+set(BLYT_GDB_LINK_OPTS "")
+if(BLYT_GDB AND EXISTS "${BLYT_GDB_DIR}/gdb_transport_wasm.c")
+  list(APPEND BLYT_GDB_SOURCES "${BLYT_GDB_DIR}/gdb_stub.c"
+       "${BLYT_GDB_DIR}/gdb_transport_wasm.c")
+  list(APPEND BLYT_GDB_DEFS BLYT_GDB=1)
+  # wgdb_dequeue_pkt (EM_JS) calls _malloc/_free from JavaScript.
+  list(APPEND BLYT_GDB_LINK_OPTS "-sEXPORTED_FUNCTIONS=_main,_malloc,_free")
+  message(STATUS "blyt WASM: GDB RSP debugging enabled")
+else()
+  if(BLYT_GDB AND NOT EXISTS "${BLYT_GDB_DIR}/gdb_transport_wasm.c")
+    message(STATUS "blyt WASM: GDB disabled (gdb_transport_wasm.c not found)")
+  else()
+    message(STATUS "blyt WASM: GDB disabled")
+  endif()
+endif()
+
+# -------------------------------------------------------------------------
 # Embed guest libraries as C byte arrays (same approach as blyt_libretro)
 # -------------------------------------------------------------------------
 set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blytrun_embedded_libs.c")
@@ -256,7 +284,8 @@ set(RV32EMU_FEATURE_DEFS
     RV32_FEATURE_T2C=0
     RV32_FEATURE_SYSTEM=0
     RV32_FEATURE_ELF_LOADER=0
-    RV32_FEATURE_ARCH_TEST=0)
+    RV32_FEATURE_ARCH_TEST=0
+    RV32EMU_MANAGED_BY_HOST=1)
 
 # -------------------------------------------------------------------------
 # flatccrt sources (runtime only; flatcc_cli is a host tool, not needed here)
@@ -277,7 +306,8 @@ add_executable(
   "${BLYT_ROOT}/runtime/host/src/libblyt/cart_run.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c"
   ${BLYT_LUA_SOURCES}
-  ${BLYT_DAP_SOURCES})
+  ${BLYT_DAP_SOURCES}
+  ${BLYT_GDB_SOURCES})
 
 # Produce blytrun.html + blytrun.js + blytrun.wasm
 set_target_properties(blytrun PROPERTIES SUFFIX ".html")
@@ -289,7 +319,7 @@ endif()
 
 target_compile_definitions(
   blytrun PRIVATE ${RV32EMU_FEATURE_DEFS} BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS}
-                  ${BLYT_DAP_DEFS})
+                  ${BLYT_DAP_DEFS} ${BLYT_GDB_DEFS})
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
 # (not a cmake definition) to avoid quoting issues. Force-include rv32emu
@@ -329,6 +359,11 @@ if(BLYT_DAP_SOURCES)
   list(APPEND _BLYT_DAP_INCLUDES "${BLYT_DAP_DIR}")
 endif()
 
+set(_BLYT_GDB_INCLUDES "")
+if(BLYT_GDB_SOURCES)
+  list(APPEND _BLYT_GDB_INCLUDES "${BLYT_GDB_DIR}")
+endif()
+
 target_include_directories(
   blytrun
   PRIVATE "${RV32EMU_DIR}"
@@ -340,13 +375,15 @@ target_include_directories(
           "${BLYT_ROOT}/runtime/host/include"
           "${BLYT_ROOT}/runtime/host/src/libblyt"
           ${_BLYT_LUA_INCLUDES}
-          ${_BLYT_DAP_INCLUDES})
+          ${_BLYT_DAP_INCLUDES}
+          ${_BLYT_GDB_INCLUDES})
 
 # Emscripten link options
 target_link_options(
   blytrun
   PRIVATE
   ${BLYT_DAP_LINK_OPTS}
+  ${BLYT_GDB_LINK_OPTS}
   # Allow WASM linear memory to grow to accommodate the 256 MiB guest region.
   "-sALLOW_MEMORY_GROWTH=1"
   # 64 MiB initial allocation; grows when blyt_session_create mallocs the 256

@@ -121,7 +121,7 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
  * Public entry point
  * ------------------------------------------------------------------------- */
 
-pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildError> {
+pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<PathBuf, BuildError> {
     let info_path = project_dir.join("cart.info.yaml");
     if !info_path.exists() {
         return Err(err(format!(
@@ -175,6 +175,26 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
         CartLanguage::Rust => {}
     }
 
+    // Compute debug flags once; passed to all compile_c/compile_cpp invocations
+    // for user source files.  Generated stubs (_blyt_entry.c etc.) are excluded.
+    let debug_c_flags: Vec<String> = if debug {
+        vec![
+            "-g".to_string(),
+            "-O0".to_string(),
+            format!("-ffile-prefix-map={}=/blyt/src", project_dir.display()),
+        ]
+    } else {
+        vec![]
+    };
+    let debug_rust_flags: String = if debug {
+        format!(
+            " -g --remap-path-prefix={}=/blyt/src",
+            project_dir.display()
+        )
+    } else {
+        String::new()
+    };
+
     // Build all libraries before game code.
     let lib_names = discover_libraries(project_dir)?;
     let mut built_libs: Vec<BuiltLib> = Vec::new();
@@ -198,6 +218,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
             name,
             &sdk_include,
             &lua_lib_defines,
+            &debug_c_flags,
         )?);
     }
     let lib_include_paths: Vec<PathBuf> =
@@ -221,7 +242,10 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                 .arg(lib_path.join("Cargo.toml"))
                 .arg("--target-dir")
                 .arg(&lib_build_dir)
-                .env("RUSTFLAGS", "-C relocation-model=pic -C panic=abort")
+                .env(
+                    "RUSTFLAGS",
+                    format!("-C relocation-model=pic -C panic=abort{debug_rust_flags}"),
+                )
                 .status()
                 .map_err(|e| err(format!("failed to run cargo for Rust lib {lib_name}: {e}")))?;
             if !status.success() {
@@ -280,6 +304,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
     )?;
 
     // Generated stubs need no lib includes — they only call blyt_main/blyt_exit.
+    // No debug flags: these are auto-generated files, not user source.
     let mut obj_files = Vec::new();
     obj_files.push(compile_c(
         &clang,
@@ -288,12 +313,14 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
         &sdk_include,
         &[],
         &[],
+        &[],
     )?);
     obj_files.push(compile_c(
         &clang,
         &interp_src,
         &build_dir,
         &sdk_include,
+        &[],
         &[],
         &[],
     )?);
@@ -311,6 +338,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                     &sdk_include,
                     &lib_include_refs,
                     &[],
+                    &debug_c_flags,
                 )?);
             }
             None
@@ -355,6 +383,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                     &sdk_include,
                     &libcxx_include,
                     &lib_include_refs,
+                    &debug_c_flags,
                 )?);
             }
             None
@@ -378,6 +407,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                 &rust_build_dir,
                 &rust_sdk,
                 &rust_libs,
+                &debug_rust_flags,
             )?)
         }
         CartLanguage::Lua => {
@@ -400,11 +430,13 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
 
             let data_c = build_dir.join("cart_lua_data.c");
             generate_lua_data_c(&bytecode_path, &data_c)?;
+            // Generated file — no debug info needed.
             obj_files.push(compile_c(
                 &clang,
                 &data_c,
                 &build_dir,
                 &sdk_include,
+                &[],
                 &[],
                 &[],
             )?);
@@ -422,6 +454,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                         &sdk_include,
                         &lib_include_refs,
                         &lua_lib_defines,
+                        &debug_c_flags,
                     )?);
                 }
             }
@@ -450,6 +483,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                             &sdk_include,
                             &libcxx_include,
                             &lib_include_refs,
+                            &debug_c_flags,
                         )?);
                     }
                 }
@@ -473,6 +507,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildEr
                     &rust_build_dir,
                     &rust_sdk,
                     &rust_libs,
+                    &debug_rust_flags,
                 )?;
                 lib_archives.push(archive);
             }
@@ -572,6 +607,7 @@ pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, B
         project_dir,
         lib_name,
         &sdk_include,
+        &[],
         &[],
     )?;
     println!("built: {}", built.archive.display());
@@ -886,6 +922,7 @@ fn build_rust_archive(
     build_dir: &Path,
     rust_sdk_path: &Path,
     rust_lib_patches: &[(String, PathBuf)],
+    extra_rustflags: &str,
 ) -> Result<PathBuf, BuildError> {
     // Inject the SDK crate and any src/lib/ Rust crates via --config patches so
     // the game's Cargo.toml needs only version constraints and cargo resolves to
@@ -915,7 +952,10 @@ fn build_rust_archive(
     // relocation-model=pic: cart ELF is ET_DYN (PIE); Rust objects must be PIC.
     // panic=abort: no unwinding runtime; matches profile setting in the SDK crate.
     let status = cmd
-        .env("RUSTFLAGS", "-C relocation-model=pic -C panic=abort")
+        .env(
+            "RUSTFLAGS",
+            format!("-C relocation-model=pic -C panic=abort{extra_rustflags}"),
+        )
         .status()
         .map_err(|e| err(format!("failed to run {cargo}: {e}")))?;
 
@@ -1065,6 +1105,7 @@ fn build_library(
     lib_name: &str,
     sdk_include: &Path,
     extra_defines: &[String],
+    debug_flags: &[String],
 ) -> Result<BuiltLib, BuildError> {
     let src_dir = project_dir.join("src/lib").join(lib_name);
     let build_dir = project_dir.join("build/lib").join(lib_name);
@@ -1098,6 +1139,7 @@ fn build_library(
             sdk_include,
             &[include_path.as_path()],
             extra_defines,
+            debug_flags,
         )?);
     }
 
@@ -1113,6 +1155,7 @@ fn build_library(
                 sdk_include,
                 &libcxx_include,
                 &[include_path.as_path()],
+                debug_flags,
             )?);
         }
     }
@@ -1178,6 +1221,7 @@ fn compile_c(
     sdk_include: &Path,
     extra_includes: &[&Path],
     extra_defines: &[String],
+    debug_flags: &[String],
 ) -> Result<PathBuf, BuildError> {
     let stem = src.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
     let obj = build_dir.join(format!("{stem}.o"));
@@ -1211,6 +1255,9 @@ fn compile_c(
     }
     for def in extra_defines {
         cmd.arg(def);
+    }
+    for flag in debug_flags {
+        cmd.arg(flag);
     }
 
     let status = cmd
@@ -1268,6 +1315,7 @@ fn compile_cpp(
     sdk_include: &Path,
     libcxx_include: &Path,
     extra_includes: &[&Path],
+    debug_flags: &[String],
 ) -> Result<PathBuf, BuildError> {
     let stem = src.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
     let obj = build_dir.join(format!("{stem}.o"));
@@ -1300,6 +1348,9 @@ fn compile_cpp(
 
     for inc in extra_includes {
         cmd.arg("-I").arg(inc);
+    }
+    for flag in debug_flags {
+        cmd.arg(flag);
     }
 
     let status = cmd

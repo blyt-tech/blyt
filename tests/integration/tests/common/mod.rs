@@ -485,3 +485,85 @@ pub fn find_wasm_dir() -> PathBuf {
     }
     build_dir().join("sdk/share/wasm")
 }
+
+// -------------------------------------------------------------------------
+// GDB helpers
+// -------------------------------------------------------------------------
+
+pub fn require_gdb() {
+    assert!(
+        blytrun().exists(),
+        "blytrun not built — run `cmake --build build` first"
+    );
+    let out = std::process::Command::new(blytrun())
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|_| {
+            // blytrun exits non-zero for --help; capture output anyway
+            std::process::Command::new(blytrun())
+                .args(["--gdb", "0"])
+                .output()
+                .unwrap()
+        });
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = (stdout, stderr); // just ensure blytrun accepts --gdb
+}
+
+/// Parse "blyt: GDB listening on port N" from combined stdout/stderr output.
+pub fn blytrun_gdb_port(output: &str) -> Option<u16> {
+    let m = output.find("GDB listening on port ")?;
+    let rest = &output[m + "GDB listening on port ".len()..];
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Build a cart with debug information.
+///
+/// Runs `blyt build --debug <project_dir>` and returns the expected cart path.
+pub fn build_debug_cart(project_dir: &std::path::Path) -> PathBuf {
+    use assert_cmd::Command;
+    let sdk = sdk_dir();
+    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    cmd.args(["build", "--debug", project_dir.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_RUST_SDK", repo_root().join("sdk/rust/blyt"));
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if sdk_clang.exists() {
+        cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    let sdk_clangpp = sdk.join("bin/blyt-clang++");
+    if sdk_clangpp.exists() {
+        cmd.env("BLYT_CLANGPP", &sdk_clangpp);
+    }
+    let sdk_ar = sdk.join("bin/blyt-llvm-ar");
+    if sdk_ar.exists() {
+        cmd.env("BLYT_AR", &sdk_ar);
+    }
+    cmd.assert().success();
+
+    project_dir.parent().unwrap().join(format!(
+        "{}.blyt",
+        project_dir.file_name().unwrap().to_str().unwrap()
+    ))
+}
+
+/// Find the virtual address of a symbol in a cart ELF using `readelf -s`.
+///
+/// Returns `None` if `readelf` is not available or the symbol is not found.
+pub fn find_symbol_addr(cart: &std::path::Path, symbol: &str) -> Option<u64> {
+    let out = std::process::Command::new("readelf")
+        .args(["-s", "--wide", cart.to_str()?])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // readelf -s format: Num: Value Size Type Bind Vis Ndx Name
+        if parts.len() >= 8 && parts[7] == symbol {
+            return u64::from_str_radix(parts[1], 16).ok();
+        }
+    }
+    None
+}

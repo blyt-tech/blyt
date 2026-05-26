@@ -68,6 +68,14 @@ pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
         (0, 0)
     };
 
+    // GDB relay: WebSocket on PORT+3 (WASM runtime), raw TCP on PORT+4 (gdb-multiarch).
+    // Only started when --debug is passed.
+    let (gdb_ws_port, gdb_tcp_port) = if debug {
+        start_gdb_relay(port.wrapping_add(3), port.wrapping_add(4))
+    } else {
+        (0, 0)
+    };
+
     println!("blyt run: serving on http://127.0.0.1:{port}/");
     println!("  Cart:     {}", cart_path.display());
     println!("  WASM dir: {}", wasm_dir.display());
@@ -77,6 +85,8 @@ pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
     if debug {
         println!();
         println!("  DAP debugger (Lua):    127.0.0.1:{dap_tcp_port}");
+        println!("  GDB debugger:          127.0.0.1:{gdb_tcp_port}");
+        println!("  (gdb-multiarch: set arch riscv:rv32 && target remote :{gdb_tcp_port})");
     }
 
     serve(
@@ -84,6 +94,7 @@ pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
         Arc::new(wasm_dir),
         Arc::new(cart_path),
         dap_ws_port,
+        gdb_ws_port,
     )
 }
 
@@ -385,6 +396,150 @@ pub(crate) fn find_wasm_dir() -> Result<PathBuf, RunError> {
 }
 
 /* -------------------------------------------------------------------------
+ * GDB relay
+ *
+ * Bridges the WASM runtime's WebSocket GDB transport and a raw TCP port that
+ * gdb-multiarch connects to.  GDB RSP packets are forwarded verbatim in both
+ * directions without protocol conversion (RSP is ASCII text in both transports).
+ *
+ * ws_port  — WebSocket, for the WASM runtime (injected into shell.html)
+ * tcp_port — raw TCP, for gdb-multiarch (`target remote 127.0.0.1:PORT`)
+ * ------------------------------------------------------------------------- */
+
+fn start_gdb_relay(ws_port: u16, tcp_port: u16) -> (u16, u16) {
+    let ws_listener =
+        TcpListener::bind(format!("127.0.0.1:{ws_port}")).expect("GDB relay: WebSocket bind failed");
+    let tcp_listener =
+        TcpListener::bind(format!("127.0.0.1:{tcp_port}")).expect("GDB relay: TCP bind failed");
+
+    let actual_ws = ws_listener.local_addr().map(|a| a.port()).unwrap_or(ws_port);
+    let actual_tcp = tcp_listener.local_addr().map(|a| a.port()).unwrap_or(tcp_port);
+
+    std::thread::spawn(move || {
+        run_gdb_relay_loop(ws_listener, tcp_listener);
+    });
+
+    (actual_ws, actual_tcp)
+}
+
+fn run_gdb_relay_loop(ws_listener: TcpListener, tcp_listener: TcpListener) {
+    use std::sync::mpsc;
+
+    loop {
+        let (ws_tx, ws_rx) = mpsc::channel();
+        let (tcp_tx, tcp_rx) = mpsc::channel::<TcpStream>();
+
+        let ws_listener2 = ws_listener.try_clone().expect("clone gdb ws listener");
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = ws_listener2.accept() {
+                if let Ok(ws) = tungstenite::accept(stream) {
+                    let _ = ws_tx.send(ws);
+                }
+            }
+        });
+
+        let tcp_listener2 = tcp_listener.try_clone().expect("clone gdb tcp listener");
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = tcp_listener2.accept() {
+                let _ = tcp_tx.send(stream);
+            }
+        });
+
+        let ws = match ws_rx.recv() {
+            Ok(ws) => ws,
+            Err(_) => continue,
+        };
+        let tcp = match tcp_rx.recv() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        run_gdb_relay_session(ws, tcp);
+    }
+}
+
+fn run_gdb_relay_session(mut ws: WsConn, tcp: TcpStream) {
+    use std::io::ErrorKind::WouldBlock;
+    use std::sync::mpsc;
+
+    let (tcp_to_ws_tx, tcp_to_ws_rx) = mpsc::channel::<String>();
+    let (ws_to_tcp_tx, ws_to_tcp_rx) = mpsc::channel::<String>();
+
+    let tcp_write = match tcp.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let tcp_read = tcp;
+
+    // Thread: raw TCP reader — sends each read chunk as a WebSocket frame.
+    // GDB RSP is stop-wait so each read typically yields exactly one RSP token.
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut r = tcp_read;
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if tcp_to_ws_tx.send(s).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Thread: owns the WebSocket; polls non-blocking to interleave reads and writes.
+    std::thread::spawn(move || {
+        ws.get_mut().set_nonblocking(true).ok();
+        let delay = std::time::Duration::from_millis(1);
+        'relay: loop {
+            loop {
+                match ws.read() {
+                    Ok(Message::Text(s)) => {
+                        if ws_to_tcp_tx.send(s.to_string()).is_err() {
+                            break 'relay;
+                        }
+                    }
+                    Ok(Message::Binary(b)) => {
+                        if let Ok(s) = String::from_utf8(b.into()) {
+                            if ws_to_tcp_tx.send(s).is_err() {
+                                break 'relay;
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) => break 'relay,
+                    Err(tungstenite::Error::Io(e)) if e.kind() == WouldBlock => break,
+                    Err(_) => break 'relay,
+                    _ => break,
+                }
+            }
+            loop {
+                match tcp_to_ws_rx.try_recv() {
+                    Ok(msg) => {
+                        if ws.send(Message::Text(msg.into())).is_err() {
+                            break 'relay;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break 'relay,
+                }
+            }
+            std::thread::sleep(delay);
+        }
+    });
+
+    // Forward WebSocket messages (from WASM) to the TCP client (gdb-multiarch).
+    let mut tcp_write = tcp_write;
+    for msg in ws_to_tcp_rx {
+        if tcp_write.write_all(msg.as_bytes()).is_err() {
+            break;
+        }
+        let _ = tcp_write.flush();
+    }
+}
+
+/* -------------------------------------------------------------------------
  * HTTP server
  * ------------------------------------------------------------------------- */
 
@@ -393,6 +548,7 @@ fn serve(
     wasm_dir: Arc<PathBuf>,
     cart_path: Arc<PathBuf>,
     dap_port: u16,
+    gdb_port: u16,
 ) -> Result<(), RunError> {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -402,13 +558,19 @@ fn serve(
         let wasm_dir = Arc::clone(&wasm_dir);
         let cart_path = Arc::clone(&cart_path);
         std::thread::spawn(move || {
-            handle_connection(stream, &wasm_dir, &cart_path, dap_port);
+            handle_connection(stream, &wasm_dir, &cart_path, dap_port, gdb_port);
         });
     }
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, wasm_dir: &Path, cart_path: &Path, dap_port: u16) {
+fn handle_connection(
+    mut stream: TcpStream,
+    wasm_dir: &Path,
+    cart_path: &Path,
+    dap_port: u16,
+    gdb_port: u16,
+) {
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf) {
         Ok(0) | Err(_) => return,
@@ -435,9 +597,11 @@ fn handle_connection(mut stream: TcpStream, wasm_dir: &Path, cart_path: &Path, d
     match fs::read(&file_path) {
         Ok(data) => {
             if inject_dap {
-                // Replace {{BLYT_DAP_PORT}} with the actual relay port.
+                // Replace {{BLYT_DAP_PORT}} and {{BLYT_GDB_PORT}} with actual relay ports.
                 let html = String::from_utf8_lossy(&data);
-                let patched = html.replace("{{BLYT_DAP_PORT}}", &dap_port.to_string());
+                let patched = html
+                    .replace("{{BLYT_DAP_PORT}}", &dap_port.to_string())
+                    .replace("{{BLYT_GDB_PORT}}", &gdb_port.to_string());
                 respond(&mut stream, 200, content_type, patched.as_bytes());
             } else {
                 respond(&mut stream, 200, content_type, &data);

@@ -64,6 +64,7 @@ function startBlytRun(cartPath, cwd, output) {
 
         let buf      = '';
         let httpPort = 0;
+        let gdbPort  = 0;
         let resolved = false;
 
         function check(data) {
@@ -75,10 +76,21 @@ function startBlytRun(cartPath, cwd, output) {
                 if (m) httpPort = parseInt(m[1], 10);
             }
 
+            if (!gdbPort) {
+                const g = buf.match(/GDB debugger:\s+127\.0\.0\.1:(\d+)/);
+                if (g) {
+                    gdbPort = parseInt(g[1], 10);
+                    output.appendLine(
+                        `\n── GDB: connect gdb-multiarch to 127.0.0.1:${gdbPort}` +
+                        `\n       (set architecture riscv:rv32, then: target remote :${gdbPort})`
+                    );
+                }
+            }
+
             const m = buf.match(/DAP debugger \(Lua\):\s+127\.0\.0\.1:(\d+)/);
             if (m && !resolved) {
                 resolved = true;
-                resolve({ proc, httpPort, dapPort: parseInt(m[1], 10) });
+                resolve({ proc, httpPort, dapPort: parseInt(m[1], 10), gdbPort });
             }
         }
 

@@ -692,6 +692,38 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# GDB RSP debugging support (TCP+pthread transport for SDL2 / libretro)
+#
+# gdb_stub is a static library containing gdb_stub.c (protocol handler, no
+# threading) and gdb_transport_tcp.c (blocking TCP accept + pthread reader).
+# Linked into libblyt when BLYT_GDB=ON. gdb_transport_wasm.c is compiled into
+# the WASM binary separately (frontends/wasm/CMakeLists.txt).
+# -------------------------------------------------------------------------
+find_package(Threads QUIET)
+option(BLYT_GDB "Enable GDB RSP debugger support (TCP transport)" ON)
+
+if(BLYT_GDB AND Threads_FOUND)
+  set(BLYT_GDB_DIR "${CMAKE_SOURCE_DIR}/runtime/host/src/gdb")
+  add_library(gdb_stub STATIC "${BLYT_GDB_DIR}/gdb_stub.c"
+                               "${BLYT_GDB_DIR}/gdb_transport_tcp.c")
+  set_target_properties(gdb_stub PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(
+    gdb_stub PRIVATE "${BLYT_GDB_DIR}"
+                     "${CMAKE_SOURCE_DIR}/runtime/host/include")
+  target_compile_definitions(gdb_stub PRIVATE BLYT_GDB=1 BLYT_GDB_TCP=1)
+  target_link_libraries(gdb_stub PRIVATE Threads::Threads)
+
+  target_compile_definitions(libblyt PRIVATE BLYT_GDB=1)
+  target_include_directories(libblyt PRIVATE "${BLYT_GDB_DIR}")
+  target_link_libraries(libblyt PRIVATE gdb_stub)
+  message(STATUS "BLYT_GDB: GDB RSP debugging enabled (TCP transport)")
+elseif(BLYT_GDB)
+  message(STATUS "BLYT_GDB: disabled (Threads not found)")
+else()
+  message(STATUS "BLYT_GDB: GDB RSP debugging disabled")
+endif()
+
+# -------------------------------------------------------------------------
 # SDL2 frontend — try find_package, then pkg-config, then sdl2-config
 # -------------------------------------------------------------------------
 find_package(SDL2 QUIET)
@@ -747,6 +779,9 @@ if(TARGET blytrun)
   if(BLYT_DAP)
     target_compile_definitions(blytrun PRIVATE BLYT_DAP=1)
   endif()
+  if(BLYT_GDB AND Threads_FOUND)
+    target_compile_definitions(blytrun PRIVATE BLYT_GDB=1)
+  endif()
 endif()
 
 # -------------------------------------------------------------------------
@@ -786,6 +821,9 @@ if(LIBBLYTC_OUT)
   endif()
   if(BLYT_DAP)
     list(APPEND _blyt_libretro_defs BLYT_DAP=1)
+  endif()
+  if(BLYT_GDB AND Threads_FOUND)
+    list(APPEND _blyt_libretro_defs BLYT_GDB=1)
   endif()
   target_compile_definitions(blyt_libretro PRIVATE ${_blyt_libretro_defs})
   set_target_properties(blyt_libretro PROPERTIES PREFIX "" SUFFIX ".so")
@@ -1068,6 +1106,8 @@ file(
   _LINT_C_FILES
   "${CMAKE_SOURCE_DIR}/runtime/host/src/libblyt/*.h"
   "${CMAKE_SOURCE_DIR}/runtime/host/src/libblyt/*.c"
+  "${CMAKE_SOURCE_DIR}/runtime/host/src/gdb/*.h"
+  "${CMAKE_SOURCE_DIR}/runtime/host/src/gdb/*.c"
   "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/*.c"
   "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/*.c"
   "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_arena.c"
