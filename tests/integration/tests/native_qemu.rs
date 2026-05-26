@@ -1,14 +1,14 @@
 /// Native RISC-V QEMU gate tests: trusted native cart execution on RISC-V ILP32 QEMU.
 ///
-/// Skipped unless the following are set:
-///   BLYT_QEMU_KERNEL — path to patched c-sky 6.5-rc1 kernel Image
-///   BLYT_QEMU_ROOTFS — path to blyt-qemu-images rootfs qcow2 (Alpine + ILP32F musl)
-///                      (must have /lib/ld-blyt.so.1 symlink + blyt SSH key)
-///   BLYT_QEMU_SSH_KEY (optional) — SSH key; default: tests/native/.ssh/id_ed25519
+/// Images default to qemu-images/{kernel,rootfs.qcow2,id_ed25519} in the repo root.
+/// Download them with: cmake --build build --target fetch_qemu_images
 ///
-/// Run with:
-///   BLYT_QEMU_KERNEL=... BLYT_QEMU_ROOTFS=... cargo test \
-///       -- native_riscv_qemu_gate --nocapture
+/// Override paths with env vars:
+///   BLYT_QEMU_KERNEL   — path to patched c-sky 6.5-rc1 kernel Image
+///   BLYT_QEMU_ROOTFS   — path to blyt-qemu-images rootfs qcow2 (Alpine + ILP32F musl)
+///   BLYT_QEMU_SSH_KEY  — SSH private key (default: qemu-images/id_ed25519)
+///
+/// Silently skipped if images or qemu-system-riscv64 are not present.
 mod common;
 
 use common::{build_dir, repo_root, sdk_dir, write_c_cart_project};
@@ -200,29 +200,17 @@ fn build_cart(project_dir: &Path) -> PathBuf {
 fn native_riscv_qemu_gate() {
     // ── Prerequisites ──────────────────────────────────────────────────
 
-    let kernel = match std::env::var("BLYT_QEMU_KERNEL") {
-        Ok(k) => PathBuf::from(k),
-        Err(_) => {
-            eprintln!("native_riscv_qemu_gate: BLYT_QEMU_KERNEL not set — skip");
-            return;
-        }
-    };
-    let rootfs = match std::env::var("BLYT_QEMU_ROOTFS") {
-        Ok(r) => PathBuf::from(r),
-        Err(_) => {
-            eprintln!("native_riscv_qemu_gate: BLYT_QEMU_ROOTFS not set — skip");
-            return;
-        }
-    };
+    let kernel = std::env::var("BLYT_QEMU_KERNEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("qemu-images/kernel"));
+    let rootfs = std::env::var("BLYT_QEMU_ROOTFS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("qemu-images/rootfs.qcow2"));
     let ssh_key = std::env::var("BLYT_QEMU_SSH_KEY")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root().join("tests/native/.ssh/id_ed25519"));
+        .unwrap_or_else(|_| repo_root().join("qemu-images/id_ed25519"));
 
-    for (label, path) in [
-        ("BLYT_QEMU_KERNEL", &kernel),
-        ("BLYT_QEMU_ROOTFS", &rootfs),
-        ("ssh key", &ssh_key),
-    ] {
+    for (label, path) in [("kernel", &kernel), ("rootfs", &rootfs), ("ssh key", &ssh_key)] {
         if !path.exists() {
             eprintln!(
                 "native_riscv_qemu_gate: {label} not found ({}) — skip",

@@ -6,4 +6,5 @@ tests/game/*.blyt
 tests/wasm/node_modules/
 tools/vscode/node_modules/
 .cache/
-.cache/
+qemu-images/*
+!qemu-images/.gitkeep

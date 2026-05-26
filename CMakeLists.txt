@@ -915,3 +915,18 @@ if(APPLE)
     endforeach()
   endif()
 endif()
+
+# ── QEMU images ────────────────────────────────────────────────────────────────
+# kernel + rootfs.qcow2 + id_ed25519 are downloaded from a GitHub release into
+# qemu-images/.  Override the release base URL with -DBLYT_QEMU_IMAGE_URL=...
+set(BLYT_QEMU_IMAGE_URL
+    "https://github.com/blyt-tech/blyt-qemu-images/releases/download/v2"
+    CACHE STRING "Base URL for QEMU image downloads")
+
+add_custom_target(fetch_qemu_images
+  COMMAND ${CMAKE_COMMAND}
+    -DQEMU_IMAGES_DIR=${CMAKE_SOURCE_DIR}/qemu-images
+    -DBLYT_QEMU_IMAGE_URL=${BLYT_QEMU_IMAGE_URL}
+    -P ${CMAKE_SOURCE_DIR}/cmake/fetch_qemu_images.cmake
+  COMMENT "Downloading QEMU images → qemu-images/"
+  VERBATIM)
