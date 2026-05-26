@@ -1,7 +1,10 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{build_cart, find_wasm_dir, repo_root, require_wasm, sdk_dir, write_c_cart_project};
+use common::{
+    build_cart, find_wasm_dir, repo_root, require_playwright, require_wasm, sdk_dir,
+    write_c_cart_project,
+};
 use std::fs;
 use tempfile::TempDir;
 
@@ -194,4 +197,70 @@ void blyt_cart_draw(void)   {}
         "HTML is suspiciously small ({} bytes) — WASM may not be embedded",
         html.len()
     );
+}
+
+/// Browser canvas gate: run the testcard cart in headless Chromium via Playwright,
+/// read the canvas via getImageData, and pixel-compare against the golden frame.
+/// This is the only test that exercises blyt_js_present's canvas-drawing path.
+///
+/// Requires playwright + Chromium:
+///   cd tests/wasm && npm install && npx playwright install chromium
+#[test]
+fn wasm_canvas_renders_in_browser() {
+    require_wasm();
+    require_playwright();
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let golden_path = repo_root().join("tests/testcard_frame0.bin");
+    assert!(
+        golden_path.exists(),
+        "golden file missing: {}",
+        golden_path.display()
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("browser_canvas_cart");
+    write_c_cart_project(
+        &project,
+        r#"
+#include "blyt.h"
+void blyt_cart_init(void)   {}
+void blyt_cart_update(void) {}
+void blyt_cart_draw(void)   {}
+"#,
+    );
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    /* Build a standalone HTML with the WASM runtime and cart embedded as base64,
+     * so the page can be loaded via file:// without a server. */
+    let html_path = tmp.path().join("browser_canvas_cart.html");
+    Command::cargo_bin("blyt")
+        .unwrap()
+        .args([
+            "build",
+            "wasm",
+            cart.to_str().unwrap(),
+            "--output",
+            html_path.to_str().unwrap(),
+        ])
+        .env("BLYT_SDK_DIR", sdk_dir())
+        .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
+        .env("BLYT_WASM_DIR", find_wasm_dir())
+        .assert()
+        .success();
+    assert!(html_path.exists(), "standalone HTML not written");
+
+    let script = repo_root().join("tests/wasm/browser_canvas_test.mjs");
+    Command::new("node")
+        .args([
+            script.to_str().unwrap(),
+            html_path.to_str().unwrap(),
+            golden_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
 }
