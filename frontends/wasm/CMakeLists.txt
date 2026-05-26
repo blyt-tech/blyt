@@ -117,9 +117,9 @@ endif()
 # -------------------------------------------------------------------------
 # DAP debugging support (Lua source-level via Debug Adapter Protocol)
 #
-# When ON: compile dap_transport_wasm.c + master_hook.c into blytrun and
-# define BLYT_DAP=1.  Pausing the Lua VM uses Lua coroutine yield (not
-# ASYNCIFY), so no special link options are needed.
+# When ON: compile dap_transport_wasm.c + master_hook.c into blytrun and define
+# BLYT_DAP=1.  Pausing the Lua VM uses Lua coroutine yield (not ASYNCIFY), so no
+# special link options are needed.
 # -------------------------------------------------------------------------
 set(BLYT_DAP_DIR "${BLYT_ROOT}/runtime/host/src/dap")
 option(BLYT_DAP "Enable DAP Lua debugger support" ON)
@@ -128,11 +128,8 @@ set(BLYT_DAP_SOURCES "")
 set(BLYT_DAP_DEFS "")
 set(BLYT_DAP_LINK_OPTS "")
 if(BLYT_DAP AND EXISTS "${LUA_DIR}/lvm.c")
-  list(
-    APPEND
-    BLYT_DAP_SOURCES
-    "${BLYT_DAP_DIR}/dap_transport_wasm.c"
-    "${BLYT_DAP_DIR}/master_hook.c")
+  list(APPEND BLYT_DAP_SOURCES "${BLYT_DAP_DIR}/dap_transport_wasm.c"
+       "${BLYT_DAP_DIR}/master_hook.c")
   list(APPEND BLYT_DAP_DEFS BLYT_DAP=1)
   # wdap_dequeue_json (EM_JS) calls _malloc/_free from JavaScript.
   list(APPEND BLYT_DAP_LINK_OPTS "-sEXPORTED_FUNCTIONS=_main,_malloc,_free")
@@ -141,7 +138,7 @@ else()
   if(BLYT_DAP AND NOT EXISTS "${LUA_DIR}/lvm.c")
     message(
       STATUS
-      "blyt WASM: DAP disabled (requires BLYT_LUA; third_party/lua not initialised)"
+        "blyt WASM: DAP disabled (requires BLYT_LUA; third_party/lua not initialised)"
     )
   else()
     message(STATUS "blyt WASM: DAP disabled")
@@ -290,9 +287,9 @@ if(BLYT_LUA_SOURCES)
   list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 LUA_32BITS=1 LUA_USE_LONGJMP=1)
 endif()
 
-target_compile_definitions(blytrun PRIVATE ${RV32EMU_FEATURE_DEFS}
-                                           BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS}
-                                           ${BLYT_DAP_DEFS})
+target_compile_definitions(
+  blytrun PRIVATE ${RV32EMU_FEATURE_DEFS} BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS}
+                  ${BLYT_DAP_DEFS})
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
 # (not a cmake definition) to avoid quoting issues. Force-include rv32emu

@@ -418,16 +418,12 @@ if(CLANG_RV32
   set(LIBBLYT32_OUT "${CMAKE_BINARY_DIR}/libblyt32.so")
 
   if(MUSL_DIR)
-    # Full build: DT_NEEDED for both libblytcommon.so and libblytc.so.
-    # Use full paths to avoid lld defaulting to -Bstatic on bare-metal targets.
+    # Full build: DT_NEEDED for both libblytcommon.so and libblytc.so. Use full
+    # paths to avoid lld defaulting to -Bstatic on bare-metal targets.
     set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}"
                        "${LIBBLYTC_OUT}")
-    set(LIBBLYT32_LINK
-        -Wl,-Bdynamic
-        "${LIBBLYTCOMMON_OUT}"
-        -Wl,--no-as-needed
-        "${LIBBLYTC_OUT}"
-        -Wl,--as-needed)
+    set(LIBBLYT32_LINK -Wl,-Bdynamic "${LIBBLYTCOMMON_OUT}" -Wl,--no-as-needed
+                       "${LIBBLYTC_OUT}" -Wl,--as-needed)
   else()
     # musl unavailable: build without libblytc.so dependency.
     set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}")
@@ -482,8 +478,8 @@ if(CLANG_RV32
   # causing a crash before any constructor fires.  libblytc.so is intentionally
   # omitted — the native process C library comes from the musl ld.so
   # interpreter.  Use full path to avoid lld -Bstatic on bare-metal targets.
-  set(LIBBLYT32_NATIVE_LINK
-      -Wl,-Bdynamic -Wl,--no-as-needed "${LIBBLYTCOMMON_OUT}" -Wl,--as-needed)
+  set(LIBBLYT32_NATIVE_LINK -Wl,-Bdynamic -Wl,--no-as-needed
+                            "${LIBBLYTCOMMON_OUT}" -Wl,--as-needed)
 
   add_custom_command(
     OUTPUT "${LIBBLYT32_NATIVE_OUT}"
@@ -552,12 +548,12 @@ add_dependencies(libblyt flatbuffers_generated)
 # -------------------------------------------------------------------------
 # DAP debugging support (TCP+pthread transport for SDL2 / libretro)
 #
-# dap is a static library containing dap_server.c (TCP transport).
-# Linked into libblyt and blytrun when BLYT_DAP=ON.
-# master_hook.c is compiled into the WASM binary separately (frontends/wasm/)
-# and into libblyt32lua.so as RV32 guest code (cmake/blyt_sdk.cmake).
-# It is NOT part of the native host libdap.a — the master hook runs inside
-# rv32emu and does not need to be present in the host address space.
+# dap is a static library containing dap_server.c (TCP transport). Linked into
+# libblyt and blytrun when BLYT_DAP=ON. master_hook.c is compiled into the WASM
+# binary separately (frontends/wasm/) and into libblyt32lua.so as RV32 guest
+# code (cmake/blyt_sdk.cmake). It is NOT part of the native host libdap.a — the
+# master hook runs inside rv32emu and does not need to be present in the host
+# address space.
 # -------------------------------------------------------------------------
 option(BLYT_DAP "Enable DAP Lua debugger support (TCP transport)" ON)
 
@@ -839,8 +835,8 @@ target_link_libraries(test_session_api PRIVATE libblyt)
 # core is available (LIBBLYTC_OUT set → blyt_libretro.so will be built).
 if(LIBBLYTC_OUT)
   add_executable(test_libretro_dap tests/unit/test_libretro_dap.c)
-  target_include_directories(test_libretro_dap PRIVATE
-    third_party/libretro-common/include)
+  target_include_directories(test_libretro_dap
+                             PRIVATE third_party/libretro-common/include)
   target_link_libraries(test_libretro_dap PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
@@ -875,9 +871,9 @@ add_custom_target(
 # less reliable and can leave source files unresolvable.
 # -------------------------------------------------------------------------
 # -------------------------------------------------------------------------
-# VS Code extension: install-vscode-ext target for local development.
-# Creates a symlink in ~/.vscode/extensions/ so edits to tools/vscode/ are
-# reflected immediately on VS Code window reload.
+# VS Code extension: install-vscode-ext target for local development. Creates a
+# symlink in ~/.vscode/extensions/ so edits to tools/vscode/ are reflected
+# immediately on VS Code window reload.
 # -------------------------------------------------------------------------
 file(STRINGS "${CMAKE_SOURCE_DIR}/tools/vscode/package.json" _vscode_pkg_lines)
 foreach(_line IN LISTS _vscode_pkg_lines)
@@ -890,13 +886,14 @@ foreach(_line IN LISTS _vscode_pkg_lines)
   endif()
 endforeach()
 set(_vscode_ext_dir
-  "$ENV{HOME}/.vscode/extensions/${_vscode_publisher}.${_vscode_name}-${_vscode_version}")
+    "$ENV{HOME}/.vscode/extensions/${_vscode_publisher}.${_vscode_name}-${_vscode_version}"
+)
 
 add_custom_target(
   install-vscode-ext
   COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vscode_ext_dir}"
-  COMMAND ${CMAKE_COMMAND} -E create_symlink
-    "${CMAKE_SOURCE_DIR}/tools/vscode" "${_vscode_ext_dir}"
+  COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_SOURCE_DIR}/tools/vscode"
+          "${_vscode_ext_dir}"
   COMMENT "Installing VS Code extension → ${_vscode_ext_dir}"
   VERBATIM)
 
@@ -916,17 +913,19 @@ if(APPLE)
   endif()
 endif()
 
-# ── QEMU images ────────────────────────────────────────────────────────────────
-# kernel + rootfs.qcow2 + id_ed25519 are downloaded from a GitHub release into
+# ── QEMU images
+# ──────────────────────────────────────────────────────────────── kernel +
+# rootfs.qcow2 + id_ed25519 are downloaded from a GitHub release into
 # qemu-images/.  Override the release base URL with -DBLYT_QEMU_IMAGE_URL=...
 set(BLYT_QEMU_IMAGE_URL
     "https://github.com/blyt-tech/blyt-qemu-images/releases/download/v2"
     CACHE STRING "Base URL for QEMU image downloads")
 
-add_custom_target(fetch_qemu_images
-  COMMAND ${CMAKE_COMMAND}
-    -DQEMU_IMAGES_DIR=${CMAKE_SOURCE_DIR}/qemu-images
-    -DBLYT_QEMU_IMAGE_URL=${BLYT_QEMU_IMAGE_URL}
-    -P ${CMAKE_SOURCE_DIR}/cmake/fetch_qemu_images.cmake
+add_custom_target(
+  fetch_qemu_images
+  COMMAND
+    ${CMAKE_COMMAND} -DQEMU_IMAGES_DIR=${CMAKE_SOURCE_DIR}/qemu-images
+    -DBLYT_QEMU_IMAGE_URL=${BLYT_QEMU_IMAGE_URL} -P
+    ${CMAKE_SOURCE_DIR}/cmake/fetch_qemu_images.cmake
   COMMENT "Downloading QEMU images → qemu-images/"
   VERBATIM)
