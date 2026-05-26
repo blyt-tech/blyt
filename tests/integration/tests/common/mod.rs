@@ -518,6 +518,39 @@ pub fn blytrun_gdb_port(output: &str) -> Option<u16> {
     rest[..end].parse().ok()
 }
 
+/// Run `blyt build <project_dir>` with Lua-specific env vars and the `--debug`
+/// flag, returning the cart path.
+pub fn build_debug_lua_cart(project_dir: &std::path::Path) -> PathBuf {
+    use assert_cmd::Command;
+    let sdk = sdk_dir();
+    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    cmd.args(["build", "--debug", project_dir.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if sdk_clang.exists() {
+        cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    let sdk_clangpp = sdk.join("bin/blyt-clang++");
+    if sdk_clangpp.exists() {
+        cmd.env("BLYT_CLANGPP", &sdk_clangpp);
+    }
+    let sdk_ar = sdk.join("bin/blyt-llvm-ar");
+    if sdk_ar.exists() {
+        cmd.env("BLYT_AR", &sdk_ar);
+    }
+    let sdk_luac = sdk.join("bin/blyt-luac");
+    if sdk_luac.exists() {
+        cmd.env("BLYT_LUAC", &sdk_luac);
+    }
+    cmd.assert().success();
+
+    project_dir.parent().unwrap().join(format!(
+        "{}.blyt",
+        project_dir.file_name().unwrap().to_str().unwrap()
+    ))
+}
+
 /// Build a cart with debug information.
 ///
 /// Runs `blyt build --debug <project_dir>` and returns the expected cart path.

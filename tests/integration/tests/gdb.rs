@@ -2,9 +2,9 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_cart, build_debug_cart, find_symbol_addr, find_wasm_dir,
-    libretro_so, repo_root, require_gdb, require_libretro_core, require_sdk, require_wasm,
-    sdk_dir, test_libretro_core,
+    CartProject, blytrun, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
+    find_wasm_dir, libretro_so, repo_root, require_gdb, require_libretro_core, require_lua_sdk,
+    require_sdk, require_wasm, sdk_dir, test_libretro_core,
 };
 use tempfile::TempDir;
 
@@ -259,5 +259,92 @@ fn wasm_gdb_breakpoint_step() {
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
     }
+    cmd.assert().success();
+}
+
+/// SDL2 hybrid: Lua cart with a C native library — both DAP and GDB active
+/// simultaneously.
+///
+/// Scenario:
+///   - DAP breakpoint at line 3 (Lua call site: `blyt_native_work()`)
+///   - GDB software breakpoint at the C function entry
+///   - DAP "next" triggers the native call → GDB fires inside C
+///   - GDB single-steps × 2, then continues
+///   - DAP receives stopped at line 4 (step-over complete)
+///
+/// WASM hybrid is architecturally unsupported: Lua carts on WASM bypass
+/// rv32emu (host-side Lua interpreter), so GDB (which operates on the
+/// rv32emu PC) cannot intercept native C calls made from Lua.  The SDL2 /
+/// libretro paths run the Lua interpreter inside rv32emu, so both debuggers
+/// operate on the same execution stream.
+///
+/// Requires: blytrun built with BLYT_DAP=ON and BLYT_GDB=ON, Lua SDK,
+/// `readelf` on PATH (for symbol address; falls back to DAP-only if absent).
+#[test]
+fn sdl_hybrid_gdb_and_dap() {
+    require_sdk();
+    require_lua_sdk();
+    require_gdb();
+
+    let tmp     = TempDir::new().unwrap();
+    let project = tmp.path().join("hybrid_gdb_dap");
+
+    // C library: blyt_native_work is a Lua C function with a couple of
+    // volatile assignments so that two single-steps land on distinct PCs.
+    const C_SOURCE: &str = r#"
+#include "lua.h"
+#include "lauxlib.h"
+
+int blyt_native_work(lua_State *L) {
+    volatile int x = 42;
+    volatile int y = x + 1;
+    (void)y;
+    return 0;
+}
+
+void cart_lua_modules(lua_State *L) {
+    lua_pushcfunction(L, blyt_native_work);
+    lua_setglobal(L, "blyt_native_work");
+}
+"#;
+
+    // Lua cart: line 3 is the native call site; line 4 is the expected DAP
+    // landing point after the step-over completes.
+    const LUA_SOURCE: &str = "\
+function init()\n\
+    local _ = 0\n\
+    blyt_native_work()\n\
+    local done = true\n\
+    blyt.quit()\n\
+end\n\
+\n\
+function update() end\n\
+function draw()   end\n";
+
+    CartProject::new()
+        .lib_file("nativework", "nativework.c", C_SOURCE)
+        .lua(LUA_SOURCE)
+        .write(&project);
+
+    let cart = build_debug_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    // Look up blyt_native_work in the cart ELF symbol table.  With --debug
+    // the symbol is in .symtab even though it is statically linked in.
+    let addr = find_symbol_addr(&cart, "blyt_native_work");
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_hybrid_test.mjs");
+    let mut cmd = Command::new("node");
+    cmd.args([
+        orchestrator.to_str().unwrap(),
+        blytrun().to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ])
+    .env("BLYT_LIB_DIR", sdk_dir().join("lib"));
+
+    if let Some(a) = addr {
+        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
+    }
+
     cmd.assert().success();
 }
