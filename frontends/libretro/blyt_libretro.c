@@ -176,15 +176,21 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
     {
         const char *dap_port_str = getenv("BLYT_DAP_PORT");
         if (dap_port_str) {
-            int dap_port = atoi(dap_port_str);
-            int actual_port = 0;
-            if (blyt_session_dap_listen(g_session, &actual_port) >= 0) {
-                if (g_log_cb)
-                    g_log_cb(RETRO_LOG_INFO, "blyt: DAP listening on port %d\n", actual_port);
-                else
-                    fprintf(stderr, "blyt: DAP listening on port %d\n", actual_port);
+            /* DAP only applies to Lua carts — the DAP hook lives in
+             * libblyt32lua.so which is not loaded for C carts. */
+            size_t lua_sec_size;
+            bool is_lua = blyt_cart_find_section(g_cart, ".cart.lua", &lua_sec_size) != NULL;
+            if (is_lua) {
+                int dap_port = atoi(dap_port_str);
+                int actual_port = 0;
+                if (blyt_session_dap_listen(g_session, &actual_port) >= 0) {
+                    if (g_log_cb)
+                        g_log_cb(RETRO_LOG_INFO, "blyt: DAP listening on port %d\n", actual_port);
+                    else
+                        fprintf(stderr, "blyt: DAP listening on port %d\n", actual_port);
+                }
+                (void)dap_port;
             }
-            (void)dap_port;
         }
     }
 #endif

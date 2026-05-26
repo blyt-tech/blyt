@@ -2,9 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_cart, build_lua_cart, find_wasm_dir, libretro_so, repo_root,
+    CartProject, blytrun, build_lua_cart, find_wasm_dir, libretro_so, repo_root,
     require_libretro_dap, require_lua_sdk, require_sdk, require_wasm, sdk_dir, test_libretro_dap,
-    write_c_cart_project,
 };
 use tempfile::TempDir;
 
@@ -100,28 +99,33 @@ fn sdl_dap_breakpoint_step_inspect() {
         .success();
 }
 
-/// Libretro DAP handshake: load a cart via the libretro API with BLYT_DAP_PORT=0,
-/// connect a TCP socket, and verify the DAP server responds to "initialize".
+/// Libretro DAP handshake: load a Lua cart via the libretro API with
+/// BLYT_DAP_PORT=0, connect a TCP socket, and verify the DAP server responds
+/// to "initialize".
+///
+/// Uses a Lua cart because the DAP hook lives in libblyt32lua.so, which is only
+/// loaded for Lua carts.  C carts skip DAP entirely (no port is opened).
 ///
 /// Covers: blyt_session_dap_listen, BLYT_DAP_PORT env-var pickup, TCP server
 /// startup, and the DAP initialize handshake on the emulated-cart path.
 ///
-/// Requires: blyt_libretro.so and test_libretro_dap binary (RV32 toolchain).
+/// Requires: blyt_libretro.so, test_libretro_dap binary, and Lua SDK.
 #[test]
 fn libretro_dap_listen_and_handshake() {
     require_sdk();
+    require_lua_sdk();
     require_libretro_dap();
 
     let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("libretro_dap_c");
-    write_c_cart_project(
-        &project,
-        "#include \"blyt.h\"\n\
-         void blyt_cart_init(void)   {}\n\
-         void blyt_cart_update(void) {}\n\
-         void blyt_cart_draw(void)   {}\n",
-    );
-    let cart = build_cart(&project);
+    let project = tmp.path().join("libretro_dap_lua");
+    CartProject::new()
+        .lua(
+            "function init() end\n\
+             function update() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+    let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
     Command::new(test_libretro_dap())
