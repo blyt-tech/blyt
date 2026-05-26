@@ -377,6 +377,10 @@ pub fn test_libretro_dap() -> PathBuf {
     build_dir().join("test_libretro_dap")
 }
 
+pub fn test_libretro_core() -> PathBuf {
+    build_dir().join("test_libretro_core")
+}
+
 pub fn require_libretro_dap() {
     assert!(
         libretro_so().exists(),
@@ -385,6 +389,18 @@ pub fn require_libretro_dap() {
     assert!(
         test_libretro_dap().exists(),
         "test_libretro_dap not built — run `cmake --build build` first \
+         (requires RV32 toolchain for LIBBLYTC_OUT)"
+    );
+}
+
+pub fn require_libretro_core() {
+    assert!(
+        libretro_so().exists(),
+        "blyt_libretro.so not built — run `cmake --build build` first"
+    );
+    assert!(
+        test_libretro_core().exists(),
+        "test_libretro_core not built — run `cmake --build build` first \
          (requires RV32 toolchain for LIBBLYTC_OUT)"
     );
 }

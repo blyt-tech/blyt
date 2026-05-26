@@ -962,6 +962,11 @@ if(LIBBLYTC_OUT)
   target_include_directories(test_libretro_dap
                              PRIVATE third_party/libretro-common/include)
   target_link_libraries(test_libretro_dap PRIVATE ${CMAKE_DL_LIBS})
+
+  add_executable(test_libretro_core tests/unit/test_libretro_core.c)
+  target_include_directories(test_libretro_core
+                             PRIVATE third_party/libretro-common/include)
+  target_link_libraries(test_libretro_core PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # -------------------------------------------------------------------------
