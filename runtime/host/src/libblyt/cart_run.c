@@ -227,9 +227,9 @@ static void blyt_ecall_handler(riscv_t *rv) {
 #ifdef BLYT_DAP
         {
             uint32_t src_vaddr = rv_get_reg(rv, rv_reg_a0);
-            uint32_t src_len   = rv_get_reg(rv, rv_reg_a1);
-            int32_t  line      = (int32_t)rv_get_reg(rv, rv_reg_a2);
-            int32_t  depth     = (int32_t)rv_get_reg(rv, rv_reg_a3);
+            uint32_t src_len = rv_get_reg(rv, rv_reg_a1);
+            int32_t line = (int32_t)rv_get_reg(rv, rv_reg_a2);
+            int32_t depth = (int32_t)rv_get_reg(rv, rv_reg_a3);
 
             /* Probe call from blyt_dap_active(): src=0 or line<0 */
             if (src_vaddr == 0 || line < 0) {
@@ -266,17 +266,22 @@ static void blyt_ecall_handler(riscv_t *rv) {
 #ifdef BLYT_DAP
     case BLYT_ECALL_DAP_SEND: {
         /* Guest sends a DAP JSON message; forward to connected TCP client. */
-        if (!g_run_ctx || !g_run_ctx->dap_enabled) { rv->PC += 4; return; }
+        if (!g_run_ctx || !g_run_ctx->dap_enabled) {
+            rv->PC += 4;
+            return;
+        }
         uint32_t vaddr = rv_get_reg(rv, rv_reg_a0);
-        uint32_t vlen  = rv_get_reg(rv, rv_reg_a1);
+        uint32_t vlen = rv_get_reg(rv, rv_reg_a1);
         vm_attr_t *attr = PRIV(rv);
-        memory_t  *mem  = attr->mem;
-        if (vlen > 65535u) vlen = 65535u;
+        memory_t *mem = attr->mem;
+        if (vlen > 65535u)
+            vlen = 65535u;
         char *json = malloc((size_t)vlen + 1);
         if (json) {
             uint32_t i;
             for (i = 0; i < vlen; i++) {
-                if (!GUEST_RAM_CONTAINS(mem, vaddr + i, 1)) break;
+                if (!GUEST_RAM_CONTAINS(mem, vaddr + i, 1))
+                    break;
                 uint8_t c;
                 memory_read(mem, &c, vaddr + i, 1);
                 json[i] = (char)c;
@@ -297,10 +302,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
             return;
         }
         uint32_t buf_vaddr = rv_get_reg(rv, rv_reg_a0);
-        uint32_t max_len   = rv_get_reg(rv, rv_reg_a1);
+        uint32_t max_len = rv_get_reg(rv, rv_reg_a1);
         vm_attr_t *attr = PRIV(rv);
-        memory_t  *mem  = attr->mem;
-        if (max_len > 65535u) max_len = 65535u;
+        memory_t *mem = attr->mem;
+        if (max_len > 65535u)
+            max_len = 65535u;
         char *buf = malloc((size_t)max_len + 1);
         int len = 0;
         if (buf) {
@@ -985,7 +991,8 @@ void blyt_session_dap_shutdown(blyt_session_t *s) {
 
 int blyt_session_dap_wait_ready(blyt_session_t *s) {
 #ifdef BLYT_DAP
-    if (!s || !s->ctx.dap_enabled) return 0;
+    if (!s || !s->ctx.dap_enabled)
+        return 0;
     return fc_dap_wait_configuration_done();
 #else
     (void)s;

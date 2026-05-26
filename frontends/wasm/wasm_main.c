@@ -32,10 +32,10 @@
 #include "blyt_runtime.h"
 
 #ifdef BLYT_LUA
+#include "testcard.h"
 #include <lauxlib.h>
 #include <lua.h>
 #include <lualib.h>
-#include "testcard.h"
 #endif
 
 #ifdef BLYT_DAP
@@ -80,14 +80,14 @@ static uint32_t g_xrgb[BLYT_FRAME_W * BLYT_FRAME_H];
 
 #ifdef BLYT_LUA
 /* Lua-direct path state (used when the cart contains a .cart.lua section). */
-static lua_State *g_lua        = NULL;
-static lua_State *g_lua_co     = NULL;   /* game-loop coroutine */
-static int        g_lua_co_ref = LUA_NOREF;
-static bool       g_lua_quit   = false;
-static bool       g_lua_active = false;
+static lua_State *g_lua = NULL;
+static lua_State *g_lua_co = NULL; /* game-loop coroutine */
+static int g_lua_co_ref = LUA_NOREF;
+static bool g_lua_quit = false;
+static bool g_lua_active = false;
 #ifdef BLYT_DAP
-static bool       g_lua_dap_paused  = false;  /* hook yielded, waiting for DAP */
-static bool       g_lua_needs_start = false;  /* waiting for configurationDone */
+static bool g_lua_dap_paused = false; /* hook yielded, waiting for DAP */
+static bool g_lua_needs_start = false; /* waiting for configurationDone */
 #endif
 #endif
 
@@ -196,11 +196,14 @@ static bool g_lua_drawn = false;
 
 /* Render testcard into g_xrgb — used when draw() produces no output. */
 static void render_testcard(void) {
-    static uint8_t  s_pixels[BLYT_FRAME_W * BLYT_FRAME_H];
+    static uint8_t s_pixels[BLYT_FRAME_W * BLYT_FRAME_H];
     static uint32_t s_palette[256];
     static uint32_t s_frame = 0;
-    static bool     s_tc_init = false;
-    if (!s_tc_init) { blyt_testcard_init_palette(s_palette); s_tc_init = true; }
+    static bool s_tc_init = false;
+    if (!s_tc_init) {
+        blyt_testcard_init_palette(s_palette);
+        s_tc_init = true;
+    }
     blyt_testcard_draw(s_frame++, s_pixels);
     for (int i = 0; i < BLYT_FRAME_W * BLYT_FRAME_H; i++)
         g_xrgb[i] = s_palette[s_pixels[i]];
@@ -213,8 +216,14 @@ static void lua_cleanup(void) {
         g_lua_co_ref = LUA_NOREF;
     }
     g_lua_co = NULL;
-    if (g_lua) { lua_close(g_lua); g_lua = NULL; }
-    if (g_cart) { blyt_cart_close(g_cart); g_cart = NULL; }
+    if (g_lua) {
+        lua_close(g_lua);
+        g_lua = NULL;
+    }
+    if (g_cart) {
+        blyt_cart_close(g_cart);
+        g_cart = NULL;
+    }
 }
 
 /* Called once per animation frame by Emscripten when a Lua cart is active. */
@@ -268,7 +277,7 @@ static void wasm_lua_loop(void) {
     g_lua_drawn = false;
     int nresults = 0;
     int status = lua_resume(g_lua_co, g_lua, 0, &nresults);
-    lua_settop(g_lua_co, 0);  /* discard any yielded values */
+    lua_settop(g_lua_co, 0); /* discard any yielded values */
 
     if (status == LUA_YIELD) {
 #ifdef BLYT_DAP
@@ -370,13 +379,12 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
 
     /* Compile the loop body and push it onto the coroutine's stack.
      * The first lua_resume() will invoke this chunk. */
-    static const char co_body[] =
-        "init() "
-        "while true do "
-        "  update() "
-        "  if type(draw) == 'function' then draw() end "
-        "  coroutine.yield() "
-        "end";
+    static const char co_body[] = "init() "
+                                  "while true do "
+                                  "  update() "
+                                  "  if type(draw) == 'function' then draw() end "
+                                  "  coroutine.yield() "
+                                  "end";
     if (luaL_loadstring(g_lua_co, co_body) != LUA_OK) {
         blyt_js_error(lua_tostring(g_lua_co, -1));
         lua_close(g_lua);

@@ -31,8 +31,7 @@
 
 static volatile int g_dap_port = 0;
 
-static void RETRO_CALLCONV test_log(enum retro_log_level level,
-                                    const char *fmt, ...) {
+static void RETRO_CALLCONV test_log(enum retro_log_level level, const char *fmt, ...) {
     (void)level;
     char buf[512];
     va_list ap;
@@ -60,24 +59,39 @@ static bool env_callback(unsigned cmd, void *data) {
 }
 
 static void video_refresh(const void *d, unsigned w, unsigned h, size_t p) {
-    (void)d; (void)w; (void)h; (void)p;
+    (void)d;
+    (void)w;
+    (void)h;
+    (void)p;
 }
-static void audio_sample(int16_t l, int16_t r) { (void)l; (void)r; }
-static size_t audio_batch(const int16_t *d, size_t f) { (void)d; return f; }
-static void input_poll(void) {}
+static void audio_sample(int16_t l, int16_t r) {
+    (void)l;
+    (void)r;
+}
+static size_t audio_batch(const int16_t *d, size_t f) {
+    (void)d;
+    return f;
+}
+static void input_poll(void) {
+}
 static int16_t input_state(unsigned p, unsigned d, unsigned i, unsigned id) {
-    (void)p; (void)d; (void)i; (void)id; return 0;
+    (void)p;
+    (void)d;
+    (void)i;
+    (void)id;
+    return 0;
 }
 
 /* ── TCP helpers ────────────────────────────────────────────────────────── */
 
 static int tcp_connect(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons((uint16_t)port);
+    addr.sin_port = htons((uint16_t)port);
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         close(fd);
@@ -88,10 +102,11 @@ static int tcp_connect(int port) {
 
 static int write_cl(int fd, const char *json) {
     char hdr[64];
-    int  n = snprintf(hdr, sizeof hdr, "Content-Length: %zu\r\n\r\n",
-                      strlen(json));
-    if (write(fd, hdr, (size_t)n) < 0) return -1;
-    if (write(fd, json, strlen(json)) < 0) return -1;
+    int n = snprintf(hdr, sizeof hdr, "Content-Length: %zu\r\n\r\n", strlen(json));
+    if (write(fd, hdr, (size_t)n) < 0)
+        return -1;
+    if (write(fd, json, strlen(json)) < 0)
+        return -1;
     return 0;
 }
 
@@ -101,19 +116,24 @@ static int read_cl(int fd, char *buf, size_t bufsz) {
     /* Read header byte-by-byte until \r\n\r\n */
     size_t hi = 0;
     while (hi + 4 <= bufsz) {
-        if (read(fd, buf + hi, 1) <= 0) return -1;
+        if (read(fd, buf + hi, 1) <= 0)
+            return -1;
         hi++;
-        if (hi >= 4 && memcmp(buf + hi - 4, "\r\n\r\n", 4) == 0) break;
+        if (hi >= 4 && memcmp(buf + hi - 4, "\r\n\r\n", 4) == 0)
+            break;
     }
     buf[hi] = '\0';
     const char *cl = strstr(buf, "Content-Length:");
-    if (!cl) return -1;
+    if (!cl)
+        return -1;
     int len = atoi(cl + 15);
-    if (len <= 0 || (size_t)len >= bufsz) return -1;
+    if (len <= 0 || (size_t)len >= bufsz)
+        return -1;
     size_t got = 0;
     while ((int)got < len) {
         ssize_t r = read(fd, buf + got, (size_t)(len - (int)got));
-        if (r <= 0) return -1;
+        if (r <= 0)
+            return -1;
         got += (size_t)r;
     }
     buf[len] = '\0';
@@ -127,7 +147,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "usage: test_libretro_dap <blyt_libretro.so> <cart.blyt>\n");
         return 1;
     }
-    const char *so_path   = argv[1];
+    const char *so_path = argv[1];
     const char *cart_path = argv[2];
 
     /* 1. Load libretro core. */
@@ -137,9 +157,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-#define LOAD(name) \
-    __typeof__(name) *p_##name = (__typeof__(name)*)dlsym(lib, #name); \
-    if (!p_##name) { fprintf(stderr, "dlsym(%s): %s\n", #name, dlerror()); dlclose(lib); return 1; }
+#define LOAD(name)                                                                                 \
+    __typeof__(name) *p_##name = (__typeof__(name) *)dlsym(lib, #name);                            \
+    if (!p_##name) {                                                                               \
+        fprintf(stderr, "dlsym(%s): %s\n", #name, dlerror());                                      \
+        dlclose(lib);                                                                              \
+        return 1;                                                                                  \
+    }
 
     LOAD(retro_set_environment)
     LOAD(retro_set_video_refresh)
@@ -194,10 +218,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* 6. Send DAP initialize request. */
-    const char *init_req =
-        "{\"seq\":1,\"type\":\"request\",\"command\":\"initialize\","
-        "\"arguments\":{\"clientID\":\"test_libretro_dap\","
-        "\"adapterID\":\"blyt-lua\",\"linesStartAt1\":true}}";
+    const char *init_req = "{\"seq\":1,\"type\":\"request\",\"command\":\"initialize\","
+                           "\"arguments\":{\"clientID\":\"test_libretro_dap\","
+                           "\"adapterID\":\"blyt-lua\",\"linesStartAt1\":true}}";
     if (write_cl(sock, init_req) < 0) {
         fprintf(stderr, "write failed\n");
         close(sock);
@@ -210,7 +233,7 @@ int main(int argc, char *argv[]) {
     /* 7. Read messages until we see the initialize response with success:true.
      *    The server may also send an "initialized" event before or after. */
     char buf[65536];
-    int  found = 0;
+    int found = 0;
     for (int i = 0; i < 5 && !found; i++) {
         int n = read_cl(sock, buf, sizeof buf);
         if (n <= 0) {
@@ -218,8 +241,7 @@ int main(int argc, char *argv[]) {
             break;
         }
         fprintf(stderr, "[test] recv: %.120s\n", buf);
-        if (strstr(buf, "\"command\":\"initialize\"") &&
-            strstr(buf, "\"success\":true"))
+        if (strstr(buf, "\"command\":\"initialize\"") && strstr(buf, "\"success\":true"))
             found = 1;
     }
 
