@@ -135,6 +135,12 @@ jobs:
             --manifest-path tests/integration/Cargo.toml \
             -- native_riscv_qemu_gate --nocapture
 
+      - name: Install Playwright
+        run: |
+          cd tests/wasm
+          npm install
+          npx playwright install --with-deps chromium
+
       - name: Rust tests (unit + integration)
         env:
           BLYT_BUILD_DIR: ${{ github.workspace }}/build
