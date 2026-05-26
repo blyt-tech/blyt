@@ -1144,11 +1144,17 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             uint32_t gdb_pc = rv_get_pc(session->rv);
             if (fc_gdb_stub_check_break(gdb_pc)) {
                 session->ctx.debug_state = BLYT_DEBUG_PAUSED_GDB;
-                fc_gdb_stub_notify_stopped();
 #ifdef __EMSCRIPTEN__
+                /* Only send T05 if the relay is connected; set gdb_notified
+                 * so the re-entry path does not send a duplicate T05. */
+                if (fc_gdb_transport_wasm_is_connected()) {
+                    session->gdb_notified = true;
+                    fc_gdb_stub_notify_stopped();
+                }
                 g_run_ctx = NULL;
                 return BLYT_RUN_GDB_PAUSED;
 #else
+                fc_gdb_stub_notify_stopped();
                 fc_gdb_stub_block_until_resume();
                 int gdb_action = fc_gdb_stub_pending_action();
                 session->ctx.debug_state = BLYT_DEBUG_RUNNING;
