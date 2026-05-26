@@ -929,3 +929,39 @@ add_custom_target(
     ${CMAKE_SOURCE_DIR}/cmake/fetch_qemu_images.cmake
   COMMENT "Downloading QEMU images → qemu-images/"
   VERBATIM)
+
+# ── lint ──────────────────────────────────────────────────────────────────────
+# Mirrors the "Check formatting" step in .github/workflows/ci.yml exactly. Run
+# before every commit: cmake --build build --target lint
+
+file(
+  GLOB
+  _LINT_C_FILES
+  "${CMAKE_SOURCE_DIR}/runtime/host/src/libblyt/*.h"
+  "${CMAKE_SOURCE_DIR}/runtime/host/src/libblyt/*.c"
+  "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/*.c"
+  "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/*.c"
+  "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_arena.c"
+  "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c"
+  "${CMAKE_SOURCE_DIR}/runtime/guest/include/*.h"
+  "${CMAKE_SOURCE_DIR}/runtime/host/include/*.h"
+  "${CMAKE_SOURCE_DIR}/tests/unit/*.c"
+  "${CMAKE_SOURCE_DIR}/tests/tools/*.c"
+  "${CMAKE_SOURCE_DIR}/tests/game/hello-c/src/game/c/*.c"
+  "${CMAKE_SOURCE_DIR}/frontends/sdl/main.c"
+  "${CMAKE_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
+  "${CMAKE_SOURCE_DIR}/frontends/wasm/wasm_main.c"
+  "${CMAKE_SOURCE_DIR}/frontends/native/launcher.c"
+  "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c"
+  "${CMAKE_SOURCE_DIR}/runtime/host/src/libblyt/testcard.c")
+
+add_custom_target(
+  lint
+  COMMAND clang-format --dry-run --Werror ${_LINT_C_FILES}
+  COMMAND cmake-format --check "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
+          "${CMAKE_SOURCE_DIR}/frontends/wasm/CMakeLists.txt"
+  COMMAND yamllint "${CMAKE_SOURCE_DIR}/.github/workflows/ci.yml"
+  COMMAND cargo fmt --check --all
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  COMMENT "Linting: clang-format, cmake-format, yamllint, cargo fmt"
+  VERBATIM)
