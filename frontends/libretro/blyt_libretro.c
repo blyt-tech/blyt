@@ -25,7 +25,11 @@ extern const unsigned char blytc_so[];
 extern const unsigned int blytc_so_len;
 extern const unsigned char blyt32_so[];
 extern const unsigned int blyt32_so_len;
-#endif
+#ifdef BLYT_EMBED_LUA
+extern const unsigned char blyt32lua_so[];
+extern const unsigned int blyt32lua_so_len;
+#endif /* BLYT_EMBED_LUA */
+#endif /* BLYT_EMBED_LIBS */
 
 /* -------------------------------------------------------------------------
  * Frontend callbacks (set before retro_init by the frontend)
@@ -109,6 +113,9 @@ RETRO_API void retro_init(void) {
     blyt_register_lib("libblytcommon.so", blytcommon_so, blytcommon_so_len);
     blyt_register_lib("libblytc.so", blytc_so, blytc_so_len);
     blyt_register_lib("libblyt32.so", blyt32_so, blyt32_so_len);
+#ifdef BLYT_EMBED_LUA
+    blyt_register_lib("libblyt32lua.so", blyt32lua_so, blyt32lua_so_len);
+#endif
 #endif
 }
 

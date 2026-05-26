@@ -409,6 +409,118 @@ if(CLANG_RV32
       VERBATIM)
 
     message(STATUS "libblytc.so: will be built (musl at ${MUSL_DIR})")
+
+    # ---- libblyt32lua.so (Lua VM + SoftFloat + runtime stubs) ----
+    #
+    # Provides the symbols that libblytc.so omits: strerror, soft-float double
+    # ops (__muldf3 etc.), setjmp/longjmp, and the Lua VM itself. Embedded into
+    # blyt_libretro.so alongside the other guest libs so the core is
+    # self-contained (no BLYT_LIB_DIR required at runtime).
+    set(LIBBLYT32LUA_OUT "")
+    set(_LUA_DIR "${CMAKE_SOURCE_DIR}/third_party/lua")
+    set(_SF_SRC "${CMAKE_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
+    if(EXISTS "${_LUA_DIR}/lvm.c" AND EXISTS "${_SF_SRC}/s_addMagsF64.c")
+      set(LIBBLYT32LUA_OUT "${CMAKE_BINARY_DIR}/libblyt32lua.so")
+
+      set(_SF_PLATFORM_DIR "${CMAKE_BINARY_DIR}/softfloat-rv32")
+      file(MAKE_DIRECTORY "${_SF_PLATFORM_DIR}")
+      file(WRITE "${_SF_PLATFORM_DIR}/platform.h" "#define THREAD_LOCAL\n")
+
+      file(GLOB _SF_ALL "${_SF_SRC}/*.c")
+      foreach(
+        _EXCL_PAT
+        "${_SF_SRC}/extF80*"
+        "${_SF_SRC}/*M_*"
+        "${_SF_SRC}/*M.*"
+        "${_SF_SRC}/bf16*"
+        "${_SF_SRC}/f16*"
+        "${_SF_SRC}/f32_to_extF80*"
+        "${_SF_SRC}/f64_to_extF80*"
+        "${_SF_SRC}/f128_to_extF80*")
+        file(GLOB _EXCL_LIST "${_EXCL_PAT}")
+        list(REMOVE_ITEM _SF_ALL ${_EXCL_LIST})
+      endforeach()
+      file(
+        GLOB
+        _SF_RISCV
+        "${_SF_SRC}/RISCV/s_propagateNaNF16UI.c"
+        "${_SF_SRC}/RISCV/s_propagateNaNF32UI.c"
+        "${_SF_SRC}/RISCV/s_propagateNaNF64UI.c"
+        "${_SF_SRC}/RISCV/s_propagateNaNF128UI.c"
+        "${_SF_SRC}/RISCV/s_propagateNaNExtF80UI.c"
+        "${_SF_SRC}/RISCV/s_f16UIToCommonNaN.c"
+        "${_SF_SRC}/RISCV/s_f32UIToCommonNaN.c"
+        "${_SF_SRC}/RISCV/s_f64UIToCommonNaN.c"
+        "${_SF_SRC}/RISCV/s_f128UIToCommonNaN.c"
+        "${_SF_SRC}/RISCV/s_extF80UIToCommonNaN.c"
+        "${_SF_SRC}/RISCV/s_commonNaNToF16UI.c"
+        "${_SF_SRC}/RISCV/s_commonNaNToF32UI.c"
+        "${_SF_SRC}/RISCV/s_commonNaNToF64UI.c"
+        "${_SF_SRC}/RISCV/s_commonNaNToF128UI.c"
+        "${_SF_SRC}/RISCV/s_commonNaNToExtF80UI.c"
+        "${_SF_SRC}/RISCV/softfloat_raiseFlags.c")
+      set(_SF_MWORD
+          "${_SF_SRC}/s_add256M.c" "${_SF_SRC}/s_sub256M.c"
+          "${_SF_SRC}/s_mul128To256M.c" "${_SF_SRC}/s_shiftRightJam256M.c")
+
+      file(GLOB _LUA_SRCS "${_LUA_DIR}/*.c")
+      foreach(
+        _EXCL
+        "${_LUA_DIR}/lua.c"
+        "${_LUA_DIR}/luac.c"
+        "${_LUA_DIR}/onelua.c"
+        "${_LUA_DIR}/liolib.c"
+        "${_LUA_DIR}/loslib.c"
+        "${_LUA_DIR}/loadlib.c"
+        "${_LUA_DIR}/ldblib.c"
+        "${_LUA_DIR}/lutf8lib.c")
+        list(REMOVE_ITEM _LUA_SRCS "${_EXCL}")
+      endforeach()
+
+      # Public musl headers — avoids the `#define weak __attribute__((weak))` in
+      # musl's src/include/ that clashes with Lua's GCObject *weak field.
+      set(_LUA_MUSL_INC
+          -I
+          "${MUSL_DIR}/include"
+          -I
+          "${MUSL_DIR}/arch/riscv32"
+          -I
+          "${MUSL_DIR}/arch/generic"
+          -I
+          "${LIBBLYTC_BITS_DIR}/..")
+
+      set(_LUA32_SRCS
+          ${_LUA_SRCS}
+          "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
+          "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S"
+          ${_SF_ALL}
+          ${_SF_RISCV}
+          ${_SF_MWORD}
+          "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/softfloat_builtins.c"
+          "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/lua_runtime_stubs.c"
+          "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.c"
+          "${CMAKE_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"
+          "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/master_hook_ecall.c"
+      )
+
+      add_custom_command(
+        OUTPUT "${LIBBLYT32LUA_OUT}"
+        COMMAND
+          "${CLANG_RV32}" ${RV32_FLAGS} ${_LUA_MUSL_INC} ${LIBBLYTC_CFLAGS}
+          -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -DBLYT_DAP=1 -I "${_LUA_DIR}" -I
+          "${_SF_SRC}/include" -I "${_SF_SRC}/RISCV" -I "${_SF_PLATFORM_DIR}" -I
+          "${CMAKE_SOURCE_DIR}/runtime/host/src/dap" -DSOFTFLOAT_FAST_INT64=1
+          -DSOFTFLOAT_ROUND_ODD=1 -Wl,-soname,libblyt32lua.so -Wl,--as-needed
+          "${LIBBLYT32_OUT}" -o "${LIBBLYT32LUA_OUT}" ${_LUA32_SRCS}
+        DEPENDS "${LIBBLYT32_OUT}" ${_LUA32_SRCS}
+        COMMENT "Cross-compiling libblyt32lua.so (RV32IMAFC, Lua + SoftFloat)"
+        VERBATIM)
+
+      message(STATUS "libblyt32lua.so: will be built (Lua + SoftFloat)")
+    else()
+      message(STATUS "libblyt32lua.so: skipping \
+(third_party/lua or rv32emu/softfloat not initialised)")
+    endif()
   endif()
 
   # libblyt32.so — Blyt32 variant. DT_NEEDED: libblytcommon.so, libblytc.so (the
@@ -440,9 +552,12 @@ if(CLANG_RV32
     VERBATIM)
 
   if(MUSL_DIR)
-    add_custom_target(
-      libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}" "${LIBBLYTCOMMON_OUT}"
-                               "${LIBBLYTC_OUT}")
+    set(_libblyt32_all_deps "${LIBBLYT32_OUT}" "${LIBBLYTCOMMON_OUT}"
+                            "${LIBBLYTC_OUT}")
+    if(LIBBLYT32LUA_OUT)
+      list(APPEND _libblyt32_all_deps "${LIBBLYT32LUA_OUT}")
+    endif()
+    add_custom_target(libblyt32_so ALL DEPENDS ${_libblyt32_all_deps})
     message(
       STATUS "libblytcommon.so + libblytc.so + libblyt32.so: will be built \
 (${CLANG_RV32})")
@@ -642,13 +757,18 @@ endif()
 # -------------------------------------------------------------------------
 if(LIBBLYTC_OUT)
   set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blyt_embedded_libs.c")
+  set(_bin2c_args blytcommon_so "${LIBBLYTCOMMON_OUT}" blytc_so
+                  "${LIBBLYTC_OUT}" blyt32_so "${LIBBLYT32_OUT}")
+  set(_bin2c_deps "${LIBBLYTCOMMON_OUT}" "${LIBBLYTC_OUT}" "${LIBBLYT32_OUT}")
+  if(LIBBLYT32LUA_OUT)
+    list(APPEND _bin2c_args blyt32lua_so "${LIBBLYT32LUA_OUT}")
+    list(APPEND _bin2c_deps "${LIBBLYT32LUA_OUT}")
+  endif()
   add_custom_command(
     OUTPUT "${EMBEDDED_LIBS_C}"
-    COMMAND
-      python3 "${CMAKE_SOURCE_DIR}/cmake/bin2c.py" blytcommon_so
-      "${LIBBLYTCOMMON_OUT}" blytc_so "${LIBBLYTC_OUT}" blyt32_so
-      "${LIBBLYT32_OUT}" "${EMBEDDED_LIBS_C}"
-    DEPENDS "${LIBBLYTCOMMON_OUT}" "${LIBBLYTC_OUT}" "${LIBBLYT32_OUT}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/cmake/bin2c.py" ${_bin2c_args}
+            "${EMBEDDED_LIBS_C}"
+    DEPENDS ${_bin2c_deps}
     COMMENT "Embedding guest libs into blyt_libretro"
     VERBATIM)
 
@@ -660,6 +780,9 @@ if(LIBBLYTC_OUT)
     PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
             "${CMAKE_SOURCE_DIR}/runtime/host/include")
   set(_blyt_libretro_defs BLYT_VERSION="${BLYT_VERSION}" BLYT_EMBED_LIBS)
+  if(LIBBLYT32LUA_OUT)
+    list(APPEND _blyt_libretro_defs BLYT_EMBED_LUA)
+  endif()
   if(BLYT_DAP)
     list(APPEND _blyt_libretro_defs BLYT_DAP=1)
   endif()

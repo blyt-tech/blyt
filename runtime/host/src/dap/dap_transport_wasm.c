@@ -669,8 +669,18 @@ void fc_dap_emit_loaded_source(const char *source_path) {
     send_event("loadedSource", body);
 }
 
-int fc_dap_on_hook_line(const char *source, int line, int depth) {
+/* ── ECALL stubs (RV32 ELF cart path — not used in WASM Lua builds) ───────── */
+
+int fc_dap_check_hook_line(const char *source, int line, int depth) {
     (void)source; (void)line; (void)depth;
-    /* Not used on the WASM Lua-direct path. */
+    return 0;
+}
+
+void fc_dap_host_send(const char *json, size_t len) {
+    (void)json; (void)len;
+}
+
+int fc_dap_host_recv(char *buf, size_t max_len) {
+    (void)buf; (void)max_len;
     return 0;
 }

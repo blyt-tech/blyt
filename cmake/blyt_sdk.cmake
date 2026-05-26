@@ -497,11 +497,9 @@ else()
   execute_process(
     COMMAND
       "${FOUND_CLANG}" ${RV32_BASE} ${LUA_MUSL_INCLUDES} ${LIBBLYTC_CFLAGS}
-      -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -DBLYT_DAP=1
-      -I "${LUA_DIR}" -I "${SF_INC}" -I
-      "${SF_SRC}/RISCV" -I "${SF_PLATFORM_DIR}"
-      -I "${BLYT_SOURCE_DIR}/runtime/host/src/dap"
-      -DSOFTFLOAT_FAST_INT64=1
+      -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -DBLYT_DAP=1 -I "${LUA_DIR}" -I
+      "${SF_INC}" -I "${SF_SRC}/RISCV" -I "${SF_PLATFORM_DIR}" -I
+      "${BLYT_SOURCE_DIR}/runtime/host/src/dap" -DSOFTFLOAT_FAST_INT64=1
       -DSOFTFLOAT_ROUND_ODD=1 -Wl,-soname,libblyt32lua.so -Wl,--as-needed
       "${SDK_LIB}/libblyt32.so" -o "${SDK_LIB}/libblyt32lua.so"
       # Lua VM sources embedded directly (exports lua_*/luaL_* in .dynsym)
@@ -866,12 +864,24 @@ else()
 
   set(EMBEDDED_LIBS_C "${BLYT_BINARY_DIR}/blyt_embedded_libs.c")
 
-  execute_process(
-    COMMAND
-      python3 "${BLYT_SOURCE_DIR}/cmake/bin2c.py" blytcommon_so
-      "${SDK_LIB}/libblytcommon.so" blytc_so "${SDK_LIB}/libblytc.so" blyt32_so
-      "${SDK_LIB}/libblyt32.so" "${EMBEDDED_LIBS_C}"
-    RESULT_VARIABLE R)
+  if(EXISTS "${SDK_LIB}/libblyt32lua.so")
+    execute_process(
+      COMMAND
+        python3 "${BLYT_SOURCE_DIR}/cmake/bin2c.py" blytcommon_so
+        "${SDK_LIB}/libblytcommon.so" blytc_so "${SDK_LIB}/libblytc.so"
+        blyt32_so "${SDK_LIB}/libblyt32.so" blyt32lua_so
+        "${SDK_LIB}/libblyt32lua.so" "${EMBEDDED_LIBS_C}"
+      RESULT_VARIABLE R)
+    set(_libretro_embed_defs "-DBLYT_EMBED_LIBS" "-DBLYT_EMBED_LUA")
+  else()
+    execute_process(
+      COMMAND
+        python3 "${BLYT_SOURCE_DIR}/cmake/bin2c.py" blytcommon_so
+        "${SDK_LIB}/libblytcommon.so" blytc_so "${SDK_LIB}/libblytc.so"
+        blyt32_so "${SDK_LIB}/libblyt32.so" "${EMBEDDED_LIBS_C}"
+      RESULT_VARIABLE R)
+    set(_libretro_embed_defs "-DBLYT_EMBED_LIBS")
+  endif()
   if(NOT R EQUAL 0)
     message(FATAL_ERROR "Failed to generate blyt_embedded_libs.c")
   endif()
@@ -892,7 +902,7 @@ else()
   execute_process(
     COMMAND
       "${HOST_CC}" ${LINK_FLAGS} -fPIC -o "${LIBRETRO_OUT}"
-      "-DBLYT_VERSION=\"${BLYT_VERSION}\"" "-DBLYT_EMBED_LIBS"
+      "-DBLYT_VERSION=\"${BLYT_VERSION}\"" ${_libretro_embed_defs}
       "${BLYT_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
       "${EMBEDDED_LIBS_C}" -I
       "${BLYT_SOURCE_DIR}/third_party/libretro-common/include" -I
