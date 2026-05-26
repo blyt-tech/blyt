@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "blyt_runtime.h"
@@ -164,6 +165,23 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
         return false;
     }
 
+#ifdef BLYT_DAP
+    {
+        const char *dap_port_str = getenv("BLYT_DAP_PORT");
+        if (dap_port_str) {
+            int dap_port = atoi(dap_port_str);
+            int actual_port = 0;
+            if (blyt_session_dap_listen(g_session, &actual_port) >= 0) {
+                if (g_log_cb)
+                    g_log_cb(RETRO_LOG_INFO, "blyt: DAP listening on port %d\n", actual_port);
+                else
+                    fprintf(stderr, "blyt: DAP listening on port %d\n", actual_port);
+            }
+            (void)dap_port;
+        }
+    }
+#endif
+
     g_cart_done = false;
     return true;
 }
@@ -177,6 +195,10 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 }
 
 RETRO_API void retro_unload_game(void) {
+#ifdef BLYT_DAP
+    if (g_session)
+        blyt_session_dap_shutdown(g_session);
+#endif
     blyt_session_destroy(g_session);
     g_session = NULL;
     blyt_cart_close(g_cart);
@@ -258,6 +280,14 @@ RETRO_API size_t retro_get_memory_size(unsigned id) {
 bool blyt_libretro_is_done(void) {
     return g_cart_done;
 }
+
+#ifdef BLYT_DAP
+/* Block until the DAP client sends configurationDone (breakpoints set) or the
+ * server shuts down.  Called by the SDL frontend before starting the game loop. */
+bool blyt_libretro_dap_wait_ready(void) {
+    return g_session && blyt_session_dap_wait_ready(g_session) != 0;
+}
+#endif
 
 blyt_cart_run_err_t blyt_libretro_run_err(void) {
     return g_run_err;

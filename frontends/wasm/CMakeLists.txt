@@ -115,6 +115,40 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# DAP debugging support (Lua source-level via Debug Adapter Protocol)
+#
+# When ON: compile dap_transport_wasm.c + master_hook.c into blytrun and
+# define BLYT_DAP=1.  Pausing the Lua VM uses Lua coroutine yield (not
+# ASYNCIFY), so no special link options are needed.
+# -------------------------------------------------------------------------
+set(BLYT_DAP_DIR "${BLYT_ROOT}/runtime/host/src/dap")
+option(BLYT_DAP "Enable DAP Lua debugger support" ON)
+
+set(BLYT_DAP_SOURCES "")
+set(BLYT_DAP_DEFS "")
+set(BLYT_DAP_LINK_OPTS "")
+if(BLYT_DAP AND EXISTS "${LUA_DIR}/lvm.c")
+  list(
+    APPEND
+    BLYT_DAP_SOURCES
+    "${BLYT_DAP_DIR}/dap_transport_wasm.c"
+    "${BLYT_DAP_DIR}/master_hook.c")
+  list(APPEND BLYT_DAP_DEFS BLYT_DAP=1)
+  # wdap_dequeue_json (EM_JS) calls _malloc/_free from JavaScript.
+  list(APPEND BLYT_DAP_LINK_OPTS "-sEXPORTED_FUNCTIONS=_main,_malloc,_free")
+  message(STATUS "blyt WASM: DAP debugging enabled")
+else()
+  if(BLYT_DAP AND NOT EXISTS "${LUA_DIR}/lvm.c")
+    message(
+      STATUS
+      "blyt WASM: DAP disabled (requires BLYT_LUA; third_party/lua not initialised)"
+    )
+  else()
+    message(STATUS "blyt WASM: DAP disabled")
+  endif()
+endif()
+
+# -------------------------------------------------------------------------
 # Embed guest libraries as C byte arrays (same approach as blyt_libretro)
 # -------------------------------------------------------------------------
 set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blytrun_embedded_libs.c")
@@ -245,7 +279,8 @@ add_executable(
   "${BLYT_ROOT}/runtime/host/src/libblyt/cart_load.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/cart_run.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c"
-  ${BLYT_LUA_SOURCES})
+  ${BLYT_LUA_SOURCES}
+  ${BLYT_DAP_SOURCES})
 
 # Produce blytrun.html + blytrun.js + blytrun.wasm
 set_target_properties(blytrun PROPERTIES SUFFIX ".html")
@@ -256,7 +291,8 @@ if(BLYT_LUA_SOURCES)
 endif()
 
 target_compile_definitions(blytrun PRIVATE ${RV32EMU_FEATURE_DEFS}
-                                           BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS})
+                                           BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS}
+                                           ${BLYT_DAP_DEFS})
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
 # (not a cmake definition) to avoid quoting issues. Force-include rv32emu
@@ -291,6 +327,11 @@ if(BLYT_LUA_SOURCES)
   list(APPEND _BLYT_LUA_INCLUDES "${LUA_DIR}")
 endif()
 
+set(_BLYT_DAP_INCLUDES "")
+if(BLYT_DAP_SOURCES)
+  list(APPEND _BLYT_DAP_INCLUDES "${BLYT_DAP_DIR}")
+endif()
+
 target_include_directories(
   blytrun
   PRIVATE "${RV32EMU_DIR}"
@@ -301,12 +342,14 @@ target_include_directories(
           "${GENERATED_DIR}"
           "${BLYT_ROOT}/runtime/host/include"
           "${BLYT_ROOT}/runtime/host/src/libblyt"
-          ${_BLYT_LUA_INCLUDES})
+          ${_BLYT_LUA_INCLUDES}
+          ${_BLYT_DAP_INCLUDES})
 
 # Emscripten link options
 target_link_options(
   blytrun
   PRIVATE
+  ${BLYT_DAP_LINK_OPTS}
   # Allow WASM linear memory to grow to accommodate the 256 MiB guest region.
   "-sALLOW_MEMORY_GROWTH=1"
   # 64 MiB initial allocation; grows when blyt_session_create mallocs the 256

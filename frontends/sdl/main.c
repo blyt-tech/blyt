@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef BLYT_DAP
+#include <unistd.h> /* setenv */
+#endif
 
 #include "blyt_runtime.h"
 #include "libretro.h"
@@ -32,6 +35,9 @@ void retro_run(void);
  * status — not part of the standard libretro interface. */
 bool blyt_libretro_is_done(void);
 blyt_cart_run_err_t blyt_libretro_run_err(void);
+#ifdef BLYT_DAP
+bool blyt_libretro_dap_wait_ready(void);
+#endif
 
 /* -------------------------------------------------------------------------
  * Logging
@@ -130,6 +136,8 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index, unsig
  * main
  * ------------------------------------------------------------------------- */
 
+static int g_dap_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
+
 static const char *parse_args(int argc, char *argv[], bool *headless) {
     const char *cart = NULL;
     *headless = false;
@@ -139,6 +147,12 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
         } else if (strcmp(argv[i], "--dump-frame0") == 0 && i + 1 < argc) {
             g_dump_frame0_path = argv[++i];
             *headless = true; /* frame dump implies headless */
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            /* Optional port number; defaults to 0 (OS-assigned) */
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                g_dap_port = atoi(argv[++i]);
+            else
+                g_dap_port = 0;
         } else if (argv[i][0] != '-') {
             cart = argv[i];
         } else {
@@ -156,6 +170,14 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "usage: blytrun [--headless] <cart.blyt>\n");
         return 1;
     }
+
+#ifdef BLYT_DAP
+    if (g_dap_port >= 0) {
+        char portbuf[16];
+        snprintf(portbuf, sizeof(portbuf), "%d", g_dap_port);
+        setenv("BLYT_DAP_PORT", portbuf, 1);
+    }
+#endif
 
     retro_set_environment(env_callback);
     retro_set_video_refresh(video_refresh);
@@ -176,6 +198,14 @@ int main(int argc, char *argv[]) {
     retro_get_system_av_info(&av);
     double fps = av.timing.fps > 0.0 ? av.timing.fps : 60.0;
     uint32_t frame_ms = (uint32_t)(1000.0 / fps);
+
+#ifdef BLYT_DAP
+    /* Wait for the DAP client to finish configuration (setBreakpoints +
+     * configurationDone) before starting the game loop, so that breakpoints
+     * are registered before init() executes. */
+    if (g_dap_port >= 0)
+        blyt_libretro_dap_wait_ready();
+#endif
 
     SDL_Window *win = NULL;
     if (!headless) {

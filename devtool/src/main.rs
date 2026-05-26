@@ -22,6 +22,10 @@ enum Commands {
     Run {
         /// Path to the .blyt cart file to run
         cart: PathBuf,
+
+        /// Enable debugging (DAP, GDB, frame stepping)
+        #[arg(long)]
+        debug: bool,
     },
 }
 
@@ -115,7 +119,7 @@ fn main() {
                 .map_err(|e| e.to_string())
         }
 
-        Commands::Run { cart } => run::run(&cart).map_err(|e| e.to_string()),
+        Commands::Run { cart, debug } => run::run(&cart, debug).map_err(|e| e.to_string()),
     };
 
     if let Err(e) = result {

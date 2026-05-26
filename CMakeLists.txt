@@ -550,6 +550,36 @@ target_link_libraries(
 add_dependencies(libblyt flatbuffers_generated)
 
 # -------------------------------------------------------------------------
+# DAP debugging support (TCP+pthread transport for SDL2 / libretro)
+#
+# dap is a static library containing dap_server.c (TCP transport).
+# Linked into libblyt and blytrun when BLYT_DAP=ON.
+# master_hook.c is compiled into the WASM binary separately (frontends/wasm/)
+# and into libblyt32lua.so as RV32 guest code (cmake/blyt_sdk.cmake).
+# It is NOT part of the native host libdap.a — the master hook runs inside
+# rv32emu and does not need to be present in the host address space.
+# -------------------------------------------------------------------------
+option(BLYT_DAP "Enable DAP Lua debugger support (TCP transport)" ON)
+
+if(BLYT_DAP)
+  set(BLYT_DAP_DIR "${CMAKE_SOURCE_DIR}/runtime/host/src/dap")
+  add_library(dap STATIC "${BLYT_DAP_DIR}/dap_server.c")
+  set_target_properties(dap PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(
+    dap
+    PUBLIC "${BLYT_DAP_DIR}"
+    PRIVATE "${CMAKE_SOURCE_DIR}/runtime/host/include")
+  target_compile_definitions(dap PRIVATE BLYT_DAP=1)
+
+  target_compile_definitions(libblyt PRIVATE BLYT_DAP=1)
+  target_include_directories(libblyt PRIVATE "${BLYT_DAP_DIR}")
+  target_link_libraries(libblyt PRIVATE dap)
+  message(STATUS "BLYT_DAP: DAP debugging enabled (TCP transport)")
+else()
+  message(STATUS "BLYT_DAP: DAP debugging disabled")
+endif()
+
+# -------------------------------------------------------------------------
 # SDL2 frontend — try find_package, then pkg-config, then sdl2-config
 # -------------------------------------------------------------------------
 find_package(SDL2 QUIET)
@@ -602,6 +632,9 @@ if(TARGET blytrun)
     blytrun PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
                     "${CMAKE_SOURCE_DIR}/runtime/host/include")
   target_compile_definitions(blytrun PRIVATE BLYT_VERSION="${BLYT_VERSION}")
+  if(BLYT_DAP)
+    target_compile_definitions(blytrun PRIVATE BLYT_DAP=1)
+  endif()
 endif()
 
 # -------------------------------------------------------------------------

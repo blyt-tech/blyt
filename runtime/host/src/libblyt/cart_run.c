@@ -13,6 +13,9 @@
 #include "blyt_runtime.h"
 #include "cart_load.h"
 #include "ecall.h"
+#ifdef BLYT_DAP
+#include "dap_server.h"
+#endif
 #include "elf32.h"
 #include "testcard.h"
 
@@ -98,6 +101,7 @@ typedef struct {
     bool ecall_trapped; /* cart issued a non-permitted ecall */
     bool ecall_aborted; /* cart called abort() — ECALL_EXIT with a0 != 0 */
     bool frame_done; /* set by BLYT_ECALL_FRAME_DONE; cleared by run_frame */
+    bool dap_enabled; /* set by blyt_session_dap_listen(); enables ECALL_DAP_HOOK */
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -210,6 +214,108 @@ static void blyt_ecall_handler(riscv_t *rv) {
             g_run_ctx->frame_done = true;
         return;
     }
+
+    case BLYT_ECALL_DAP_HOOK: {
+        /* Probe (src=0, line<0) or line event from libblyt32lua master hook.
+         * Always handled — even without BLYT_DAP — so probe returns 0 (inactive)
+         * rather than trapping when the host was not built with DAP support. */
+        if (!g_run_ctx || !g_run_ctx->dap_enabled) {
+            rv_set_reg(rv, rv_reg_a0, 0);
+            rv->PC += 4;
+            return;
+        }
+#ifdef BLYT_DAP
+        {
+            uint32_t src_vaddr = rv_get_reg(rv, rv_reg_a0);
+            uint32_t src_len   = rv_get_reg(rv, rv_reg_a1);
+            int32_t  line      = (int32_t)rv_get_reg(rv, rv_reg_a2);
+            int32_t  depth     = (int32_t)rv_get_reg(rv, rv_reg_a3);
+
+            /* Probe call from blyt_dap_active(): src=0 or line<0 */
+            if (src_vaddr == 0 || line < 0) {
+                rv_set_reg(rv, rv_reg_a0, 1);
+                rv->PC += 4;
+                return;
+            }
+
+            vm_attr_t *attr = PRIV(rv);
+            memory_t *mem = attr->mem;
+            char src_buf[4096];
+            if (src_len >= sizeof(src_buf))
+                src_len = (uint32_t)(sizeof(src_buf) - 1);
+            uint32_t ri;
+            for (ri = 0; ri < src_len; ri++) {
+                if (!GUEST_RAM_CONTAINS(mem, src_vaddr + ri, 1))
+                    break;
+                uint8_t c;
+                memory_read(mem, &c, src_vaddr + ri, 1);
+                src_buf[ri] = (char)c;
+            }
+            src_buf[ri] = '\0';
+
+            int cmd = fc_dap_check_hook_line(src_buf, line, depth);
+            rv_set_reg(rv, rv_reg_a0, (uint32_t)cmd);
+        }
+#else
+        rv_set_reg(rv, rv_reg_a0, 0);
+#endif
+        rv->PC += 4;
+        return;
+    }
+
+#ifdef BLYT_DAP
+    case BLYT_ECALL_DAP_SEND: {
+        /* Guest sends a DAP JSON message; forward to connected TCP client. */
+        if (!g_run_ctx || !g_run_ctx->dap_enabled) { rv->PC += 4; return; }
+        uint32_t vaddr = rv_get_reg(rv, rv_reg_a0);
+        uint32_t vlen  = rv_get_reg(rv, rv_reg_a1);
+        vm_attr_t *attr = PRIV(rv);
+        memory_t  *mem  = attr->mem;
+        if (vlen > 65535u) vlen = 65535u;
+        char *json = malloc((size_t)vlen + 1);
+        if (json) {
+            uint32_t i;
+            for (i = 0; i < vlen; i++) {
+                if (!GUEST_RAM_CONTAINS(mem, vaddr + i, 1)) break;
+                uint8_t c;
+                memory_read(mem, &c, vaddr + i, 1);
+                json[i] = (char)c;
+            }
+            json[i] = '\0';
+            fc_dap_host_send(json, i);
+            free(json);
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_DAP_RECV: {
+        /* Block until VS Code sends an inspection command; write JSON to guest. */
+        if (!g_run_ctx || !g_run_ctx->dap_enabled) {
+            rv_set_reg(rv, rv_reg_a0, 0);
+            rv->PC += 4;
+            return;
+        }
+        uint32_t buf_vaddr = rv_get_reg(rv, rv_reg_a0);
+        uint32_t max_len   = rv_get_reg(rv, rv_reg_a1);
+        vm_attr_t *attr = PRIV(rv);
+        memory_t  *mem  = attr->mem;
+        if (max_len > 65535u) max_len = 65535u;
+        char *buf = malloc((size_t)max_len + 1);
+        int len = 0;
+        if (buf) {
+            len = fc_dap_host_recv(buf, (size_t)max_len);
+            if (len > 0) {
+                uint32_t wr = (uint32_t)len < max_len ? (uint32_t)len : max_len;
+                memory_write(mem, buf_vaddr, (const uint8_t *)buf, wr);
+            }
+            free(buf);
+        }
+        rv_set_reg(rv, rv_reg_a0, (uint32_t)len);
+        rv->PC += 4;
+        return;
+    }
+#endif /* BLYT_DAP */
 
     case 93: /* SYS_exit (Linux NR 93) — blyt_exit on emulated path */
     case 94: /* SYS_exit_group (Linux NR 94) — blyt_exit on emulated path */
@@ -846,6 +952,45 @@ void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out
     const uint32_t *pal = session->palette;
     for (int i = 0; i < BLYT_FRAME_W * BLYT_FRAME_H; i++)
         xrgb_out[i] = pal[px[i]];
+}
+
+/* -------------------------------------------------------------------------
+ * DAP session helpers
+ * ------------------------------------------------------------------------- */
+
+int blyt_session_dap_listen(blyt_session_t *s, int *port_out) {
+#ifdef BLYT_DAP
+    int port = fc_consolelua_dap_listen(0);
+    if (port < 0)
+        return -1;
+    s->ctx.dap_enabled = true;
+    if (port_out)
+        *port_out = port;
+    return port;
+#else
+    (void)s;
+    (void)port_out;
+    return -1;
+#endif
+}
+
+void blyt_session_dap_shutdown(blyt_session_t *s) {
+#ifdef BLYT_DAP
+    fc_consolelua_dap_shutdown();
+    s->ctx.dap_enabled = false;
+#else
+    (void)s;
+#endif
+}
+
+int blyt_session_dap_wait_ready(blyt_session_t *s) {
+#ifdef BLYT_DAP
+    if (!s || !s->ctx.dap_enabled) return 0;
+    return fc_dap_wait_configuration_done();
+#else
+    (void)s;
+    return 0;
+#endif
 }
 
 /* -------------------------------------------------------------------------

@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+tungstenite = "0.24"

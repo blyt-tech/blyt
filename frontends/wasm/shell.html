@@ -37,6 +37,10 @@
     <div id="status">Loading…</div>
 
     <script>
+      /* DAP relay port injected by `blyt run --debug`.  0 when DAP is not active. */
+      window.blyt_dap_port = {{BLYT_DAP_PORT}};
+    </script>
+    <script>
       /* Pre-load the cart into the Emscripten virtual filesystem before
        * main() runs.  The cart is served as /cart.blyt by `blyt run`
        * alongside this page.

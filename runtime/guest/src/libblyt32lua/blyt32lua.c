@@ -24,6 +24,13 @@
 #include <lualib.h>
 
 #include "blyt.h"
+#ifdef BLYT_DAP
+#include "master_hook.h"
+/* Weak default: 0 (hook disabled).  master_hook_ecall.c provides the strong
+ * definition that probes the host via BLYT_ECALL_DAP_HOOK. */
+int blyt_dap_active(void) __attribute__((weak));
+int blyt_dap_active(void) { return 0; }
+#endif
 
 /* Per-cart bytecode — defined in the generated cart_lua_data.c object. */
 extern const unsigned char cart_lua_bytecode[] __attribute__((weak));
@@ -161,6 +168,12 @@ void blyt_cart_init(void) {
     blyt_console_debug("blyt_cart_init: start");
     g_L = open_state();
     blyt_console_debug(g_L ? "blyt_cart_init: open_state ok" : "blyt_cart_init: open_state FAILED");
+#ifdef BLYT_DAP
+    if (g_L && blyt_dap_active()) {
+        fc_master_hook_cfg.dap_enabled = true;
+        fc_consolelua_master_hook_install(g_L);
+    }
+#endif
     call_global("init");
     blyt_console_debug("blyt_cart_init: done");
 }

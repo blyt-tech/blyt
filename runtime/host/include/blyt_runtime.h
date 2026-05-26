@@ -161,6 +161,29 @@ const uint32_t *blyt_session_get_palette(const blyt_session_t *session);
  * xrgb_out must hold at least BLYT_FRAME_W * BLYT_FRAME_H uint32_t. */
 void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out);
 
+/* --- DAP debugging (optional, requires BLYT_DAP compile flag) ------------ */
+
+/*
+ * Start a DAP server alongside this session.  port=0 lets the OS pick a free
+ * port; the actual port is written to *port_out.  Call before the first
+ * blyt_session_run_frame().  Returns the actual port (>0) on success, -1 on
+ * failure or when BLYT_DAP is not compiled in.
+ */
+int blyt_session_dap_listen(blyt_session_t *s, int *port_out);
+
+/* Stop the DAP server and free its resources. Idempotent. */
+void blyt_session_dap_shutdown(blyt_session_t *s);
+
+/*
+ * Block until the connected DAP client sends configurationDone (meaning all
+ * breakpoints are registered) or the server shuts down.  Call this after
+ * blyt_session_dap_listen() and before the first blyt_session_run_frame() to
+ * ensure breakpoints are in place when the cart starts executing.
+ * Returns non-zero if configurationDone was received; 0 if shutting down.
+ * No-op (returns 0) when BLYT_DAP is not compiled in or DAP is not active.
+ */
+int blyt_session_dap_wait_ready(blyt_session_t *s);
+
 #ifdef __cplusplus
 }
 #endif

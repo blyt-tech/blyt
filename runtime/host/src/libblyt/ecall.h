@@ -18,6 +18,14 @@
 #define BLYT_ECALL_EXIT 0 /* halt emulation; a0=exit code (0=clean, 1=abort) */
 #define BLYT_ECALL_CONSOLE_DEBUG 1 /* blyt_console_debug: a0=ptr, a1=len */
 #define BLYT_ECALL_FRAME_DONE 2 /* end of one update+draw cycle */
+/* DAP hook: a0=source_vaddr, a1=source_len, a2=line, a3=depth
+ * returns 1 (guest should pause) or 0 (continue); host sends "stopped" event */
+#define BLYT_ECALL_DAP_HOOK 3
+/* DAP send: a0=json_vaddr, a1=json_len; forwards JSON to DAP TCP client */
+#define BLYT_ECALL_DAP_SEND 4
+/* DAP recv: a0=buf_vaddr, a1=max_len; blocks until inspection command arrives;
+ * writes JSON to guest buf; returns length in a0 (0 = continue/disconnect) */
+#define BLYT_ECALL_DAP_RECV 5
 
 /*
  * EXIT trampoline — injected into rv32emu guest memory by the runtime.

@@ -497,8 +497,11 @@ else()
   execute_process(
     COMMAND
       "${FOUND_CLANG}" ${RV32_BASE} ${LUA_MUSL_INCLUDES} ${LIBBLYTC_CFLAGS}
-      -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -I "${LUA_DIR}" -I "${SF_INC}" -I
-      "${SF_SRC}/RISCV" -I "${SF_PLATFORM_DIR}" -DSOFTFLOAT_FAST_INT64=1
+      -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -DBLYT_DAP=1
+      -I "${LUA_DIR}" -I "${SF_INC}" -I
+      "${SF_SRC}/RISCV" -I "${SF_PLATFORM_DIR}"
+      -I "${BLYT_SOURCE_DIR}/runtime/host/src/dap"
+      -DSOFTFLOAT_FAST_INT64=1
       -DSOFTFLOAT_ROUND_ODD=1 -Wl,-soname,libblyt32lua.so -Wl,--as-needed
       "${SDK_LIB}/libblyt32.so" -o "${SDK_LIB}/libblyt32lua.so"
       # Lua VM sources embedded directly (exports lua_*/luaL_* in .dynsym)
@@ -513,6 +516,9 @@ else()
       "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/lua_runtime_stubs.c"
       # blyt32 API Lua bindings + cart lifecycle
       "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.c"
+      # DAP master hook dispatcher + ECALL stubs (compiled for RV32 guest)
+      "${BLYT_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"
+      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/master_hook_ecall.c"
     RESULT_VARIABLE R)
   if(NOT R EQUAL 0)
     message(FATAL_ERROR "Failed to build libblyt32lua.so")
