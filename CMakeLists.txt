@@ -506,12 +506,13 @@ if(CLANG_RV32
       add_custom_command(
         OUTPUT "${LIBBLYT32LUA_OUT}"
         COMMAND
-          "${CLANG_RV32}" ${RV32_FLAGS} ${_LUA_MUSL_INC} ${LIBBLYTC_CFLAGS}
-          -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -DBLYT_DAP=1 -I "${_LUA_DIR}" -I
-          "${_SF_SRC}/include" -I "${_SF_SRC}/RISCV" -I "${_SF_PLATFORM_DIR}" -I
-          "${CMAKE_SOURCE_DIR}/runtime/host/src/dap" -DSOFTFLOAT_FAST_INT64=1
-          -DSOFTFLOAT_ROUND_ODD=1 -Wl,-soname,libblyt32lua.so -Wl,--as-needed
-          "${LIBBLYT32_OUT}" -o "${LIBBLYT32LUA_OUT}" ${_LUA32_SRCS}
+          "${CLANG_RV32}" ${RV32_FLAGS} ${RV32_INCLUDE} ${_LUA_MUSL_INC}
+          ${LIBBLYTC_CFLAGS} -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -DBLYT_DAP=1 -I
+          "${_LUA_DIR}" -I "${_SF_SRC}/include" -I "${_SF_SRC}/RISCV" -I
+          "${_SF_PLATFORM_DIR}" -I "${CMAKE_SOURCE_DIR}/runtime/host/src/dap"
+          -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_ROUND_ODD=1
+          -Wl,-soname,libblyt32lua.so -Wl,--as-needed "${LIBBLYT32_OUT}" -o
+          "${LIBBLYT32LUA_OUT}" ${_LUA32_SRCS}
         DEPENDS "${LIBBLYT32_OUT}" ${_LUA32_SRCS}
         COMMENT "Cross-compiling libblyt32lua.so (RV32IMAFC, Lua + SoftFloat)"
         VERBATIM)
