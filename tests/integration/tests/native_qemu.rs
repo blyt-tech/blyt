@@ -210,7 +210,11 @@ fn native_riscv_qemu_gate() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| repo_root().join("qemu-images/id_ed25519"));
 
-    for (label, path) in [("kernel", &kernel), ("rootfs", &rootfs), ("ssh key", &ssh_key)] {
+    for (label, path) in [
+        ("kernel", &kernel),
+        ("rootfs", &rootfs),
+        ("ssh key", &ssh_key),
+    ] {
         if !path.exists() {
             eprintln!(
                 "native_riscv_qemu_gate: {label} not found ({}) — skip",

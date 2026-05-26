@@ -79,7 +79,12 @@ pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
         println!("  DAP debugger (Lua):    127.0.0.1:{dap_tcp_port}");
     }
 
-    serve(listener, Arc::new(wasm_dir), Arc::new(cart_path), dap_ws_port)
+    serve(
+        listener,
+        Arc::new(wasm_dir),
+        Arc::new(cart_path),
+        dap_ws_port,
+    )
 }
 
 /* -------------------------------------------------------------------------
@@ -98,11 +103,17 @@ pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
 fn start_dap_relay(ws_port: u16, tcp_port: u16) -> (u16, u16) {
     let ws_listener = TcpListener::bind(format!("127.0.0.1:{ws_port}"))
         .expect("DAP relay: WebSocket bind failed");
-    let tcp_listener = TcpListener::bind(format!("127.0.0.1:{tcp_port}"))
-        .expect("DAP relay: TCP bind failed");
+    let tcp_listener =
+        TcpListener::bind(format!("127.0.0.1:{tcp_port}")).expect("DAP relay: TCP bind failed");
 
-    let actual_ws = ws_listener.local_addr().map(|a| a.port()).unwrap_or(ws_port);
-    let actual_tcp = tcp_listener.local_addr().map(|a| a.port()).unwrap_or(tcp_port);
+    let actual_ws = ws_listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(ws_port);
+    let actual_tcp = tcp_listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(tcp_port);
 
     std::thread::spawn(move || {
         run_relay_loop(ws_listener, tcp_listener);
@@ -267,7 +278,11 @@ mod tests {
         let json = r#"{"seq":1,"type":"request","command":"initialize"}"#;
         let mut buf = Vec::new();
         write_cl(&mut buf, json).unwrap();
-        assert!(std::str::from_utf8(&buf).unwrap().starts_with("Content-Length: "));
+        assert!(
+            std::str::from_utf8(&buf)
+                .unwrap()
+                .starts_with("Content-Length: ")
+        );
         let mut reader = BufReader::new(Cursor::new(buf));
         assert_eq!(read_cl(&mut reader).as_deref(), Some(json));
     }
@@ -315,8 +330,7 @@ mod tests {
         assert_eq!(frame.to_text().unwrap(), msg_to_wasm);
 
         // WS → TCP: WASM sends a WebSocket frame; VS Code receives a Content-Length message.
-        let msg_to_vscode =
-            r#"{"seq":1,"type":"response","command":"initialize","success":true}"#;
+        let msg_to_vscode = r#"{"seq":1,"type":"response","command":"initialize","success":true}"#;
         ws_client.send(Message::Text(msg_to_vscode.into())).unwrap();
         let mut tcp_read = BufReader::new(tcp_client);
         let received = read_cl(&mut tcp_read).unwrap();
@@ -404,7 +418,11 @@ fn handle_connection(mut stream: TcpStream, wasm_dir: &Path, cart_path: &Path, d
     let path = request_path(request);
 
     let (file_path, content_type, inject_dap): (PathBuf, &str, bool) = match path {
-        "/" | "/index.html" => (wasm_dir.join("blytrun.html"), "text/html; charset=utf-8", true),
+        "/" | "/index.html" => (
+            wasm_dir.join("blytrun.html"),
+            "text/html; charset=utf-8",
+            true,
+        ),
         "/blytrun.js" => (wasm_dir.join("blytrun.js"), "application/javascript", false),
         "/blytrun.wasm" => (wasm_dir.join("blytrun.wasm"), "application/wasm", false),
         "/cart.blyt" => (cart_path.to_path_buf(), "application/octet-stream", false),
