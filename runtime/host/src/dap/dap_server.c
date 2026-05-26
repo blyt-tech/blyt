@@ -370,6 +370,15 @@ static void handle_continue(int seq, const char *args) {
 
 static void handle_step(int seq, const char *args, int mode) {
     (void)args;
+    /* Send the response first so the client is in gdb.recv() before we signal
+     * the condvar.  If we signal first, the main thread can hit the GDB
+     * breakpoint and send T05 before the "next" response is delivered, causing
+     * the client to miss T05 in a race on Linux. */
+    const char *cmd = (mode == DAP_STEP_OVER) ? "next"
+                      : (mode == DAP_STEP_IN) ? "stepIn"
+                                              : "stepOut";
+    send_response(seq, cmd, 1, "{\"allThreadsContinued\":true}");
+    send_event("continued", "{\"threadId\":1,\"allThreadsContinued\":true}");
     pthread_mutex_lock(&g_dap.mu);
     g_dap.pending_step_base_depth = g_dap.paused_depth;
     g_dap.pending_step_mode = mode;
@@ -379,11 +388,6 @@ static void handle_step(int seq, const char *args, int mode) {
         pthread_cond_signal(&g_dap.msg_cond);
     }
     pthread_mutex_unlock(&g_dap.mu);
-    const char *cmd = (mode == DAP_STEP_OVER) ? "next"
-                      : (mode == DAP_STEP_IN) ? "stepIn"
-                                              : "stepOut";
-    send_response(seq, cmd, 1, "{\"allThreadsContinued\":true}");
-    send_event("continued", "{\"threadId\":1,\"allThreadsContinued\":true}");
 }
 
 static void handle_pause(int seq, const char *args) {

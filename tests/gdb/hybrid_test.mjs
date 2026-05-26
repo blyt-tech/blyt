@@ -87,7 +87,8 @@ async function connectGdb(endpointStr) {
     const sock = createConnection(parseInt(url.port, 10), url.hostname);
     sock.setEncoding('utf8');
 
-    const pending = [];
+    const pending  = [];
+    const received = []; /* buffer for packets that arrive before recv() is called */
     let buf    = '';
     let closed = false;
 
@@ -97,7 +98,11 @@ async function connectGdb(endpointStr) {
         let pkt;
         while ((pkt = gdbParseOne(buf)) !== null) {
             buf = pkt.rest;
-            if (pending.length > 0) pending.shift()(pkt.payload);
+            if (pending.length > 0) {
+                pending.shift()(pkt.payload);
+            } else {
+                received.push(pkt.payload);
+            }
         }
     }
     function onClose() {
@@ -118,7 +123,12 @@ async function connectGdb(endpointStr) {
             sock.write(gdbFrame(payload));
             return new Promise((r) => pending.push(r));
         },
-        recv()          { return new Promise((r) => pending.push(r)); },
+        recv() {
+            /* Return a buffered packet immediately if one arrived early. */
+            if (received.length > 0)
+                return Promise.resolve(received.shift());
+            return new Promise((r) => pending.push(r));
+        },
         close()         { if (!closed) sock.destroy(); },
     };
 }
