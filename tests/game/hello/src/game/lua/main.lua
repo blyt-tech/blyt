@@ -11,5 +11,5 @@ function update()
     end
 end
 
-function draw()
-end
+-- function draw()
+-- end

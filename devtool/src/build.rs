@@ -122,6 +122,15 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
  * ------------------------------------------------------------------------- */
 
 pub fn run(project_dir: &Path, output: Option<&Path>) -> Result<PathBuf, BuildError> {
+    let info_path = project_dir.join("cart.info.yaml");
+    if !info_path.exists() {
+        return Err(err(format!(
+            "cart.info.yaml not found in {} — \
+             every blyt cart project must have this file",
+            project_dir.display()
+        )));
+    }
+
     let clang = find_clang();
     let clangpp = find_clangpp();
     let objcopy = find_objcopy();

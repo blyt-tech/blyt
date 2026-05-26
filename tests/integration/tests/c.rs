@@ -9,12 +9,38 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
+/// blyt build fails immediately with a clear error when cart.info.yaml is absent.
+/// Does not require the SDK because the check fires before any toolchain call.
+#[test]
+fn build_fails_without_cart_info_yaml() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("no_info");
+    fs::create_dir_all(project.join("src/game/c")).unwrap();
+    fs::write(project.join("cart.build.yaml"), "language: c\n").unwrap();
+    fs::write(
+        project.join("src/game/c/main.c"),
+        "#include \"blyt.h\"\nvoid blyt_cart_init(void){}\nvoid blyt_cart_update(void){}\nvoid blyt_cart_draw(void){}\n",
+    )
+    .unwrap();
+    // No cart.info.yaml written.
+
+    Command::cargo_bin("blyt")
+        .unwrap()
+        .args(["build", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", sdk_dir())
+        .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cart.info.yaml"));
+}
+
 /// blyt build with a C manifest but no source files produces a clear error.
 #[test]
 fn build_empty_c_project_fails_with_error() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("empty");
     fs::create_dir_all(project.join("src/game/c")).unwrap();
+    fs::write(project.join("cart.info.yaml"), "name: empty\n").unwrap();
     fs::write(project.join("cart.build.yaml"), "language: c\n").unwrap();
 
     Command::cargo_bin("blyt")

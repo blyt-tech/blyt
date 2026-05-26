@@ -186,6 +186,14 @@ impl CartProject {
         // Ensure the project root exists before writing any files into it.
         fs::create_dir_all(dir).unwrap();
 
+        // cart.info.yaml — mandatory for all blyt cart projects.
+        let project_name = dir.file_name().unwrap_or_default().to_string_lossy();
+        fs::write(
+            dir.join("cart.info.yaml"),
+            format!("name: {project_name}\n"),
+        )
+        .unwrap();
+
         // cart.build.yaml — language declaration (ADR-0073).
         // Lua carts omit the file; the absent manifest signals Lua to blyt build.
         if !has_lua {
