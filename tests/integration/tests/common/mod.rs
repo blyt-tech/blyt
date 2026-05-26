@@ -514,7 +514,9 @@ pub fn require_gdb() {
 pub fn blytrun_gdb_port(output: &str) -> Option<u16> {
     let m = output.find("GDB listening on port ")?;
     let rest = &output[m + "GDB listening on port ".len()..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 

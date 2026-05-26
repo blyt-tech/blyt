@@ -705,7 +705,7 @@ option(BLYT_GDB "Enable GDB RSP debugger support (TCP transport)" ON)
 if(BLYT_GDB AND Threads_FOUND)
   set(BLYT_GDB_DIR "${CMAKE_SOURCE_DIR}/runtime/host/src/gdb")
   add_library(gdb_stub STATIC "${BLYT_GDB_DIR}/gdb_stub.c"
-                               "${BLYT_GDB_DIR}/gdb_transport_tcp.c")
+                              "${BLYT_GDB_DIR}/gdb_transport_tcp.c")
   set_target_properties(gdb_stub PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(
     gdb_stub PRIVATE "${BLYT_GDB_DIR}"

@@ -407,13 +407,19 @@ pub(crate) fn find_wasm_dir() -> Result<PathBuf, RunError> {
  * ------------------------------------------------------------------------- */
 
 fn start_gdb_relay(ws_port: u16, tcp_port: u16) -> (u16, u16) {
-    let ws_listener =
-        TcpListener::bind(format!("127.0.0.1:{ws_port}")).expect("GDB relay: WebSocket bind failed");
+    let ws_listener = TcpListener::bind(format!("127.0.0.1:{ws_port}"))
+        .expect("GDB relay: WebSocket bind failed");
     let tcp_listener =
         TcpListener::bind(format!("127.0.0.1:{tcp_port}")).expect("GDB relay: TCP bind failed");
 
-    let actual_ws = ws_listener.local_addr().map(|a| a.port()).unwrap_or(ws_port);
-    let actual_tcp = tcp_listener.local_addr().map(|a| a.port()).unwrap_or(tcp_port);
+    let actual_ws = ws_listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(ws_port);
+    let actual_tcp = tcp_listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(tcp_port);
 
     std::thread::spawn(move || {
         run_gdb_relay_loop(ws_listener, tcp_listener);

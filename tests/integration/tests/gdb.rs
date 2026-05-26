@@ -22,13 +22,11 @@ fn sdl_gdb_handshake() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("sdl_gdb_c");
     CartProject::new()
-        .c(
-            "#include \"blyt.h\"\n\
+        .c("#include \"blyt.h\"\n\
              static int g_frame = 0;\n\
              void blyt_cart_init(void)   {}\n\
              void blyt_cart_update(void) { if (++g_frame >= 3) blyt_quit(); }\n\
-             void blyt_cart_draw(void)   {}\n",
-        )
+             void blyt_cart_draw(void)   {}\n")
         .write(&project);
 
     let cart = build_cart(&project);
@@ -59,13 +57,11 @@ fn sdl_gdb_breakpoint_step() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("sdl_gdb_bp");
     CartProject::new()
-        .c(
-            "#include \"blyt.h\"\n\
+        .c("#include \"blyt.h\"\n\
              static int g_frame = 0;\n\
              void blyt_cart_init(void)   {}\n\
              void blyt_cart_update(void) { if (++g_frame >= 3) blyt_quit(); }\n\
-             void blyt_cart_draw(void)   {}\n",
-        )
+             void blyt_cart_draw(void)   {}\n")
         .write(&project);
 
     let cart = build_debug_cart(&project);
@@ -167,13 +163,11 @@ fn libretro_gdb_listen_and_handshake() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("libretro_gdb_c");
     CartProject::new()
-        .c(
-            "#include \"blyt.h\"\n\
+        .c("#include \"blyt.h\"\n\
              static int g_frame = 0;\n\
              void blyt_cart_init(void)   {}\n\
              void blyt_cart_update(void) { if (++g_frame >= 3) blyt_quit(); }\n\
-             void blyt_cart_draw(void)   {}\n",
-        )
+             void blyt_cart_draw(void)   {}\n")
         .write(&project);
 
     let cart = build_cart(&project);
@@ -202,13 +196,11 @@ fn wasm_gdb_handshake() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("wasm_gdb_c");
     CartProject::new()
-        .c(
-            "#include \"blyt.h\"\n\
+        .c("#include \"blyt.h\"\n\
              static int g_frame = 0;\n\
              void blyt_cart_init(void)   {}\n\
              void blyt_cart_update(void) { if (++g_frame >= 3) blyt_quit(); }\n\
-             void blyt_cart_draw(void)   {}\n",
-        )
+             void blyt_cart_draw(void)   {}\n")
         .write(&project);
 
     let cart = build_cart(&project);
@@ -236,13 +228,11 @@ fn wasm_gdb_breakpoint_step() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("wasm_gdb_bp");
     CartProject::new()
-        .c(
-            "#include \"blyt.h\"\n\
+        .c("#include \"blyt.h\"\n\
              static int g_frame = 0;\n\
              void blyt_cart_init(void)   {}\n\
              void blyt_cart_update(void) { if (++g_frame >= 3) blyt_quit(); }\n\
-             void blyt_cart_draw(void)   {}\n",
-        )
+             void blyt_cart_draw(void)   {}\n")
         .write(&project);
 
     let cart = build_debug_cart(&project);
@@ -286,7 +276,7 @@ fn sdl_hybrid_gdb_and_dap() {
     require_lua_sdk();
     require_gdb();
 
-    let tmp     = TempDir::new().unwrap();
+    let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hybrid_gdb_dap");
 
     // C library: blyt_native_work is a Lua C function with a couple of

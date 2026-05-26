@@ -105,7 +105,7 @@ void blyt_clear_libs(void) {
  * ------------------------------------------------------------------------- */
 
 typedef enum {
-    BLYT_DEBUG_RUNNING    = 0,
+    BLYT_DEBUG_RUNNING = 0,
     BLYT_DEBUG_PAUSED_GDB = 1,
     BLYT_DEBUG_PAUSED_DAP = 2,
 } blyt_debug_state_t;
@@ -117,7 +117,7 @@ typedef struct {
     bool frame_done; /* set by BLYT_ECALL_FRAME_DONE; cleared by run_frame */
     bool dap_enabled; /* set by blyt_session_dap_listen(); enables ECALL_DAP_HOOK */
     blyt_debug_state_t debug_state;
-    bool gdb_enabled;    /* set by blyt_session_gdb_listen() */
+    bool gdb_enabled; /* set by blyt_session_gdb_listen() */
     bool gdb_single_step; /* set when vCont;s received; cleared after one step */
 } blyt_run_ctx_t;
 
@@ -127,13 +127,13 @@ static blyt_run_ctx_t *g_run_ctx = NULL;
  * Session
  * ------------------------------------------------------------------------- */
 
-#define MAX_GDB_LIBS   8
+#define MAX_GDB_LIBS 8
 #define MAX_GDB_BREAKS 128
 
 typedef struct {
-    char     path[256]; /* host name or filesystem path of the .so */
-    uint32_t l_addr;    /* load base in guest memory */
-    uint32_t l_ld;      /* runtime address of .dynamic section */
+    char path[256]; /* host name or filesystem path of the .so */
+    uint32_t l_addr; /* load base in guest memory */
+    uint32_t l_ld; /* runtime address of .dynamic section */
 } blyt_gdb_lib_t;
 
 typedef struct {
@@ -157,13 +157,13 @@ struct blyt_session {
 #ifdef BLYT_GDB
     /* Library layout for GDB qXfer:libraries-svr4:read. */
     blyt_gdb_lib_t gdb_libs[MAX_GDB_LIBS];
-    int            gdb_nlibs;
-    char           gdb_exec_path[4096]; /* cart path for qXfer:exec-file:read */
+    int gdb_nlibs;
+    char gdb_exec_path[4096]; /* cart path for qXfer:exec-file:read */
     /* Software breakpoints: saved original words. */
-    blyt_gdb_bp_t  gdb_bps[MAX_GDB_BREAKS];
-    int            gdb_nbp;
+    blyt_gdb_bp_t gdb_bps[MAX_GDB_BREAKS];
+    int gdb_nbp;
     /* WASM only: true once T05 has been sent on initial attach. */
-    bool           gdb_notified;
+    bool gdb_notified;
 #endif
 };
 
@@ -171,64 +171,74 @@ struct blyt_session {
 static blyt_session_t *g_gdb_session = NULL;
 
 static void gdb_read_regs(uint8_t out[33 * 4]) {
-    if (!g_gdb_session) return;
+    if (!g_gdb_session)
+        return;
     for (int i = 0; i < 32; i++) {
         uint32_t v = rv_get_reg(g_gdb_session->rv, (uint32_t)i);
-        out[i*4+0] = (uint8_t)(v);
-        out[i*4+1] = (uint8_t)(v >> 8);
-        out[i*4+2] = (uint8_t)(v >> 16);
-        out[i*4+3] = (uint8_t)(v >> 24);
+        out[i * 4 + 0] = (uint8_t)(v);
+        out[i * 4 + 1] = (uint8_t)(v >> 8);
+        out[i * 4 + 2] = (uint8_t)(v >> 16);
+        out[i * 4 + 3] = (uint8_t)(v >> 24);
     }
     uint32_t pc = rv_get_pc(g_gdb_session->rv);
-    out[32*4+0] = (uint8_t)(pc);
-    out[32*4+1] = (uint8_t)(pc >> 8);
-    out[32*4+2] = (uint8_t)(pc >> 16);
-    out[32*4+3] = (uint8_t)(pc >> 24);
+    out[32 * 4 + 0] = (uint8_t)(pc);
+    out[32 * 4 + 1] = (uint8_t)(pc >> 8);
+    out[32 * 4 + 2] = (uint8_t)(pc >> 16);
+    out[32 * 4 + 3] = (uint8_t)(pc >> 24);
 }
 
 static void gdb_write_regs(const uint8_t in[33 * 4]) {
-    if (!g_gdb_session) return;
+    if (!g_gdb_session)
+        return;
     for (int i = 0; i < 32; i++) {
-        uint32_t v = (uint32_t)in[i*4] | ((uint32_t)in[i*4+1] << 8) |
-                     ((uint32_t)in[i*4+2] << 16) | ((uint32_t)in[i*4+3] << 24);
+        uint32_t v = (uint32_t)in[i * 4] | ((uint32_t)in[i * 4 + 1] << 8) |
+                     ((uint32_t)in[i * 4 + 2] << 16) | ((uint32_t)in[i * 4 + 3] << 24);
         rv_set_reg(g_gdb_session->rv, (uint32_t)i, v);
     }
     /* PC is register index 32 */
-    uint32_t pc = (uint32_t)in[32*4] | ((uint32_t)in[32*4+1] << 8) |
-                  ((uint32_t)in[32*4+2] << 16) | ((uint32_t)in[32*4+3] << 24);
+    uint32_t pc = (uint32_t)in[32 * 4] | ((uint32_t)in[32 * 4 + 1] << 8) |
+                  ((uint32_t)in[32 * 4 + 2] << 16) | ((uint32_t)in[32 * 4 + 3] << 24);
     g_gdb_session->rv->PC = pc;
 }
 
 static uint32_t gdb_read_mem(uint32_t addr, uint8_t *dst, uint32_t n) {
-    if (!g_gdb_session) return 0;
+    if (!g_gdb_session)
+        return 0;
     vm_attr_t *attr = PRIV(g_gdb_session->rv);
     uint32_t i;
     for (i = 0; i < n; i++) {
-        if (!GUEST_RAM_CONTAINS(attr->mem, addr + i, 1)) break;
+        if (!GUEST_RAM_CONTAINS(attr->mem, addr + i, 1))
+            break;
         memory_read(attr->mem, &dst[i], addr + i, 1);
     }
     return i;
 }
 
 static uint32_t gdb_write_mem(uint32_t addr, const uint8_t *src, uint32_t n) {
-    if (!g_gdb_session) return 0;
+    if (!g_gdb_session)
+        return 0;
     vm_attr_t *attr = PRIV(g_gdb_session->rv);
-    if (!memory_write(attr->mem, addr, src, n)) return 0;
+    if (!memory_write(attr->mem, addr, src, n))
+        return 0;
     return n;
 }
 
 static int gdb_set_bp(uint32_t addr) {
-    if (!g_gdb_session) return -1;
+    if (!g_gdb_session)
+        return -1;
     blyt_session_t *s = g_gdb_session;
-    if (s->gdb_nbp >= MAX_GDB_BREAKS) return -1;
+    if (s->gdb_nbp >= MAX_GDB_BREAKS)
+        return -1;
     /* Read original word. */
     uint8_t orig[4];
-    if (gdb_read_mem(addr, orig, 4) != 4) return -1;
-    uint32_t orig_word = (uint32_t)orig[0] | ((uint32_t)orig[1] << 8) |
-                         ((uint32_t)orig[2] << 16) | ((uint32_t)orig[3] << 24);
+    if (gdb_read_mem(addr, orig, 4) != 4)
+        return -1;
+    uint32_t orig_word = (uint32_t)orig[0] | ((uint32_t)orig[1] << 8) | ((uint32_t)orig[2] << 16) |
+                         ((uint32_t)orig[3] << 24);
     /* Patch ebreak = 0x00100073. */
-    static const uint8_t ebreak[4] = { 0x73, 0x00, 0x10, 0x00 };
-    if (gdb_write_mem(addr, ebreak, 4) != 4) return -1;
+    static const uint8_t ebreak[4] = {0x73, 0x00, 0x10, 0x00};
+    if (gdb_write_mem(addr, ebreak, 4) != 4)
+        return -1;
     s->gdb_bps[s->gdb_nbp].addr = addr;
     s->gdb_bps[s->gdb_nbp].original_word = orig_word;
     s->gdb_nbp++;
@@ -236,17 +246,18 @@ static int gdb_set_bp(uint32_t addr) {
 }
 
 static int gdb_clear_bp(uint32_t addr) {
-    if (!g_gdb_session) return -1;
+    if (!g_gdb_session)
+        return -1;
     blyt_session_t *s = g_gdb_session;
     for (int i = 0; i < s->gdb_nbp; i++) {
         if (s->gdb_bps[i].addr == addr) {
             uint32_t w = s->gdb_bps[i].original_word;
-            uint8_t bytes[4] = { (uint8_t)w, (uint8_t)(w>>8),
-                                 (uint8_t)(w>>16), (uint8_t)(w>>24) };
+            uint8_t bytes[4] = {(uint8_t)w, (uint8_t)(w >> 8), (uint8_t)(w >> 16),
+                                (uint8_t)(w >> 24)};
             gdb_write_mem(addr, bytes, 4);
             /* Remove entry by shifting. */
             for (int j = i; j + 1 < s->gdb_nbp; j++)
-                s->gdb_bps[j] = s->gdb_bps[j+1];
+                s->gdb_bps[j] = s->gdb_bps[j + 1];
             s->gdb_nbp--;
             return 0;
         }
@@ -255,11 +266,11 @@ static int gdb_clear_bp(uint32_t addr) {
 }
 
 static const fc_gdb_cpu_ops_t gdb_cpu_ops = {
-    .read_regs       = gdb_read_regs,
-    .write_regs      = gdb_write_regs,
-    .read_mem        = gdb_read_mem,
-    .write_mem       = gdb_write_mem,
-    .set_breakpoint  = gdb_set_bp,
+    .read_regs = gdb_read_regs,
+    .write_regs = gdb_write_regs,
+    .read_mem = gdb_read_mem,
+    .write_mem = gdb_write_mem,
+    .set_breakpoint = gdb_set_bp,
     .clear_breakpoint = gdb_clear_bp,
 };
 #endif /* BLYT_GDB */
@@ -959,7 +970,8 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
             gl->l_ld = 0;
             for (uint16_t pi = 0; pi < leh->e_phnum; pi++) {
                 size_t poff = (size_t)leh->e_phoff + (size_t)pi * leh->e_phentsize;
-                if (poff + sizeof(Elf32_Phdr) > lsz) break;
+                if (poff + sizeof(Elf32_Phdr) > lsz)
+                    break;
                 const Elf32_Phdr *ph = (const Elf32_Phdr *)(lmap + poff);
                 if (ph->p_type == PT_DYNAMIC) {
                     gl->l_ld = bias + ph->p_vaddr;
@@ -1091,8 +1103,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
 #if defined(BLYT_GDB) && defined(__EMSCRIPTEN__)
     /* On WASM, drain the GDB WebSocket queue once per frame so the handshake
      * (qSupported, Z0 breakpoint setup, vCont;c) can proceed while running. */
-    if (session->ctx.gdb_enabled &&
-        session->ctx.debug_state == BLYT_DEBUG_RUNNING) {
+    if (session->ctx.gdb_enabled && session->ctx.debug_state == BLYT_DEBUG_RUNNING) {
         fc_gdb_stub_poll();
     }
 #endif
@@ -1105,8 +1116,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             if (session->ctx.debug_state == BLYT_DEBUG_PAUSED_GDB) {
 #ifdef __EMSCRIPTEN__
                 /* Send T05 once the WebSocket relay connection is established. */
-                if (!session->gdb_notified &&
-                    fc_gdb_transport_wasm_is_connected()) {
+                if (!session->gdb_notified && fc_gdb_transport_wasm_is_connected()) {
                     session->gdb_notified = true;
                     fc_gdb_stub_notify_stopped();
                 }
@@ -1118,7 +1128,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
                     return BLYT_RUN_GDB_PAUSED; /* still paused, try again next tick */
                 }
                 session->ctx.debug_state = BLYT_DEBUG_RUNNING;
-                if (_reentry_action == 2) { rv_halt(session->rv); break; }
+                if (_reentry_action == 2) {
+                    rv_halt(session->rv);
+                    break;
+                }
                 session->ctx.gdb_single_step = (_reentry_action == 1);
                 /* fall through to execute next instruction */
 #else
@@ -1139,7 +1152,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
                 fc_gdb_stub_block_until_resume();
                 int gdb_action = fc_gdb_stub_pending_action();
                 session->ctx.debug_state = BLYT_DEBUG_RUNNING;
-                if (gdb_action == 2) { rv_halt(session->rv); break; }
+                if (gdb_action == 2) {
+                    rv_halt(session->rv);
+                    break;
+                }
                 session->ctx.gdb_single_step = (gdb_action == 1);
 #endif
             }
@@ -1165,7 +1181,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             fc_gdb_stub_block_until_resume();
             int gdb_action = fc_gdb_stub_pending_action();
             session->ctx.debug_state = BLYT_DEBUG_RUNNING;
-            if (gdb_action == 2) { rv_halt(session->rv); break; }
+            if (gdb_action == 2) {
+                rv_halt(session->rv);
+                break;
+            }
             session->ctx.gdb_single_step = (gdb_action == 1);
 #endif
         }
@@ -1261,32 +1280,34 @@ int blyt_session_dap_wait_ready(blyt_session_t *s) {
 
 int blyt_session_gdb_listen(blyt_session_t *s, int *port_out) {
 #ifdef BLYT_GDB
-    if (!s) return -1;
+    if (!s)
+        return -1;
 
     /* Register layout with the stub. */
     fc_gdb_library_t libs[MAX_GDB_LIBS];
     for (int i = 0; i < s->gdb_nlibs; i++) {
-        libs[i].path   = s->gdb_libs[i].path;
+        libs[i].path = s->gdb_libs[i].path;
         libs[i].l_addr = s->gdb_libs[i].l_addr;
-        libs[i].l_ld   = s->gdb_libs[i].l_ld;
+        libs[i].l_ld = s->gdb_libs[i].l_ld;
     }
     fc_gdb_layout_t layout = {
-        .exec_path   = s->gdb_exec_path,
-        .libraries   = libs,
+        .exec_path = s->gdb_exec_path,
+        .libraries = libs,
         .n_libraries = s->gdb_nlibs,
     };
     fc_gdb_stub_set_layout(&layout);
 
     g_gdb_session = s;
     s->ctx.gdb_enabled = true;
-    s->gdb_notified    = false;
+    s->gdb_notified = false;
 
     int actual_port = port_out ? *port_out : 0;
 #ifdef __EMSCRIPTEN__
     /* Start in paused state so the cart waits for vCont;c before running. */
     s->ctx.debug_state = BLYT_DEBUG_PAUSED_GDB;
     fc_gdb_transport_wasm_open(actual_port);
-    if (port_out) *port_out = actual_port;
+    if (port_out)
+        *port_out = actual_port;
     return actual_port;
 #else
     if (fc_gdb_transport_tcp_listen(actual_port, &actual_port) != 0) {
@@ -1294,25 +1315,29 @@ int blyt_session_gdb_listen(blyt_session_t *s, int *port_out) {
         g_gdb_session = NULL;
         return -1;
     }
-    if (port_out) *port_out = actual_port;
+    if (port_out)
+        *port_out = actual_port;
     return actual_port;
 #endif
 #else
-    (void)s; (void)port_out;
+    (void)s;
+    (void)port_out;
     return -1;
 #endif
 }
 
 void blyt_session_gdb_shutdown(blyt_session_t *s) {
 #ifdef BLYT_GDB
-    if (!s || !s->ctx.gdb_enabled) return;
+    if (!s || !s->ctx.gdb_enabled)
+        return;
 #ifdef __EMSCRIPTEN__
     fc_gdb_transport_wasm_shutdown();
 #else
     fc_gdb_transport_tcp_shutdown();
 #endif
     s->ctx.gdb_enabled = false;
-    if (g_gdb_session == s) g_gdb_session = NULL;
+    if (g_gdb_session == s)
+        g_gdb_session = NULL;
 #else
     (void)s;
 #endif
@@ -1320,7 +1345,8 @@ void blyt_session_gdb_shutdown(blyt_session_t *s) {
 
 int blyt_session_gdb_wait_attached(blyt_session_t *s) {
 #ifdef BLYT_GDB
-    if (!s || !s->ctx.gdb_enabled) return 0;
+    if (!s || !s->ctx.gdb_enabled)
+        return 0;
 #ifdef __EMSCRIPTEN__
     /* On WASM, connection is async; caller cannot block. */
     return fc_gdb_transport_wasm_is_connected();
