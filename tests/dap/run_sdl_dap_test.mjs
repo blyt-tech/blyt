@@ -2,12 +2,12 @@
 /*
  * tests/dap/run_sdl_dap_test.mjs — SDL2 DAP test orchestrator.
  *
- * Spawns blytrun --debug --headless <cart>, waits for the DAP TCP port to
+ * Spawns blytplay --debug --headless <cart>, waits for the DAP TCP port to
  * appear on stdout ("blyt: DAP listening on port N"), then runs dap_test.mjs
  * in TCP mode against that port.
  *
  * Usage:
- *   node run_sdl_dap_test.mjs <blytrun_path> <cart_path>
+ *   node run_sdl_dap_test.mjs <blytplay_path> <cart_path>
  *
  * Environment:
  *   BLYT_DAP_BP_LINE  — 1-based line to break on (default 3)
@@ -29,7 +29,7 @@ const CART    = process.argv[3];
 const BP_LINE = process.env.BLYT_DAP_BP_LINE || '3';
 
 if (!BLYTRUN || !CART) {
-    process.stderr.write('usage: run_sdl_dap_test.mjs <blytrun> <cart>\n');
+    process.stderr.write('usage: run_sdl_dap_test.mjs <blytplay> <cart>\n');
     process.exit(1);
 }
 
@@ -38,7 +38,7 @@ function findDapPort(proc) {
     return new Promise((resolve, reject) => {
         let buf = '';
         const timer = setTimeout(
-            () => reject(new Error('timeout: blytrun did not print DAP port')),
+            () => reject(new Error('timeout: blytplay did not print DAP port')),
             15000
         );
         proc.stdout.on('data', (chunk) => {
@@ -49,20 +49,20 @@ function findDapPort(proc) {
         proc.on('exit', (code) => {
             clearTimeout(timer);
             if (code !== null && code !== 0)
-                reject(new Error(`blytrun exited early with code ${code}`));
+                reject(new Error(`blytplay exited early with code ${code}`));
         });
         proc.on('error', (e) => { clearTimeout(timer); reject(e); });
     });
 }
 
 async function main() {
-    const blytrun = spawn(BLYTRUN, ['--debug', '--headless', CART], {
+    const blytplay = spawn(BLYTRUN, ['--debug', '--headless', CART], {
         stdio: ['ignore', 'pipe', 'pipe'],
     });
-    blytrun.stderr.on('data', (d) => process.stderr.write(d));
+    blytplay.stderr.on('data', (d) => process.stderr.write(d));
 
-    const port = await findDapPort(blytrun);
-    console.log(`[sdl_dap_test] blytrun DAP on tcp://127.0.0.1:${port}`);
+    const port = await findDapPort(blytplay);
+    console.log(`[sdl_dap_test] blytplay DAP on tcp://127.0.0.1:${port}`);
 
     const testScript = path.join(__dirname, 'dap_test.mjs');
     const endpoint   = `tcp://127.0.0.1:${port}`;
@@ -80,10 +80,10 @@ async function main() {
         );
     });
 
-    /* DAP client sent continue; wait for blytrun to exit (cart calls blyt.quit()). */
+    /* DAP client sent continue; wait for blytplay to exit (cart calls blyt.quit()). */
     await new Promise((resolve) => {
-        blytrun.on('exit', resolve);
-        setTimeout(() => { blytrun.kill(); resolve(); }, 5000);
+        blytplay.on('exit', resolve);
+        setTimeout(() => { blytplay.kill(); resolve(); }, 5000);
     });
 }
 

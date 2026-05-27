@@ -30,8 +30,8 @@ pub fn sdk_dir() -> PathBuf {
     build_dir().join("sdk")
 }
 
-pub fn blytrun() -> PathBuf {
-    build_dir().join("blytrun")
+pub fn blytplay() -> PathBuf {
+    build_dir().join("blytplay")
 }
 
 /// Path to the `blyt` devtool binary.
@@ -372,7 +372,7 @@ pub fn require_test_session_api() {
 
 pub fn require_wasm() {
     assert!(
-        find_wasm_dir().join("blytrun.js").exists(),
+        find_wasm_dir().join("blytplay.js").exists(),
         "WASM runtime not built — install emscripten and run \
          `cmake --build build --target sdk` (or \
          `emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm`)"
@@ -499,7 +499,7 @@ pub fn test_session_api() -> PathBuf {
 /// Prefers a direct emcmake build output; falls back to the SDK's share/wasm/.
 pub fn find_wasm_dir() -> PathBuf {
     let direct = repo_root().join("build-wasm");
-    if direct.join("blytrun.js").exists() {
+    if direct.join("blytplay.js").exists() {
         return direct;
     }
     build_dir().join("sdk/share/wasm")
@@ -511,26 +511,26 @@ pub fn find_wasm_dir() -> PathBuf {
 
 pub fn require_gdb() {
     assert!(
-        blytrun().exists(),
-        "blytrun not built — run `cmake --build build` first"
+        blytplay().exists(),
+        "blytplay not built — run `cmake --build build` first"
     );
-    let out = std::process::Command::new(blytrun())
+    let out = std::process::Command::new(blytplay())
         .arg("--help")
         .output()
         .unwrap_or_else(|_| {
-            // blytrun exits non-zero for --help; capture output anyway
-            std::process::Command::new(blytrun())
+            // blytplay exits non-zero for --help; capture output anyway
+            std::process::Command::new(blytplay())
                 .args(["--gdb", "0"])
                 .output()
                 .unwrap()
         });
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let _ = (stdout, stderr); // just ensure blytrun accepts --gdb
+    let _ = (stdout, stderr); // just ensure blytplay accepts --gdb
 }
 
 /// Parse "blyt: GDB listening on port N" from combined stdout/stderr output.
-pub fn blytrun_gdb_port(output: &str) -> Option<u16> {
+pub fn blytplay_gdb_port(output: &str) -> Option<u16> {
     let m = output.find("GDB listening on port ")?;
     let rest = &output[m + "GDB listening on port ".len()..];
     let end = rest

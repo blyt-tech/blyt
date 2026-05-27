@@ -2,7 +2,7 @@
 /*
  * tests/gdb/run_gdb_test.mjs — end-to-end WASM GDB test orchestrator.
  *
- * Starts an in-process WebSocket relay on /gdb, loads blytrun.js (the WASM
+ * Starts an in-process WebSocket relay on /gdb, loads blytplay.js (the WASM
  * binary) with the relay port injected as globalThis.__blyt_gdb_port, then
  * runs gdb_test.mjs against the relay via WebSocket.
  *
@@ -182,7 +182,7 @@ function startRelay() {
     });
 }
 
-/* ── Load blytrun.js ────────────────────────────────────────────────────── */
+/* ── Load blytplay.js ────────────────────────────────────────────────────── */
 
 function loadWasmRuntime(wasmDir, cartPath, gdbPort) {
     return new Promise((resolve, reject) => {
@@ -196,7 +196,7 @@ function loadWasmRuntime(wasmDir, cartPath, gdbPort) {
         };
         try {
             const require = createRequire(import.meta.url);
-            require(path.join(wasmDir, 'blytrun.js'));
+            require(path.join(wasmDir, 'blytplay.js'));
         } catch (e) {
             reject(e);
         }

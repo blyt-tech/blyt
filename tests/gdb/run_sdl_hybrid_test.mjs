@@ -2,11 +2,11 @@
 /*
  * tests/gdb/run_sdl_hybrid_test.mjs — SDL2 hybrid (DAP + GDB) test orchestrator.
  *
- * Spawns blytrun --debug 0 --gdb 0 --headless <cart>, waits for both the DAP
+ * Spawns blytplay --debug 0 --gdb 0 --headless <cart>, waits for both the DAP
  * and GDB TCP ports, then drives hybrid_test.mjs with both endpoints.
  *
  * Usage:
- *   node run_sdl_hybrid_test.mjs <blytrun_path> <cart_path>
+ *   node run_sdl_hybrid_test.mjs <blytplay_path> <cart_path>
  *
  * Environment:
  *   BLYT_GDB_BREAK_ADDR — hex VMA of the native function entry point (from
@@ -30,7 +30,7 @@ const BLYTRUN = process.argv[2];
 const CART    = process.argv[3];
 
 if (!BLYTRUN || !CART) {
-    process.stderr.write('usage: run_sdl_hybrid_test.mjs <blytrun> <cart>\n');
+    process.stderr.write('usage: run_sdl_hybrid_test.mjs <blytplay> <cart>\n');
     process.exit(1);
 }
 
@@ -41,7 +41,7 @@ function findBothPorts(proc) {
         let dapPort = null;
         let gdbPort = null;
         const timer = setTimeout(
-            () => reject(new Error('timeout: blytrun did not print both DAP and GDB ports')),
+            () => reject(new Error('timeout: blytplay did not print both DAP and GDB ports')),
             15000
         );
         function check(chunk) {
@@ -57,19 +57,19 @@ function findBothPorts(proc) {
         proc.on('exit', (code) => {
             clearTimeout(timer);
             if (code !== null && code !== 0)
-                reject(new Error(`blytrun exited early with code ${code}`));
+                reject(new Error(`blytplay exited early with code ${code}`));
         });
         proc.on('error', (e) => { clearTimeout(timer); reject(e); });
     });
 }
 
 async function main() {
-    const blytrun = spawn(BLYTRUN, ['--debug', '0', '--gdb', '0', '--headless', CART], {
+    const blytplay = spawn(BLYTRUN, ['--debug', '0', '--gdb', '0', '--headless', CART], {
         stdio: ['ignore', 'pipe', 'pipe'],
     });
-    blytrun.stderr.on('data', (d) => process.stderr.write(d));
+    blytplay.stderr.on('data', (d) => process.stderr.write(d));
 
-    const { dapPort, gdbPort } = await findBothPorts(blytrun);
+    const { dapPort, gdbPort } = await findBothPorts(blytplay);
     console.log(`[hybrid_test] DAP tcp://127.0.0.1:${dapPort}  GDB tcp://127.0.0.1:${gdbPort}`);
 
     const testScript  = path.join(__dirname, 'hybrid_test.mjs');
@@ -92,10 +92,10 @@ async function main() {
         );
     });
 
-    /* Wait for blytrun to exit after DAP/GDB clients send continue. */
+    /* Wait for blytplay to exit after DAP/GDB clients send continue. */
     await new Promise((resolve) => {
-        blytrun.on('exit', resolve);
-        setTimeout(() => { blytrun.kill(); resolve(); }, 5000);
+        blytplay.on('exit', resolve);
+        setTimeout(() => { blytplay.kill(); resolve(); }, 5000);
     });
 }
 

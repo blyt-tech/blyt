@@ -1,7 +1,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{blytrun, build_cart, sdk_dir, test_session_api, write_c_cart_project};
+use common::{blytplay, build_cart, sdk_dir, test_session_api, write_c_cart_project};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -9,7 +9,7 @@ use tempfile::TempDir;
 ///
 /// The SDK binary auto-discovers its toolchain and libraries from its own
 /// location in build/sdk/bin/ — no env vars required for blyt build.
-/// blytrun needs BLYT_LIB_DIR since it cannot yet auto-discover its libraries.
+/// blytplay needs BLYT_LIB_DIR since it cannot yet auto-discover its libraries.
 ///
 /// Requires `cmake --build build --target sdk` to have completed.
 /// Silently skipped if the SDK has not been assembled.
@@ -17,10 +17,10 @@ use tempfile::TempDir;
 fn sdk_e2e_build_and_run() {
     let sdk = sdk_dir();
     let sdk_blyt = sdk.join("bin/blyt");
-    let sdk_blytrun = sdk.join("bin/blytrun");
+    let sdk_blytplay = sdk.join("bin/blytplay");
 
     assert!(
-        sdk_blyt.exists() && sdk_blytrun.exists(),
+        sdk_blyt.exists() && sdk_blytplay.exists(),
         "SDK not assembled — run `cmake --build build --target sdk` first"
     );
 
@@ -58,8 +58,8 @@ void blyt_cart_draw(void)   {}
     ));
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    // Run the cart with the SDK's blytrun.
-    let out = Command::new(&sdk_blytrun)
+    // Run the cart with the SDK's blytplay.
+    let out = Command::new(&sdk_blytplay)
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
@@ -107,7 +107,7 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
@@ -155,7 +155,7 @@ void blyt_cart_draw(void)   {}
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    Command::new(blytrun())
+    Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
@@ -163,10 +163,10 @@ void blyt_cart_draw(void)   {}
         .stderr(predicate::str::contains("aborted"));
 }
 
-/// blytrun --headless rejects a non-existent cart path with a non-zero exit.
+/// blytplay --headless rejects a non-existent cart path with a non-zero exit.
 #[test]
 fn run_missing_cart_fails() {
-    Command::new(blytrun())
+    Command::new(blytplay())
         .args(["--headless", "/nonexistent/path/cart.blyt"])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()

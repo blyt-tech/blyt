@@ -54,7 +54,7 @@ jobs:
             tests/unit/*.c \
             tests/tools/*.c \
             tests/game/hello-c/src/game/c/*.c \
-            frontends/sdl/main.c \
+            frontends/player/main.c \
             frontends/libretro/blyt_libretro.c \
             frontends/wasm/wasm_main.c \
             frontends/native/launcher.c \

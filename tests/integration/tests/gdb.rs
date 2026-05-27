@@ -2,7 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
+    CartProject, blytplay, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
     find_wasm_dir, libretro_so, repo_root, require_gdb, require_libretro_core, require_lua_sdk,
     require_sdk, require_wasm, sdk_dir, test_libretro_core,
 };
@@ -13,7 +13,7 @@ use tempfile::TempDir;
 ///
 /// Does not set a breakpoint — verifies transport and handshake only.
 ///
-/// Requires: blytrun built with BLYT_GDB=ON, SDK assembled.
+/// Requires: blytplay built with BLYT_GDB=ON, SDK assembled.
 #[test]
 fn sdl_gdb_handshake() {
     require_sdk();
@@ -36,7 +36,7 @@ fn sdl_gdb_handshake() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytrun().to_str().unwrap(),
+            blytplay().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
@@ -48,7 +48,7 @@ fn sdl_gdb_handshake() {
 /// software breakpoint at `blyt_cart_init`, verify T05 stop reply and register
 /// read, single-step, then continue to completion.
 ///
-/// Requires: blytrun with BLYT_GDB=ON, SDK, `readelf` on PATH.
+/// Requires: blytplay with BLYT_GDB=ON, SDK, `readelf` on PATH.
 #[test]
 fn sdl_gdb_breakpoint_step() {
     require_sdk();
@@ -74,7 +74,7 @@ fn sdl_gdb_breakpoint_step() {
         Command::new("node")
             .args([
                 orchestrator.to_str().unwrap(),
-                blytrun().to_str().unwrap(),
+                blytplay().to_str().unwrap(),
                 cart.to_str().unwrap(),
             ])
             .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
@@ -88,7 +88,7 @@ fn sdl_gdb_breakpoint_step() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytrun().to_str().unwrap(),
+            blytplay().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
@@ -137,7 +137,7 @@ fn sdl_gdb_rust_cart() {
     let mut cmd = Command::new("node");
     cmd.args([
         orchestrator.to_str().unwrap(),
-        blytrun().to_str().unwrap(),
+        blytplay().to_str().unwrap(),
         cart.to_str().unwrap(),
     ])
     .env("BLYT_LIB_DIR", sdk_dir().join("lib"));
@@ -183,7 +183,7 @@ fn libretro_gdb_listen_and_handshake() {
         .success();
 }
 
-/// WASM GDB handshake: load a C cart in blytrun.js with the GDB relay port
+/// WASM GDB handshake: load a C cart in blytplay.js with the GDB relay port
 /// injected, connect gdb_test.mjs via WebSocket, and verify the session
 /// completes successfully.
 ///
@@ -268,7 +268,7 @@ fn wasm_gdb_breakpoint_step() {
 /// libretro paths run the Lua interpreter inside rv32emu, so both debuggers
 /// operate on the same execution stream.
 ///
-/// Requires: blytrun built with BLYT_DAP=ON and BLYT_GDB=ON, Lua SDK,
+/// Requires: blytplay built with BLYT_DAP=ON and BLYT_GDB=ON, Lua SDK,
 /// `readelf` on PATH (for symbol address; falls back to DAP-only if absent).
 #[test]
 fn sdl_hybrid_gdb_and_dap() {
@@ -327,7 +327,7 @@ function draw()   end\n";
     let mut cmd = Command::new("node");
     cmd.args([
         orchestrator.to_str().unwrap(),
-        blytrun().to_str().unwrap(),
+        blytplay().to_str().unwrap(),
         cart.to_str().unwrap(),
     ])
     .env("BLYT_LIB_DIR", sdk_dir().join("lib"));

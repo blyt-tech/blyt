@@ -2,7 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blyt_bin, blytrun, build_lua_cart, require_cpp_sdk, require_lua_sdk,
+    CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_lua_sdk,
     require_rust_riscv_target, require_sdk, sdk_dir,
 };
 use predicates::prelude::*;
@@ -57,7 +57,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
@@ -150,7 +150,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
@@ -273,7 +273,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
@@ -371,7 +371,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
@@ -469,7 +469,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
@@ -557,7 +557,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
@@ -645,7 +645,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
@@ -752,7 +752,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()

@@ -37,10 +37,10 @@ pub fn run(cart_path: &Path, output: Option<&Path>) -> Result<(), ExportError> {
 
     let wasm_dir = find_wasm_dir().map_err(|e| ExportError(e.to_string()))?;
 
-    let js = fs::read_to_string(wasm_dir.join("blytrun.js"))
-        .map_err(|e| err(format!("cannot read blytrun.js: {e}")))?;
-    let wasm_bytes = fs::read(wasm_dir.join("blytrun.wasm"))
-        .map_err(|e| err(format!("cannot read blytrun.wasm: {e}")))?;
+    let js = fs::read_to_string(wasm_dir.join("blytplay.js"))
+        .map_err(|e| err(format!("cannot read blytplay.js: {e}")))?;
+    let wasm_bytes = fs::read(wasm_dir.join("blytplay.wasm"))
+        .map_err(|e| err(format!("cannot read blytplay.wasm: {e}")))?;
     let cart_bytes = fs::read(&cart_path).map_err(|e| err(format!("cannot read cart: {e}")))?;
 
     let cart_name = cart_path
@@ -100,7 +100,7 @@ fn generate_html(cart_name: &str, cart_bytes: &[u8], wasm_bytes: &[u8], js: &str
     // Inline script: decode embedded data and configure the Emscripten Module.
     //
     // Module.wasmBinary — ArrayBuffer of the WASM module.  When set,
-    // Emscripten uses it directly and skips any fetch of blytrun.wasm.
+    // Emscripten uses it directly and skips any fetch of blytplay.wasm.
     //
     // preRun — writes the cart into the virtual filesystem before main()
     // runs, exactly as the dev shell does via a fetch.
@@ -127,8 +127,8 @@ fn generate_html(cart_name: &str, cart_bytes: &[u8], wasm_bytes: &[u8], js: &str
     html.push_str("}());\n");
     html.push_str("</script>\n");
 
-    // Inline blytrun.js — the Emscripten JS glue with module_pre.js baked in.
-    // module_pre.js inside blytrun.js reads window.Module and picks up our
+    // Inline blytplay.js — the Emscripten JS glue with module_pre.js baked in.
+    // module_pre.js inside blytplay.js reads window.Module and picks up our
     // wasmBinary and preRun without modification (globalThis.__blyt_cart_data
     // is not set, so module_pre.js adds no additional preRun hooks).
     html.push_str("<script>\n");

@@ -677,7 +677,7 @@ add_dependencies(libblyt flatbuffers_generated)
 # DAP debugging support (TCP+pthread transport for SDL2 / libretro)
 #
 # dap is a static library containing dap_server.c (TCP transport). Linked into
-# libblyt and blytrun when BLYT_DAP=ON. master_hook.c is compiled into the WASM
+# libblyt and blytplay when BLYT_DAP=ON. master_hook.c is compiled into the WASM
 # binary separately (frontends/wasm/) and into libblyt32lua.so as RV32 guest
 # code (cmake/blyt_sdk.cmake). It is NOT part of the native host libdap.a — the
 # master hook runs inside rv32emu and does not need to be present in the host
@@ -740,20 +740,20 @@ endif()
 # -------------------------------------------------------------------------
 find_package(SDL2 QUIET)
 if(SDL2_FOUND OR TARGET SDL2::SDL2)
-  add_executable(blytrun frontends/sdl/main.c)
-  target_link_libraries(blytrun PRIVATE libblyt SDL2::SDL2)
-  message(STATUS "SDL2 found via find_package — blytrun (SDL2) will be built")
+  add_executable(blytplay frontends/player/main.c)
+  target_link_libraries(blytplay PRIVATE libblyt SDL2::SDL2)
+  message(STATUS "SDL2 found via find_package — blytplay (SDL2) will be built")
 else()
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
     pkg_check_modules(SDL2 QUIET sdl2)
   endif()
   if(SDL2_FOUND)
-    add_executable(blytrun frontends/sdl/main.c)
-    target_include_directories(blytrun PRIVATE ${SDL2_INCLUDE_DIRS})
-    target_compile_options(blytrun PRIVATE ${SDL2_CFLAGS_OTHER})
-    target_link_libraries(blytrun PRIVATE libblyt ${SDL2_LIBRARIES})
-    message(STATUS "SDL2 found via pkg-config — blytrun (SDL2) will be built")
+    add_executable(blytplay frontends/player/main.c)
+    target_include_directories(blytplay PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_compile_options(blytplay PRIVATE ${SDL2_CFLAGS_OTHER})
+    target_link_libraries(blytplay PRIVATE libblyt ${SDL2_LIBRARIES})
+    message(STATUS "SDL2 found via pkg-config — blytplay (SDL2) will be built")
   else()
     # Last resort: try sdl2-config
     find_program(SDL2_CONFIG sdl2-config)
@@ -768,31 +768,31 @@ else()
         OUTPUT_STRIP_TRAILING_WHITESPACE)
       separate_arguments(SDL2_CFLAGS_LIST UNIX_COMMAND "${SDL2_CFLAGS}")
       separate_arguments(SDL2_LDFLAGS_LIST UNIX_COMMAND "${SDL2_LDFLAGS}")
-      add_executable(blytrun frontends/sdl/main.c)
-      target_compile_options(blytrun PRIVATE ${SDL2_CFLAGS_LIST})
-      target_link_options(blytrun PRIVATE ${SDL2_LDFLAGS_LIST})
-      target_link_libraries(blytrun PRIVATE libblyt)
+      add_executable(blytplay frontends/player/main.c)
+      target_compile_options(blytplay PRIVATE ${SDL2_CFLAGS_LIST})
+      target_link_options(blytplay PRIVATE ${SDL2_LDFLAGS_LIST})
+      target_link_libraries(blytplay PRIVATE libblyt)
       message(
-        STATUS "SDL2 found via sdl2-config — blytrun (SDL2) will be built")
+        STATUS "SDL2 found via sdl2-config — blytplay (SDL2) will be built")
     else()
-      message(STATUS "SDL2 not found — blytrun (SDL2) will not be built")
+      message(STATUS "SDL2 not found — blytplay (SDL2) will not be built")
     endif()
   endif()
 endif()
 
-# blytrun drives the runtime via the libretro API (blyt_libretro.c compiled in
+# blytplay drives the runtime via the libretro API (blyt_libretro.c compiled in
 # directly, without BLYT_EMBED_LIBS so dynlink uses BLYT_LIB_DIR as usual).
-if(TARGET blytrun)
-  target_sources(blytrun PRIVATE frontends/libretro/blyt_libretro.c)
+if(TARGET blytplay)
+  target_sources(blytplay PRIVATE frontends/libretro/blyt_libretro.c)
   target_include_directories(
-    blytrun PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
+    blytplay PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
                     "${CMAKE_SOURCE_DIR}/runtime/host/include")
-  target_compile_definitions(blytrun PRIVATE BLYT_VERSION="${BLYT_VERSION}")
+  target_compile_definitions(blytplay PRIVATE BLYT_VERSION="${BLYT_VERSION}")
   if(BLYT_DAP)
-    target_compile_definitions(blytrun PRIVATE BLYT_DAP=1)
+    target_compile_definitions(blytplay PRIVATE BLYT_DAP=1)
   endif()
   if(BLYT_GDB AND Threads_FOUND)
-    target_compile_definitions(blytrun PRIVATE BLYT_GDB=1)
+    target_compile_definitions(blytplay PRIVATE BLYT_GDB=1)
   endif()
 endif()
 
@@ -1079,7 +1079,7 @@ add_custom_target(
 if(APPLE)
   find_program(DSYMUTIL dsymutil)
   if(DSYMUTIL)
-    foreach(_bin blytrun test_cart_load test_cart_run verify_cart)
+    foreach(_bin blytplay test_cart_load test_cart_run verify_cart)
       if(TARGET ${_bin})
         add_custom_command(
           TARGET ${_bin}
@@ -1129,7 +1129,7 @@ file(
   "${CMAKE_SOURCE_DIR}/tests/unit/*.c"
   "${CMAKE_SOURCE_DIR}/tests/tools/*.c"
   "${CMAKE_SOURCE_DIR}/tests/game/hello-c/src/game/c/*.c"
-  "${CMAKE_SOURCE_DIR}/frontends/sdl/main.c"
+  "${CMAKE_SOURCE_DIR}/frontends/player/main.c"
   "${CMAKE_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
   "${CMAKE_SOURCE_DIR}/frontends/wasm/wasm_main.c"
   "${CMAKE_SOURCE_DIR}/frontends/native/launcher.c"

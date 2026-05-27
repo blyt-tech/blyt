@@ -2,7 +2,7 @@
 #
 # Assembles a self-contained blyt SDK under build/sdk/:
 #
-# build/sdk/ bin/        blyt (devtool), blytrun (SDL2 runtime) include/ blyt.h,
+# build/sdk/ bin/        blyt (devtool), blytplay (SDL2 runtime) include/ blyt.h,
 # blyt32.h, blyt_runtime.h lib/        libblytcommon.so, libblyt32.so
 # (RV32IMAFC) toolchain/  clang, ld.lld, llvm-objcopy, … (downloaded LLVM)
 #
@@ -841,11 +841,11 @@ if(FOUND_AR)
   file(CREATE_LINK "${FOUND_AR}" "${SDK_BIN}/blyt-llvm-ar" SYMBOLIC)
 endif()
 # -------------------------------------------------------------------------
-# Step 5: blytrun (if built)
+# Step 5: blytplay (if built)
 # -------------------------------------------------------------------------
 
-if(EXISTS "${BLYT_BINARY_DIR}/blytrun")
-  file(COPY "${BLYT_BINARY_DIR}/blytrun" DESTINATION "${SDK_BIN}")
+if(EXISTS "${BLYT_BINARY_DIR}/blytplay")
+  file(COPY "${BLYT_BINARY_DIR}/blytplay" DESTINATION "${SDK_BIN}")
 endif()
 
 # -------------------------------------------------------------------------
@@ -939,7 +939,7 @@ endif()
 # -------------------------------------------------------------------------
 # Step 7: WASM runtime (optional — requires Emscripten)
 #
-# Builds blytrun.js + blytrun.wasm using the guest libraries from Step 2.
+# Builds blytplay.js + blytplay.wasm using the guest libraries from Step 2.
 # Outputs land in sdk/share/wasm/ so `blyt run` can locate them and developers
 # can embed them directly without any build commands.
 #
@@ -950,7 +950,7 @@ set(SDK_SHARE_WASM "${SDK_DIR}/share/wasm")
 
 find_program(EMCC emcc)
 if(EMCC)
-  message(STATUS "Building blytrun WASM runtime (emcc found at ${EMCC})…")
+  message(STATUS "Building blytplay WASM runtime (emcc found at ${EMCC})…")
 
   file(MAKE_DIRECTORY "${SDK_SHARE_WASM}")
 
@@ -965,7 +965,7 @@ if(EMCC)
   if(NOT R EQUAL 0)
     message(
       WARNING
-        "blytrun WASM: emcmake cmake configure failed — skipping WASM step")
+        "blytplay WASM: emcmake cmake configure failed — skipping WASM step")
     set(EMCC "")
   endif()
 endif()
@@ -974,15 +974,15 @@ if(EMCC)
   execute_process(COMMAND ${CMAKE_COMMAND} --build
                           "${BLYT_BINARY_DIR}/build-wasm" RESULT_VARIABLE R)
   if(NOT R EQUAL 0)
-    message(WARNING "blytrun WASM: build failed — skipping WASM step")
+    message(WARNING "blytplay WASM: build failed — skipping WASM step")
     set(EMCC "")
   endif()
 endif()
 
 if(EMCC)
-  # Ship blytrun.js + blytrun.wasm.  The dev shell (blytrun.html) is kept
+  # Ship blytplay.js + blytplay.wasm.  The dev shell (blytplay.html) is kept
   # internal to `blyt run`; developers write their own page using the README.
-  foreach(_F blytrun.js blytrun.wasm blytrun.html)
+  foreach(_F blytplay.js blytplay.wasm blytplay.html)
     if(EXISTS "${BLYT_BINARY_DIR}/build-wasm/${_F}")
       file(COPY "${BLYT_BINARY_DIR}/build-wasm/${_F}"
            DESTINATION "${SDK_SHARE_WASM}")
@@ -992,9 +992,9 @@ if(EMCC)
   # Write the embedding README alongside the runtime files.
   file(
     WRITE "${SDK_SHARE_WASM}/README.md"
-    "# blytrun WASM runtime\n\
+    "# blytplay WASM runtime\n\
 \n\
-`blytrun.js` and `blytrun.wasm` are the blyt emulator compiled to WebAssembly\n\
+`blytplay.js` and `blytplay.wasm` are the blyt emulator compiled to WebAssembly\n\
 via Emscripten.  Drop them on any HTTP server alongside your cart and a page\n\
 that wires up the canvas — no build tools required.\n\
 \n\
@@ -1035,7 +1035,7 @@ that wires up the canvas — no build tools required.\n\
       printErr: function(s) { console.error(s); },\n\
     };\n\
   </script>\n\
-  <script src=\"blytrun.js\"></script>\n\
+  <script src=\"blytplay.js\"></script>\n\
 </body>\n\
 </html>\n\
 ```\n\
@@ -1049,13 +1049,13 @@ and opens the correct URL.  It uses an internal shell page; for a\n\
 production-ready page use the template above as a starting point.\n\
 ")
 
-  message(STATUS "blytrun WASM runtime assembled at ${SDK_SHARE_WASM}")
+  message(STATUS "blytplay WASM runtime assembled at ${SDK_SHARE_WASM}")
   message(STATUS "  Embed in a page: see ${SDK_SHARE_WASM}/README.md")
   message(STATUS "  Run a cart:      ${SDK_BIN}/blyt run <cart.blyt>")
 else()
   message(
     STATUS
-      "blytrun WASM: skipped (emcc not found — install Emscripten to build WASM runtime)"
+      "blytplay WASM: skipped (emcc not found — install Emscripten to build WASM runtime)"
   )
 endif()
 

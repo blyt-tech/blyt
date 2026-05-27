@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(blytrun C)
+project(blytplay C)
 
 # -------------------------------------------------------------------------
 # Guard: this project must be configured with Emscripten. Usage: emcmake cmake
@@ -8,7 +8,7 @@ project(blytrun C)
 if(NOT EMSCRIPTEN)
   message(
     FATAL_ERROR
-      "blytrun (WASM) must be built with Emscripten.\n" "Configure with:\n"
+      "blytplay (WASM) must be built with Emscripten.\n" "Configure with:\n"
       "  emcmake cmake -B build-wasm -S frontends/wasm\n"
       "  cmake --build build-wasm")
 endif()
@@ -117,7 +117,7 @@ endif()
 # -------------------------------------------------------------------------
 # DAP debugging support (Lua source-level via Debug Adapter Protocol)
 #
-# When ON: compile dap_transport_wasm.c + master_hook.c into blytrun and define
+# When ON: compile dap_transport_wasm.c + master_hook.c into blytplay and define
 # BLYT_DAP=1.  Pausing the Lua VM uses Lua coroutine yield (not ASYNCIFY), so no
 # special link options are needed.
 # -------------------------------------------------------------------------
@@ -148,7 +148,7 @@ endif()
 # -------------------------------------------------------------------------
 # GDB RSP debugging support (WebSocket transport)
 #
-# When ON: compile gdb_stub.c + gdb_transport_wasm.c into blytrun and define
+# When ON: compile gdb_stub.c + gdb_transport_wasm.c into blytplay and define
 # BLYT_GDB=1.  The WebSocket transport is non-blocking; the emulator polls each
 # animation tick via blyt_session_run_frame (no threads needed).
 # -------------------------------------------------------------------------
@@ -176,7 +176,7 @@ endif()
 # -------------------------------------------------------------------------
 # Embed guest libraries as C byte arrays (same approach as blyt_libretro)
 # -------------------------------------------------------------------------
-set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blytrun_embedded_libs.c")
+set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blytplay_embedded_libs.c")
 set(LIBBLYTCOMMON "${BLYT_GUEST_LIB_DIR}/libblytcommon.so")
 set(LIBBLYTC "${BLYT_GUEST_LIB_DIR}/libblytc.so")
 set(LIBBLYT32 "${BLYT_GUEST_LIB_DIR}/libblyt32.so")
@@ -186,7 +186,7 @@ add_custom_command(
   COMMAND python3 "${BLYT_ROOT}/cmake/bin2c.py" blytcommon_so "${LIBBLYTCOMMON}"
           blytc_so "${LIBBLYTC}" blyt32_so "${LIBBLYT32}" "${EMBEDDED_LIBS_C}"
   DEPENDS "${LIBBLYTCOMMON}" "${LIBBLYTC}" "${LIBBLYT32}"
-  COMMENT "Embedding guest libs for blytrun (WASM)"
+  COMMENT "Embedding guest libs for blytplay (WASM)"
   VERBATIM)
 
 # -------------------------------------------------------------------------
@@ -293,10 +293,10 @@ set(RV32EMU_FEATURE_DEFS
 file(GLOB FLATCCRT_SOURCES "${BLYT_ROOT}/third_party/flatcc/src/runtime/*.c")
 
 # -------------------------------------------------------------------------
-# blytrun executable
+# blytplay executable
 # -------------------------------------------------------------------------
 add_executable(
-  blytrun
+  blytplay
   "${CMAKE_CURRENT_SOURCE_DIR}/wasm_main.c"
   "${EMBEDDED_LIBS_C}"
   ${RV32EMU_SOURCES}
@@ -309,8 +309,8 @@ add_executable(
   ${BLYT_DAP_SOURCES}
   ${BLYT_GDB_SOURCES})
 
-# Produce blytrun.html + blytrun.js + blytrun.wasm
-set_target_properties(blytrun PROPERTIES SUFFIX ".html")
+# Produce blytplay.html + blytplay.js + blytplay.wasm
+set_target_properties(blytplay PROPERTIES SUFFIX ".html")
 
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)
@@ -318,7 +318,7 @@ if(BLYT_LUA_SOURCES)
 endif()
 
 target_compile_definitions(
-  blytrun PRIVATE ${RV32EMU_FEATURE_DEFS} BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS}
+  blytplay PRIVATE ${RV32EMU_FEATURE_DEFS} BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS}
                   ${BLYT_DAP_DEFS} ${BLYT_GDB_DEFS})
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
@@ -333,7 +333,7 @@ foreach(_SRC ${RV32EMU_SOURCES} ${SOFTFLOAT_SOURCES})
 endforeach()
 
 target_compile_options(
-  blytrun
+  blytplay
   PRIVATE -DBLYT_VERSION="${BLYT_VERSION}"
           # Softfloat
           -DLITTLEENDIAN=1
@@ -365,7 +365,7 @@ if(BLYT_GDB_SOURCES)
 endif()
 
 target_include_directories(
-  blytrun
+  blytplay
   PRIVATE "${RV32EMU_DIR}"
           "${SOFTFLOAT_SRC}/include"
           "${SOFTFLOAT_SRC}/RISCV"
@@ -380,7 +380,7 @@ target_include_directories(
 
 # Emscripten link options
 target_link_options(
-  blytrun
+  blytplay
   PRIVATE
   ${BLYT_DAP_LINK_OPTS}
   ${BLYT_GDB_LINK_OPTS}
@@ -412,8 +412,8 @@ target_link_options(
 # -------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------
-message(STATUS "blytrun (WASM) configured")
-message(STATUS "  Output:    ${CMAKE_BINARY_DIR}/blytrun.js + blytrun.wasm")
+message(STATUS "blytplay (WASM) configured")
+message(STATUS "  Output:    ${CMAKE_BINARY_DIR}/blytplay.js + blytplay.wasm")
 message(STATUS "  WASM dir:  ${CMAKE_BINARY_DIR}")
 message(
   STATUS

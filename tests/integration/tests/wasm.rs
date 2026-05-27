@@ -8,7 +8,7 @@ use common::{
 use std::fs;
 use tempfile::TempDir;
 
-/// WASM gate test: run an idle cart inside blytrun.js under Node.js and
+/// WASM gate test: run an idle cart inside blytplay.js under Node.js and
 /// compare the first rendered XRGB8888 frame byte-for-byte against the same
 /// golden file used by testcard_frame0_matches_golden.
 ///
@@ -16,7 +16,7 @@ use tempfile::TempDir;
 ///   emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm
 /// (or cmake --build build --target sdk when emcc is present).
 ///
-/// Silently skipped when blytrun.js is not found.
+/// Silently skipped when blytplay.js is not found.
 #[test]
 fn wasm_testcard_frame0_matches_golden() {
     require_wasm();
@@ -73,7 +73,7 @@ void blyt_cart_draw(void)   {}
 /// blyt build wasm: exporting a pre-built cart produces a self-contained HTML
 /// page with the WASM runtime and cart embedded as base64.
 ///
-/// Silently skipped when blytrun.js is not found.
+/// Silently skipped when blytplay.js is not found.
 #[test]
 fn build_wasm_produces_html() {
     require_wasm();
@@ -142,7 +142,7 @@ void blyt_cart_draw(void)   {}
 /// blyt build all: compiling and exporting in one step produces both a .blyt
 /// cart and a .html page, with the HTML containing the embedded runtime.
 ///
-/// Silently skipped when blytrun.js is not found.
+/// Silently skipped when blytplay.js is not found.
 #[test]
 fn build_all_produces_cart_and_html() {
     require_wasm();

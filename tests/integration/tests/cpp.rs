@@ -1,7 +1,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{CartProject, blytrun, build_cart, require_cpp_sdk, sdk_dir};
+use common::{CartProject, blytplay, build_cart, require_cpp_sdk, sdk_dir};
 use tempfile::TempDir;
 
 /// Build and run a minimal C++ cart.
@@ -42,7 +42,7 @@ extern "C" void blyt_cart_draw()   {}
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()

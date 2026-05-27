@@ -1,0 +1,72 @@
+# Dockerfile.testing — Linux test environment matching GitHub Actions ubuntu-24.04.
+#
+# Used by the test-linux-docker cmake target to run integration tests locally on
+# a Linux guest that mirrors CI.  Build time: ~15 min first run; cached layers
+# rebuild in seconds.
+#
+# Usage (via cmake):
+#   cmake --build build --target test-linux-docker
+#   # single test:
+#   cmake -DBLYT_LINUX_TEST_FILTER=sdl_hybrid_gdb_and_dap -B build
+#   cmake --build build --target test-linux-docker
+
+FROM --platform=linux/amd64 ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System packages + LLVM 22 ──────────────────────────────────────────────────
+RUN apt-get update -q \
+    && apt-get install -y --no-install-recommends curl ca-certificates gpg \
+    && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+       | gpg --dearmor -o /etc/apt/keyrings/apt.llvm.org.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] \
+       https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+       > /etc/apt/sources.list.d/llvm-22.list \
+    && apt-get update -q \
+    && apt-get install -y --no-install-recommends \
+       cmake ninja-build libsdl2-dev \
+       clang-22 lld-22 llvm-22 \
+       qemu-system-misc \
+       gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+       libc6-dev-riscv64-cross libgcc-s1-riscv64-cross \
+       python3-pip git pkg-config binutils xz-utils \
+    && update-alternatives \
+       --install /usr/bin/clang        clang        /usr/bin/clang-22        100 \
+    && update-alternatives \
+       --install /usr/bin/clang++       clang++       /usr/bin/clang++-22       100 \
+    && update-alternatives \
+       --install /usr/bin/cc            cc            /usr/bin/clang-22        100 \
+    && update-alternatives \
+       --install /usr/bin/c++           c++           /usr/bin/clang++-22      100 \
+    && update-alternatives \
+       --install /usr/bin/ld.lld        ld.lld        /usr/bin/ld.lld-22        100 \
+    && update-alternatives \
+       --install /usr/bin/llvm-objcopy  llvm-objcopy  /usr/bin/llvm-objcopy-22  100 \
+    && update-alternatives \
+       --install /usr/bin/llvm-ar       llvm-ar       /usr/bin/llvm-ar-22       100 \
+    && pip3 install --break-system-packages clang-format==22.1.5 cmakelang yamllint \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Node.js 22 ─────────────────────────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Rust ───────────────────────────────────────────────────────────────────────
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --default-toolchain stable \
+    && rustup target add riscv32imafc-unknown-none-elf
+
+# ── Emscripten SDK ─────────────────────────────────────────────────────────────
+RUN git clone --depth 1 https://github.com/emscripten-core/emsdk.git /opt/emsdk \
+    && /opt/emsdk/emsdk install latest \
+    && /opt/emsdk/emsdk activate latest
+ENV EMSDK=/opt/emsdk \
+    EM_CONFIG=/opt/emsdk/.emscripten
+
+WORKDIR /repo

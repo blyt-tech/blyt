@@ -2,7 +2,7 @@
 /*
  * tests/dap/run_dap_test.mjs — end-to-end WASM DAP test orchestrator.
  *
- * Starts an in-process WebSocket relay, loads blytrun.js (the WASM binary)
+ * Starts an in-process WebSocket relay, loads blytplay.js (the WASM binary)
  * with the relay port injected, then runs dap_test.mjs against the relay.
  *
  * Usage:
@@ -167,7 +167,7 @@ function startRelay() {
     });
 }
 
-/* ── Load blytrun.js via require() (same as run_cart.js) ────────────────── */
+/* ── Load blytplay.js via require() (same as run_cart.js) ────────────────── */
 
 function loadWasmRuntime(wasmDir, cartPath, dapPort) {
     return new Promise((resolve, reject) => {
@@ -188,7 +188,7 @@ function loadWasmRuntime(wasmDir, cartPath, dapPort) {
 
         try {
             const require = createRequire(import.meta.url);
-            require(path.join(wasmDir, 'blytrun.js'));
+            require(path.join(wasmDir, 'blytplay.js'));
         } catch (e) {
             reject(e);
         }

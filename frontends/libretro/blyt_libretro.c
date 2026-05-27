@@ -16,7 +16,7 @@
 
 /* Embedded guest library blobs — only present when BLYT_EMBED_LIBS is defined
  * (i.e. when building the standalone libretro .so via cmake/blyt_sdk.cmake).
- * When blyt_libretro.c is compiled into blytrun without embedding, dynlink
+ * When blyt_libretro.c is compiled into blytplay without embedding, dynlink
  * falls back to BLYT_LIB_DIR as usual. */
 #ifdef BLYT_EMBED_LIBS
 extern const unsigned char blytcommon_so[];

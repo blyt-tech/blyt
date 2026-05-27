@@ -2,12 +2,12 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_lua_cart, find_wasm_dir, libretro_so, repo_root,
+    CartProject, blytplay, build_lua_cart, find_wasm_dir, libretro_so, repo_root,
     require_libretro_dap, require_lua_sdk, require_sdk, require_wasm, sdk_dir, test_libretro_dap,
 };
 use tempfile::TempDir;
 
-/// WASM DAP gate test: set a breakpoint in a Lua cart running inside blytrun.js,
+/// WASM DAP gate test: set a breakpoint in a Lua cart running inside blytplay.js,
 /// verify the stopped event, inspect locals, step over, and continue to completion.
 ///
 /// Requires the WASM runtime to have been built with BLYT_DAP=ON:
@@ -55,18 +55,18 @@ fn wasm_dap_breakpoint_step_inspect() {
         .success();
 }
 
-/// SDL2 DAP gate: set a breakpoint in a Lua cart running under blytrun --debug
+/// SDL2 DAP gate: set a breakpoint in a Lua cart running under blytplay --debug
 /// --headless, connect a TCP DAP client, verify stopped / step / continue.
 ///
-/// Requires the native build (blytrun + libblyt32lua.so) and Lua SDK.
+/// Requires the native build (blytplay + libblyt32lua.so) and Lua SDK.
 /// Uses BLYT_DAP_BP_LINE=3 (third line of init(), "local y = x + 1").
 #[test]
 fn sdl_dap_breakpoint_step_inspect() {
     require_sdk();
     require_lua_sdk();
     assert!(
-        blytrun().exists(),
-        "blytrun not built — run `cmake --build build` first"
+        blytplay().exists(),
+        "blytplay not built — run `cmake --build build` first"
     );
 
     let tmp = TempDir::new().unwrap();
@@ -90,7 +90,7 @@ fn sdl_dap_breakpoint_step_inspect() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytrun().to_str().unwrap(),
+            blytplay().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))

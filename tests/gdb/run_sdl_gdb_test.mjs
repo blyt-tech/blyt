@@ -2,12 +2,12 @@
 /*
  * tests/gdb/run_sdl_gdb_test.mjs — SDL2 GDB test orchestrator.
  *
- * Spawns blytrun --gdb 0 --headless <cart>, waits for the GDB TCP port to
+ * Spawns blytplay --gdb 0 --headless <cart>, waits for the GDB TCP port to
  * appear on stdout ("blyt: GDB listening on port N"), then runs gdb_test.mjs
  * in TCP mode against that port.
  *
  * Usage:
- *   node run_sdl_gdb_test.mjs <blytrun_path> <cart_path>
+ *   node run_sdl_gdb_test.mjs <blytplay_path> <cart_path>
  *
  * Environment:
  *   BLYT_GDB_BREAK_ADDR — hex address to set Z0 breakpoint (passed to gdb_test.mjs)
@@ -28,7 +28,7 @@ const BLYTRUN = process.argv[2];
 const CART    = process.argv[3];
 
 if (!BLYTRUN || !CART) {
-    process.stderr.write('usage: run_sdl_gdb_test.mjs <blytrun> <cart>\n');
+    process.stderr.write('usage: run_sdl_gdb_test.mjs <blytplay> <cart>\n');
     process.exit(1);
 }
 
@@ -37,7 +37,7 @@ function findGdbPort(proc) {
     return new Promise((resolve, reject) => {
         let buf = '';
         const timer = setTimeout(
-            () => reject(new Error('timeout: blytrun did not print GDB port')),
+            () => reject(new Error('timeout: blytplay did not print GDB port')),
             15000
         );
         function check(chunk) {
@@ -50,20 +50,20 @@ function findGdbPort(proc) {
         proc.on('exit', (code) => {
             clearTimeout(timer);
             if (code !== null && code !== 0)
-                reject(new Error(`blytrun exited early with code ${code}`));
+                reject(new Error(`blytplay exited early with code ${code}`));
         });
         proc.on('error', (e) => { clearTimeout(timer); reject(e); });
     });
 }
 
 async function main() {
-    const blytrun = spawn(BLYTRUN, ['--gdb', '0', '--headless', CART], {
+    const blytplay = spawn(BLYTRUN, ['--gdb', '0', '--headless', CART], {
         stdio: ['ignore', 'pipe', 'pipe'],
     });
-    blytrun.stderr.on('data', (d) => process.stderr.write(d));
+    blytplay.stderr.on('data', (d) => process.stderr.write(d));
 
-    const port = await findGdbPort(blytrun);
-    console.log(`[sdl_gdb_test] blytrun GDB on tcp://127.0.0.1:${port}`);
+    const port = await findGdbPort(blytplay);
+    console.log(`[sdl_gdb_test] blytplay GDB on tcp://127.0.0.1:${port}`);
 
     const testScript = path.join(__dirname, 'gdb_test.mjs');
     const endpoint   = `tcp://127.0.0.1:${port}`;
@@ -84,10 +84,10 @@ async function main() {
         );
     });
 
-    /* gdb_test sent vCont;c; wait for blytrun to exit (cart completes). */
+    /* gdb_test sent vCont;c; wait for blytplay to exit (cart completes). */
     await new Promise((resolve) => {
-        blytrun.on('exit', resolve);
-        setTimeout(() => { blytrun.kill(); resolve(); }, 5000);
+        blytplay.on('exit', resolve);
+        setTimeout(() => { blytplay.kill(); resolve(); }, 5000);
     });
 }
 

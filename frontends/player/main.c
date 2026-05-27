@@ -166,7 +166,7 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
         } else if (argv[i][0] != '-') {
             cart = argv[i];
         } else {
-            fprintf(stderr, "blytrun: unknown flag: %s\n", argv[i]);
+            fprintf(stderr, "blytplay: unknown flag: %s\n", argv[i]);
             return NULL;
         }
     }
@@ -177,7 +177,7 @@ int main(int argc, char *argv[]) {
     bool headless;
     const char *cart_path = parse_args(argc, argv, &headless);
     if (!cart_path) {
-        fprintf(stderr, "usage: blytrun [--headless] <cart.blyt>\n");
+        fprintf(stderr, "usage: blytplay [--headless] <cart.blyt>\n");
         return 1;
     }
 
@@ -206,7 +206,7 @@ int main(int argc, char *argv[]) {
 
     struct retro_game_info game = {.path = cart_path, .data = NULL, .size = 0, .meta = NULL};
     if (!retro_load_game(&game)) {
-        fprintf(stderr, "blytrun: failed to load cart: %s\n", cart_path);
+        fprintf(stderr, "blytplay: failed to load cart: %s\n", cart_path);
         retro_deinit();
         return 1;
     }
@@ -233,7 +233,7 @@ int main(int argc, char *argv[]) {
     SDL_Window *win = NULL;
     if (!headless) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
-            fprintf(stderr, "blytrun: SDL_Init failed: %s\n", SDL_GetError());
+            fprintf(stderr, "blytplay: SDL_Init failed: %s\n", SDL_GetError());
             retro_unload_game();
             retro_deinit();
             return 1;
@@ -243,7 +243,7 @@ int main(int argc, char *argv[]) {
                                (int)av.geometry.base_width * 2, (int)av.geometry.base_height * 2,
                                SDL_WINDOW_SHOWN);
         if (!win) {
-            fprintf(stderr, "blytrun: SDL_CreateWindow failed: %s\n", SDL_GetError());
+            fprintf(stderr, "blytplay: SDL_CreateWindow failed: %s\n", SDL_GetError());
             SDL_Quit();
             retro_unload_game();
             retro_deinit();

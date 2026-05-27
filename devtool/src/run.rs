@@ -43,7 +43,7 @@ pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
     let wasm_dir = find_wasm_dir()?;
 
     // Validate that required WASM files are present.
-    for name in &["blytrun.js", "blytrun.wasm", "blytrun.html"] {
+    for name in &["blytplay.js", "blytplay.wasm", "blytplay.html"] {
         if !wasm_dir.join(name).exists() {
             return Err(err(format!(
                 "WASM runtime file missing: {}/{}\n\
@@ -361,18 +361,18 @@ mod tests {
 pub(crate) fn find_wasm_dir() -> Result<PathBuf, RunError> {
     if let Ok(d) = std::env::var("BLYT_WASM_DIR") {
         let p = PathBuf::from(&d);
-        if p.join("blytrun.js").exists() {
+        if p.join("blytplay.js").exists() {
             return Ok(p);
         }
         return Err(err(format!(
-            "BLYT_WASM_DIR={d} does not contain blytrun.js"
+            "BLYT_WASM_DIR={d} does not contain blytplay.js"
         )));
     }
 
-    // SDK layout: <sdk>/share/wasm/blytrun.js  (binary lives in <sdk>/bin/blyt)
+    // SDK layout: <sdk>/share/wasm/blytplay.js  (binary lives in <sdk>/bin/blyt)
     if let Some(sdk) = sdk_root_from_exe() {
         let p = sdk.join("share").join("wasm");
-        if p.join("blytrun.js").exists() {
+        if p.join("blytplay.js").exists() {
             return Ok(p);
         }
     }
@@ -381,17 +381,17 @@ pub(crate) fn find_wasm_dir() -> Result<PathBuf, RunError> {
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().skip(1) {
             let candidate = ancestor.join("build-wasm");
-            if candidate.join("blytrun.js").exists() {
+            if candidate.join("blytplay.js").exists() {
                 return Ok(candidate);
             }
         }
     }
 
     Err(err(
-        "cannot find blytrun.js — build the WASM runtime first:\n\
+        "cannot find blytplay.js — build the WASM runtime first:\n\
          \x20 emcmake cmake -B build-wasm -S frontends/wasm\n\
          \x20 cmake --build build-wasm\n\
-         or set BLYT_WASM_DIR to the directory containing blytrun.js.",
+         or set BLYT_WASM_DIR to the directory containing blytplay.js.",
     ))
 }
 
@@ -587,12 +587,12 @@ fn handle_connection(
 
     let (file_path, content_type, inject_dap): (PathBuf, &str, bool) = match path {
         "/" | "/index.html" => (
-            wasm_dir.join("blytrun.html"),
+            wasm_dir.join("blytplay.html"),
             "text/html; charset=utf-8",
             true,
         ),
-        "/blytrun.js" => (wasm_dir.join("blytrun.js"), "application/javascript", false),
-        "/blytrun.wasm" => (wasm_dir.join("blytrun.wasm"), "application/wasm", false),
+        "/blytplay.js" => (wasm_dir.join("blytplay.js"), "application/javascript", false),
+        "/blytplay.wasm" => (wasm_dir.join("blytplay.wasm"), "application/wasm", false),
         "/cart.blyt" => (cart_path.to_path_buf(), "application/octet-stream", false),
         _ => {
             respond(&mut stream, 404, "text/plain", b"Not Found");

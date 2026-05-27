@@ -2,7 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blyt_bin, blytrun, build_cart, repo_root, require_sdk, require_test_session_api,
+    CartProject, blyt_bin, blytplay, build_cart, repo_root, require_sdk, require_test_session_api,
     sdk_dir, test_session_api, write_c_cart_project,
 };
 use predicates::prelude::*;
@@ -104,7 +104,7 @@ void blyt_cart_draw(void)   {}
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
@@ -235,7 +235,7 @@ void blyt_cart_draw(void)   {}
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
@@ -457,7 +457,7 @@ void blyt_cart_draw(void)   {}
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
     let frame_path = tmp.path().join("frame0.bin");
-    Command::new(blytrun())
+    Command::new(blytplay())
         .args([
             "--dump-frame0",
             frame_path.to_str().unwrap(),
@@ -521,7 +521,7 @@ void blyt_cart_draw(void)   {}
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
@@ -566,7 +566,7 @@ void blyt_cart_draw(void)   {}
         .write(&project);
 
     let cart = build_cart(&project);
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
@@ -618,7 +618,7 @@ void blyt_cart_draw(void)   {}
         .write(&project);
 
     let cart = build_cart(&project);
-    let output = Command::new(blytrun())
+    let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
