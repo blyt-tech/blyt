@@ -4,8 +4,13 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug",
+            "name": "Debug Lua",
             "type": "blyt-lua",
+            "request": "launch"
+        },
+        {
+            "name": "Debug Native (GDB)",
+            "type": "blyt-native-gdb",
             "request": "launch"
         }
     ]
