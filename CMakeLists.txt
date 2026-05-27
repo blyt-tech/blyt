@@ -1134,3 +1134,56 @@ add_custom_target(
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
   COMMENT "Linting: clang-format, cmake-format, yamllint, cargo fmt"
   VERBATIM)
+
+# ── test-linux-docker ─────────────────────────────────────────────────────────
+# Run integration tests inside a Linux Docker container that mirrors the GitHub
+# CI environment (ubuntu-24.04 + LLVM 22 + Rust + emsdk).
+#
+# Usage: cmake --build build --target test-linux-docker
+#
+# To run a single test, reconfigure with a filter first: cmake
+# -DBLYT_LINUX_TEST_FILTER=sdl_hybrid_gdb_and_dap -B build cmake --build build
+# --target test-linux-docker
+#
+# To test arm64, pass -DBLYT_LINUX_ARCH=arm64. Each arch keeps its own named
+# Docker image and build volumes so switching architectures does not require a
+# full rebuild of the other.
+#
+# Delete volumes with: docker volume rm blyt-linux-build-amd64
+# blyt-linux-cargo-amd64
+set(BLYT_LINUX_TEST_FILTER
+    ""
+    CACHE
+      STRING
+      "Cargo test filter for test-linux-docker (e.g. sdl_hybrid_gdb_and_dap)")
+set(BLYT_LINUX_ARCH
+    "amd64"
+    CACHE STRING
+          "Docker target architecture for test-linux-docker (amd64 or arm64)")
+find_program(
+  _BLYT_DOCKER docker
+  HINTS /usr/local/bin /opt/homebrew/bin /usr/bin NO_CACHE
+  NO_DEFAULT_PATH)
+if(_BLYT_DOCKER)
+  add_custom_target(
+    test-linux-docker
+    COMMAND
+      /usr/bin/env docker build --platform linux/${BLYT_LINUX_ARCH} -t
+      blyt-testing-${BLYT_LINUX_ARCH} -f
+      "${CMAKE_SOURCE_DIR}/Dockerfile.testing" "${CMAKE_SOURCE_DIR}"
+    COMMAND
+      /usr/bin/env docker run --platform linux/${BLYT_LINUX_ARCH} --rm -v
+      "${CMAKE_SOURCE_DIR}:/repo:ro" -v
+      blyt-linux-build-${BLYT_LINUX_ARCH}:/build -v
+      blyt-linux-cargo-${BLYT_LINUX_ARCH}:/root/.cargo
+      blyt-testing-${BLYT_LINUX_ARCH} bash -c
+      "source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1; set -e && cmake -B /build -G Ninja /repo && cmake --build /build --parallel && cmake --build /build --target sdk && BLYT_BUILD_DIR=/build CARGO_TARGET_DIR=/build/cargo-target cargo test --workspace -- ${BLYT_LINUX_TEST_FILTER} --nocapture"
+    COMMENT "Building and running integration tests in Linux Docker container"
+    USES_TERMINAL VERBATIM)
+else()
+  add_custom_target(
+    test-linux-docker
+    COMMAND ${CMAKE_COMMAND} -E echo
+            "Docker not found — install Docker Desktop to run Linux tests"
+    COMMENT "test-linux-docker requires Docker")
+endif()
