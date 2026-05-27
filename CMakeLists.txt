@@ -1162,7 +1162,6 @@ add_custom_target(
 # full rebuild of the other.
 #
 # Delete volumes with: docker volume rm blyt-linux-build-amd64
-# blyt-linux-cargo-amd64
 set(BLYT_LINUX_TEST_FILTER
     ""
     CACHE
@@ -1186,10 +1185,9 @@ if(_BLYT_DOCKER)
     COMMAND
       /usr/bin/env docker run --platform linux/${BLYT_LINUX_ARCH} --rm -v
       "${CMAKE_SOURCE_DIR}:/repo:ro" -v
-      blyt-linux-build-${BLYT_LINUX_ARCH}:/build -v
-      blyt-linux-cargo-${BLYT_LINUX_ARCH}:/root/.cargo
-      blyt-testing-${BLYT_LINUX_ARCH} bash -c
-      "source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1; set -e && cmake -B /build -G Ninja /repo && cmake --build /build --parallel && cmake --build /build --target sdk && BLYT_BUILD_DIR=/build CARGO_TARGET_DIR=/build/cargo-target cargo test --workspace -- ${BLYT_LINUX_TEST_FILTER} --nocapture"
+      blyt-linux-build-${BLYT_LINUX_ARCH}:/build blyt-testing-${BLYT_LINUX_ARCH}
+      bash -c
+      "source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1; set -e && cmake -B /build -G Ninja /repo && cmake --build /build --parallel && cmake --build /build --target sdk && BLYT_BUILD_DIR=/build CARGO_HOME=/build/cargo-home CARGO_TARGET_DIR=/build/cargo-target cargo test --workspace -- ${BLYT_LINUX_TEST_FILTER} --nocapture"
     COMMENT "Building and running integration tests in Linux Docker container"
     USES_TERMINAL VERBATIM)
 else()

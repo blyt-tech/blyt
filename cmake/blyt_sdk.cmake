@@ -787,10 +787,12 @@ endif()
 
 file(MAKE_DIRECTORY "${SDK_BIN}")
 set(_cargo_target_dir "${BLYT_BINARY_DIR}/cargo-target")
+set(ENV{CARGO_HOME} "${BLYT_BINARY_DIR}/cargo-home")
 set(ENV{CARGO_TARGET_DIR} "${_cargo_target_dir}")
 execute_process(
   COMMAND cargo build --manifest-path "${BLYT_SOURCE_DIR}/Cargo.toml" --bin blyt
   RESULT_VARIABLE R)
+unset(ENV{CARGO_HOME})
 unset(ENV{CARGO_TARGET_DIR})
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build blyt devtool")
