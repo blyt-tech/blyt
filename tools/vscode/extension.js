@@ -273,8 +273,8 @@ function detectAnyCart(folder) {
 
 /* ── VS Code project setup ────────────────────────────────────────────────── */
 
-/* For each workspace folder that is a Lua cart project, run
- * `blyt setup vscode <dir>` if .vscode/launch.json is missing.
+/* For each workspace folder that is any blyt cart project (Lua or native),
+ * run `blyt setup vscode <dir>` if .vscode/launch.json is missing.
  * Runs silently in the background on activation so F5 works immediately. */
 async function autoSetupVscode(output) {
     const blyt = findBlytSilent();
@@ -283,7 +283,7 @@ async function autoSetupVscode(output) {
     const folders = vscode.workspace.workspaceFolders ?? [];
     for (const folder of folders) {
         const projectDir = findCartProject(folder.uri.fsPath);
-        if (!projectDir || !isLuaCart(projectDir)) continue;
+        if (!projectDir) continue;  // not a blyt project at all
 
         const launchJson = path.join(projectDir, '.vscode', 'launch.json');
         if (fs.existsSync(launchJson)) continue;

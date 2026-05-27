@@ -11,7 +11,9 @@
     "onStartupFinished",
     "onDebugInitialConfigurations",
     "onDebugResolve:blyt-lua",
-    "onDebugDynamicConfigurations:blyt-lua"
+    "onDebugDynamicConfigurations:blyt-lua",
+    "onDebugResolve:blyt-native-gdb",
+    "onDebugDynamicConfigurations:blyt-native-gdb"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -21,7 +23,7 @@
         "blyt.sdkDir": {
           "type": "string",
           "default": "",
-          "description": "Path to the blyt SDK directory (contains bin/blyt, bin/blyt-clang, etc.). Also settable via the BLYT_SDK_DIR environment variable."
+          "description": "Path to the blyt SDK directory (contains bin/blyt, bin/blytplay, bin/blyt-clang, etc.). Also settable via the BLYT_SDK_DIR environment variable."
         }
       }
     },
@@ -35,6 +37,20 @@
               "cart": {
                 "type": "string",
                 "description": "Path to the compiled .blyt cart file."
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "blyt-native-gdb",
+        "label": "Blyt Native (GDB)",
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "cart": {
+                "type": "string",
+                "description": "Path to the compiled .blyt cart file. Auto-detected from the workspace if omitted."
               }
             }
           }
