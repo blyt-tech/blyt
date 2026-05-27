@@ -7,13 +7,14 @@ void blyt_cart_init(void) {
 }
 
 void blyt_cart_update(void) {
-    blyt_console_debug("update");
     s_frame++;
-    if (s_frame >= 2) {
-        blyt_quit();
+    if (s_frame % 60 == 0) {
+        blyt_console_debug("update");
     }
 }
 
 void blyt_cart_draw(void) {
-    blyt_console_debug("draw");
+    if (s_frame % 60 == 0) {
+        blyt_console_debug("draw");
+    }
 }

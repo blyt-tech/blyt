@@ -6,10 +6,13 @@ end
 
 function update()
     frame = frame + 1
-    if frame >= 2 then
-        blyt.quit()
+    if frame % 60 == 0 then
+        blyt32.debug.print("update")
     end
 end
 
--- function draw()
--- end
+function draw()
+    if frame % 60 == 0 then
+        blyt32.debug.print("draw")
+    end
+end
