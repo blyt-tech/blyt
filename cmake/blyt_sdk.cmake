@@ -786,13 +786,16 @@ endif()
 # -------------------------------------------------------------------------
 
 file(MAKE_DIRECTORY "${SDK_BIN}")
+set(_cargo_target_dir "${BLYT_BINARY_DIR}/cargo-target")
+set(ENV{CARGO_TARGET_DIR} "${_cargo_target_dir}")
 execute_process(
   COMMAND cargo build --manifest-path "${BLYT_SOURCE_DIR}/Cargo.toml" --bin blyt
   RESULT_VARIABLE R)
+unset(ENV{CARGO_TARGET_DIR})
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build blyt devtool")
 endif()
-file(COPY "${BLYT_SOURCE_DIR}/target/debug/blyt" DESTINATION "${SDK_BIN}")
+file(COPY "${_cargo_target_dir}/debug/blyt" DESTINATION "${SDK_BIN}")
 
 # Expose toolchain binaries under blyt-prefixed names in bin/.
 #

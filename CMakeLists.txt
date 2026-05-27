@@ -27,6 +27,18 @@ set(FLATCC_DEBUG_CLANG_SANITIZE
     OFF
     CACHE BOOL "" FORCE)
 add_subdirectory(third_party/flatcc EXCLUDE_FROM_ALL)
+# flatcc hardcodes PROJECT_SOURCE_DIR/lib as the archive output, which fails
+# when the source is mounted read-only (e.g. Docker :ro). Override it here so
+# all targets write to the build tree instead.
+foreach(_flatcc_tgt flatcc flatccrt flatcc_cli)
+  if(TARGET ${_flatcc_tgt})
+    set_target_properties(
+      ${_flatcc_tgt}
+      PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/flatcc-lib"
+                 LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/flatcc-lib"
+                 RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/flatcc-bin")
+  endif()
+endforeach()
 
 # FlatBuffers codegen — generates pure C reader headers for the runtime
 # (ADR-0126)
