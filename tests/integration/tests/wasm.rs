@@ -175,8 +175,8 @@ void blyt_cart_draw(void)   {}
     }
     cmd.assert().success();
 
-    let cart = project.parent().unwrap().join("all_cart.blyt");
-    let html_path = project.parent().unwrap().join("all_cart.html");
+    let cart = project.join("build").join("all_cart.blyt");
+    let html_path = project.join("build").join("all_cart.html");
 
     assert!(cart.exists(), "cart not found at {}", cart.display());
     assert!(

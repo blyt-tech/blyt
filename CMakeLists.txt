@@ -786,7 +786,7 @@ if(TARGET blytplay)
   target_sources(blytplay PRIVATE frontends/libretro/blyt_libretro.c)
   target_include_directories(
     blytplay PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
-                    "${CMAKE_SOURCE_DIR}/runtime/host/include")
+                     "${CMAKE_SOURCE_DIR}/runtime/host/include")
   target_compile_definitions(blytplay PRIVATE BLYT_VERSION="${BLYT_VERSION}")
   if(BLYT_DAP)
     target_compile_definitions(blytplay PRIVATE BLYT_DAP=1)

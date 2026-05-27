@@ -451,7 +451,7 @@ pub fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     }
     cmd.assert().success();
 
-    project_dir.parent().unwrap().join(format!(
+    project_dir.join("build").join(format!(
         "{}.blyt",
         project_dir.file_name().unwrap().to_str().unwrap()
     ))
@@ -483,7 +483,7 @@ pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     }
     cmd.assert().success();
 
-    project_dir.parent().unwrap().join(format!(
+    project_dir.join("build").join(format!(
         "{}.blyt",
         project_dir.file_name().unwrap().to_str().unwrap()
     ))
@@ -566,7 +566,7 @@ pub fn build_debug_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     }
     cmd.assert().success();
 
-    project_dir.parent().unwrap().join(format!(
+    project_dir.join("build").join(format!(
         "{}.blyt",
         project_dir.file_name().unwrap().to_str().unwrap()
     ))
@@ -597,7 +597,7 @@ pub fn build_debug_cart(project_dir: &std::path::Path) -> PathBuf {
     }
     cmd.assert().success();
 
-    project_dir.parent().unwrap().join(format!(
+    project_dir.join("build").join(format!(
         "{}.blyt",
         project_dir.file_name().unwrap().to_str().unwrap()
     ))

@@ -591,7 +591,11 @@ fn handle_connection(
             "text/html; charset=utf-8",
             true,
         ),
-        "/blytplay.js" => (wasm_dir.join("blytplay.js"), "application/javascript", false),
+        "/blytplay.js" => (
+            wasm_dir.join("blytplay.js"),
+            "application/javascript",
+            false,
+        ),
         "/blytplay.wasm" => (wasm_dir.join("blytplay.wasm"), "application/wasm", false),
         "/cart.blyt" => (cart_path.to_path_buf(), "application/octet-stream", false),
         _ => {

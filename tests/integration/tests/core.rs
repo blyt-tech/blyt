@@ -52,7 +52,7 @@ void blyt_cart_draw(void)   {}
         .assert()
         .success();
 
-    let cart = project.parent().unwrap().join(format!(
+    let cart = project.join("build").join(format!(
         "{}.blyt",
         project.file_name().unwrap().to_str().unwrap()
     ));

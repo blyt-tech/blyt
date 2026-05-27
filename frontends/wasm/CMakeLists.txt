@@ -319,7 +319,7 @@ endif()
 
 target_compile_definitions(
   blytplay PRIVATE ${RV32EMU_FEATURE_DEFS} BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS}
-                  ${BLYT_DAP_DEFS} ${BLYT_GDB_DEFS})
+                   ${BLYT_DAP_DEFS} ${BLYT_GDB_DEFS})
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
 # (not a cmake definition) to avoid quoting issues. Force-include rv32emu

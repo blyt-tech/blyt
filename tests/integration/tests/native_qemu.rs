@@ -188,7 +188,7 @@ fn build_cart(project_dir: &Path) -> PathBuf {
         .then_some(())
         .expect("blyt build returned non-zero");
 
-    project_dir.parent().unwrap().join(format!(
+    project_dir.join("build").join(format!(
         "{}.blyt",
         project_dir.file_name().unwrap().to_str().unwrap()
     ))

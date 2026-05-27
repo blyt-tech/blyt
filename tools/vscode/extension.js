@@ -161,7 +161,7 @@ function detectCart(folder) {
         const projectDir = findCartProject(start);
         if (projectDir && isLuaCart(projectDir)) {
             const name = path.basename(projectDir);
-            const cart = path.join(path.dirname(projectDir), `${name}.blyt`);
+            const cart = path.join(projectDir, 'build', `${name}.blyt`);
             return { projectDir, cart };
         }
     }
@@ -224,7 +224,7 @@ function activate(context) {
     /* Offer a "Blyt: Debug Lua Cart" config when the workspace looks like a
      * blyt Lua project.  Registered for both Initial (F5 with no launch.json)
      * and Dynamic (Add Configuration button).  Cart path mirrors blyt build's
-     * output convention: <parent-dir>/<project-dir-name>.blyt. */
+     * output convention: <project-dir>/build/<project-dir-name>.blyt. */
     function provideDebugConfigurations(folder) {
         console.error('[blyt] provideDebugConfigurations', folder?.uri.fsPath);
         output.show(true);

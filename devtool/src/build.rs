@@ -619,7 +619,7 @@ fn default_output(project_dir: &Path) -> PathBuf {
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("cart");
-    project_dir.with_file_name(format!("{name}.blyt"))
+    project_dir.join("build").join(format!("{name}.blyt"))
 }
 
 /* -------------------------------------------------------------------------

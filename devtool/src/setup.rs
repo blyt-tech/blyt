@@ -50,18 +50,19 @@ pub fn vscode(project_dir: &Path, force: bool) -> Result<(), SetupError> {
 
     // For now only Lua carts use the DAP debugger wired by the blyt-lua type.
     if !project_dir.join("src/game/lua").exists() {
-        return Err(err(
-            "blyt setup vscode currently only supports Lua carts \
+        return Err(err("blyt setup vscode currently only supports Lua carts \
              (src/game/lua/ not found)"
-                .to_string(),
-        ));
+            .to_string()));
     }
 
     let vscode_dir = project_dir.join(".vscode");
     let launch_path = vscode_dir.join("launch.json");
 
     if launch_path.exists() && !force {
-        println!("exists: {} (use --force to overwrite)", launch_path.display());
+        println!(
+            "exists: {} (use --force to overwrite)",
+            launch_path.display()
+        );
         return Ok(());
     }
 
