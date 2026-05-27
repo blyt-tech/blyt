@@ -175,8 +175,9 @@ async function connectDap(endpointStr) {
                 else p.reject(new Error(msg.message || `${msg.command} failed`));
             }
         } else if (msg.type === 'event') {
-            eventQueue.push(msg);
-            for (const w of [...waiters]) w(msg);
+            let handled = false;
+            for (const w of [...waiters]) { if (w(msg)) { handled = true; break; } }
+            if (!handled) eventQueue.push(msg);
         }
     }
 
@@ -210,7 +211,9 @@ async function connectDap(endpointStr) {
                     }
                     return false;
                 };
-                for (const e of eventQueue) { if (check(e)) return; }
+                for (let i = 0; i < eventQueue.length; i++) {
+                    if (check(eventQueue[i])) { eventQueue.splice(i, 1); return; }
+                }
                 waiters.push(check);
             });
         },

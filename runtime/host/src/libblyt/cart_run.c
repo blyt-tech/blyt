@@ -1132,6 +1132,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     while (!rv_has_halted(session->rv) && !session->ctx.ecall_trapped &&
            !session->ctx.ecall_aborted) {
 #ifdef BLYT_GDB
+        uint32_t gdb_bp_step_addr = 0;
         if (session->ctx.gdb_enabled) {
             /* If already paused waiting for vCont, poll for a resume packet. */
             if (session->ctx.debug_state == BLYT_DEBUG_PAUSED_GDB) {
@@ -1184,6 +1185,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
                     break;
                 }
                 session->ctx.gdb_single_step = (gdb_action == 1);
+                /* Restore original instruction so rv_step executes it, not the
+                 * ebreak.  Re-patch after rv_step via gdb_bp_step_addr. */
+                fc_gdb_stub_restore_bp_temp(gdb_pc);
+                gdb_bp_step_addr = gdb_pc;
 #endif
             }
         }
@@ -1192,6 +1197,9 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
         rv_step(session->rv);
 
 #ifdef BLYT_GDB
+        /* Re-patch a SW BP that was temporarily removed to allow stepping over it. */
+        if (session->ctx.gdb_enabled && gdb_bp_step_addr != 0)
+            fc_gdb_stub_repatch_bp(gdb_bp_step_addr);
         /* Breakpoint fired inside rv_step() via on_ebreak: rv->halt was set to
          * force rv_step to return.  Clear halt and handle the GDB pause now. */
         if (session->ctx.gdb_enabled && session->ctx.gdb_ebreak_pending) {

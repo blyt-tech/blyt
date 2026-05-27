@@ -629,7 +629,6 @@ static int check_bp(const char *source, int line) {
 int fc_dap_check_hook_line(const char *source, int line, int depth) {
     if (g_dap.client_fd < 0)
         return 0;
-
     /* On the first hook call, wait for the client to finish configuration
      * (setBreakpoints, configurationDone) before checking any breakpoints.
      * This prevents the cart from running past init() before breakpoints are set. */

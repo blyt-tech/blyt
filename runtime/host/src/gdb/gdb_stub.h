@@ -102,6 +102,14 @@ int  fc_gdb_stub_has_client(void);
 /* Call transport->on_stop() — blocks for TCP, no-op for WASM. */
 void fc_gdb_stub_block_until_resume(void);
 
+/* Temporarily restore the original instruction at addr (for stepping through
+ * a software breakpoint) without removing addr from the breaks[] table.
+ * Call fc_gdb_stub_repatch_bp() after rv_step() to re-install the ebreak. */
+void fc_gdb_stub_restore_bp_temp(uint32_t addr);
+
+/* Re-install the ebreak at addr if it is still in the breaks[] table. */
+void fc_gdb_stub_repatch_bp(uint32_t addr);
+
 #ifdef __cplusplus
 }
 #endif

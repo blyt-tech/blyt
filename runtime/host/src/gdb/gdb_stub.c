@@ -342,3 +342,19 @@ int fc_gdb_stub_has_client(void) {
 void fc_gdb_stub_set_has_client(int val) {
     g_gdb.has_client = val;
 }
+
+void fc_gdb_stub_restore_bp_temp(uint32_t addr) {
+    if (g_gdb.ops.clear_breakpoint)
+        g_gdb.ops.clear_breakpoint(addr);
+    /* breaks[] is intentionally not modified — repatch_bp uses it */
+}
+
+void fc_gdb_stub_repatch_bp(uint32_t addr) {
+    for (int i = 0; i < g_gdb.n_breaks; i++) {
+        if (g_gdb.breaks[i] == addr) {
+            if (g_gdb.ops.set_breakpoint)
+                g_gdb.ops.set_breakpoint(addr);
+            return;
+        }
+    }
+}
