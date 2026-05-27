@@ -37,8 +37,7 @@ static void dap_dispatch(lua_State *L, lua_Debug *ar) {
         return;
     }
 
-    if (ar->event == LUA_HOOKLINE &&
-        fc_master_hook_cfg.dap_step_mode != DAP_STEP_NONE) {
+    if (ar->event == LUA_HOOKLINE && fc_master_hook_cfg.dap_step_mode != DAP_STEP_NONE) {
         int depth = dap_call_depth(L);
         bool should_pause = false;
         switch (fc_master_hook_cfg.dap_step_mode) {

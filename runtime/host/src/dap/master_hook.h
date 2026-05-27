@@ -12,19 +12,19 @@
 #include "lua.h"
 
 typedef enum {
-    DAP_STEP_NONE  = 0,
-    DAP_STEP_OVER  = 1, /* next:   pause on next line at <= current depth */
-    DAP_STEP_IN    = 2, /* stepIn: pause on next line at any depth */
-    DAP_STEP_OUT   = 3, /* stepOut: pause on next line at < current depth */
+    DAP_STEP_NONE = 0,
+    DAP_STEP_OVER = 1, /* next:   pause on next line at <= current depth */
+    DAP_STEP_IN = 2, /* stepIn: pause on next line at any depth */
+    DAP_STEP_OUT = 3, /* stepOut: pause on next line at < current depth */
     DAP_STEP_PAUSE = 4, /* pause:  stop on next line event */
 } dap_step_mode_t;
 
 typedef struct {
     bool dap_enabled;
     dap_step_mode_t dap_step_mode;
-    int             dap_step_base_depth;
-    int             dap_pending_pause;
-    void           *dap_state; /* opaque pointer owned by the transport */
+    int dap_step_base_depth;
+    int dap_pending_pause;
+    void *dap_state; /* opaque pointer owned by the transport */
 } hook_config_t;
 
 extern hook_config_t fc_master_hook_cfg;

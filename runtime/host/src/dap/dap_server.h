@@ -22,13 +22,13 @@ extern "C" {
  *                                    relay at the given port; returns that port.
  *
  * Returns the port in use (>0) on success, -1 on failure. */
-int  fc_consolelua_dap_listen(int port);
+int fc_consolelua_dap_listen(int port);
 
 /* Stop the server and free all resources. Idempotent. */
 void fc_consolelua_dap_shutdown(void);
 
 /* Returns non-zero once the DAP client has sent configurationDone. */
-int  fc_dap_configuration_done(void);
+int fc_dap_configuration_done(void);
 
 /* Process any pending incoming DAP messages.
  * WASM: drains the WebSocket message queue (call once per frame, outside Lua hooks).
@@ -51,10 +51,10 @@ void fc_dap_pause_loop(struct lua_State *L, struct lua_Debug *ar);
 /* Returns non-zero (and clears the flag) if the last LUA_YIELD from
  * lua_resume() was initiated by fc_dap_pause_loop (a DAP pause), not by
  * the normal coroutine.yield() at end of each game frame. */
-int  fc_dap_hook_yielded(void);
+int fc_dap_hook_yielded(void);
 
 /* Returns non-zero if the DAP client has sent continue/next/stepIn/stepOut. */
-int  fc_dap_continue_pending(void);
+int fc_dap_continue_pending(void);
 
 /* Apply pending step mode and send the "continued" event.  Call this from
  * wasm_lua_loop just before resuming the coroutine after a DAP pause. */
@@ -71,7 +71,7 @@ void fc_dap_output(const char *msg);
  * Checks breakpoints + pending step mode against source/line/depth.
  * Non-blocking: emits "stopped" and returns 1 if the guest should pause,
  * 0 if execution should continue. */
-int  fc_dap_check_hook_line(const char *source, int line, int depth);
+int fc_dap_check_hook_line(const char *source, int line, int depth);
 
 /* BLYT_ECALL_DAP_SEND: forward guest-built JSON to the connected DAP client. */
 void fc_dap_host_send(const char *json, size_t len);
@@ -79,11 +79,11 @@ void fc_dap_host_send(const char *json, size_t len);
 /* BLYT_ECALL_DAP_RECV: block until VS Code sends an inspection command.
  * Writes the command JSON to buf (max_len bytes incl. NUL).
  * Returns message length, or 0 when the guest should resume (continue/disconnect). */
-int  fc_dap_host_recv(char *buf, size_t max_len);
+int fc_dap_host_recv(char *buf, size_t max_len);
 
 /* Block until the client sends configurationDone, or the server shuts down.
  * Returns non-zero if configurationDone was received; 0 if shutting down. */
-int  fc_dap_wait_configuration_done(void);
+int fc_dap_wait_configuration_done(void);
 
 #ifdef __cplusplus
 }

@@ -69,8 +69,7 @@ static const unsigned int blyt_restricted_nrs[] = {
 
 /* ── Raw RV32 syscall helpers ── */
 
-static inline void blyt_rs_write(int fd, const char *buf, unsigned int len)
-{
+static inline void blyt_rs_write(int fd, const char *buf, unsigned int len) {
     register long a0 __asm__("a0") = fd;
     register const char *a1 __asm__("a1") = buf;
     register long a2 __asm__("a2") = len;
@@ -78,16 +77,14 @@ static inline void blyt_rs_write(int fd, const char *buf, unsigned int len)
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
 }
 
-static __attribute__((noreturn)) void blyt_rs_exit_group(int code)
-{
+static __attribute__((noreturn)) void blyt_rs_exit_group(int code) {
     register long a0 __asm__("a0") = code;
     register long a7 __asm__("a7") = 94; /* SYS_exit_group */
     __asm__ volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
     __builtin_unreachable();
 }
 
-static inline int blyt_rs_seccomp(unsigned int mode, unsigned int flags, void *prog)
-{
+static inline int blyt_rs_seccomp(unsigned int mode, unsigned int flags, void *prog) {
     register long a0 __asm__("a0") = mode;
     register long a1 __asm__("a1") = flags;
     register long a2 __asm__("a2") = (long)prog;
@@ -108,8 +105,7 @@ static inline int blyt_rs_seccomp(unsigned int mode, unsigned int flags, void *p
  */
 #define BLYT_RESTRICTED_BUF 32
 
-static int blyt_build_restricted_filter(struct blyt_sock_filter *buf, int bufsz)
-{
+static int blyt_build_restricted_filter(struct blyt_sock_filter *buf, int bufsz) {
     int n = BLYT_RESTRICTED_N;
     int total = 4 + 2 * n;
     if (total > bufsz)
@@ -117,21 +113,21 @@ static int blyt_build_restricted_filter(struct blyt_sock_filter *buf, int bufsz)
 
     int i = 0;
 
-#define FS(c_, k_)                          \
-    do {                                    \
-        buf[i].code = (unsigned short)(c_); \
-        buf[i].jt = 0;                      \
-        buf[i].jf = 0;                      \
-        buf[i].k = (k_);                    \
-        i++;                                \
+#define FS(c_, k_)                                                                                 \
+    do {                                                                                           \
+        buf[i].code = (unsigned short)(c_);                                                        \
+        buf[i].jt = 0;                                                                             \
+        buf[i].jf = 0;                                                                             \
+        buf[i].k = (k_);                                                                           \
+        i++;                                                                                       \
     } while (0)
-#define FJ(c_, k_, jt_, jf_)               \
-    do {                                    \
-        buf[i].code = (unsigned short)(c_); \
-        buf[i].jt = (unsigned char)(jt_);   \
-        buf[i].jf = (unsigned char)(jf_);   \
-        buf[i].k = (k_);                    \
-        i++;                                \
+#define FJ(c_, k_, jt_, jf_)                                                                       \
+    do {                                                                                           \
+        buf[i].code = (unsigned short)(c_);                                                        \
+        buf[i].jt = (unsigned char)(jt_);                                                          \
+        buf[i].jf = (unsigned char)(jf_);                                                          \
+        buf[i].k = (k_);                                                                           \
+        i++;                                                                                       \
     } while (0)
 
     FS(BLYT_BPF_LD | BLYT_BPF_W | BLYT_BPF_ABS, BLYT_SDAT_ARCH);
@@ -151,8 +147,7 @@ static int blyt_build_restricted_filter(struct blyt_sock_filter *buf, int bufsz)
     return i;
 }
 
-static int blyt_install_restricted_filter(void)
-{
+static int blyt_install_restricted_filter(void) {
     struct blyt_sock_filter prog[BLYT_RESTRICTED_BUF];
     int len = blyt_build_restricted_filter(prog, BLYT_RESTRICTED_BUF);
     if (len < 0)

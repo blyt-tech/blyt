@@ -34,37 +34,37 @@
 #include "dap_server.h"
 #include "master_hook.h"
 
-#define MAX_BREAKPOINTS  256
-#define MAX_FRAMES       64
-#define MAX_VARS         64
-#define MAX_SOURCE_PATH  1024
-#define MAX_MSG          (64 * 1024)
+#define MAX_BREAKPOINTS 256
+#define MAX_FRAMES 64
+#define MAX_VARS 64
+#define MAX_SOURCE_PATH 1024
+#define MAX_MSG (64 * 1024)
 
 /* ── State ─────────────────────────────────────────────────────────────────── */
 
 typedef struct {
     char source[MAX_SOURCE_PATH];
-    int  line;
-    int  id;
+    int line;
+    int id;
 } wdap_bp_t;
 
 static struct {
-    int    connected;
-    int    configuration_done;
-    int    seq;
+    int connected;
+    int configuration_done;
+    int seq;
 
     wdap_bp_t bps[MAX_BREAKPOINTS];
-    int       n_bps;
-    int       next_bp_id;
+    int n_bps;
+    int next_bp_id;
 
     lua_State *paused_L;
-    int        paused;
-    int        continue_pending;
+    int paused;
+    int continue_pending;
 
-    int        pending_step_mode;
-    int        pending_step_base_depth;
-    int        pending_pause;
-    int        hook_yielded;  /* set by fc_dap_pause_loop; cleared by fc_dap_hook_yielded */
+    int pending_step_mode;
+    int pending_step_base_depth;
+    int pending_pause;
+    int hook_yielded; /* set by fc_dap_pause_loop; cleared by fc_dap_hook_yielded */
 } g_wdap;
 
 /* ── JSON helpers ──────────────────────────────────────────────────────────── */
@@ -73,11 +73,14 @@ static int json_get_int(const char *buf, const char *key, int def) {
     char k[64];
     snprintf(k, sizeof k, "\"%s\"", key);
     const char *p = strstr(buf, k);
-    if (!p) return def;
+    if (!p)
+        return def;
     p = strchr(p, ':');
-    if (!p) return def;
+    if (!p)
+        return def;
     p++;
-    while (*p == ' ' || *p == '\t') p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
     return atoi(p);
 }
 
@@ -85,12 +88,16 @@ static int json_get_string(const char *buf, const char *key, char *out, size_t n
     char k[64];
     snprintf(k, sizeof k, "\"%s\"", key);
     const char *p = strstr(buf, k);
-    if (!p) return 0;
+    if (!p)
+        return 0;
     p = strchr(p, ':');
-    if (!p) return 0;
+    if (!p)
+        return 0;
     p++;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != '"') return 0;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != '"')
+        return 0;
     p++;
     size_t i = 0;
     while (*p && *p != '"' && i + 1 < n) {
@@ -109,16 +116,21 @@ static int json_get_int_array(const char *buf, const char *key, int *out, int ma
     char k[64];
     snprintf(k, sizeof k, "\"%s\"", key);
     const char *p = strstr(buf, k);
-    if (!p) return 0;
+    if (!p)
+        return 0;
     p = strchr(p, '[');
-    if (!p) return 0;
+    if (!p)
+        return 0;
     p++;
     int n = 0;
     while (*p && *p != ']' && n < max) {
-        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n') p++;
-        if (*p == ']') break;
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')
+            p++;
+        if (*p == ']')
+            break;
         out[n++] = atoi(p);
-        while (*p && *p != ',' && *p != ']') p++;
+        while (*p && *p != ',' && *p != ']')
+            p++;
     }
     return n;
 }
@@ -154,10 +166,10 @@ static void send_json(const char *json) {
     wdap_ws_send_js(json);
 }
 
-static void send_response(int request_seq, const char *command,
-                          int success, const char *body_or_msg) {
+static void send_response(int request_seq, const char *command, int success,
+                          const char *body_or_msg) {
     static char buf[MAX_MSG];
-    int  seq = ++g_wdap.seq;
+    int seq = ++g_wdap.seq;
     if (success) {
         snprintf(buf, sizeof buf,
                  "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,"
@@ -174,10 +186,9 @@ static void send_response(int request_seq, const char *command,
 
 static void send_event(const char *event, const char *body) {
     static char buf[MAX_MSG];
-    int  seq = ++g_wdap.seq;
-    snprintf(buf, sizeof buf,
-             "{\"seq\":%d,\"type\":\"event\",\"event\":\"%s\",\"body\":%s}",
-             seq, event, body ? body : "{}");
+    int seq = ++g_wdap.seq;
+    snprintf(buf, sizeof buf, "{\"seq\":%d,\"type\":\"event\",\"event\":\"%s\",\"body\":%s}", seq,
+             event, body ? body : "{}");
     send_json(buf);
 }
 
@@ -185,12 +196,11 @@ static void send_event(const char *event, const char *body) {
 
 static void handle_initialize(int seq, const char *args) {
     (void)args;
-    const char *body =
-        "{\"supportsConfigurationDoneRequest\":true,"
-        "\"supportsLoadedSourcesRequest\":true,"
-        "\"supportsRestartRequest\":false,"
-        "\"supportsStepBack\":false,"
-        "\"supportsTerminateRequest\":true}";
+    const char *body = "{\"supportsConfigurationDoneRequest\":true,"
+                       "\"supportsLoadedSourcesRequest\":true,"
+                       "\"supportsRestartRequest\":false,"
+                       "\"supportsStepBack\":false,"
+                       "\"supportsTerminateRequest\":true}";
     send_response(seq, "initialize", 1, body);
     send_event("initialized", "{}");
 }
@@ -209,20 +219,26 @@ static void handle_configuration_done(int seq, const char *args) {
 /* Parse "breakpoints":[{"line":N},{...}] — preferred VS Code format. */
 static int json_get_bp_array_lines(const char *buf, int *out, int max) {
     const char *p = strstr(buf, "\"breakpoints\"");
-    if (!p) return 0;
+    if (!p)
+        return 0;
     p = strchr(p, '[');
-    if (!p) return 0;
+    if (!p)
+        return 0;
     const char *end = strchr(p, ']');
-    if (!end) return 0;
+    if (!end)
+        return 0;
     int n = 0;
     p++;
     while (p < end && n < max) {
         const char *lp = strstr(p, "\"line\"");
-        if (!lp || lp >= end) break;
+        if (!lp || lp >= end)
+            break;
         lp = strchr(lp, ':');
-        if (!lp || lp >= end) break;
+        if (!lp || lp >= end)
+            break;
         lp++;
-        while (*lp == ' ' || *lp == '\t') lp++;
+        while (*lp == ' ' || *lp == '\t')
+            lp++;
         out[n++] = atoi(lp);
         p = lp;
     }
@@ -243,7 +259,8 @@ static void handle_set_breakpoints(int seq, const char *args) {
     int kept = 0;
     for (int i = 0; i < g_wdap.n_bps; i++) {
         if (strcmp(g_wdap.bps[i].source, source) != 0) {
-            if (kept != i) g_wdap.bps[kept] = g_wdap.bps[i];
+            if (kept != i)
+                g_wdap.bps[kept] = g_wdap.bps[i];
             kept++;
         }
     }
@@ -252,7 +269,7 @@ static void handle_set_breakpoints(int seq, const char *args) {
         wdap_bp_t *bp = &g_wdap.bps[g_wdap.n_bps++];
         snprintf(bp->source, sizeof bp->source, "%s", source);
         bp->line = lines[i];
-        bp->id   = ++g_wdap.next_bp_id;
+        bp->id = ++g_wdap.next_bp_id;
     }
 
     static char body[MAX_MSG];
@@ -260,15 +277,13 @@ static void handle_set_breakpoints(int seq, const char *args) {
     for (int i = 0; i < n; i++) {
         int fid = 0;
         for (int j = 0; j < g_wdap.n_bps; j++) {
-            if (strcmp(g_wdap.bps[j].source, source) == 0 &&
-                g_wdap.bps[j].line == lines[i]) {
+            if (strcmp(g_wdap.bps[j].source, source) == 0 && g_wdap.bps[j].line == lines[i]) {
                 fid = g_wdap.bps[j].id;
                 break;
             }
         }
         off += snprintf(body + off, sizeof(body) - (size_t)off,
-                        "%s{\"id\":%d,\"verified\":true,\"line\":%d}",
-                        i ? "," : "", fid, lines[i]);
+                        "%s{\"id\":%d,\"verified\":true,\"line\":%d}", i ? "," : "", fid, lines[i]);
     }
     snprintf(body + off, sizeof(body) - (size_t)off, "]}");
     send_response(seq, "setBreakpoints", 1, body);
@@ -276,8 +291,7 @@ static void handle_set_breakpoints(int seq, const char *args) {
 
 static void handle_threads(int seq, const char *args) {
     (void)args;
-    send_response(seq, "threads", 1,
-                  "{\"threads\":[{\"id\":1,\"name\":\"cart\"}]}");
+    send_response(seq, "threads", 1, "{\"threads\":[{\"id\":1,\"name\":\"cart\"}]}");
 }
 
 static void handle_stack_trace(int seq, const char *args) {
@@ -288,9 +302,9 @@ static void handle_stack_trace(int seq, const char *args) {
         return;
     }
     static char body[MAX_MSG];
-    int  off         = snprintf(body, sizeof body, "{\"stackFrames\":[");
-    int  display     = 0;
-    int  lua_frame   = 0;
+    int off = snprintf(body, sizeof body, "{\"stackFrames\":[");
+    int display = 0;
+    int lua_frame = 0;
     lua_Debug ar;
     while (lua_frame < MAX_FRAMES && lua_getstack(L, lua_frame, &ar)) {
         lua_getinfo(L, "Snl", &ar);
@@ -298,8 +312,9 @@ static void handle_stack_trace(int seq, const char *args) {
         /* Skip synthetic frames (inline strings, C functions).
          * Only show @-prefixed file-backed sources so VS Code gets real paths. */
         const char *src = ar.source ? ar.source : "";
-        if (*src != '@') continue;
-        src++;  /* strip leading @ */
+        if (*src != '@')
+            continue;
+        src++; /* strip leading @ */
         const char *name = ar.name ? ar.name : (ar.what ? ar.what : "?");
         off += snprintf(body + off, sizeof(body) - (size_t)off,
                         "%s{\"id\":%d,\"name\":\"%s\","
@@ -321,10 +336,9 @@ static void handle_scopes(int seq, const char *args) {
     send_response(seq, "scopes", 1, body);
 }
 
-static int append_variable(char *buf, size_t remaining, const char *vn,
-                           lua_State *L, int first) {
+static int append_variable(char *buf, size_t remaining, const char *vn, lua_State *L, int first) {
     const char *vt = luaL_typename(L, -1);
-    char val[256]  = {0};
+    char val[256] = {0};
     if (lua_isstring(L, -1) || lua_isnumber(L, -1)) {
         const char *s = lua_tostring(L, -1);
         snprintf(val, sizeof val, "%s", s ? s : "?");
@@ -332,7 +346,8 @@ static int append_variable(char *buf, size_t remaining, const char *vn,
         snprintf(val, sizeof val, "%s", vt);
     }
     for (char *q = val; *q; q++)
-        if (*q == '"' || *q == '\\') *q = '_';
+        if (*q == '"' || *q == '\\')
+            *q = '_';
     return snprintf(buf, remaining,
                     "%s{\"name\":\"%s\",\"value\":\"%s\","
                     "\"type\":\"%s\",\"variablesReference\":0}",
@@ -340,7 +355,7 @@ static int append_variable(char *buf, size_t remaining, const char *vn,
 }
 
 static void handle_variables(int seq, const char *args) {
-    int vref     = json_get_int(args, "variablesReference", 0);
+    int vref = json_get_int(args, "variablesReference", 0);
     int frame_id = vref - 1;
     lua_State *L = g_wdap.paused_L;
     if (!L || frame_id < 0) {
@@ -348,7 +363,7 @@ static void handle_variables(int seq, const char *args) {
         return;
     }
     static char body[MAX_MSG];
-    int  off = snprintf(body, sizeof body, "{\"variables\":[");
+    int off = snprintf(body, sizeof body, "{\"variables\":[");
     lua_Debug ar;
     if (lua_getstack(L, frame_id, &ar)) {
         int first = 1;
@@ -358,8 +373,7 @@ static void handle_variables(int seq, const char *args) {
         int idx = 1;
         while ((vn = lua_getlocal(L, &ar, idx)) != NULL && idx <= MAX_VARS) {
             if (vn[0] != '(') {
-                off += append_variable(body + off, sizeof(body) - (size_t)off,
-                                       vn, L, first);
+                off += append_variable(body + off, sizeof(body) - (size_t)off, vn, L, first);
                 first = 0;
             }
             lua_pop(L, 1);
@@ -367,20 +381,20 @@ static void handle_variables(int seq, const char *args) {
         }
 
         /* Upvalues of the current function (captures like outer locals). */
-        lua_getinfo(L, "f", &ar);  /* pushes function onto stack */
-        int fn  = lua_gettop(L);
+        lua_getinfo(L, "f", &ar); /* pushes function onto stack */
+        int fn = lua_gettop(L);
         int uvi = 1;
         while (uvi <= MAX_VARS) {
             vn = lua_getupvalue(L, fn, uvi++);
-            if (!vn) break;
+            if (!vn)
+                break;
             if (strcmp(vn, "_ENV") != 0) {
-                off += append_variable(body + off, sizeof(body) - (size_t)off,
-                                       vn, L, first);
+                off += append_variable(body + off, sizeof(body) - (size_t)off, vn, L, first);
                 first = 0;
             }
             lua_pop(L, 1);
         }
-        lua_pop(L, 1);  /* pop function */
+        lua_pop(L, 1); /* pop function */
     }
     snprintf(body + off, sizeof(body) - (size_t)off, "]}");
     send_response(seq, "variables", 1, body);
@@ -407,44 +421,48 @@ static void handle_evaluate(int seq, const char *args) {
     const char *vn;
     int idx = 1;
     while ((vn = lua_getlocal(L, &ar, idx++)) != NULL) {
-        if (strcmp(vn, expr) == 0) goto found;
+        if (strcmp(vn, expr) == 0)
+            goto found;
         lua_pop(L, 1);
     }
     lua_getinfo(L, "f", &ar);
     {
         int fn = lua_gettop(L), uvi = 1;
         while ((vn = lua_getupvalue(L, fn, uvi++)) != NULL) {
-            if (strcmp(vn, expr) == 0) { lua_remove(L, fn); goto found; }
+            if (strcmp(vn, expr) == 0) {
+                lua_remove(L, fn);
+                goto found;
+            }
             lua_pop(L, 1);
         }
-        lua_pop(L, 1);  /* pop function */
+        lua_pop(L, 1); /* pop function */
     }
     send_response(seq, "evaluate", 1, "{\"result\":\"?\",\"variablesReference\":0}");
     return;
 
 found: {
-        static char body[MAX_MSG];
-        char val[256] = {0};
-        if (lua_isstring(L, -1) || lua_isnumber(L, -1)) {
-            const char *s = lua_tostring(L, -1);
-            snprintf(val, sizeof val, "%s", s ? s : "?");
-        } else {
-            snprintf(val, sizeof val, "%s", luaL_typename(L, -1));
-        }
-        lua_pop(L, 1);
-        for (char *q = val; *q; q++)
-            if (*q == '"' || *q == '\\') *q = '_';
-        snprintf(body, sizeof body,
-                 "{\"result\":\"%s\",\"variablesReference\":0}", val);
-        send_response(seq, "evaluate", 1, body);
+    static char body[MAX_MSG];
+    char val[256] = {0};
+    if (lua_isstring(L, -1) || lua_isnumber(L, -1)) {
+        const char *s = lua_tostring(L, -1);
+        snprintf(val, sizeof val, "%s", s ? s : "?");
+    } else {
+        snprintf(val, sizeof val, "%s", luaL_typename(L, -1));
     }
+    lua_pop(L, 1);
+    for (char *q = val; *q; q++)
+        if (*q == '"' || *q == '\\')
+            *q = '_';
+    snprintf(body, sizeof body, "{\"result\":\"%s\",\"variablesReference\":0}", val);
+    send_response(seq, "evaluate", 1, body);
+}
 }
 
 static void handle_continue(int seq, const char *args) {
     (void)args;
-    g_wdap.continue_pending  = 1;
+    g_wdap.continue_pending = 1;
     g_wdap.pending_step_mode = 0;
-    g_wdap.pending_pause     = 0;
+    g_wdap.pending_pause = 0;
     send_response(seq, "continue", 1, "{\"allThreadsContinued\":true}");
 }
 
@@ -454,15 +472,16 @@ static void handle_step(int seq, const char *args, int mode) {
     int depth = 0;
     if (g_wdap.paused_L) {
         lua_Debug ar;
-        while (lua_getstack(g_wdap.paused_L, depth, &ar)) depth++;
+        while (lua_getstack(g_wdap.paused_L, depth, &ar))
+            depth++;
     }
-    g_wdap.pending_step_mode       = mode;
+    g_wdap.pending_step_mode = mode;
     g_wdap.pending_step_base_depth = depth;
-    g_wdap.pending_pause           = 0;
-    g_wdap.continue_pending        = 1;
+    g_wdap.pending_pause = 0;
+    g_wdap.continue_pending = 1;
     const char *cmd = (mode == DAP_STEP_OVER) ? "next"
-                    : (mode == DAP_STEP_IN)   ? "stepIn"
-                    : "stepOut";
+                      : (mode == DAP_STEP_IN) ? "stepIn"
+                                              : "stepOut";
     send_response(seq, cmd, 1, "{\"allThreadsContinued\":true}");
 }
 
@@ -475,9 +494,9 @@ static void handle_pause(int seq, const char *args) {
 static void handle_disconnect(int seq, const char *args) {
     (void)args;
     send_response(seq, "disconnect", 1, "{}");
-    g_wdap.continue_pending  = 1;
+    g_wdap.continue_pending = 1;
     g_wdap.pending_step_mode = 0;
-    g_wdap.pending_pause     = 0;
+    g_wdap.pending_pause = 0;
 }
 
 static void handle_source(int seq, const char *args) {
@@ -488,28 +507,47 @@ static void handle_source(int seq, const char *args) {
 /* ── Dispatcher ────────────────────────────────────────────────────────────── */
 
 static void dispatch(const char *msg) {
-    int  seq = json_get_int(msg, "seq", 0);
+    int seq = json_get_int(msg, "seq", 0);
     char cmd[64];
-    if (!json_get_string(msg, "command", cmd, sizeof cmd)) return;
+    if (!json_get_string(msg, "command", cmd, sizeof cmd))
+        return;
 
-    if      (strcmp(cmd, "initialize")        == 0) handle_initialize(seq, msg);
-    else if (strcmp(cmd, "launch")            == 0) handle_launch(seq, msg);
-    else if (strcmp(cmd, "configurationDone") == 0) handle_configuration_done(seq, msg);
-    else if (strcmp(cmd, "setBreakpoints")    == 0) handle_set_breakpoints(seq, msg);
-    else if (strcmp(cmd, "threads")           == 0) handle_threads(seq, msg);
-    else if (strcmp(cmd, "stackTrace")        == 0) handle_stack_trace(seq, msg);
-    else if (strcmp(cmd, "scopes")            == 0) handle_scopes(seq, msg);
-    else if (strcmp(cmd, "variables")         == 0) handle_variables(seq, msg);
-    else if (strcmp(cmd, "evaluate")          == 0) handle_evaluate(seq, msg);
-    else if (strcmp(cmd, "continue")          == 0) handle_continue(seq, msg);
-    else if (strcmp(cmd, "next")              == 0) handle_step(seq, msg, DAP_STEP_OVER);
-    else if (strcmp(cmd, "stepIn")            == 0) handle_step(seq, msg, DAP_STEP_IN);
-    else if (strcmp(cmd, "stepOut")           == 0) handle_step(seq, msg, DAP_STEP_OUT);
-    else if (strcmp(cmd, "pause")             == 0) handle_pause(seq, msg);
-    else if (strcmp(cmd, "disconnect")        == 0) handle_disconnect(seq, msg);
-    else if (strcmp(cmd, "terminate")         == 0) handle_disconnect(seq, msg);
-    else if (strcmp(cmd, "source")            == 0) handle_source(seq, msg);
-    else send_response(seq, cmd, 0, "unknown command");
+    if (strcmp(cmd, "initialize") == 0)
+        handle_initialize(seq, msg);
+    else if (strcmp(cmd, "launch") == 0)
+        handle_launch(seq, msg);
+    else if (strcmp(cmd, "configurationDone") == 0)
+        handle_configuration_done(seq, msg);
+    else if (strcmp(cmd, "setBreakpoints") == 0)
+        handle_set_breakpoints(seq, msg);
+    else if (strcmp(cmd, "threads") == 0)
+        handle_threads(seq, msg);
+    else if (strcmp(cmd, "stackTrace") == 0)
+        handle_stack_trace(seq, msg);
+    else if (strcmp(cmd, "scopes") == 0)
+        handle_scopes(seq, msg);
+    else if (strcmp(cmd, "variables") == 0)
+        handle_variables(seq, msg);
+    else if (strcmp(cmd, "evaluate") == 0)
+        handle_evaluate(seq, msg);
+    else if (strcmp(cmd, "continue") == 0)
+        handle_continue(seq, msg);
+    else if (strcmp(cmd, "next") == 0)
+        handle_step(seq, msg, DAP_STEP_OVER);
+    else if (strcmp(cmd, "stepIn") == 0)
+        handle_step(seq, msg, DAP_STEP_IN);
+    else if (strcmp(cmd, "stepOut") == 0)
+        handle_step(seq, msg, DAP_STEP_OUT);
+    else if (strcmp(cmd, "pause") == 0)
+        handle_pause(seq, msg);
+    else if (strcmp(cmd, "disconnect") == 0)
+        handle_disconnect(seq, msg);
+    else if (strcmp(cmd, "terminate") == 0)
+        handle_disconnect(seq, msg);
+    else if (strcmp(cmd, "source") == 0)
+        handle_source(seq, msg);
+    else
+        send_response(seq, cmd, 0, "unknown command");
 }
 
 /* ── Message queue ─────────────────────────────────────────────────────────── */
@@ -533,7 +571,8 @@ EM_JS(char *, wdap_dequeue_json, (void), {
 static void drain_queue(void) {
     while (wdap_queue_length() > 0) {
         char *json = wdap_dequeue_json();
-        if (!json) break;
+        if (!json)
+            break;
         dispatch(json);
         free(json);
     }
@@ -553,7 +592,11 @@ int fc_consolelua_dap_listen(int relay_port) {
 void fc_consolelua_dap_shutdown(void) {
     EM_ASM({
         if (Module._wdap_ws) {
-            try { Module._wdap_ws.close(1000, 'shutdown'); } catch(e) {}
+            try {
+                Module._wdap_ws.close(1000, 'shutdown');
+            }
+            catch(e) {
+            }
             Module._wdap_ws = null;
         }
         Module._wdap_connected = 0;
@@ -570,19 +613,24 @@ int fc_dap_configuration_done(void) {
 static const char *basename_of(const char *p) {
     const char *b = p;
     for (const char *q = p; *q; q++)
-        if (*q == '/') b = q + 1;
+        if (*q == '/')
+            b = q + 1;
     return b;
 }
 
 bool fc_dap_should_break(lua_State *L, lua_Debug *ar) {
-    if (!wdap_is_connected_js()) return false;
-    if (g_wdap.pending_pause) return true;
+    if (!wdap_is_connected_js())
+        return false;
+    if (g_wdap.pending_pause)
+        return true;
     lua_getinfo(L, "Sl", ar);
     const char *src = ar->source ? ar->source : "";
-    if (*src == '@') src++;
+    if (*src == '@')
+        src++;
     const char *src_base = basename_of(src);
     for (int i = 0; i < g_wdap.n_bps; i++) {
-        if (g_wdap.bps[i].line != ar->currentline) continue;
+        if (g_wdap.bps[i].line != ar->currentline)
+            continue;
         if (strcmp(basename_of(g_wdap.bps[i].source), src_base) == 0)
             return true;
     }
@@ -591,21 +639,24 @@ bool fc_dap_should_break(lua_State *L, lua_Debug *ar) {
 
 void fc_dap_pause_loop(lua_State *L, lua_Debug *ar) {
     (void)ar;
-    g_wdap.paused_L         = L;
-    g_wdap.paused           = 1;
+    g_wdap.paused_L = L;
+    g_wdap.paused = 1;
     g_wdap.continue_pending = 0;
-    g_wdap.pending_pause    = 0;
-    g_wdap.hook_yielded     = 1;  /* signal to wasm_lua_loop */
-    { lua_Debug info; lua_getstack(L, 0, &info); lua_getinfo(L, "Sl", &info);
-      printf("[dap] pause_loop: line=%d src=%s\n",
-             info.currentline, info.source ? info.source : "?"); }
+    g_wdap.pending_pause = 0;
+    g_wdap.hook_yielded = 1; /* signal to wasm_lua_loop */
+    {
+        lua_Debug info;
+        lua_getstack(L, 0, &info);
+        lua_getinfo(L, "Sl", &info);
+        printf("[dap] pause_loop: line=%d src=%s\n", info.currentline,
+               info.source ? info.source : "?");
+    }
 
-    const char *reason = (fc_master_hook_cfg.dap_pending_pause) ? "pause"
-                       : (fc_master_hook_cfg.dap_step_mode != DAP_STEP_NONE) ? "step"
-                       : "breakpoint";
+    const char *reason = (fc_master_hook_cfg.dap_pending_pause)                ? "pause"
+                         : (fc_master_hook_cfg.dap_step_mode != DAP_STEP_NONE) ? "step"
+                                                                               : "breakpoint";
     char body[256];
-    snprintf(body, sizeof body,
-             "{\"reason\":\"%s\",\"threadId\":1,\"allThreadsStopped\":true}",
+    snprintf(body, sizeof body, "{\"reason\":\"%s\",\"threadId\":1,\"allThreadsStopped\":true}",
              reason);
     send_event("stopped", body);
 
@@ -632,55 +683,69 @@ void fc_dap_do_resume(void) {
     int step_mode = g_wdap.pending_step_mode;
     int step_base = g_wdap.pending_step_base_depth;
     printf("[dap] do_resume: step_mode=%d step_base=%d\n", step_mode, step_base);
-    g_wdap.paused_L         = NULL;
-    g_wdap.paused           = 0;
+    g_wdap.paused_L = NULL;
+    g_wdap.paused = 0;
     g_wdap.continue_pending = 0;
 
-    fc_master_hook_cfg.dap_step_mode       = (dap_step_mode_t)step_mode;
+    fc_master_hook_cfg.dap_step_mode = (dap_step_mode_t)step_mode;
     fc_master_hook_cfg.dap_step_base_depth = step_base;
-    fc_master_hook_cfg.dap_pending_pause   = 0;
+    fc_master_hook_cfg.dap_pending_pause = 0;
 
     send_event("continued", "{\"threadId\":1,\"allThreadsContinued\":true}");
 }
 
 void fc_dap_output(const char *msg) {
-    if (!wdap_is_connected_js()) return;
+    if (!wdap_is_connected_js())
+        return;
     static char body[MAX_MSG];
     char esc[MAX_MSG / 2];
     size_t j = 0;
     for (size_t i = 0; msg[i] && j + 4 < sizeof esc; i++) {
-        if      (msg[i] == '"')  { esc[j++] = '\\'; esc[j++] = '"';  }
-        else if (msg[i] == '\\') { esc[j++] = '\\'; esc[j++] = '\\'; }
-        else if (msg[i] == '\n') { esc[j++] = '\\'; esc[j++] = 'n';  }
-        else if (msg[i] == '\r') { esc[j++] = '\\'; esc[j++] = 'r';  }
-        else                     { esc[j++] = msg[i]; }
+        if (msg[i] == '"') {
+            esc[j++] = '\\';
+            esc[j++] = '"';
+        } else if (msg[i] == '\\') {
+            esc[j++] = '\\';
+            esc[j++] = '\\';
+        } else if (msg[i] == '\n') {
+            esc[j++] = '\\';
+            esc[j++] = 'n';
+        } else if (msg[i] == '\r') {
+            esc[j++] = '\\';
+            esc[j++] = 'r';
+        } else {
+            esc[j++] = msg[i];
+        }
     }
     esc[j] = '\0';
-    snprintf(body, sizeof body,
-             "{\"category\":\"stdout\",\"output\":\"%s\\n\"}", esc);
+    snprintf(body, sizeof body, "{\"category\":\"stdout\",\"output\":\"%s\\n\"}", esc);
     send_event("output", body);
 }
 
 void fc_dap_emit_loaded_source(const char *source_path) {
     char body[MAX_SOURCE_PATH + 128];
     snprintf(body, sizeof body,
-             "{\"reason\":\"changed\",\"source\":{\"path\":\"%s\",\"name\":\"%s\"}}",
-             source_path, source_path);
+             "{\"reason\":\"changed\",\"source\":{\"path\":\"%s\",\"name\":\"%s\"}}", source_path,
+             source_path);
     send_event("loadedSource", body);
 }
 
 /* ── ECALL stubs (RV32 ELF cart path — not used in WASM Lua builds) ───────── */
 
 int fc_dap_check_hook_line(const char *source, int line, int depth) {
-    (void)source; (void)line; (void)depth;
+    (void)source;
+    (void)line;
+    (void)depth;
     return 0;
 }
 
 void fc_dap_host_send(const char *json, size_t len) {
-    (void)json; (void)len;
+    (void)json;
+    (void)len;
 }
 
 int fc_dap_host_recv(char *buf, size_t max_len) {
-    (void)buf; (void)max_len;
+    (void)buf;
+    (void)max_len;
     return 0;
 }

@@ -13,7 +13,7 @@ void fc_gdb_transport_wasm_open(int relay_port);
 void fc_gdb_transport_wasm_shutdown(void);
 
 /* Returns 1 if the WebSocket is connected. */
-int  fc_gdb_transport_wasm_is_connected(void);
+int fc_gdb_transport_wasm_is_connected(void);
 
 #ifdef __cplusplus
 }

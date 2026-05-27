@@ -20,7 +20,7 @@
 
 typedef struct {
     unsigned char *buf;
-    size_t         size;
+    size_t size;
 } WBuf;
 
 static int writer_cb(lua_State *L, const void *p, size_t sz, void *ud) {
@@ -122,7 +122,7 @@ int main(int argc, char *argv[]) {
          * since they share the same environment. */
         size_t total = 0;
         char **contents = malloc((size_t)nfiles * sizeof(char *));
-        size_t *sizes   = malloc((size_t)nfiles * sizeof(size_t));
+        size_t *sizes = malloc((size_t)nfiles * sizeof(size_t));
         if (!contents || !sizes) {
             free(contents);
             free(sizes);

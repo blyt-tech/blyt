@@ -29,7 +29,9 @@
 /* Weak default: 0 (hook disabled).  master_hook_ecall.c provides the strong
  * definition that probes the host via BLYT_ECALL_DAP_HOOK. */
 int blyt_dap_active(void) __attribute__((weak));
-int blyt_dap_active(void) { return 0; }
+int blyt_dap_active(void) {
+    return 0;
+}
 #endif
 
 /* Per-cart bytecode — defined in the generated cart_lua_data.c object. */
@@ -84,29 +86,29 @@ static int lua_blyt_quit(lua_State *L) {
  */
 static void register_blyt32(lua_State *L) {
     /* --- shared: blyt.debug subtable --- */
-    lua_newtable(L);                        /* idx A: blyt.debug */
+    lua_newtable(L); /* idx A: blyt.debug */
     lua_pushcfunction(L, lua_blyt_debug_print);
     lua_setfield(L, -2, "print");
 
     /* --- blyt table --- */
-    lua_newtable(L);                        /* blyt */
-    lua_pushvalue(L, -2);                   /* copy ref to blyt.debug */
+    lua_newtable(L); /* blyt */
+    lua_pushvalue(L, -2); /* copy ref to blyt.debug */
     lua_setfield(L, -2, "debug");
-    lua_pushcfunction(L, lua_blyt_quit);    /* shared: blyt.quit */
+    lua_pushcfunction(L, lua_blyt_quit); /* shared: blyt.quit */
     lua_setfield(L, -2, "quit");
-    lua_setglobal(L, "blyt");              /* pops blyt */
+    lua_setglobal(L, "blyt"); /* pops blyt */
 
     /* --- blyt32 table — distinct table; shared entries alias blyt.* --- */
-    lua_newtable(L);                        /* blyt32 */
-    lua_pushvalue(L, -2);                   /* copy ref to blyt.debug (idx A still on stack) */
+    lua_newtable(L); /* blyt32 */
+    lua_pushvalue(L, -2); /* copy ref to blyt.debug (idx A still on stack) */
     lua_setfield(L, -2, "debug");
     lua_getglobal(L, "blyt");
-    lua_getfield(L, -1, "quit");            /* blyt.quit */
-    lua_setfield(L, -3, "quit");            /* blyt32.quit = blyt.quit */
-    lua_pop(L, 1);                          /* pop blyt */
-    lua_setglobal(L, "blyt32");            /* pops blyt32 */
+    lua_getfield(L, -1, "quit"); /* blyt.quit */
+    lua_setfield(L, -3, "quit"); /* blyt32.quit = blyt.quit */
+    lua_pop(L, 1); /* pop blyt */
+    lua_setglobal(L, "blyt32"); /* pops blyt32 */
 
-    lua_pop(L, 1);                          /* pop blyt.debug (idx A) */
+    lua_pop(L, 1); /* pop blyt.debug (idx A) */
 
     lua_pushcfunction(L, lua_blyt_require);
     lua_setglobal(L, "require");
@@ -130,9 +132,10 @@ static lua_State *open_state(void) {
 
     if (cart_lua_bytecode && cart_lua_bytecode_size) {
         blyt_console_debug("open_state: before luaL_loadbuffer");
-        int load_result = luaL_loadbuffer(L, (const char *)cart_lua_bytecode,
-                            cart_lua_bytecode_size, "@cart");
-        blyt_console_debug(load_result == LUA_OK ? "open_state: loadbuffer OK" : "open_state: loadbuffer FAILED");
+        int load_result =
+            luaL_loadbuffer(L, (const char *)cart_lua_bytecode, cart_lua_bytecode_size, "@cart");
+        blyt_console_debug(load_result == LUA_OK ? "open_state: loadbuffer OK"
+                                                 : "open_state: loadbuffer FAILED");
         if (load_result != LUA_OK) {
             blyt_console_debug(lua_tostring(L, -1));
             lua_close(L);
@@ -178,5 +181,9 @@ void blyt_cart_init(void) {
     blyt_console_debug("blyt_cart_init: done");
 }
 
-void blyt_cart_update(void) { call_global("update"); }
-void blyt_cart_draw(void)   { call_global("draw"); }
+void blyt_cart_update(void) {
+    call_global("update");
+}
+void blyt_cart_draw(void) {
+    call_global("draw");
+}

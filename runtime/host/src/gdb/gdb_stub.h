@@ -15,9 +15,9 @@
 #ifndef BLYT_GDB_STUB_H
 #define BLYT_GDB_STUB_H
 
-#include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,10 +27,10 @@ extern "C" {
 
 typedef struct {
     /* Send GDB RSP packet (payload only; framing added by transport). */
-    int  (*send_pkt)(const char *payload);
+    int (*send_pkt)(const char *payload);
     /* Receive one GDB RSP packet payload into buf.
      * Returns payload length on success, -1 if no packet is available. */
-    int  (*recv_pkt)(char *buf, size_t cap);
+    int (*recv_pkt)(char *buf, size_t cap);
     /* Called when the CPU halts at a breakpoint or step boundary.
      * May block until the client sends vCont (TCP) or return immediately (WASM). */
     void (*on_stop)(void);
@@ -39,29 +39,29 @@ typedef struct {
 /* ── Library layout ───────────────────────────────────────────────────────── */
 
 typedef struct {
-    const char *path;   /* host filesystem path of the .so (or registered name) */
-    uint32_t    l_addr; /* load base in guest memory */
-    uint32_t    l_ld;   /* runtime address of dynamic section */
+    const char *path; /* host filesystem path of the .so (or registered name) */
+    uint32_t l_addr; /* load base in guest memory */
+    uint32_t l_ld; /* runtime address of dynamic section */
 } fc_gdb_library_t;
 
 typedef struct {
-    const char            *exec_path;   /* cart path for qXfer:exec-file:read */
+    const char *exec_path; /* cart path for qXfer:exec-file:read */
     const fc_gdb_library_t *libraries;
-    int                    n_libraries;
+    int n_libraries;
 } fc_gdb_layout_t;
 
 /* ── CPU operations ───────────────────────────────────────────────────────── */
 
 typedef struct {
     /* Read/write the 32 RV32 GPRs + PC into a 33×4-byte little-endian buffer. */
-    void     (*read_regs)(uint8_t out[33 * 4]);
-    void     (*write_regs)(const uint8_t in[33 * 4]);
+    void (*read_regs)(uint8_t out[33 * 4]);
+    void (*write_regs)(const uint8_t in[33 * 4]);
     /* Read/write guest memory.  Returns bytes actually transferred. */
     uint32_t (*read_mem)(uint32_t addr, uint8_t *dst, uint32_t n);
     uint32_t (*write_mem)(uint32_t addr, const uint8_t *src, uint32_t n);
     /* Patch / unpatch a software breakpoint (ebreak = 0x00100073). */
-    int      (*set_breakpoint)(uint32_t addr);
-    int      (*clear_breakpoint)(uint32_t addr);
+    int (*set_breakpoint)(uint32_t addr);
+    int (*clear_breakpoint)(uint32_t addr);
 } fc_gdb_cpu_ops_t;
 
 /* ── Public API ───────────────────────────────────────────────────────────── */
@@ -77,7 +77,7 @@ void fc_gdb_stub_set_cpu_ops(const fc_gdb_cpu_ops_t *ops);
 
 /* Called by the instruction loop before each dispatch.
  * Returns 1 if the loop should pause (breakpoint hit or single-step boundary). */
-int  fc_gdb_stub_check_break(uint32_t pc);
+int fc_gdb_stub_check_break(uint32_t pc);
 
 /* Notify the client that the CPU has stopped (sends T05swbreak:;).
  * Call this before invoking transport->on_stop(). */
@@ -94,10 +94,10 @@ void fc_gdb_stub_process_pkt(const char *pkt);
 
 /* Returns the pending action after a vCont is received:
  *   0 = continue, 1 = single-step, 2 = exit, -1 = no action yet (still halted). */
-int  fc_gdb_stub_pending_action(void);
+int fc_gdb_stub_pending_action(void);
 
 /* Returns 1 if a GDB client is currently connected. */
-int  fc_gdb_stub_has_client(void);
+int fc_gdb_stub_has_client(void);
 
 /* Call transport->on_stop() — blocks for TCP, no-op for WASM. */
 void fc_gdb_stub_block_until_resume(void);

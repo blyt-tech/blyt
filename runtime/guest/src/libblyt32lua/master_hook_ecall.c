@@ -33,10 +33,10 @@
 #define BLYT_ECALL_DAP_SEND 4
 #define BLYT_ECALL_DAP_RECV 5
 
-#define MAX_FRAMES     32
-#define MAX_VARS       64
-#define MAX_SOURCE     512
-#define MSG_MAX        (32 * 1024)
+#define MAX_FRAMES 32
+#define MAX_VARS 64
+#define MAX_SOURCE 512
+#define MSG_MAX (32 * 1024)
 
 /* ── ECALL helpers ─────────────────────────────────────────────────────────── */
 
@@ -72,11 +72,14 @@ static int jget_int(const char *buf, const char *key, int def) {
     char k[64];
     snprintf(k, sizeof k, "\"%s\"", key);
     const char *p = strstr(buf, k);
-    if (!p) return def;
+    if (!p)
+        return def;
     p = strchr(p, ':');
-    if (!p) return def;
+    if (!p)
+        return def;
     p++;
-    while (*p == ' ' || *p == '\t') p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
     return (*p == '"') ? def : (int)strtol(p, NULL, 10);
 }
 
@@ -84,17 +87,24 @@ static int jget_str(const char *buf, const char *key, char *out, size_t n) {
     char k[64];
     snprintf(k, sizeof k, "\"%s\"", key);
     const char *p = strstr(buf, k);
-    if (!p) return 0;
+    if (!p)
+        return 0;
     p = strchr(p, ':');
-    if (!p) return 0;
+    if (!p)
+        return 0;
     p++;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != '"') return 0;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != '"')
+        return 0;
     p++;
     size_t i = 0;
     while (*p && *p != '"' && i + 1 < n) {
-        if (*p == '\\' && p[1]) { out[i++] = p[1]; p += 2; }
-        else out[i++] = *p++;
+        if (*p == '\\' && p[1]) {
+            out[i++] = p[1];
+            p += 2;
+        } else
+            out[i++] = *p++;
     }
     out[i] = 0;
     return 1;
@@ -121,8 +131,7 @@ static void send_resp(int req_seq, const char *cmd, int ok, const char *body) {
 
 /* ── Variable appender ─────────────────────────────────────────────────────── */
 
-static int append_var(char *buf, size_t rem, const char *vn,
-                      lua_State *L, int first) {
+static int append_var(char *buf, size_t rem, const char *vn, lua_State *L, int first) {
     const char *vt = luaL_typename(L, -1);
     char val[256] = {0};
     if (lua_isstring(L, -1) || lua_isnumber(L, -1)) {
@@ -132,7 +141,8 @@ static int append_var(char *buf, size_t rem, const char *vn,
         snprintf(val, sizeof val, "%s", vt);
     }
     for (char *q = val; *q; q++)
-        if (*q == '"' || *q == '\\') *q = '_';
+        if (*q == '"' || *q == '\\')
+            *q = '_';
     return snprintf(buf, rem,
                     "%s{\"name\":\"%s\",\"value\":\"%s\","
                     "\"type\":\"%s\",\"variablesReference\":0}",
@@ -149,16 +159,16 @@ static void on_stack_trace(int seq, lua_State *L) {
     while (frame < MAX_FRAMES && lua_getstack(L, frame, &ar2)) {
         lua_getinfo(L, "Snl", &ar2);
         const char *name = ar2.name ? ar2.name : (ar2.what ? ar2.what : "?");
-        const char *s    = ar2.source ? ar2.source : "?";
-        if (*s == '@') s++;
+        const char *s = ar2.source ? ar2.source : "?";
+        if (*s == '@')
+            s++;
         off += snprintf(body + off, sizeof(body) - (size_t)off,
                         "%s{\"id\":%d,\"name\":\"%s\","
                         "\"source\":{\"path\":\"%s\"},\"line\":%d,\"column\":1}",
                         frame ? "," : "", frame, name, s, ar2.currentline);
         frame++;
     }
-    snprintf(body + off, sizeof(body) - (size_t)off,
-             "],\"totalFrames\":%d}", frame);
+    snprintf(body + off, sizeof(body) - (size_t)off, "],\"totalFrames\":%d}", frame);
     send_resp(seq, "stackTrace", 1, body);
 }
 
@@ -173,7 +183,7 @@ static void on_scopes(int seq, const char *msg) {
 }
 
 static void on_variables(int seq, const char *msg, lua_State *L) {
-    int vref     = jget_int(msg, "variablesReference", 0);
+    int vref = jget_int(msg, "variablesReference", 0);
     int frame_id = vref - 1;
     static char body[MSG_MAX];
     int off = snprintf(body, sizeof body, "{\"variables\":[");
@@ -184,8 +194,7 @@ static void on_variables(int seq, const char *msg, lua_State *L) {
         int idx = 1;
         while ((vn = lua_getlocal(L, &ar2, idx)) != NULL && idx <= MAX_VARS) {
             if (vn[0] != '(') {
-                off += append_var(body + off, sizeof(body) - (size_t)off,
-                                  vn, L, first);
+                off += append_var(body + off, sizeof(body) - (size_t)off, vn, L, first);
                 first = 0;
             }
             lua_pop(L, 1);
@@ -195,10 +204,10 @@ static void on_variables(int seq, const char *msg, lua_State *L) {
         int fn = lua_gettop(L), uvi = 1;
         while (uvi <= MAX_VARS) {
             vn = lua_getupvalue(L, fn, uvi++);
-            if (!vn) break;
+            if (!vn)
+                break;
             if (strcmp(vn, "_ENV") != 0) {
-                off += append_var(body + off, sizeof(body) - (size_t)off,
-                                  vn, L, first);
+                off += append_var(body + off, sizeof(body) - (size_t)off, vn, L, first);
                 first = 0;
             }
             lua_pop(L, 1);
@@ -223,14 +232,18 @@ static void on_evaluate(int seq, const char *msg, lua_State *L) {
     const char *vn;
     int idx = 1;
     while ((vn = lua_getlocal(L, &ar2, idx++)) != NULL) {
-        if (strcmp(vn, expr) == 0) goto found;
+        if (strcmp(vn, expr) == 0)
+            goto found;
         lua_pop(L, 1);
     }
     lua_getinfo(L, "f", &ar2);
     {
         int fn = lua_gettop(L), uvi = 1;
         while ((vn = lua_getupvalue(L, fn, uvi++)) != NULL) {
-            if (strcmp(vn, expr) == 0) { lua_remove(L, fn); goto found; }
+            if (strcmp(vn, expr) == 0) {
+                lua_remove(L, fn);
+                goto found;
+            }
             lua_pop(L, 1);
         }
         lua_pop(L, 1);
@@ -246,12 +259,12 @@ found: {
         snprintf(val, sizeof val, "%s", luaL_typename(L, -1));
     lua_pop(L, 1);
     for (char *q = val; *q; q++)
-        if (*q == '"' || *q == '\\') *q = '_';
+        if (*q == '"' || *q == '\\')
+            *q = '_';
     char body[320];
-    snprintf(body, sizeof body,
-             "{\"result\":\"%s\",\"variablesReference\":0}", val);
+    snprintf(body, sizeof body, "{\"result\":\"%s\",\"variablesReference\":0}", val);
     send_resp(seq, "evaluate", 1, body);
-    }
+}
 }
 
 static void on_threads(int seq) {
@@ -278,10 +291,11 @@ bool fc_dap_should_break(lua_State *L, lua_Debug *ar) {
     lua_getinfo(L, "Sl", ar);
 
     const char *src = ar->source ? ar->source : "?";
-    if (*src == '@') src++;
+    if (*src == '@')
+        src++;
     int src_len = (int)strlen(src);
-    int line    = ar->currentline;
-    int depth   = hook_call_depth(L);
+    int line = ar->currentline;
+    int depth = hook_call_depth(L);
 
     int result = ecall_dap_hook(src, src_len, line, depth);
     return result != 0;
@@ -297,18 +311,25 @@ void fc_dap_pause_loop(lua_State *L, lua_Debug *ar) {
 
     for (;;) {
         int len = ecall_dap_recv(recv_buf, (int)sizeof(recv_buf) - 1);
-        if (len <= 0) break; /* host sent continue/step/disconnect */
+        if (len <= 0)
+            break; /* host sent continue/step/disconnect */
 
         recv_buf[len] = '\0';
         int seq = jget_int(recv_buf, "seq", 0);
         char cmd[64] = {0};
         jget_str(recv_buf, "command", cmd, sizeof cmd);
 
-        if      (strcmp(cmd, "stackTrace") == 0) on_stack_trace(seq, L);
-        else if (strcmp(cmd, "scopes")     == 0) on_scopes(seq, recv_buf);
-        else if (strcmp(cmd, "variables")  == 0) on_variables(seq, recv_buf, L);
-        else if (strcmp(cmd, "evaluate")   == 0) on_evaluate(seq, recv_buf, L);
-        else if (strcmp(cmd, "threads")    == 0) on_threads(seq);
-        else send_resp(seq, cmd, 0, "handled by host");
+        if (strcmp(cmd, "stackTrace") == 0)
+            on_stack_trace(seq, L);
+        else if (strcmp(cmd, "scopes") == 0)
+            on_scopes(seq, recv_buf);
+        else if (strcmp(cmd, "variables") == 0)
+            on_variables(seq, recv_buf, L);
+        else if (strcmp(cmd, "evaluate") == 0)
+            on_evaluate(seq, recv_buf, L);
+        else if (strcmp(cmd, "threads") == 0)
+            on_threads(seq);
+        else
+            send_resp(seq, cmd, 0, "handled by host");
     }
 }

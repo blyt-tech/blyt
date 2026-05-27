@@ -136,8 +136,8 @@ static const unsigned int blytal_rv32_nrs[] = {
 #define BLYTAL_FILTER_BUF 256
 
 static int blyt_build_launcher_filter(struct blytal_sock_filter *buf, int bufsz,
-                                    const unsigned int *rv64, int n64, const unsigned int *rv32,
-                                    int n32) {
+                                      const unsigned int *rv64, int n64, const unsigned int *rv32,
+                                      int n32) {
     int total = 8 + 2 * (n64 + n32);
     if (total > bufsz) {
         fprintf(stderr, "blyt_launcher: launcher filter too large: %d > %d\n", total, bufsz);
@@ -201,11 +201,11 @@ static int blyt_build_launcher_filter(struct blytal_sock_filter *buf, int bufsz,
 static int blyt_install_launcher_filter(void) {
     struct blytal_sock_filter prog[BLYTAL_FILTER_BUF];
     int len = blyt_build_launcher_filter(prog, BLYTAL_FILTER_BUF, blytal_rv64_nrs, BLYTAL_RV64_N,
-                                       blytal_rv32_nrs, BLYTAL_RV32_N);
+                                         blytal_rv32_nrs, BLYTAL_RV32_N);
     if (len < 0)
         return -1;
-    fprintf(stderr, "blyt_native: launcher filter: %d insns (rv64=%d rv32=%d)\n", len, BLYTAL_RV64_N,
-            BLYTAL_RV32_N);
+    fprintf(stderr, "blyt_native: launcher filter: %d insns (rv64=%d rv32=%d)\n", len,
+            BLYTAL_RV64_N, BLYTAL_RV32_N);
     struct blytal_sock_fprog fp;
     fp.len = (unsigned short)len;
     fp.filter = prog;

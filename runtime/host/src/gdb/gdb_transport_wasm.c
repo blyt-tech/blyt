@@ -76,9 +76,11 @@ EM_JS(int, wgdb_is_connected_js, (void), {
 static int wgdb_send_pkt(const char *payload) {
     size_t plen = strlen(payload);
     char *buf = malloc(plen + 8);
-    if (!buf) return -1;
+    if (!buf)
+        return -1;
     int csum = 0;
-    for (size_t i = 0; i < plen; i++) csum += (unsigned char)payload[i];
+    for (size_t i = 0; i < plen; i++)
+        csum += (unsigned char)payload[i];
     snprintf(buf, plen + 8, "$%s#%02x", payload, csum & 0xff);
     wgdb_ws_send_js(buf);
     free(buf);
@@ -89,13 +91,17 @@ static int wgdb_send_pkt(const char *payload) {
  * Returns payload length, or -1 if the frame is an ack/invalid. */
 static int wgdb_extract_payload(const char *frame, char *buf, size_t cap) {
     /* Skip leading ack chars (+/-). */
-    while (*frame == '+' || *frame == '-') frame++;
-    if (*frame != '$') return -1;
-    frame++;  /* skip '$' */
+    while (*frame == '+' || *frame == '-')
+        frame++;
+    if (*frame != '$')
+        return -1;
+    frame++; /* skip '$' */
     const char *end = strchr(frame, '#');
-    if (!end) return -1;
+    if (!end)
+        return -1;
     size_t plen = (size_t)(end - frame);
-    if (plen + 1 > cap) return -1;
+    if (plen + 1 > cap)
+        return -1;
     memcpy(buf, frame, plen);
     buf[plen] = '\0';
     /* Send ack. */
@@ -107,10 +113,12 @@ static int wgdb_recv_pkt(char *buf, size_t cap) {
     /* Drain ack-only frames and find a real packet. */
     while (wgdb_queue_length() > 0) {
         char *frame = wgdb_dequeue_frame();
-        if (!frame) break;
+        if (!frame)
+            break;
         int n = wgdb_extract_payload(frame, buf, cap);
         free(frame);
-        if (n >= 0) return n;
+        if (n >= 0)
+            return n;
         /* n < 0: ack-only frame, continue draining. */
     }
     return -1;
@@ -124,7 +132,7 @@ static void wgdb_on_stop(void) {
 static const fc_gdb_transport_t wasm_transport = {
     .send_pkt = wgdb_send_pkt,
     .recv_pkt = wgdb_recv_pkt,
-    .on_stop  = wgdb_on_stop,
+    .on_stop = wgdb_on_stop,
 };
 
 /* ── Public API ───────────────────────────────────────────────────────────── */
@@ -137,7 +145,11 @@ void fc_gdb_transport_wasm_open(int relay_port) {
 void fc_gdb_transport_wasm_shutdown(void) {
     EM_ASM({
         if (Module._wgdb_ws) {
-            try { Module._wgdb_ws.close(1000, 'shutdown'); } catch(e) {}
+            try {
+                Module._wgdb_ws.close(1000, 'shutdown');
+            }
+            catch(e) {
+            }
             Module._wgdb_ws = null;
         }
         Module._wgdb_connected = 0;
