@@ -8,7 +8,7 @@ use common::{
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-/// `blyt build` with no cart.build.yaml defaults to Lua; without Lua source
+/// `blyt build` with no blyt.build.yaml defaults to Lua; without Lua source
 /// files it fails with a clear "no .lua files" error.
 #[test]
 fn build_lua_no_source_fails_with_error() {
@@ -16,7 +16,7 @@ fn build_lua_no_source_fails_with_error() {
     let project = tmp.path().join("no_manifest");
     // Create the project root but no src/game/lua/ directory.
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::write(project.join("cart.info.yaml"), "name: no_manifest\n").unwrap();
+    std::fs::write(project.join("blyt.info.yaml"), "name: no_manifest\n").unwrap();
 
     Command::new(blyt_bin())
         .args(["build", project.to_str().unwrap()])

@@ -9,20 +9,20 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
-/// blyt build fails immediately with a clear error when cart.info.yaml is absent.
+/// blyt build fails immediately with a clear error when blyt.info.yaml is absent.
 /// Does not require the SDK because the check fires before any toolchain call.
 #[test]
-fn build_fails_without_cart_info_yaml() {
+fn build_fails_without_blyt_info_yaml() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("no_info");
     fs::create_dir_all(project.join("src/game/c")).unwrap();
-    fs::write(project.join("cart.build.yaml"), "language: c\n").unwrap();
+    fs::write(project.join("blyt.build.yaml"), "language: c\n").unwrap();
     fs::write(
         project.join("src/game/c/main.c"),
         "#include \"blyt.h\"\nvoid blyt_cart_init(void){}\nvoid blyt_cart_update(void){}\nvoid blyt_cart_draw(void){}\n",
     )
     .unwrap();
-    // No cart.info.yaml written.
+    // No blyt.info.yaml written.
 
     Command::new(blyt_bin())
         .args(["build", project.to_str().unwrap()])
@@ -30,7 +30,7 @@ fn build_fails_without_cart_info_yaml() {
         .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cart.info.yaml"));
+        .stderr(predicate::str::contains("blyt.info.yaml"));
 }
 
 /// blyt build with a C manifest but no source files produces a clear error.
@@ -39,8 +39,8 @@ fn build_empty_c_project_fails_with_error() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("empty");
     fs::create_dir_all(project.join("src/game/c")).unwrap();
-    fs::write(project.join("cart.info.yaml"), "name: empty\n").unwrap();
-    fs::write(project.join("cart.build.yaml"), "language: c\n").unwrap();
+    fs::write(project.join("blyt.info.yaml"), "name: empty\n").unwrap();
+    fs::write(project.join("blyt.build.yaml"), "language: c\n").unwrap();
 
     Command::new(blyt_bin())
         .args(["build", project.to_str().unwrap()])
@@ -649,7 +649,7 @@ fn build_lib_subcommand_produces_archive() {
     CartProject::new()
         .lib_file("mylib", "include/mylib.h", "int mylib_fn(void);")
         .lib_file("mylib", "mylib.c", "int mylib_fn(void) { return 42; }\n")
-        // A minimal cart.build.yaml is still required for SDK discovery,
+        // A minimal blyt.build.yaml is still required for SDK discovery,
         // even when only building a library.
         .c("#include \"blyt.h\"\nvoid blyt_cart_init(void){} void blyt_cart_update(void){blyt_quit();} void blyt_cart_draw(void){}")
         .write(&project);

@@ -90,7 +90,7 @@ fn rust_lib_cargo_toml(name: &str) -> String {
 ///
 /// Call `.c(source)` and/or `.rust(lib_rs)` to declare languages, then
 /// `.write(dir)` to materialise the project layout under `dir`.  The
-/// `cart.build.yaml` is generated automatically from the declared languages.
+/// `blyt.build.yaml` is generated automatically from the declared languages.
 ///
 /// ```
 /// CartProject::new().c(r#"..."#).write(&project_dir);
@@ -205,15 +205,15 @@ impl CartProject {
         // Ensure the project root exists before writing any files into it.
         fs::create_dir_all(dir).unwrap();
 
-        // cart.info.yaml — mandatory for all blyt cart projects.
+        // blyt.info.yaml — mandatory for all blyt cart projects.
         let project_name = dir.file_name().unwrap_or_default().to_string_lossy();
         fs::write(
-            dir.join("cart.info.yaml"),
+            dir.join("blyt.info.yaml"),
             format!("name: {project_name}\n"),
         )
         .unwrap();
 
-        // cart.build.yaml — language declaration (ADR-0073).
+        // blyt.build.yaml — language declaration (ADR-0073).
         // Lua carts omit the file; the absent manifest signals Lua to blyt build.
         if !has_lua {
             let manifest = if has_c {
@@ -223,7 +223,7 @@ impl CartProject {
             } else {
                 "language: rust\n"
             };
-            fs::write(dir.join("cart.build.yaml"), manifest).unwrap();
+            fs::write(dir.join("blyt.build.yaml"), manifest).unwrap();
         }
 
         if has_c {

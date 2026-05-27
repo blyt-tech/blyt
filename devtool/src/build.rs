@@ -69,11 +69,11 @@ fn err(msg: impl Into<String>) -> BuildError {
 }
 
 /* -------------------------------------------------------------------------
- * Build manifest (cart.build.yaml)
+ * Build manifest (blyt.build.yaml)
  *
  * ADR-0073: Lua is the default cart language and does not need to be declared.
  * Native languages (C, Rust) require explicit declaration via `language: <lang>`
- * in cart.build.yaml.  Future: `languages: [c, rust]` for hybrid carts.
+ * in blyt.build.yaml.  Future: `languages: [c, rust]` for hybrid carts.
  * ------------------------------------------------------------------------- */
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -85,7 +85,7 @@ enum CartLanguage {
 }
 
 fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
-    let manifest_path = project_dir.join("cart.build.yaml");
+    let manifest_path = project_dir.join("blyt.build.yaml");
     if !manifest_path.exists() {
         // Absent manifest → Lua default (ADR-0073).
         return Ok(CartLanguage::Lua);
@@ -93,7 +93,7 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
     let text = fs::read_to_string(&manifest_path)?;
     // Minimal parse: find first non-comment `language: <value>` line.
     // YAML allows quoting: `language: "c++"` and `language: c++` both work.
-    // TODO(phase-9): replace with serde_yaml once cart.build.yaml grows more fields.
+    // TODO(phase-9): replace with serde_yaml once blyt.build.yaml grows more fields.
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') {
@@ -107,7 +107,7 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
                 "rust" => Ok(CartLanguage::Rust),
                 "lua" => Ok(CartLanguage::Lua),
                 other => Err(err(format!(
-                    "cart.build.yaml: unknown language {other:?} — \
+                    "blyt.build.yaml: unknown language {other:?} — \
                      expected `c`, `\"c++\"`, `rust`, or `lua`"
                 ))),
             };
@@ -122,10 +122,10 @@ fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
  * ------------------------------------------------------------------------- */
 
 pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<PathBuf, BuildError> {
-    let info_path = project_dir.join("cart.info.yaml");
+    let info_path = project_dir.join("blyt.info.yaml");
     if !info_path.exists() {
         return Err(err(format!(
-            "cart.info.yaml not found in {} — \
+            "blyt.info.yaml not found in {} — \
              every blyt cart project must have this file",
             project_dir.display()
         )));
@@ -149,7 +149,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                 return Err(err(format!(
                     "no .lua files found under {} — \
                      for a C or Rust cart add `language: c` or `language: rust` \
-                     to cart.build.yaml",
+                     to blyt.build.yaml",
                     lua_src_dir.display()
                 )));
             }

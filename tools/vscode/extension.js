@@ -122,14 +122,14 @@ function startBlytRun(cartPath, cwd, output) {
 /* ── Cart project detection ───────────────────────────────────────────────── */
 
 /* Walk up from startPath to find the nearest directory containing
- * cart.info.yaml.  Returns the project directory path, or null. */
+ * blyt.info.yaml.  Returns the project directory path, or null. */
 function findCartProject(startPath) {
     let dir = startPath;
     try {
         if (!fs.statSync(startPath).isDirectory()) dir = path.dirname(startPath);
     } catch { return null; }
     while (true) {
-        if (fs.existsSync(path.join(dir, 'cart.info.yaml'))) return dir;
+        if (fs.existsSync(path.join(dir, 'blyt.info.yaml'))) return dir;
         const parent = path.dirname(dir);
         if (parent === dir) return null;
         dir = parent;
@@ -285,13 +285,13 @@ function activate(context) {
     );
 
     /* Provide a "blyt: Build" task for every workspace folder that looks like
-     * a blyt cart project (contains cart.build.yaml). */
+     * a blyt cart project (contains blyt.build.yaml). */
     context.subscriptions.push(
         vscode.tasks.registerTaskProvider('blyt', {
             provideTasks() {
                 const folders = vscode.workspace.workspaceFolders ?? [];
                 return folders
-                    .filter(f => fs.existsSync(path.join(f.uri.fsPath, 'cart.info.yaml')))
+                    .filter(f => fs.existsSync(path.join(f.uri.fsPath, 'blyt.info.yaml')))
                     .map(folder =>
                         new vscode.Task(
                             { type: 'blyt', command: 'build' },

@@ -7,7 +7,7 @@
   "engines": { "vscode": "^1.80.0" },
   "categories": ["Debuggers", "Other"],
   "activationEvents": [
-    "workspaceContains:cart.info.yaml",
+    "workspaceContains:blyt.info.yaml",
     "onStartupFinished",
     "onDebugInitialConfigurations",
     "onDebugResolve:blyt-lua",
