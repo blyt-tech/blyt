@@ -34,6 +34,21 @@ pub fn blytrun() -> PathBuf {
     build_dir().join("blytrun")
 }
 
+/// Path to the `blyt` devtool binary.
+///
+/// Uses `CARGO_BIN_EXE_blyt` when Cargo sets it (same-package tests), then
+/// falls back to the workspace `target/{profile}/blyt` path.  This is needed
+/// because `blyt` lives in the `devtool` package while these tests are in the
+/// `tests/integration` package, and Cargo 1.77+ only sets `CARGO_BIN_EXE_*`
+/// for same-package binaries.
+pub fn blyt_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_blyt") {
+        return PathBuf::from(p);
+    }
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    repo_root().join("target").join(profile).join("blyt")
+}
+
 // -------------------------------------------------------------------------
 // Cart project fixture builder
 // -------------------------------------------------------------------------
@@ -413,7 +428,7 @@ pub fn require_libretro_core() {
 pub fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     use assert_cmd::Command;
     let sdk = sdk_dir();
-    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    let mut cmd = Command::new(blyt_bin());
     cmd.args(["build", project_dir.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)
         .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
@@ -442,7 +457,7 @@ pub fn build_cart(project_dir: &std::path::Path) -> PathBuf {
 pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     use assert_cmd::Command;
     let sdk = sdk_dir();
-    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    let mut cmd = Command::new(blyt_bin());
     cmd.args(["build", project_dir.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)
         .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
@@ -525,7 +540,7 @@ pub fn blytrun_gdb_port(output: &str) -> Option<u16> {
 pub fn build_debug_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     use assert_cmd::Command;
     let sdk = sdk_dir();
-    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    let mut cmd = Command::new(blyt_bin());
     cmd.args(["build", "--debug", project_dir.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)
         .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
@@ -559,7 +574,7 @@ pub fn build_debug_lua_cart(project_dir: &std::path::Path) -> PathBuf {
 pub fn build_debug_cart(project_dir: &std::path::Path) -> PathBuf {
     use assert_cmd::Command;
     let sdk = sdk_dir();
-    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    let mut cmd = Command::new(blyt_bin());
     cmd.args(["build", "--debug", project_dir.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)
         .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))

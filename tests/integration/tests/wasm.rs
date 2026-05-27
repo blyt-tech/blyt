@@ -2,7 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    build_cart, find_wasm_dir, repo_root, require_playwright, require_wasm, sdk_dir,
+    blyt_bin, build_cart, find_wasm_dir, repo_root, require_playwright, require_wasm, sdk_dir,
     write_c_cart_project,
 };
 use std::fs;
@@ -98,8 +98,7 @@ void blyt_cart_draw(void)   {}
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
     let html_path = tmp.path().join("wasm_export.html");
-    Command::cargo_bin("blyt")
-        .unwrap()
+    Command::new(blyt_bin())
         .args([
             "build",
             "wasm",
@@ -166,7 +165,7 @@ void blyt_cart_draw(void)   {}
     );
 
     let sdk = sdk_dir();
-    let mut cmd = Command::cargo_bin("blyt").unwrap();
+    let mut cmd = Command::new(blyt_bin());
     cmd.args(["build", "all", project.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)
         .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
@@ -238,8 +237,7 @@ void blyt_cart_draw(void)   {}
     /* Build a standalone HTML with the WASM runtime and cart embedded as base64,
      * so the page can be loaded via file:// without a server. */
     let html_path = tmp.path().join("browser_canvas_cart.html");
-    Command::cargo_bin("blyt")
-        .unwrap()
+    Command::new(blyt_bin())
         .args([
             "build",
             "wasm",

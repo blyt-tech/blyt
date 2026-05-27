@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_cart, repo_root, require_sdk, require_test_session_api, sdk_dir,
-    test_session_api, write_c_cart_project,
+    CartProject, blyt_bin, blytrun, build_cart, repo_root, require_sdk, require_test_session_api,
+    sdk_dir, test_session_api, write_c_cart_project,
 };
 use predicates::prelude::*;
 use std::fs;
@@ -24,8 +24,7 @@ fn build_fails_without_cart_info_yaml() {
     .unwrap();
     // No cart.info.yaml written.
 
-    Command::cargo_bin("blyt")
-        .unwrap()
+    Command::new(blyt_bin())
         .args(["build", project.to_str().unwrap()])
         .env("BLYT_SDK_DIR", sdk_dir())
         .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
@@ -43,8 +42,7 @@ fn build_empty_c_project_fails_with_error() {
     fs::write(project.join("cart.info.yaml"), "name: empty\n").unwrap();
     fs::write(project.join("cart.build.yaml"), "language: c\n").unwrap();
 
-    Command::cargo_bin("blyt")
-        .unwrap()
+    Command::new(blyt_bin())
         .args(["build", project.to_str().unwrap()])
         .env("BLYT_SDK_DIR", sdk_dir())
         .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
@@ -657,7 +655,7 @@ fn build_lib_subcommand_produces_archive() {
         .write(&project);
 
     let sdk = sdk_dir();
-    let mut lib_cmd = Command::cargo_bin("blyt").unwrap();
+    let mut lib_cmd = Command::new(blyt_bin());
     lib_cmd
         .args(["build", "lib", "mylib", project.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)

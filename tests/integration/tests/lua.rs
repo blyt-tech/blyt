@@ -2,7 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytrun, build_lua_cart, require_cpp_sdk, require_lua_sdk,
+    CartProject, blyt_bin, blytrun, build_lua_cart, require_cpp_sdk, require_lua_sdk,
     require_rust_riscv_target, require_sdk, sdk_dir,
 };
 use predicates::prelude::*;
@@ -18,8 +18,7 @@ fn build_lua_no_source_fails_with_error() {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::write(project.join("cart.info.yaml"), "name: no_manifest\n").unwrap();
 
-    Command::cargo_bin("blyt")
-        .unwrap()
+    Command::new(blyt_bin())
         .args(["build", project.to_str().unwrap()])
         .env("BLYT_SDK_DIR", sdk_dir())
         .env("BLYT_OBJCOPY", sdk_dir().join("bin/blyt-objcopy"))
