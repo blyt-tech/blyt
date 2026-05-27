@@ -18,16 +18,25 @@ let   nextId = 0;
 
 /* ── Locate blyt executable ───────────────────────────────────────────────── */
 
-function findBlyt() {
+/* Returns the path to the blyt binary, or null (silently) if the SDK is not
+ * configured.  Use this for background / auto-setup paths. */
+function findBlytSilent() {
     const sdkDir = vscode.workspace.getConfiguration('blyt').get('sdkDir', '').trim()
         || process.env.BLYT_SDK_DIR || '';
-    if (!sdkDir) {
+    if (!sdkDir) return null;
+    return path.join(sdkDir, 'bin', 'blyt');
+}
+
+/* Returns the path to the blyt binary, or null after showing an error
+ * notification.  Use this when the user has explicitly triggered an action. */
+function findBlyt() {
+    const blyt = findBlytSilent();
+    if (!blyt) {
         vscode.window.showErrorMessage(
             'Blyt: set blyt.sdkDir in VS Code settings (or BLYT_SDK_DIR env var) to the blyt SDK directory.'
         );
-        return null;
     }
-    return path.join(sdkDir, 'bin', 'blyt');
+    return blyt;
 }
 
 /* ── Start blyt build ────────────────────────────────────────────────────── */
@@ -159,11 +168,45 @@ function detectCart(folder) {
     return null;
 }
 
+/* ── VS Code project setup ────────────────────────────────────────────────── */
+
+/* For each workspace folder that is a Lua cart project, run
+ * `blyt setup vscode <dir>` if .vscode/launch.json is missing.
+ * Runs silently in the background on activation so F5 works immediately. */
+async function autoSetupVscode(output) {
+    const blyt = findBlytSilent();
+    if (!blyt) return;  // SDK not yet configured — nothing to do
+
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    for (const folder of folders) {
+        const projectDir = findCartProject(folder.uri.fsPath);
+        if (!projectDir || !isLuaCart(projectDir)) continue;
+
+        const launchJson = path.join(projectDir, '.vscode', 'launch.json');
+        if (fs.existsSync(launchJson)) continue;
+
+        output.appendLine(`[setup] blyt setup vscode ${projectDir}`);
+        await new Promise(resolve => {
+            const proc = cp.spawn(blyt, ['setup', 'vscode', projectDir], {
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            proc.stdout.on('data', d => output.append(d.toString()));
+            proc.stderr.on('data', d => output.append(d.toString()));
+            proc.on('error', e => {
+                output.appendLine(`[setup] error: ${e.message}`);
+                resolve();
+            });
+            proc.on('exit', () => resolve());
+        });
+    }
+}
+
 /* ── Extension entry point ────────────────────────────────────────────────── */
 
 function activate(context) {
     const output = vscode.window.createOutputChannel('Blyt');
 
+    autoSetupVscode(output);
 
     /* Connect VS Code's built-in DAP client to the blyt relay TCP port. */
     context.subscriptions.push(

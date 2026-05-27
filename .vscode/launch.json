@@ -7,10 +7,10 @@
             // Run the hello cart headlessly — fastest way to verify blyt_console_debug
             // output without opening an SDL2 window.
             // Cart is built by blyt into tests/game/hello.blyt (gitignored).
-            "name": "blytrun: hello cart (headless)",
+            "name": "blytplay: hello cart (headless)",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/build/blytrun",
+            "program": "${workspaceFolder}/build/blytplay",
             "args": ["--headless", "${workspaceFolder}/tests/game/hello.blyt"],
             "env": {
                 "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib"
@@ -26,10 +26,10 @@
             ]
         },
         {
-            "name": "blytrun: hello cart (SDL2)",
+            "name": "blytplay: hello cart (SDL2)",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/build/blytrun",
+            "program": "${workspaceFolder}/build/blytplay",
             "args": ["${workspaceFolder}/tests/game/hello.blyt"],
             "env": {
                 "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib"

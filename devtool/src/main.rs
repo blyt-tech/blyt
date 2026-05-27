@@ -1,6 +1,7 @@
 mod build;
 mod export;
 mod run;
+mod setup;
 
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -26,6 +27,25 @@ enum Commands {
         /// Enable debugging (DAP, GDB, frame stepping)
         #[arg(long)]
         debug: bool,
+    },
+
+    /// Configure IDE and tooling integration for a cart project
+    Setup {
+        #[command(subcommand)]
+        sub: SetupSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SetupSubcommand {
+    /// Generate .vscode/launch.json so F5 launches the Blyt DAP debugger
+    Vscode {
+        /// Path to the cart project directory (default: current directory)
+        project_dir: Option<PathBuf>,
+
+        /// Overwrite an existing .vscode/launch.json
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -126,6 +146,13 @@ fn main() {
         }
 
         Commands::Run { cart, debug } => run::run(&cart, debug).map_err(|e| e.to_string()),
+
+        Commands::Setup {
+            sub: SetupSubcommand::Vscode { project_dir, force },
+        } => {
+            let dir = project_dir.as_deref().unwrap_or(Path::new("."));
+            setup::vscode(dir, force).map_err(|e| e.to_string())
+        }
     };
 
     if let Err(e) = result {

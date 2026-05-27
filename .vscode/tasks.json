@@ -39,7 +39,7 @@
             "problemMatcher": []
         },
         {
-            // Compound pre-launch task: builds blytrun, the SDK, and the hello cart in order.
+            // Compound pre-launch task: builds blytplay, the SDK, and the hello cart in order.
             "label": "build: hello cart launch deps",
             "dependsOn": ["cmake: build", "cmake: build sdk", "build: hello cart"],
             "dependsOrder": "sequence",
