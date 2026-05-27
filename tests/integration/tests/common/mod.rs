@@ -45,7 +45,11 @@ pub fn blyt_bin() -> PathBuf {
     if let Ok(p) = std::env::var("CARGO_BIN_EXE_blyt") {
         return PathBuf::from(p);
     }
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     repo_root().join("target").join(profile).join("blyt")
 }
 
