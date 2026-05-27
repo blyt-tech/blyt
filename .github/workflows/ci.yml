@@ -144,4 +144,6 @@ jobs:
       - name: Rust tests (unit + integration)
         env:
           BLYT_BUILD_DIR: ${{ github.workspace }}/build
-        run: cargo test --workspace
+        run: |
+          cargo build -p blyt
+          cargo test --workspace
