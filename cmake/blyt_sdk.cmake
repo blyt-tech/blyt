@@ -957,7 +957,7 @@ if(EMCC)
     COMMAND
       emcmake ${CMAKE_COMMAND} -B "${BLYT_BINARY_DIR}/build-wasm" -S
       "${BLYT_SOURCE_DIR}/frontends/wasm" "-DBLYT_GUEST_LIB_DIR=${SDK_LIB}"
-      "-DBLYT_VERSION=${BLYT_VERSION}" -G "Unix Makefiles"
+      "-DBLYT_VERSION=${BLYT_VERSION}" -G Ninja
     RESULT_VARIABLE R
     OUTPUT_QUIET)
   if(NOT R EQUAL 0)
