@@ -50,6 +50,11 @@ pub fn blyt_bin() -> PathBuf {
     } else {
         "release"
     };
+    // When CARGO_TARGET_DIR is set (e.g. Docker/CI with an out-of-tree build),
+    // the binary lives there rather than in the repo's own target/ directory.
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(target_dir).join(profile).join("blyt");
+    }
     repo_root().join("target").join(profile).join("blyt")
 }
 
