@@ -373,6 +373,14 @@ static int json_get_bp_array(const char *buf, int *lines, char (*conds)[MAX_COND
     return n;
 }
 
+static const char *basename_of(const char *p) {
+    const char *b = p;
+    for (const char *q = p; *q; q++)
+        if (*q == '/')
+            b = q + 1;
+    return b;
+}
+
 static void handle_set_breakpoints(int seq, const char *args) {
     char source[MAX_SOURCE_PATH] = {0};
     json_get_string(args, "path", source, sizeof source);
@@ -387,9 +395,10 @@ static void handle_set_breakpoints(int seq, const char *args) {
     }
 
     pthread_mutex_lock(&g_dap.mu);
+    const char *new_base = basename_of(source);
     int kept = 0;
     for (int i = 0; i < g_dap.n_bps; i++) {
-        if (strcmp(g_dap.bps[i].source, source) != 0) {
+        if (strcmp(basename_of(g_dap.bps[i].source), new_base) != 0) {
             if (kept != i)
                 g_dap.bps[kept] = g_dap.bps[i];
             kept++;
@@ -729,16 +738,6 @@ void fc_consolelua_dap_shutdown(void) {
     pthread_join(g_dap.thr, NULL);
     /* client_fd is closed by the server thread when it exits. */
     pthread_cond_destroy(&g_dap.msg_cond);
-}
-
-/* ── Breakpoint check helper ───────────────────────────────────────────────── */
-
-static const char *basename_of(const char *p) {
-    const char *b = p;
-    for (const char *q = p; *q; q++)
-        if (*q == '/')
-            b = q + 1;
-    return b;
 }
 
 /* ── ECALL path (emulated Lua inside rv32emu) ──────────────────────────────── */

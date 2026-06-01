@@ -77,6 +77,16 @@ static struct {
     int hit_bp_id; /* id of the breakpoint that caused the current pause, or 0 */
 } g_wdap;
 
+/* ── Helpers ───────────────────────────────────────────────────────────────── */
+
+static const char *basename_of(const char *p) {
+    const char *b = p;
+    for (const char *q = p; *q; q++)
+        if (*q == '/')
+            b = q + 1;
+    return b;
+}
+
 /* ── JSON helpers ──────────────────────────────────────────────────────────── */
 
 static int json_get_int(const char *buf, const char *key, int def) {
@@ -321,10 +331,13 @@ static void handle_set_breakpoints(int seq, const char *args) {
             conds[i][0] = '\0';
     }
 
-    /* Replace all breakpoints for this source. */
+    /* Replace all breakpoints for this source.  Use basename comparison so that
+     * a condition edit sent with a slightly different path format (e.g. macOS
+     * /tmp vs /private/tmp symlink) still clears the previous entry. */
+    const char *new_base = basename_of(source);
     int kept = 0;
     for (int i = 0; i < g_wdap.n_bps; i++) {
-        if (strcmp(g_wdap.bps[i].source, source) != 0) {
+        if (strcmp(basename_of(g_wdap.bps[i].source), new_base) != 0) {
             if (kept != i)
                 g_wdap.bps[kept] = g_wdap.bps[i];
             kept++;
@@ -815,14 +828,6 @@ int fc_dap_configuration_done(void) {
 
 /* ── Master hook callbacks (WASM direct-Lua path) ──────────────────────────── */
 
-static const char *basename_of(const char *p) {
-    const char *b = p;
-    for (const char *q = p; *q; q++)
-        if (*q == '/')
-            b = q + 1;
-    return b;
-}
-
 /* Evaluate a Lua condition expression; returns non-zero if truthy. */
 /* Evaluate a Lua expression in the context of the paused frame (ar).
  * Locals from the frame are injected into the chunk's _ENV so that
@@ -887,7 +892,7 @@ bool fc_dap_should_break(lua_State *L, lua_Debug *ar) {
             continue;
         if (g_wdap.bps[i].condition[0]) {
             if (!eval_condition(L, ar, g_wdap.bps[i].condition))
-                return false;
+                continue;
         }
         g_wdap.hit_bp_id = g_wdap.bps[i].id;
         return true;

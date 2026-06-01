@@ -135,6 +135,56 @@ fn wasm_dap_conditional_breakpoint() {
         .success();
 }
 
+/// WASM DAP: condition editing — set a conditional BP, stop once, then update the
+/// condition while paused and verify the new condition controls the next stop.
+///
+/// Cart loops `for i = 1, 10` with `local x = i` on each iteration (line 3).
+/// Initial condition: `x == 3` → first stop at i=3.
+/// Edited condition: `x == 7` → second stop at i=7; verifies the edit took effect.
+#[test]
+fn wasm_dap_conditional_breakpoint_edit() {
+    require_wasm();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_cond_edit");
+    // BP is at line 4 (local dummy = x), where x was assigned at line 3 and is
+    // already in scope.  Condition "x == 3" fires on the 3rd iteration; after
+    // the edit "x == 7" fires on the 7th.
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   for i = 1, 10 do\n\
+             \x20       local x = i\n\
+             \x20       local dummy = x\n\
+             \x20   end\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_CONDITIONAL_COND", "x == 3")
+        .env("BLYT_DAP_CONDITIONAL_COND_EDIT", "x == 7")
+        .env("BLYT_DAP_COND_EDIT_STOP_VAR", "x")
+        .env("BLYT_DAP_COND_EDIT_STOP_VAL", "7")
+        .assert()
+        .success();
+}
+
 /// SDL2 DAP gate: set a breakpoint in a Lua cart running under blytplay --debug
 /// --headless, connect a TCP DAP client, verify stopped / step / continue.
 ///

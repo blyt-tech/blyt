@@ -30,6 +30,7 @@ const TIMEOUT_MS           = 20000;
 /* Optional feature flags */
 const LOADED_SOURCES_CHECK = !!process.env.BLYT_DAP_LOADED_SOURCES;
 const CONDITIONAL_COND     = process.env.BLYT_DAP_CONDITIONAL_COND || '';
+const CONDITIONAL_COND_EDIT = process.env.BLYT_DAP_CONDITIONAL_COND_EDIT || '';
 const TEST_RESTART         = !!process.env.BLYT_DAP_TEST_RESTART;
 const EXCEPTION_FILTER     = process.env.BLYT_DAP_EXCEPTION_FILTER || '';
 const EVALUATE_EXPR        = process.env.BLYT_DAP_EVALUATE_EXPR || '';
@@ -285,6 +286,43 @@ async function run() {
         if (EVALUATE_EXPECT)
             assert(ev.result === EVALUATE_EXPECT,
                    `evaluate("${EVALUATE_EXPR}"): result is "${EVALUATE_EXPECT}" (got "${ev.result}")`);
+    }
+
+    /* 9c. condition edit (optional) — update the breakpoint condition while paused,
+     *     continue, and verify the new condition controls the next stop. */
+    if (CONDITIONAL_COND_EDIT) {
+        const stopped3P = nextEvent('stopped');
+        await request('setBreakpoints', {
+            source:      { path: SOURCE_PATH, name: SOURCE_PATH },
+            breakpoints: [{ line: BP_LINE, condition: CONDITIONAL_COND_EDIT }],
+            lines:       [BP_LINE],
+        });
+        await request('continue', { threadId: 1 });
+        const stopped3 = await stopped3P;
+        assert(
+            stopped3.body.reason === 'breakpoint',
+            `after condition edit: stopped with reason "breakpoint" (got "${stopped3.body.reason}")`
+        );
+        /* Inspect the local that the condition was written against. */
+        const stk3 = await request('stackTrace', { threadId: 1 });
+        const frame3Id = stk3.stackFrames?.[0]?.id ?? 0;
+        const scopes3 = await request('scopes', { frameId: frame3Id });
+        if (scopes3.scopes?.length >= 1) {
+            const vars3 = await request('variables', {
+                variablesReference: scopes3.scopes[0].variablesReference,
+            });
+            const EDIT_STOP_VAR = process.env.BLYT_DAP_COND_EDIT_STOP_VAR || '';
+            const EDIT_STOP_VAL = process.env.BLYT_DAP_COND_EDIT_STOP_VAL || '';
+            if (EDIT_STOP_VAR && EDIT_STOP_VAL && Array.isArray(vars3.variables)) {
+                const v = vars3.variables.find(x => x.name === EDIT_STOP_VAR);
+                assert(v != null, `condition-edit stop: variable "${EDIT_STOP_VAR}" present`);
+                if (v) assert(v.value === EDIT_STOP_VAL,
+                              `condition-edit stop: ${EDIT_STOP_VAR} == ${EDIT_STOP_VAL} (got ${v.value})`);
+            }
+        }
+        await request('continue', { threadId: 1 });
+        _closeConn();
+        return;
     }
 
     /* 9d. loadedSources (optional) */
