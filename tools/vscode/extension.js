@@ -395,6 +395,117 @@ async function autoSetupVscode(output) {
     }
 }
 
+/* ── blyt-native-gdb: DAP proxy for lldb-dap ─────────────────────────────── */
+
+/* Wraps lldb-dap as a child process and proxies DAP messages, with two
+ * workarounds for LLDB's conditional-breakpoint update bug:
+ *
+ *  1. true/false normalization — LLDB's C expression evaluator requires
+ *     stdbool.h for these names.  Replace bare `true`/`false` with `1`/`0`.
+ *
+ *  2. Clear-then-add on setBreakpoints — When the program is stopped at a
+ *     breakpoint and the user edits the condition, LLDB's stop-reason holds a
+ *     stale reference to the old BP object.  If we just update the condition
+ *     in-place, LLDB re-evaluates the OLD condition on the next continue.
+ *     Sending an empty setBreakpoints first forces LLDB to delete the old BP
+ *     object entirely; the subsequent setBreakpoints creates a fresh one,
+ *     clearing the stale stop-reason reference. */
+class BlytGdbDapProxy {
+    constructor(lldbDapBin) {
+        this._lldbSeq    = 0;
+        this._vsSeq      = 0;
+        this.sendMessage = null;   /* set by VS Code's InlineImplementation */
+        this._pending    = new Map();
+        this._buf        = Buffer.alloc(0);
+
+        this._proc = cp.spawn(lldbDapBin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+        this._proc.stdout.on('data', chunk => {
+            this._buf = Buffer.concat([this._buf, chunk]);
+            this._drain();
+        });
+        /* Errors from the lldb-dap process itself go to stderr and are not
+         * DAP messages; forward them verbatim for diagnostics. */
+        this._proc.stderr.on('data', () => {});
+    }
+
+    _drain() {
+        while (true) {
+            let i = 0;
+            for (; i + 3 < this._buf.length; i++) {
+                if (this._buf[i]   === 0x0d && this._buf[i+1] === 0x0a &&
+                    this._buf[i+2] === 0x0d && this._buf[i+3] === 0x0a) break;
+            }
+            if (i + 3 >= this._buf.length) return;
+            const hdr = this._buf.slice(0, i).toString('utf8');
+            const m   = hdr.match(/Content-Length:\s*(\d+)/i);
+            if (!m)  { this._buf = this._buf.slice(i + 4); continue; }
+            const len = parseInt(m[1], 10);
+            if (this._buf.length < i + 4 + len) return;
+            const body = this._buf.slice(i + 4, i + 4 + len).toString('utf8');
+            this._buf  = this._buf.slice(i + 4 + len);
+            let msg; try { msg = JSON.parse(body); } catch { continue; }
+            if (msg.type === 'response') {
+                const p = this._pending.get(msg.request_seq);
+                if (p) { this._pending.delete(msg.request_seq); p(msg); }
+            } else {
+                this.sendMessage?.(msg);
+            }
+        }
+    }
+
+    _ask(cmd, args) {
+        const seq = ++this._lldbSeq;
+        return new Promise(resolve => {
+            this._pending.set(seq, resolve);
+            const json = JSON.stringify(
+                { seq, type: 'request', command: cmd, arguments: args || {} });
+            this._proc.stdin.write(
+                `Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`);
+        });
+    }
+
+    handleMessage(msg) {
+        if (msg.type !== 'request') return;
+        if (msg.command === 'setBreakpoints') {
+            this._setBreakpoints(msg).catch(() => {});
+        } else {
+            const vsSeq = msg.seq;
+            const seq   = ++this._lldbSeq;
+            this._pending.set(seq, resp =>
+                this.sendMessage?.({ ...resp, seq: ++this._vsSeq, request_seq: vsSeq }));
+            const json = JSON.stringify({ ...msg, seq });
+            this._proc.stdin.write(
+                `Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`);
+        }
+    }
+
+    async _setBreakpoints(vsMsg) {
+        const vsSeq  = vsMsg.seq;
+        const source = vsMsg.arguments?.source ?? {};
+
+        /* Normalize bare true/false to 1/0. */
+        const normBps = (vsMsg.arguments?.breakpoints ?? []).map(bp => {
+            if (typeof bp.condition !== 'string') return bp;
+            const cond = bp.condition
+                .replace(/\btrue\b/g,  '1')
+                .replace(/\bfalse\b/g, '0');
+            return cond !== bp.condition ? { ...bp, condition: cond } : bp;
+        });
+
+        /* Phase 1: clear all BPs for this source. */
+        await this._ask('setBreakpoints', { source, breakpoints: [], lines: [] });
+
+        /* Phase 2: add new BPs with normalised conditions. */
+        const resp = await this._ask('setBreakpoints',
+            { ...vsMsg.arguments, breakpoints: normBps });
+
+        this.sendMessage?.({ ...resp, seq: ++this._vsSeq, request_seq: vsSeq });
+    }
+
+    onError() {}
+    onClose() { try { this._proc.kill(); } catch (_) {} }
+}
+
 /* ── Extension entry point ────────────────────────────────────────────────── */
 
 function activate(context) {
@@ -561,7 +672,7 @@ function activate(context) {
                 pendingUrls.delete(_blytGdbTempId);
                 if (proc) sessionProcs.set(session.id, proc);
                 if (url)  sessionUrls.set(session.id, url);
-                return new vscode.DebugAdapterExecutable(findLldbDap());
+                return new vscode.DebugAdapterInlineImplementation(new BlytGdbDapProxy(findLldbDap()));
             },
         })
     );
