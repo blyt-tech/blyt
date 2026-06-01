@@ -2,8 +2,8 @@
 #
 # Assembles a self-contained blyt SDK under build/sdk/:
 #
-# build/sdk/ bin/        blyt (devtool), blytplay (SDL2 runtime) include/ blyt.h,
-# blyt32.h, blyt_runtime.h lib/        libblytcommon.so, libblyt32.so
+# build/sdk/ bin/        blyt (devtool), blytplay (SDL2 runtime) include/
+# blyt.h, blyt32.h, blyt_runtime.h lib/        libblytcommon.so, libblyt32.so
 # (RV32IMAFC) toolchain/  clang, ld.lld, llvm-objcopy, … (downloaded LLVM)
 #
 # Invoked via `cmake --build build --target sdk`. Required variables (injected
@@ -84,6 +84,9 @@ foreach(IDX RANGE ${PAIR_LAST})
     elseif(EXISTS "${TOOL_DIR}/llvm-ar")
       set(FOUND_AR "${TOOL_DIR}/llvm-ar")
     endif()
+    if(EXISTS "${TOOL_DIR}/lldb-dap")
+      set(FOUND_LLDB_DAP "${TOOL_DIR}/lldb-dap")
+    endif()
     break()
   endif()
 endforeach()
@@ -153,6 +156,9 @@ if(NOT FOUND_CLANG)
   set(FOUND_LLD "${SDK_TOOLCHAIN}/bin/ld.lld")
   set(FOUND_OBJCOPY "${SDK_TOOLCHAIN}/bin/llvm-objcopy")
   set(FOUND_AR "${SDK_TOOLCHAIN}/bin/llvm-ar")
+  if(EXISTS "${SDK_TOOLCHAIN}/bin/lldb-dap")
+    set(FOUND_LLDB_DAP "${SDK_TOOLCHAIN}/bin/lldb-dap")
+  endif()
 endif()
 
 message(STATUS "blyt SDK: toolchain clang = ${FOUND_CLANG}")
@@ -818,6 +824,7 @@ foreach(
   blyt-lld
   blyt-objcopy
   blyt-llvm-ar
+  blyt-lldb-dap
   ld.lld
   llvm-objcopy)
   file(REMOVE "${SDK_BIN}/${_stale}")
@@ -839,6 +846,9 @@ if(FOUND_OBJCOPY)
 endif()
 if(FOUND_AR)
   file(CREATE_LINK "${FOUND_AR}" "${SDK_BIN}/blyt-llvm-ar" SYMBOLIC)
+endif()
+if(FOUND_LLDB_DAP)
+  file(CREATE_LINK "${FOUND_LLDB_DAP}" "${SDK_BIN}/blyt-lldb-dap" SYMBOLIC)
 endif()
 # -------------------------------------------------------------------------
 # Step 5: blytplay (if built)

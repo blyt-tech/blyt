@@ -13,7 +13,9 @@
     "onDebugResolve:blyt-lua",
     "onDebugDynamicConfigurations:blyt-lua",
     "onDebugResolve:blyt-native-gdb",
-    "onDebugDynamicConfigurations:blyt-native-gdb"
+    "onDebugDynamicConfigurations:blyt-native-gdb",
+    "onDebugResolve:blyt-run",
+    "onDebugDynamicConfigurations:blyt-run"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -27,6 +29,12 @@
         }
       }
     },
+    "breakpoints": [
+      { "language": "lua" },
+      { "language": "c" },
+      { "language": "cpp" },
+      { "language": "rust" }
+    ],
     "debuggers": [
       {
         "type": "blyt-lua",
@@ -44,7 +52,21 @@
       },
       {
         "type": "blyt-native-gdb",
-        "label": "Blyt Native (GDB)",
+        "label": "Blyt Native (LLDB)",
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "cart": {
+                "type": "string",
+                "description": "Path to the compiled .blyt cart file. Auto-detected from the workspace if omitted."
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "blyt-run",
+        "label": "Blyt Run",
         "configurationAttributes": {
           "launch": {
             "properties": {

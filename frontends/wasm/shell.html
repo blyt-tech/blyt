@@ -8,25 +8,26 @@
       body {
         margin: 0;
         padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
         background: #111;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        height: 100vh;
         font-family: monospace;
         color: #ccc;
       }
       #canvas {
-        /* 2× scale: 320×240 → 640×480 */
-        width: 640px;
-        height: 480px;
+        /* Fill the iframe viewport (sized to 4:3 by the outer wrapper). */
+        display: block;
+        width: 100%;
+        height: 100%;
         image-rendering: pixelated;
         image-rendering: crisp-edges;
-        border: 1px solid #333;
       }
       #status {
-        margin-top: 8px;
+        position: absolute;
+        bottom: 8px;
+        left: 0; right: 0;
+        text-align: center;
         font-size: 12px;
         color: #666;
       }
@@ -37,8 +38,9 @@
     <div id="status">Loading…</div>
 
     <script>
-      /* DAP relay port injected by `blyt run --debug`.  0 when DAP is not active. */
+      /* Relay ports injected by `blyt run --debug`.  0 when debugging is not active. */
       window.blyt_dap_port = {{BLYT_DAP_PORT}};
+      window.blyt_gdb_port = {{BLYT_GDB_PORT}};
     </script>
     <script>
       /* Pre-load the cart into the Emscripten virtual filesystem before

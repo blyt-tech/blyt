@@ -51,6 +51,7 @@ static blyt_cart_t *g_cart = NULL;
 static blyt_session_t *g_session = NULL;
 static bool g_cart_done = false;
 static blyt_cart_run_err_t g_run_err = BLYT_RUN_OK;
+static bool g_dap_active = false;
 
 /* XRGB8888 expansion buffer — filled by blyt_session_expand_frame() each
  * frame and passed to the frontend video callback. */
@@ -184,6 +185,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
                 int dap_port = atoi(dap_port_str);
                 int actual_port = 0;
                 if (blyt_session_dap_listen(g_session, &actual_port) >= 0) {
+                    g_dap_active = true;
                     if (g_log_cb)
                         g_log_cb(RETRO_LOG_INFO, "blyt: DAP listening on port %d\n", actual_port);
                     else
@@ -223,6 +225,7 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 }
 
 RETRO_API void retro_unload_game(void) {
+    g_dap_active = false;
 #ifdef BLYT_DAP
     if (g_session)
         blyt_session_dap_shutdown(g_session);
@@ -252,7 +255,18 @@ RETRO_API void retro_run(void) {
 
     if (!g_cart_done && g_session) {
         blyt_cart_run_err_t err = blyt_session_run_frame(g_session);
-        if (err != BLYT_RUN_FRAME_DONE) {
+        if (err == BLYT_RUN_FRAME_DONE) {
+            /* normal frame */
+        } else if (err == BLYT_RUN_RESTART) {
+            /* DAP restart: recreate session, reattach DAP, wait for reconfiguration. */
+            retro_reset();
+#ifdef BLYT_DAP
+            if (g_dap_active && g_session) {
+                blyt_session_dap_reattach(g_session);
+                blyt_session_dap_wait_ready(g_session);
+            }
+#endif
+        } else {
             g_cart_done = true;
             g_run_err = err;
             if (err == BLYT_RUN_ERR_ECALL_TRAP && g_log_cb)

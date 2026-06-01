@@ -9,14 +9,10 @@
             "request": "launch"
         },
         {
-            "name": "Debug Lua",
-            "type": "blyt-lua",
-            "request": "launch"
-        },
-        {
             "name": "Debug Native (LLDB)",
             "type": "blyt-native-gdb",
             "request": "launch"
         }
     ]
 }
+    
