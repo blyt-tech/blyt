@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 /*
- * tests/dap/run_sdl_dap_test.mjs — SDL2 DAP test orchestrator.
+ * tests/gdb/run_sdl_multi_bp_test.mjs — SDL2 multi-breakpoint orchestrator.
  *
- * Spawns blytplay --debug --headless <cart>, waits for the DAP TCP port to
- * appear on stdout ("blyt: DAP listening on port N"), then runs dap_test.mjs
- * in TCP mode against that port.
+ * Spawns blytplay --gdb 0 --headless <cart>, waits for the GDB TCP port, then
+ * runs multi_bp_test.mjs against it.
  *
  * Usage:
- *   node run_sdl_dap_test.mjs <blytplay_path> <cart_path>
+ *   node run_sdl_multi_bp_test.mjs <blytplay_path> <cart_path>
  *
  * Environment:
- *   BLYT_DAP_BP_LINE  — 1-based line to break on (default 3)
+ *   BLYT_GDB_BP_ADDRS — comma-separated hex addresses passed to multi_bp_test.mjs
  *
  * Exit 0 on success, non-zero on failure.
  * Node.js 22+ required.
@@ -26,26 +25,26 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const BLYTRUN = process.argv[2];
 const CART    = process.argv[3];
-const BP_LINE = process.env.BLYT_DAP_BP_LINE || '3';
 
 if (!BLYTRUN || !CART) {
-    process.stderr.write('usage: run_sdl_dap_test.mjs <blytplay> <cart>\n');
+    process.stderr.write('usage: run_sdl_multi_bp_test.mjs <blytplay> <cart>\n');
     process.exit(1);
 }
 
-/* Wait for "blyt: DAP listening on port N" on proc's stdout. */
-function findDapPort(proc) {
+function findGdbPort(proc) {
     return new Promise((resolve, reject) => {
         let buf = '';
         const timer = setTimeout(
-            () => reject(new Error('timeout: blytplay did not print DAP port')),
+            () => reject(new Error('timeout: blytplay did not print GDB port')),
             15000
         );
-        proc.stdout.on('data', (chunk) => {
+        function check(chunk) {
             buf += chunk.toString();
-            const m = buf.match(/DAP listening on port (\d+)/);
+            const m = buf.match(/GDB listening on port (\d+)/);
             if (m) { clearTimeout(timer); resolve(parseInt(m[1], 10)); }
-        });
+        }
+        proc.stdout.on('data', check);
+        proc.stderr.on('data', check);
         proc.on('exit', (code) => {
             clearTimeout(timer);
             if (code !== null && code !== 0)
@@ -56,21 +55,25 @@ function findDapPort(proc) {
 }
 
 async function main() {
-    const blytplay = spawn(BLYTRUN, ['--debug', '--headless', CART], {
+    const blytplay = spawn(BLYTRUN, ['--gdb', '0', '--headless', CART], {
         stdio: ['ignore', 'pipe', 'pipe'],
     });
     blytplay.stderr.on('data', (d) => process.stderr.write(d));
 
-    const port = await findDapPort(blytplay);
+    const port = await findGdbPort(blytplay);
+    console.log(`[multi_bp_sdl] blytplay GDB on tcp://127.0.0.1:${port}`);
 
-    const testScript = path.join(__dirname, 'dap_test.mjs');
+    const testScript = path.join(__dirname, 'multi_bp_test.mjs');
     const endpoint   = `tcp://127.0.0.1:${port}`;
 
     await new Promise((resolve, reject) => {
         execFile(
             process.execPath,
-            [testScript, endpoint, 'main.lua', BP_LINE],
-            { timeout: 30000 },
+            [testScript, endpoint],
+            {
+                timeout: 30000,
+                env: { ...process.env },
+            },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);
@@ -79,7 +82,6 @@ async function main() {
         );
     });
 
-    /* DAP client sent continue; wait for blytplay to exit (cart calls blyt.quit()). */
     await new Promise((resolve) => {
         blytplay.on('exit', resolve);
         setTimeout(() => { blytplay.kill(); resolve(); }, 5000);
@@ -87,6 +89,6 @@ async function main() {
 }
 
 main().then(() => process.exit(0)).catch((e) => {
-    console.error('[sdl_dap_test] FAILED:', e.message);
+    console.error('[multi_bp_sdl] FAILED:', e.message);
     process.exit(1);
 });

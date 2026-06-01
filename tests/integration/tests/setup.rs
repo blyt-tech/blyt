@@ -33,8 +33,8 @@ fn setup_vscode_native_cart() {
         "launch.json should not contain blyt-lua for a native cart:\n{content}"
     );
     assert!(
-        content.contains("Debug Native (GDB)"),
-        "launch.json missing 'Debug Native (GDB)' name:\n{content}"
+        content.contains("Debug Native (LLDB)"),
+        "launch.json missing 'Debug Native (LLDB)' name:\n{content}"
     );
 }
 
@@ -70,8 +70,8 @@ fn setup_vscode_lua_cart() {
         "launch.json missing 'Debug Lua' name:\n{content}"
     );
     assert!(
-        content.contains("Debug Native (GDB)"),
-        "launch.json missing 'Debug Native (GDB)' name:\n{content}"
+        content.contains("Debug Native (LLDB)"),
+        "launch.json missing 'Debug Native (LLDB)' name:\n{content}"
     );
 }
 

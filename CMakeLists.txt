@@ -991,6 +991,21 @@ target_compile_definitions(test_cart_run PRIVATE ${RV32EMU_FEATURE_DEFS})
 target_link_libraries(test_cart_run PRIVATE libblytemu)
 add_test(NAME test_cart_run COMMAND test_cart_run)
 
+# test_gdb_stub: unit-tests for the GDB RSP protocol stub in isolation. Compiles
+# gdb_stub.c directly without gdb_transport_tcp.c/pthreads so a mock transport
+# can be injected cleanly.  Gated on BLYT_GDB so it is only built when GDB
+# support is compiled in.
+if(BLYT_GDB)
+  add_executable(test_gdb_stub tests/unit/test_gdb_stub.c
+                               runtime/host/src/gdb/gdb_stub.c)
+  target_include_directories(test_gdb_stub PRIVATE runtime/host/src/gdb
+                                                   runtime/host/include)
+  # BLYT_GDB enables stub code; BLYT_GDB_TEST exposes fc_gdb_stub_test_reset().
+  # No BLYT_GDB_TCP: avoids pthreads so the test is self-contained.
+  target_compile_definitions(test_gdb_stub PRIVATE BLYT_GDB=1 BLYT_GDB_TEST=1)
+  add_test(NAME test_gdb_stub COMMAND test_gdb_stub)
+endif()
+
 # verify_cart: standalone tool used in CI to confirm blyt build output passes
 # load-time security checks. Not a ctest test; invoked directly with a cart.
 add_executable(verify_cart tests/tools/verify_cart.c)

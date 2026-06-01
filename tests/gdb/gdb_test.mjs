@@ -13,7 +13,15 @@
  *     ws://127.0.0.1:PORT/gdb — WebSocket relay (WASM)
  *
  * Environment:
- *   BLYT_GDB_BREAK_ADDR — hex address to set Z0 breakpoint (overrides --break-addr)
+ *   BLYT_GDB_BREAK_ADDR          — hex address to set Z0 breakpoint (overrides --break-addr)
+ *   BLYT_GDB_EXEC_FILE_CHECK      — verify qXfer:exec-file:read response
+ *   BLYT_GDB_LIBRARY_CHECK        — verify qXfer:libraries-svr4:read contains libblyt32.so
+ *   BLYT_GDB_FEATURES_CHECK       — verify qXfer:features:read returns target.xml with riscv arch
+ *   BLYT_GDB_PROCESS_INFO         — verify qProcessInfo returns riscv32/endian:little
+ *   BLYT_GDB_MEM_ADDR             — hex address to test m (memory read) packet
+ *   BLYT_GDB_REGISTER_WRITE_CHECK — verify P/p register write roundtrip
+ *   BLYT_GDB_THREAD_STOP_INFO     — verify qThreadStopInfo1 contains T05 after a stop
+ *   BLYT_GDB_DETACH               — send D (detach) instead of final vCont;c
  *
  * Exit 0 on success, non-zero on failure.
  * Node.js 22+ required.
@@ -148,6 +156,16 @@ async function main() {
         const attached = await t.exchange('qAttached');
         console.log(`[gdb_test] qAttached → ${attached}`);
 
+        /* Optional: qProcessInfo (validates target triple/endianness). */
+        if (process.env.BLYT_GDB_PROCESS_INFO) {
+            const info = await t.exchange('qProcessInfo');
+            if (!info || !info.includes('riscv32') || !info.includes('endian:little')) {
+                process.stderr.write(`[gdb_test] FAIL: qProcessInfo: ${info}\n`);
+                process.exit(1);
+            }
+            console.log('PASS: qProcessInfo contains riscv32 and endian:little');
+        }
+
         /* 3. vCont? — enumerate supported vCont actions. */
         const vcontOk = await t.exchange('vCont?');
         console.log(`[gdb_test] vCont? → ${vcontOk}`);
@@ -157,6 +175,36 @@ async function main() {
         t.send(frame('?'));
         const stopReason = await t.recv();
         console.log(`[gdb_test] ? → ${stopReason}`);
+
+        /* Optional: exec-file query (validates qXfer:exec-file:read). */
+        if (process.env.BLYT_GDB_EXEC_FILE_CHECK) {
+            const execFile = await t.exchange('qXfer:exec-file:read::0,4000');
+            if (!execFile || !execFile.startsWith('l') || execFile.length < 2) {
+                process.stderr.write(`[gdb_test] FAIL: exec-file response: ${execFile}\n`);
+                process.exit(1);
+            }
+            console.log(`PASS: exec-file = ${execFile.slice(1).trim()}`);
+        }
+
+        /* Optional: library list query (validates qXfer:libraries-svr4:read). */
+        if (process.env.BLYT_GDB_LIBRARY_CHECK) {
+            const libs = await t.exchange('qXfer:libraries-svr4:read::0,8000');
+            if (!libs || !libs.includes('libblyt32.so')) {
+                process.stderr.write(`[gdb_test] FAIL: library list missing libblyt32.so: ${libs}\n`);
+                process.exit(1);
+            }
+            console.log('PASS: library list contains libblyt32.so');
+        }
+
+        /* Optional: features query (validates qXfer:features:read / target.xml). */
+        if (process.env.BLYT_GDB_FEATURES_CHECK) {
+            const feat = await t.exchange('qXfer:features:read:target.xml:0,4000');
+            if (!feat || !feat.startsWith('l') || !feat.includes('riscv')) {
+                process.stderr.write(`[gdb_test] FAIL: features response: ${feat}\n`);
+                process.exit(1);
+            }
+            console.log('PASS: qXfer:features:read contains riscv target.xml');
+        }
 
         if (breakAddr) {
             const addrHex = parseInt(breakAddr, 16).toString(16);
@@ -180,6 +228,16 @@ async function main() {
             }
             console.log('PASS: GDB stop reply received');
 
+            /* Optional: qThreadStopInfo (validates per-thread stop reason). */
+            if (process.env.BLYT_GDB_THREAD_STOP_INFO) {
+                const tsi = await t.exchange('qThreadStopInfo1');
+                if (!tsi || !tsi.includes('T05')) {
+                    process.stderr.write(`[gdb_test] FAIL: qThreadStopInfo1: ${tsi}\n`);
+                    process.exit(1);
+                }
+                console.log('PASS: qThreadStopInfo1 contains T05');
+            }
+
             /* 7. Read all registers — verify PC (reg 32) is non-zero.
              * The reply is 33×4 bytes little-endian = 264 hex chars. */
             const regs = await t.exchange('g');
@@ -195,6 +253,32 @@ async function main() {
                 console.log(`[gdb_test] register reply: ${regs}`);
             }
 
+            /* Optional: single register write + read roundtrip (validates P packet). */
+            if (process.env.BLYT_GDB_REGISTER_WRITE_CHECK) {
+                const pResp = await t.exchange('P1:cdab3412');
+                if (pResp !== 'OK') {
+                    process.stderr.write(`[gdb_test] FAIL: P1 response: ${pResp}\n`);
+                    process.exit(1);
+                }
+                const pRead = await t.exchange('p1');
+                if (pRead !== 'cdab3412') {
+                    process.stderr.write(`[gdb_test] FAIL: p1 after P1: ${pRead}\n`);
+                    process.exit(1);
+                }
+                console.log('PASS: P/p register write roundtrip');
+            }
+
+            /* Optional: memory read at a known address. */
+            if (process.env.BLYT_GDB_MEM_ADDR) {
+                const memAddr = parseInt(process.env.BLYT_GDB_MEM_ADDR, 16).toString(16);
+                const memResp = await t.exchange(`m${memAddr},4`);
+                if (!memResp || memResp.length !== 8 || memResp.startsWith('E')) {
+                    process.stderr.write(`[gdb_test] FAIL: m response for 0x${memAddr}: ${memResp}\n`);
+                    process.exit(1);
+                }
+                console.log(`PASS: memory read 0x${memAddr} = 0x${memResp}`);
+            }
+
             /* 8. Single-step. */
             t.send('+');
             t.send(frame('vCont;s'));
@@ -205,8 +289,18 @@ async function main() {
             }
             console.log('PASS: step response received');
 
-            /* 9. Clear breakpoint, then continue to completion. */
+            /* 9. Clear breakpoint then detach (BLYT_GDB_DETACH=1) or continue. */
             await t.exchange(`z0,${addrHex},4`);
+            if (process.env.BLYT_GDB_DETACH) {
+                const detachResp = await t.exchange('D');
+                if (detachResp !== 'OK') {
+                    process.stderr.write(`[gdb_test] FAIL: D response: ${detachResp}\n`);
+                    process.exit(1);
+                }
+                console.log('PASS: detach OK');
+                t.close();
+                return; /* cart continues freely; don't wait for session end */
+            }
             t.send('+');
             t.send(frame('vCont;c'));
         } else {

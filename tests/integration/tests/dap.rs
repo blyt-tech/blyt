@@ -55,6 +55,86 @@ fn wasm_dap_breakpoint_step_inspect() {
         .success();
 }
 
+/// WASM DAP: evaluate — assert that arbitrary Lua expressions are evaluated in
+/// the frame context.  Stops at line 3 (x = 42 in scope); evaluates "x + 1"
+/// and expects "43".  Covers the handle_evaluate / dap_evaluating fix.
+#[test]
+fn wasm_dap_evaluate_expr() {
+    require_wasm();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_evaluate");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_EVALUATE_EXPR", "x + 1")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "43")
+        .assert()
+        .success();
+}
+
+/// WASM DAP: conditional breakpoint — stop only when the Lua condition is true.
+/// Stops at line 3 only when x > 10 (x = 42, so it fires on the first pass).
+#[test]
+fn wasm_dap_conditional_breakpoint() {
+    require_wasm();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_conditional_bp");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_CONDITIONAL_COND", "x > 10")
+        .assert()
+        .success();
+}
+
 /// SDL2 DAP gate: set a breakpoint in a Lua cart running under blytplay --debug
 /// --headless, connect a TCP DAP client, verify stopped / step / continue.
 ///
@@ -95,6 +175,215 @@ fn sdl_dap_breakpoint_step_inspect() {
         ])
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .env("BLYT_DAP_BP_LINE", "3")
+        .assert()
+        .success();
+}
+
+/// SDL2 DAP: verify loadedSources returns the cart's Lua source after a stop.
+#[test]
+fn sdl_dap_loaded_sources() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytplay().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_loaded_sources");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_LOADED_SOURCES", "1")
+        .assert()
+        .success();
+}
+
+/// SDL2 DAP: conditional breakpoint — stop only when the Lua expression is true.
+/// Condition references a local variable (x = 42) to verify that locals are
+/// visible in condition expressions.
+#[test]
+fn sdl_dap_conditional_breakpoint() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytplay().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_conditional_bp");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_CONDITIONAL_COND", "x > 10")
+        .assert()
+        .success();
+}
+
+/// SDL2 DAP: restart — after the first breakpoint stop, restart the cart and
+/// verify it stops at the same breakpoint a second time.
+#[test]
+fn sdl_dap_restart() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytplay().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_restart");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_TEST_RESTART", "1")
+        .assert()
+        .success();
+}
+
+/// SDL2 DAP: exception breakpoints — a cart that throws in init() pauses at the
+/// exception and reports reason "exception" to the DAP client.
+#[test]
+fn sdl_dap_exception_breakpoint() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytplay().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_exception_bp");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   error(\"test exception\")\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
+        .assert()
+        .success();
+}
+
+/// SDL2 DAP: evaluate — assert that arbitrary Lua expressions are evaluated in
+/// the frame context (not just variable name lookup). Stops at line 3 where
+/// x = 42 is defined; evaluates "x + 1" and expects "43".
+#[test]
+fn sdl_dap_evaluate_expr() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytplay().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_evaluate");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_EVALUATE_EXPR", "x + 1")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "43")
         .assert()
         .success();
 }

@@ -22,10 +22,18 @@
 
 'use strict';
 
-const ENDPOINT    = process.argv[2];
-const SOURCE_PATH = process.argv[3] || 'cart';
-const BP_LINE     = parseInt(process.argv[4] || '4', 10);
-const TIMEOUT_MS  = 20000;
+const ENDPOINT             = process.argv[2];
+const SOURCE_PATH          = process.argv[3] || 'cart';
+const BP_LINE              = parseInt(process.argv[4] || '4', 10);
+const TIMEOUT_MS           = 20000;
+
+/* Optional feature flags */
+const LOADED_SOURCES_CHECK = !!process.env.BLYT_DAP_LOADED_SOURCES;
+const CONDITIONAL_COND     = process.env.BLYT_DAP_CONDITIONAL_COND || '';
+const TEST_RESTART         = !!process.env.BLYT_DAP_TEST_RESTART;
+const EXCEPTION_FILTER     = process.env.BLYT_DAP_EXCEPTION_FILTER || '';
+const EVALUATE_EXPR        = process.env.BLYT_DAP_EVALUATE_EXPR || '';
+const EVALUATE_EXPECT      = process.env.BLYT_DAP_EVALUATE_EXPECT || '';
 
 if (!ENDPOINT) {
     process.stderr.write('usage: dap_test.mjs <endpoint> <source_path> <bp_line>\n');
@@ -198,10 +206,25 @@ async function run() {
     /* 2. launch (adapter ignores arguments; cart is already running) */
     await request('launch', {});
 
+    /* Exception-filter mode: skip regular BPs, just wait for an exception stop. */
+    if (EXCEPTION_FILTER) {
+        await request('setExceptionBreakpoints', { filters: [EXCEPTION_FILTER] });
+        await request('configurationDone');
+        const exStopped = await nextEvent('stopped');
+        assert(exStopped.body.reason === 'exception',
+               `exception stop: reason is "exception" (got "${exStopped.body.reason}")`);
+        await request('continue', { threadId: 1 });
+        _closeConn();
+        return;
+    }
+
     /* 3. setBreakpoints */
+    const bpArgs = CONDITIONAL_COND
+        ? [{ line: BP_LINE, condition: CONDITIONAL_COND }]
+        : [{ line: BP_LINE }];
     const sb = await request('setBreakpoints', {
         source:      { path: SOURCE_PATH, name: SOURCE_PATH },
-        breakpoints: [{ line: BP_LINE }],
+        breakpoints: bpArgs,
         lines:       [BP_LINE],
     });
     assert(
@@ -248,6 +271,48 @@ async function run() {
             variablesReference: scopes.scopes[0].variablesReference,
         });
         assert(Array.isArray(vars.variables), 'variables: returns array');
+    }
+
+    /* 9b. evaluate (optional) — evaluate an arbitrary expression in the top frame */
+    if (EVALUATE_EXPR) {
+        const ev = await request('evaluate', {
+            expression: EVALUATE_EXPR,
+            frameId:    topFrameId,
+            context:    'watch',
+        });
+        assert(typeof ev.result === 'string' && ev.result !== '?',
+               `evaluate("${EVALUATE_EXPR}"): got a result`);
+        if (EVALUATE_EXPECT)
+            assert(ev.result === EVALUATE_EXPECT,
+                   `evaluate("${EVALUATE_EXPR}"): result is "${EVALUATE_EXPECT}" (got "${ev.result}")`);
+    }
+
+    /* 9d. loadedSources (optional) */
+    if (LOADED_SOURCES_CHECK) {
+        const ls = await request('loadedSources', {});
+        assert(Array.isArray(ls.sources) && ls.sources.length >= 1,
+               'loadedSources: returns ≥1 source');
+    }
+
+    /* 9e. restart (optional) — re-run the cart from scratch and stop again */
+    if (TEST_RESTART) {
+        const stopped3P = nextEvent('stopped');
+        await request('restart', {});
+        await nextEvent('initialized');
+        await request('setBreakpoints', {
+            source:      { path: SOURCE_PATH, name: SOURCE_PATH },
+            breakpoints: [{ line: BP_LINE }],
+            lines:       [BP_LINE],
+        });
+        await request('configurationDone');
+        const stopped3 = await stopped3P;
+        assert(
+            stopped3.body.reason === 'breakpoint' || stopped3.body.reason === 'step',
+            `after restart: stopped again (got "${stopped3.body.reason}")`
+        );
+        await request('continue', { threadId: 1 });
+        _closeConn();
+        return;
     }
 
     /* 10. next (step over) */

@@ -338,3 +338,443 @@ function draw()   end\n";
 
     cmd.assert().success();
 }
+
+/* ── Debug test cart source — shared by the extended protocol tests ───────── */
+
+/// C source for a cart with multiple named functions and a writable global.
+/// Used by: memory_read, multi_breakpoints, detach, interrupt, exec_file, library_list.
+const DEBUG_C: &str = r#"
+#include "blyt.h"
+#include <stdint.h>
+
+volatile uint32_t g_counter = 0;
+
+static void blyt_debug_bp2(void) { g_counter += 2; }
+static void blyt_debug_bp3(void) { g_counter += 3; }
+
+void blyt_debug_bp_target(void) {
+    g_counter = 1;
+    blyt_debug_bp2();
+    blyt_debug_bp3();
+}
+
+static int g_frame = 0;
+void blyt_cart_init(void)   { blyt_debug_bp_target(); }
+void blyt_cart_update(void) { if (++g_frame >= 3) blyt_quit(); }
+void blyt_cart_draw(void)   {}
+"#;
+
+/// SDL2 GDB: read a known global variable address with the 'm' packet.
+///
+/// Sets a breakpoint at `blyt_debug_bp_target`, resumes, then reads the
+/// 4 bytes at the address of `g_counter` and verifies an 8-char hex response.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK, `readelf` on PATH.
+#[test]
+fn sdl_c_cart_gdb_memory_read() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_gdb_mem");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let bp_addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let mem_addr = find_symbol_addr(&cart, "g_counter");
+    if bp_addr.is_none() || mem_addr.is_none() {
+        // readelf not available — fall back to basic handshake.
+        let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+        Command::new("node")
+            .args([
+                orchestrator.to_str().unwrap(),
+                blytplay().to_str().unwrap(),
+                cart.to_str().unwrap(),
+            ])
+            .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+            .assert()
+            .success();
+        return;
+    }
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_GDB_BREAK_ADDR", format!("{:x}", bp_addr.unwrap()))
+        .env("BLYT_GDB_MEM_ADDR", format!("{:x}", mem_addr.unwrap()))
+        .assert()
+        .success();
+}
+
+/// SDL2 GDB: set three breakpoints and hit them in sequence.
+///
+/// Sets Z0 at `blyt_debug_bp_target`, `blyt_debug_bp2`, and `blyt_debug_bp3`,
+/// sends vCont;c three times, and asserts a T05 stop reply arrives each time.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK, `readelf` on PATH.
+#[test]
+fn sdl_c_cart_gdb_multi_breakpoints() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_gdb_multi_bp");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr1 = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let addr2 = find_symbol_addr(&cart, "blyt_debug_bp2");
+    let addr3 = find_symbol_addr(&cart, "blyt_debug_bp3");
+
+    match (addr1, addr2, addr3) {
+        (Some(a1), Some(a2), Some(a3)) => {
+            let orchestrator = repo_root().join("tests/gdb/run_sdl_multi_bp_test.mjs");
+            Command::new("node")
+                .args([
+                    orchestrator.to_str().unwrap(),
+                    blytplay().to_str().unwrap(),
+                    cart.to_str().unwrap(),
+                ])
+                .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+                .env("BLYT_GDB_BP_ADDRS", format!("{a1:x},{a2:x},{a3:x}"))
+                .assert()
+                .success();
+        }
+        _ => {
+            // readelf not available — fall back to basic handshake.
+            let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+            Command::new("node")
+                .args([
+                    orchestrator.to_str().unwrap(),
+                    blytplay().to_str().unwrap(),
+                    cart.to_str().unwrap(),
+                ])
+                .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+                .assert()
+                .success();
+        }
+    }
+}
+
+/// SDL2 GDB: detach after a breakpoint stop — cart continues to completion.
+///
+/// Sets a Z0 breakpoint, hits it, then sends 'D'.  The stub should return OK
+/// and resume the cart without a debugger; blytplay should exit cleanly.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK, `readelf` on PATH.
+#[test]
+fn sdl_c_cart_gdb_detach() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_gdb_detach");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+    let mut cmd = Command::new("node");
+    cmd.args([
+        orchestrator.to_str().unwrap(),
+        blytplay().to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ])
+    .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+    .env("BLYT_GDB_DETACH", "1");
+    if let Some(a) = addr {
+        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
+    }
+    cmd.assert().success();
+}
+
+/// SDL2 GDB: out-of-band interrupt (\x03) halts the cart and returns T02.
+///
+/// Sends vCont;c without a breakpoint, waits 100 ms, then sends the raw
+/// \x03 byte.  Asserts that the stub responds with T02 (SIGINT).
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK.
+#[test]
+fn sdl_c_cart_gdb_interrupt() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_gdb_interrupt");
+    // Use a cart that runs for many frames — blytplay headless has no frame-rate
+    // cap so 300 frames can finish in <<100ms.  30,000,000 gives several seconds
+    // of wall time before the cart quits naturally (interrupted by \x03 first).
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+             static int g_frame = 0;\n\
+             void blyt_cart_init(void)   {}\n\
+             void blyt_cart_update(void) { if (++g_frame >= 30000000) blyt_quit(); }\n\
+             void blyt_cart_draw(void)   {}\n")
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_interrupt_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .assert()
+        .success();
+}
+
+/// SDL2 GDB: qXfer:exec-file:read returns the cart path.
+///
+/// After the GDB handshake, sends qXfer:exec-file:read::0,4000 and asserts
+/// the response starts with 'l' and contains the cart filename.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK.
+#[test]
+fn sdl_c_cart_gdb_exec_file_query() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_gdb_exec_file");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_GDB_EXEC_FILE_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// SDL2 GDB: qXfer:libraries-svr4:read contains libblyt32.so.
+///
+/// After the GDB handshake, sends the libraries query and asserts the XML
+/// response contains libblyt32.so — confirming the cart's dynamic linker
+/// load addresses are correctly reported to the debugger.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK.
+#[test]
+fn sdl_c_cart_gdb_library_list() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_gdb_lib_list");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_GDB_LIBRARY_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// WASM GDB: relay announces "WASM runtime connected" once the cart connects.
+///
+/// The run_gdb_test.mjs orchestrator prints "[run_gdb_test] WASM runtime
+/// connected" once the WASM cart's WebSocket GDB transport connects to the
+/// relay.  This is the WASM-path equivalent of the "GDB: WASM ready" signal
+/// that the VS Code extension waits for in the blyt-run relay.
+///
+/// Requires: WASM build with BLYT_GDB=ON.
+#[test]
+fn wasm_c_cart_gdb_runtime_connected_signal() {
+    require_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_signal");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    let out = std::process::Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .output()
+        .expect("node must be on PATH");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        combined.contains("WASM runtime connected"),
+        "expected 'WASM runtime connected' in output:\n{combined}"
+    );
+}
+
+/// GDB: qXfer:features:read returns a target.xml with the RISC-V architecture.
+///
+/// Sends `qXfer:features:read:target.xml:0,4000` after handshake and verifies
+/// the response starts with 'l' and contains an riscv architecture element.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK.
+#[test]
+fn sdl_c_cart_gdb_features_query() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("gdb_features");
+    CartProject::new().c(DEBUG_C).write(&project);
+    let cart = build_cart(&project);
+    assert!(cart.exists());
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_GDB_FEATURES_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// GDB: qProcessInfo returns the correct RISC-V 32-bit process triple.
+///
+/// Sends `qProcessInfo` after handshake and verifies the response contains
+/// the `riscv32` triple and `endian:little`.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK.
+#[test]
+fn sdl_c_cart_gdb_process_info() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("gdb_procinfo");
+    CartProject::new().c(DEBUG_C).write(&project);
+    let cart = build_cart(&project);
+    assert!(cart.exists());
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_GDB_PROCESS_INFO", "1")
+        .assert()
+        .success();
+}
+
+/// GDB: P (single register write) correctly updates a register.
+///
+/// After stopping at a breakpoint, sends `P1:cdab3412` (write ra) then `p1`
+/// (read ra) and verifies the value roundtrips correctly.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK, readelf for symbol lookup.
+#[test]
+fn sdl_c_cart_gdb_register_write() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("gdb_reg_write");
+    CartProject::new().c(DEBUG_C).write(&project);
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists());
+
+    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    if addr.is_none() {
+        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
+        return;
+    }
+    let break_addr = format!("{:x}", addr.unwrap());
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_GDB_BREAK_ADDR", &break_addr)
+        .env("BLYT_GDB_REGISTER_WRITE_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// GDB: qThreadStopInfo returns T05 after a breakpoint stop.
+///
+/// After stopping at a breakpoint, sends `qThreadStopInfo1` and verifies the
+/// response contains `T05` (the stop reason for a software breakpoint).
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK, readelf for symbol lookup.
+#[test]
+fn sdl_c_cart_gdb_thread_stop_info() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("gdb_tsi");
+    CartProject::new().c(DEBUG_C).write(&project);
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists());
+
+    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    if addr.is_none() {
+        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
+        return;
+    }
+    let break_addr = format!("{:x}", addr.unwrap());
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_GDB_BREAK_ADDR", &break_addr)
+        .env("BLYT_GDB_THREAD_STOP_INFO", "1")
+        .assert()
+        .success();
+}

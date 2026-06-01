@@ -603,6 +603,33 @@ pub fn build_debug_cart(project_dir: &std::path::Path) -> PathBuf {
     ))
 }
 
+/// Find the lldb-dap binary — prefers the SDK-bundled copy, falls back to PATH.
+pub fn lldb_dap_bin() -> Option<PathBuf> {
+    let sdk_candidate = sdk_dir().join("bin/blyt-lldb-dap");
+    if sdk_candidate.exists() {
+        return Some(sdk_candidate);
+    }
+    let out = std::process::Command::new("which")
+        .arg("lldb-dap")
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+/// Skip test if lldb-dap is not available.
+pub fn require_lldb_dap() {
+    assert!(
+        lldb_dap_bin().is_some(),
+        "lldb-dap not found — install LLVM or build SDK with blyt-lldb-dap"
+    );
+}
+
 /// Find the virtual address of a symbol in a cart ELF using `readelf -s`.
 ///
 /// Returns `None` if `readelf` is not available or the symbol is not found.

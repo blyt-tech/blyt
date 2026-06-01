@@ -247,6 +247,11 @@ async function main() {
         assert(bpResp === 'OK', `GDB Z0 at 0x${addrHex}: ${bpResp}`);
     }
 
+    /* Clear the initial halt so the cart can run once DAP fires configurationDone.
+     * The Z0 breakpoint (if any) will stop execution again inside the C function. */
+    gdb.send('+');
+    gdb.send(gdbFrame('vCont;c'));
+
     /* ── DAP session: init + configure ───────────────────────────────────── */
     const init = await dap.request('initialize', {
         clientID:        'blyt-hybrid-test',

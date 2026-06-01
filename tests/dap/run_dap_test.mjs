@@ -181,7 +181,7 @@ function loadWasmRuntime(wasmDir, cartPath, dapPort) {
          * Must be a plain object — arrow functions throw when Emscripten
          * inspects .caller/.arguments on them in strict mode. */
         globalThis.__blyt_init_module = {
-            print:    (s) => process.stdout.write(s + '\n'),
+            print:    (s) => process.stderr.write(s + '\n'),
             printErr: (s) => process.stderr.write(s + '\n'),
             onExit:   (code) => resolve(code),
         };
@@ -199,7 +199,6 @@ function loadWasmRuntime(wasmDir, cartPath, dapPort) {
 
 async function main() {
     const relayPort = await startRelay();
-    console.log(`[run_dap_test] relay on ws://127.0.0.1:${relayPort}/dap`);
 
     /* Load the WASM runtime in the background (it will connect to the relay). */
     const runtimeDone = loadWasmRuntime(WASM_DIR, CART_PATH, relayPort).catch((e) => {
