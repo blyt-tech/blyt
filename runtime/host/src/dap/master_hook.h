@@ -24,6 +24,7 @@ typedef struct {
     dap_step_mode_t dap_step_mode;
     int dap_step_base_depth;
     int dap_pending_pause;
+    int dap_evaluating; /* set while evaluate pcall runs; hook skips to preserve trap state */
     void *dap_state; /* opaque pointer owned by the transport */
 } hook_config_t;
 

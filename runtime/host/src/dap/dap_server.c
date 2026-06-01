@@ -35,7 +35,9 @@
 #define DAP_STEP_OUT 3
 
 #define MAX_BREAKPOINTS 256
+#define MAX_CONDITION 256
 #define MAX_SOURCE_PATH 1024
+#define MAX_SOURCES 64
 #define MAX_MSG (1 << 20)
 
 /* Inspection-command queue delivered to the guest via BLYT_ECALL_DAP_RECV. */
@@ -47,6 +49,7 @@ typedef struct {
     int line;
     int verified;
     int id;
+    char condition[MAX_CONDITION];
 } dap_bp_t;
 
 typedef struct {
@@ -82,6 +85,19 @@ typedef struct {
     char q_buf[MSG_QUEUE_CAP][MSG_BODY_MAX];
     int q_head, q_tail;
     pthread_cond_t msg_cond;
+
+    /* Restart state. */
+    int restart_pending;
+
+    /* Loaded sources (for loadedSources request). */
+    char loaded_sources[MAX_SOURCES][MAX_SOURCE_PATH];
+    int n_sources;
+
+    /* Exception filter: 0=none, 1=uncaught, 2=all. */
+    int exception_filter;
+
+    /* Conditional breakpoint: condition string for the in-flight return-2 call. */
+    char pending_condition[MAX_CONDITION];
 } dap_state_t;
 
 static dap_state_t g_dap = {.mu = PTHREAD_MUTEX_INITIALIZER, .client_fd = -1};
@@ -241,11 +257,18 @@ static void q_push(const char *msg) {
 
 static void handle_initialize(int seq, const char *args) {
     (void)args;
-    const char *body = "{\"supportsConfigurationDoneRequest\":true,"
-                       "\"supportsLoadedSourcesRequest\":true,"
-                       "\"supportsRestartRequest\":false,"
-                       "\"supportsStepBack\":false,"
-                       "\"supportsTerminateRequest\":true}";
+    const char *body =
+        "{\"supportsConfigurationDoneRequest\":true,"
+        "\"supportsLoadedSourcesRequest\":true,"
+        "\"supportsRestartRequest\":true,"
+        "\"supportsStepBack\":false,"
+        "\"supportsTerminateRequest\":true,"
+        "\"supportsConditionalBreakpoints\":true,"
+        "\"supportsExceptionBreakpoints\":true,"
+        "\"exceptionBreakpointFilters\":["
+        "{\"filter\":\"uncaught\",\"label\":\"Uncaught Exceptions\",\"default\":false},"
+        "{\"filter\":\"all\",\"label\":\"All Exceptions\",\"default\":false}"
+        "]}";
     send_response(seq, "initialize", 1, body);
     send_event("initialized", "{}");
 }
@@ -272,30 +295,80 @@ int fc_dap_configuration_done(void) {
     return v;
 }
 
-static int json_get_bp_array_lines(const char *buf, int *out, int max) {
+/* Parse "breakpoints":[{"line":N,"condition":"..."},...].
+ * Fills lines[] and conds[][MAX_CONDITION] (conds may be NULL).
+ * Returns number of breakpoints parsed. */
+static int json_get_bp_array(const char *buf, int *lines, char (*conds)[MAX_CONDITION], int max) {
     const char *p = strstr(buf, "\"breakpoints\"");
     if (!p)
         return 0;
     p = strchr(p, '[');
     if (!p)
         return 0;
-    const char *end = strchr(p, ']');
-    if (!end)
-        return 0;
     int n = 0;
     p++;
-    while (p < end && n < max) {
-        const char *lp = strstr(p, "\"line\"");
-        if (!lp || lp >= end)
+    while (*p && n < max) {
+        while (*p && *p != '{' && *p != ']')
+            p++;
+        if (!*p || *p == ']')
             break;
-        lp = strchr(lp, ':');
-        if (!lp || lp >= end)
-            break;
+        /* scan object boundaries */
+        const char *obj = p;
+        int depth = 1;
+        p++;
+        while (*p && depth > 0) {
+            if (*p == '{')
+                depth++;
+            else if (*p == '}')
+                depth--;
+            if (depth > 0)
+                p++;
+        }
+        /* [obj, p] spans the object (p points at closing '}') */
+        const char *lp = strstr(obj, "\"line\"");
+        if (!lp || lp > p) {
+            if (*p)
+                p++;
+            continue;
+        }
+        lp = strchr(lp + 6, ':');
+        if (!lp || lp > p) {
+            if (*p)
+                p++;
+            continue;
+        }
         lp++;
         while (*lp == ' ' || *lp == '\t')
             lp++;
-        out[n++] = atoi(lp);
-        p = lp;
+        lines[n] = atoi(lp);
+        if (conds) {
+            conds[n][0] = '\0';
+            const char *cp = strstr(obj, "\"condition\"");
+            if (cp && cp < p) {
+                cp = strchr(cp + 11, ':');
+                if (cp && cp < p) {
+                    cp++;
+                    while (*cp == ' ' || *cp == '\t')
+                        cp++;
+                    if (*cp == '"') {
+                        cp++;
+                        size_t i = 0;
+                        while (*cp && *cp != '"' && i + 1 < MAX_CONDITION) {
+                            if (*cp == '\\' && cp[1]) {
+                                conds[n][i++] = cp[1];
+                                cp += 2;
+                            } else {
+                                conds[n][i++] = *cp++;
+                            }
+                        }
+                        conds[n][i] = '\0';
+                    }
+                }
+            }
+        }
+        n++;
+        if (*p)
+            p++;
     }
     return n;
 }
@@ -305,9 +378,13 @@ static void handle_set_breakpoints(int seq, const char *args) {
     json_get_string(args, "path", source, sizeof source);
 
     int lines[MAX_BREAKPOINTS];
-    int n = json_get_bp_array_lines(args, lines, MAX_BREAKPOINTS);
-    if (n == 0)
+    char conds[MAX_BREAKPOINTS][MAX_CONDITION];
+    int n = json_get_bp_array(args, lines, conds, MAX_BREAKPOINTS);
+    if (n == 0) {
         n = json_get_int_array(args, "lines", lines, MAX_BREAKPOINTS);
+        for (int i = 0; i < n; i++)
+            conds[i][0] = '\0';
+    }
 
     pthread_mutex_lock(&g_dap.mu);
     int kept = 0;
@@ -325,6 +402,7 @@ static void handle_set_breakpoints(int seq, const char *args) {
         bp->line = lines[i];
         bp->verified = (lines[i] > 0);
         bp->id = ++g_dap.next_bp_id;
+        snprintf(bp->condition, sizeof bp->condition, "%s", conds[i]);
     }
     pthread_mutex_unlock(&g_dap.mu);
 
@@ -410,6 +488,53 @@ static void handle_disconnect(int seq, const char *args) {
     pthread_mutex_unlock(&g_dap.mu);
 }
 
+static void handle_restart(int seq, const char *args) {
+    (void)args;
+    pthread_mutex_lock(&g_dap.mu);
+    g_dap.n_bps = 0;
+    g_dap.n_sources = 0;
+    g_dap.configuration_done = 0;
+    g_dap.restart_pending = 1;
+    g_dap.continue_pending = 1;
+    g_dap.pending_step_mode = 0;
+    g_dap.pending_pause = 0;
+    if (g_dap.guest_paused)
+        pthread_cond_signal(&g_dap.msg_cond);
+    /* Wake fc_dap_check_hook_line blocked on configuration_done wait. */
+    pthread_cond_broadcast(&g_dap.msg_cond);
+    pthread_mutex_unlock(&g_dap.mu);
+    send_response(seq, "restart", 1, "{}");
+    /* Re-send initialized so the client repeats setBreakpoints + configurationDone. */
+    send_event("initialized", "{}");
+}
+
+static void handle_loaded_sources(int seq, const char *args) {
+    (void)args;
+    static char body[MAX_MSG];
+    int off = snprintf(body, sizeof body, "{\"sources\":[");
+    pthread_mutex_lock(&g_dap.mu);
+    for (int i = 0; i < g_dap.n_sources; i++) {
+        off +=
+            snprintf(body + off, sizeof(body) - (size_t)off, "%s{\"path\":\"%s\",\"name\":\"%s\"}",
+                     i ? "," : "", g_dap.loaded_sources[i], g_dap.loaded_sources[i]);
+    }
+    pthread_mutex_unlock(&g_dap.mu);
+    snprintf(body + off, sizeof(body) - (size_t)off, "]}");
+    send_response(seq, "loadedSources", 1, body);
+}
+
+static void handle_set_exception_breakpoints(int seq, const char *args) {
+    int filter = 0;
+    if (strstr(args, "\"all\""))
+        filter = 2;
+    else if (strstr(args, "\"uncaught\""))
+        filter = 1;
+    pthread_mutex_lock(&g_dap.mu);
+    g_dap.exception_filter = filter;
+    pthread_mutex_unlock(&g_dap.mu);
+    send_response(seq, "setExceptionBreakpoints", 1, "{\"breakpoints\":[]}");
+}
+
 /* ── Dispatcher ────────────────────────────────────────────────────────────── */
 
 static void dispatch(const char *msg) {
@@ -448,6 +573,8 @@ static void dispatch(const char *msg) {
         handle_configuration_done(seq, msg);
     else if (strcmp(cmd, "setBreakpoints") == 0)
         handle_set_breakpoints(seq, msg);
+    else if (strcmp(cmd, "setExceptionBreakpoints") == 0)
+        handle_set_exception_breakpoints(seq, msg);
     else if (strcmp(cmd, "threads") == 0)
         handle_threads(seq, msg);
     else if (strcmp(cmd, "continue") == 0)
@@ -460,10 +587,14 @@ static void dispatch(const char *msg) {
         handle_step(seq, msg, DAP_STEP_OUT);
     else if (strcmp(cmd, "pause") == 0)
         handle_pause(seq, msg);
+    else if (strcmp(cmd, "restart") == 0)
+        handle_restart(seq, msg);
     else if (strcmp(cmd, "disconnect") == 0)
         handle_disconnect(seq, msg);
     else if (strcmp(cmd, "terminate") == 0)
         handle_disconnect(seq, msg);
+    else if (strcmp(cmd, "loadedSources") == 0)
+        handle_loaded_sources(seq, msg);
     else
         send_response(seq, cmd, 0, "unknown command");
 }
@@ -512,6 +643,7 @@ static void *dap_thread_main(void *arg) {
         }
         pthread_mutex_lock(&g_dap.mu);
         g_dap.client_fd = fd;
+        g_dap.n_sources = 0;
         pthread_mutex_unlock(&g_dap.mu);
         while (g_dap.running) {
             int n = read_msg(fd, buf, sizeof buf);
@@ -609,21 +741,6 @@ static const char *basename_of(const char *p) {
     return b;
 }
 
-static int check_bp(const char *source, int line) {
-    if (g_dap.client_fd < 0)
-        return 0;
-    const char *src_base = basename_of(source);
-    for (int i = 0; i < g_dap.n_bps; i++) {
-        if (!g_dap.bps[i].verified)
-            continue;
-        if (g_dap.bps[i].line != line)
-            continue;
-        if (strcmp(basename_of(g_dap.bps[i].source), src_base) == 0)
-            return 1;
-    }
-    return 0;
-}
-
 /* ── ECALL path (emulated Lua inside rv32emu) ──────────────────────────────── */
 
 int fc_dap_check_hook_line(const char *source, int line, int depth) {
@@ -631,14 +748,19 @@ int fc_dap_check_hook_line(const char *source, int line, int depth) {
         return 0;
     /* On the first hook call, wait for the client to finish configuration
      * (setBreakpoints, configurationDone) before checking any breakpoints.
-     * This prevents the cart from running past init() before breakpoints are set. */
+     * Skip this wait if a restart is pending — the guest should complete the
+     * current frame so blyt_session_run_frame() can return BLYT_RUN_RESTART. */
     pthread_mutex_lock(&g_dap.mu);
-    while (g_dap.running && g_dap.client_fd >= 0 && !g_dap.configuration_done)
+    while (g_dap.running && g_dap.client_fd >= 0 && !g_dap.configuration_done &&
+           !g_dap.restart_pending)
         pthread_cond_wait(&g_dap.msg_cond, &g_dap.mu);
     int alive = g_dap.running && g_dap.client_fd >= 0;
+    int restart = g_dap.restart_pending;
     pthread_mutex_unlock(&g_dap.mu);
-    if (!alive)
+    if (!alive || restart)
         return 0;
+
+    fc_dap_emit_loaded_source(source);
 
     pthread_mutex_lock(&g_dap.mu);
     int pending_pause = g_dap.pending_pause;
@@ -670,7 +792,27 @@ int fc_dap_check_hook_line(const char *source, int line, int depth) {
             reason = "step";
     } else {
         pthread_mutex_lock(&g_dap.mu);
-        should_break = check_bp(source, line);
+        const char *src_base = basename_of(source);
+        for (int i = 0; i < g_dap.n_bps; i++) {
+            if (!g_dap.bps[i].verified)
+                continue;
+            if (g_dap.bps[i].line != line)
+                continue;
+            if (strcmp(basename_of(g_dap.bps[i].source), src_base) != 0)
+                continue;
+            if (g_dap.bps[i].condition[0]) {
+                /* Conditional BP: stash condition, return 2 so guest evaluates. */
+                snprintf(g_dap.pending_condition, sizeof g_dap.pending_condition, "%s",
+                         g_dap.bps[i].condition);
+                snprintf(g_dap.paused_source, sizeof g_dap.paused_source, "%s", source);
+                g_dap.paused_line = line;
+                g_dap.paused_depth = depth;
+                pthread_mutex_unlock(&g_dap.mu);
+                return 2;
+            }
+            should_break = 1;
+            break;
+        }
         pthread_mutex_unlock(&g_dap.mu);
     }
 
@@ -769,9 +911,100 @@ void fc_dap_poll_messages(void) { /* TCP transport uses a dedicated thread */
 }
 
 void fc_dap_emit_loaded_source(const char *source_path) {
+    pthread_mutex_lock(&g_dap.mu);
+    int already = 0;
+    for (int i = 0; i < g_dap.n_sources; i++) {
+        if (strcmp(g_dap.loaded_sources[i], source_path) == 0) {
+            already = 1;
+            break;
+        }
+    }
+    if (!already && g_dap.n_sources < MAX_SOURCES)
+        snprintf(g_dap.loaded_sources[g_dap.n_sources++], MAX_SOURCE_PATH, "%s", source_path);
+    pthread_mutex_unlock(&g_dap.mu);
+    if (already)
+        return;
     char body[MAX_SOURCE_PATH + 128];
     snprintf(body, sizeof body,
              "{\"reason\":\"changed\",\"source\":{\"path\":\"%s\",\"name\":\"%s\"}}", source_path,
              source_path);
     send_event("loadedSource", body);
+}
+
+int fc_dap_is_restart_pending(void) {
+    pthread_mutex_lock(&g_dap.mu);
+    int v = g_dap.restart_pending;
+    g_dap.restart_pending = 0;
+    pthread_mutex_unlock(&g_dap.mu);
+    return v;
+}
+
+int fc_dap_get_condition(char *buf, size_t n) {
+    /* Synchronous: called from ECALL 7 in the same rv32emu thread as ECALL 3. */
+    size_t len = strnlen(g_dap.pending_condition, MAX_CONDITION);
+    if (len >= n)
+        len = n - 1;
+    memcpy(buf, g_dap.pending_condition, len);
+    buf[len] = '\0';
+    return (int)len;
+}
+
+int fc_dap_on_condition_result(int result) {
+    if (!result)
+        return 0;
+    pthread_mutex_lock(&g_dap.mu);
+    g_dap.pending_pause = 0;
+    g_dap.pending_step_mode = 0;
+    g_dap.paused = 1;
+    g_dap.guest_paused = 1;
+    g_dap.continue_pending = 0;
+    pthread_mutex_unlock(&g_dap.mu);
+    send_event("stopped", "{\"reason\":\"breakpoint\",\"threadId\":1,\"allThreadsStopped\":true}");
+    return 1;
+}
+
+int fc_dap_exception_filter(void) {
+    pthread_mutex_lock(&g_dap.mu);
+    int f = g_dap.exception_filter;
+    pthread_mutex_unlock(&g_dap.mu);
+    return f;
+}
+
+int fc_dap_on_exception(const char *msg, int is_uncaught) {
+    pthread_mutex_lock(&g_dap.mu);
+    int filter = g_dap.exception_filter;
+    int alive = g_dap.running && g_dap.client_fd >= 0;
+    pthread_mutex_unlock(&g_dap.mu);
+    if (!alive || filter == 0)
+        return 0;
+    if (filter == 1 && !is_uncaught)
+        return 0;
+    pthread_mutex_lock(&g_dap.mu);
+    g_dap.pending_pause = 0;
+    g_dap.pending_step_mode = 0;
+    g_dap.paused = 1;
+    g_dap.guest_paused = 1;
+    g_dap.continue_pending = 0;
+    pthread_mutex_unlock(&g_dap.mu);
+    static char body[256];
+    char esc[200] = {0};
+    if (msg) {
+        size_t j = 0;
+        for (size_t i = 0; msg[i] && j + 4 < sizeof esc; i++) {
+            if (msg[i] == '"') {
+                esc[j++] = '\\';
+                esc[j++] = '"';
+            } else if (msg[i] == '\\') {
+                esc[j++] = '\\';
+                esc[j++] = '\\';
+            } else
+                esc[j++] = msg[i];
+        }
+    }
+    snprintf(body, sizeof body,
+             "{\"reason\":\"exception\",\"description\":\"%s\","
+             "\"threadId\":1,\"allThreadsStopped\":true}",
+             esc);
+    send_event("stopped", body);
+    return 1;
 }

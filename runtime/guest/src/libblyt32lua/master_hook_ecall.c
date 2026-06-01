@@ -32,6 +32,9 @@
 #define BLYT_ECALL_DAP_HOOK 3
 #define BLYT_ECALL_DAP_SEND 4
 #define BLYT_ECALL_DAP_RECV 5
+#define BLYT_ECALL_DAP_EXCEPTION 6
+#define BLYT_ECALL_DAP_GET_CONDITION 7
+#define BLYT_ECALL_DAP_CONDITION_RESULT 8
 
 #define MAX_FRAMES 32
 #define MAX_VARS 64
@@ -63,6 +66,30 @@ static int ecall_dap_recv(char *buf, int max_len) {
     register long a1 __asm__("a1") = (long)(unsigned)max_len;
     register long a7 __asm__("a7") = BLYT_ECALL_DAP_RECV;
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    return (int)a0;
+}
+
+static int ecall_dap_exception(const char *msg, int msg_len, int is_uncaught) {
+    register long a0 __asm__("a0") = (long)msg;
+    register long a1 __asm__("a1") = (long)msg_len;
+    register long a2 __asm__("a2") = (long)is_uncaught;
+    register long a7 __asm__("a7") = BLYT_ECALL_DAP_EXCEPTION;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return (int)a0;
+}
+
+static int ecall_dap_get_condition(char *buf, int max_len) {
+    register long a0 __asm__("a0") = (long)buf;
+    register long a1 __asm__("a1") = (long)(unsigned)max_len;
+    register long a7 __asm__("a7") = BLYT_ECALL_DAP_GET_CONDITION;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    return (int)a0;
+}
+
+static int ecall_dap_condition_result(int result) {
+    register long a0 __asm__("a0") = (long)result;
+    register long a7 __asm__("a7") = BLYT_ECALL_DAP_CONDITION_RESULT;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
     return (int)a0;
 }
 
@@ -229,42 +256,48 @@ static void on_evaluate(int seq, const char *msg, lua_State *L) {
         return;
     }
 
-    const char *vn;
-    int idx = 1;
-    while ((vn = lua_getlocal(L, &ar2, idx++)) != NULL) {
-        if (strcmp(vn, expr) == 0)
-            goto found;
-        lua_pop(L, 1);
-    }
-    lua_getinfo(L, "f", &ar2);
-    {
-        int fn = lua_gettop(L), uvi = 1;
-        while ((vn = lua_getupvalue(L, fn, uvi++)) != NULL) {
-            if (strcmp(vn, expr) == 0) {
-                lua_remove(L, fn);
-                goto found;
-            }
+    static char chunk[320];
+    snprintf(chunk, sizeof chunk, "return (%s)", expr);
+
+    char val[256] = {0};
+    if (luaL_loadstring(L, chunk) == LUA_OK) {
+        /* Inject frame locals into _ENV so expressions like "x + 1" work. */
+        lua_newtable(L);
+        lua_newtable(L);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
+        lua_setfield(L, -2, "__index");
+        lua_setmetatable(L, -2);
+        int li = 1;
+        const char *vn;
+        while ((vn = lua_getlocal(L, &ar2, li++)) != NULL)
+            lua_setfield(L, -2, vn);
+        lua_setupvalue(L, -2, 1);
+        if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
+            int t = lua_type(L, -1);
+            if (t == LUA_TNIL)
+                snprintf(val, sizeof val, "nil");
+            else if (t == LUA_TBOOLEAN)
+                snprintf(val, sizeof val, "%s", lua_toboolean(L, -1) ? "true" : "false");
+            else if (t == LUA_TNUMBER || t == LUA_TSTRING)
+                snprintf(val, sizeof val, "%s", lua_tostring(L, -1));
+            else
+                snprintf(val, sizeof val, "%s", luaL_typename(L, -1));
+            lua_pop(L, 1);
+        } else {
+            snprintf(val, sizeof val, "?");
             lua_pop(L, 1);
         }
+    } else {
+        snprintf(val, sizeof val, "?");
         lua_pop(L, 1);
     }
-    send_resp(seq, "evaluate", 1, "{\"result\":\"?\",\"variablesReference\":0}");
-    return;
 
-found: {
-    char val[256] = {0};
-    if (lua_isstring(L, -1) || lua_isnumber(L, -1))
-        snprintf(val, sizeof val, "%s", lua_tostring(L, -1));
-    else
-        snprintf(val, sizeof val, "%s", luaL_typename(L, -1));
-    lua_pop(L, 1);
     for (char *q = val; *q; q++)
         if (*q == '"' || *q == '\\')
             *q = '_';
     char body[320];
     snprintf(body, sizeof body, "{\"result\":\"%s\",\"variablesReference\":0}", val);
     send_resp(seq, "evaluate", 1, body);
-}
 }
 
 static void on_threads(int seq) {
@@ -298,7 +331,68 @@ bool fc_dap_should_break(lua_State *L, lua_Debug *ar) {
     int depth = hook_call_depth(L);
 
     int result = ecall_dap_hook(src, src_len, line, depth);
+    if (result == 2) {
+        /* Conditional breakpoint: fetch condition, evaluate in Lua, report back. */
+        static char cond_buf[256];
+        int clen = ecall_dap_get_condition(cond_buf, (int)sizeof(cond_buf) - 1);
+        if (clen <= 0) {
+            ecall_dap_condition_result(0);
+            return false;
+        }
+        cond_buf[clen] = '\0';
+
+        static char chunk[320];
+        snprintf(chunk, sizeof chunk, "return (%s)", cond_buf);
+
+        int cond_val = 0;
+        if (luaL_loadstring(L, chunk) == LUA_OK) {
+            lua_newtable(L);
+            lua_newtable(L);
+            lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
+            lua_setfield(L, -2, "__index");
+            lua_setmetatable(L, -2);
+            /* Inject upvalues (skip _ENV), then locals (override upvalues). */
+            lua_getinfo(L, "f", ar);
+            {
+                int ui = 1;
+                const char *uname;
+                while ((uname = lua_getupvalue(L, -1, ui++)) != NULL) {
+                    if (strcmp(uname, "_ENV") != 0)
+                        lua_setfield(L, -3, uname);
+                    else
+                        lua_pop(L, 1);
+                }
+            }
+            lua_pop(L, 1);
+            int li = 1;
+            const char *vn;
+            while ((vn = lua_getlocal(L, ar, li++)) != NULL)
+                lua_setfield(L, -2, vn);
+            lua_setupvalue(L, -2, 1); /* chunk._ENV = env */
+            if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
+                cond_val = lua_toboolean(L, -1);
+                lua_pop(L, 1);
+            } else {
+                lua_pop(L, 1);
+            }
+        } else {
+            lua_pop(L, 1);
+        }
+
+        int should_pause = ecall_dap_condition_result(cond_val);
+        return should_pause != 0;
+    }
     return result != 0;
+}
+
+/* Call this from an xpcall error handler to notify the DAP server of a Lua
+ * exception.  Returns non-zero if the debugger paused. */
+int blyt_dap_report_exception(lua_State *L, int is_uncaught) {
+    const char *msg = lua_tostring(L, -1);
+    if (!msg)
+        msg = "(error)";
+    int msg_len = (int)strlen(msg);
+    return ecall_dap_exception(msg, msg_len, is_uncaught);
 }
 
 /* Inspect loop: called when fc_dap_should_break returned true.

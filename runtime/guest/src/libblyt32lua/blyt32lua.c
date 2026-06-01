@@ -32,6 +32,19 @@ int blyt_dap_active(void) __attribute__((weak));
 int blyt_dap_active(void) {
     return 0;
 }
+/* Weak default no-op; strong definitions in master_hook_ecall.c (ECALL path)
+ * and dap_transport_wasm.c (WASM path) call the actual transport. */
+int blyt_dap_report_exception(lua_State *L, int is_uncaught) __attribute__((weak));
+int blyt_dap_report_exception(lua_State *L, int is_uncaught) {
+    (void)L;
+    (void)is_uncaught;
+    return 0;
+}
+static int dap_error_handler(lua_State *L) {
+    if (blyt_dap_report_exception(L, 1))
+        fc_dap_pause_loop(L, NULL);
+    return 1;
+}
 #endif
 
 /* Per-cart bytecode — defined in the generated cart_lua_data.c object. */
@@ -156,15 +169,26 @@ static lua_State *open_state(void) {
 static void call_global(const char *name) {
     if (!g_L)
         return;
+    int msgh = 0;
+#ifdef BLYT_DAP
+    if (blyt_dap_active()) {
+        lua_pushcfunction(g_L, dap_error_handler);
+        msgh = lua_gettop(g_L);
+    }
+#endif
     lua_getglobal(g_L, name);
     if (lua_isfunction(g_L, -1)) {
-        if (lua_pcall(g_L, 0, 0, 0) != LUA_OK) {
+        if (lua_pcall(g_L, 0, 0, msgh) != LUA_OK) {
             blyt_console_debug(lua_tostring(g_L, -1));
             lua_pop(g_L, 1);
         }
     } else {
         lua_pop(g_L, 1);
     }
+#ifdef BLYT_DAP
+    if (msgh > 0)
+        lua_remove(g_L, msgh);
+#endif
 }
 
 void blyt_cart_init(void) {

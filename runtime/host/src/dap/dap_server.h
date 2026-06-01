@@ -85,6 +85,28 @@ int fc_dap_host_recv(char *buf, size_t max_len);
  * Returns non-zero if configurationDone was received; 0 if shutting down. */
 int fc_dap_wait_configuration_done(void);
 
+/* Returns non-zero (and clears the flag) if the client sent a restart request.
+ * Checked at the start of blyt_session_run_frame() to trigger BLYT_RUN_RESTART. */
+int fc_dap_is_restart_pending(void);
+
+/* Copy the pending conditional breakpoint expression into buf (max n bytes).
+ * Called from BLYT_ECALL_DAP_GET_CONDITION (ECALL 7) after ECALL 3 returns 2.
+ * Returns the expression length. */
+int fc_dap_get_condition(char *buf, size_t n);
+
+/* Report the Lua condition evaluation result back to the host.
+ * Called from BLYT_ECALL_DAP_CONDITION_RESULT (ECALL 8).
+ * Returns 1 and emits "stopped" if result is true; 0 otherwise. */
+int fc_dap_on_condition_result(int result);
+
+/* Returns current exception filter: 0=none, 1=uncaught, 2=all. */
+int fc_dap_exception_filter(void);
+
+/* Call when the guest catches a Lua exception.  is_uncaught=1 when the error
+ * would propagate to the top level.  Emits "stopped" if the filter matches.
+ * Returns 1 if the debugger paused; 0 if execution should continue normally. */
+int fc_dap_on_exception(const char *msg, int is_uncaught);
+
 #ifdef __cplusplus
 }
 #endif

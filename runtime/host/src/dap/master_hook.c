@@ -29,6 +29,13 @@ static int dap_call_depth(lua_State *L) {
 static void dap_dispatch(lua_State *L, lua_Debug *ar) {
     if (!fc_master_hook_cfg.dap_enabled)
         return;
+    /* Skip all breakpoint/step logic while handle_evaluate is running a pcall.
+     * If we let the hook fire and yield, luaG_traceexec would set L->status =
+     * LUA_YIELD inside the pcall, which propagates as rc=1 back to the caller.
+     * We do NOT call lua_sethook to disable the hook (that clears ci->u.l.trap
+     * and breaks subsequent hook delivery after resume). */
+    if (fc_master_hook_cfg.dap_evaluating)
+        return;
 
     if (fc_master_hook_cfg.dap_pending_pause) {
         fc_master_hook_cfg.dap_pending_pause = 0;

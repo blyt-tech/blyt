@@ -99,6 +99,7 @@ typedef enum blyt_cart_run_err {
     BLYT_RUN_ERR_ABORT = 3, /* cart called abort() */
     BLYT_RUN_FRAME_DONE = 4, /* one frame complete; call run_frame again */
     BLYT_RUN_GDB_PAUSED = 5, /* WASM: CPU is paused at a GDB breakpoint; poll GDB */
+    BLYT_RUN_RESTART = 6, /* DAP client sent restart; call blyt_session_dap_reattach then wait */
 } blyt_cart_run_err_t;
 
 /*
@@ -174,6 +175,11 @@ int blyt_session_dap_listen(blyt_session_t *s, int *port_out);
 
 /* Stop the DAP server and free its resources. Idempotent. */
 void blyt_session_dap_shutdown(blyt_session_t *s);
+
+/* Re-enable DAP on a session that was recreated after a restart (e.g. after
+ * retro_reset()).  The DAP server keeps running; this just marks the new
+ * session as DAP-enabled so fc_dap_wait_configuration_done() will be reached. */
+void blyt_session_dap_reattach(blyt_session_t *s);
 
 /*
  * Block until the connected DAP client sends configurationDone (meaning all

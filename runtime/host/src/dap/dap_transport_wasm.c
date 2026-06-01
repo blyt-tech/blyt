@@ -29,15 +29,18 @@
 #include <emscripten.h>
 
 #include "lauxlib.h"
+#include "lstate.h" /* TStatus, L->status — needed to temp-clear yield flag during eval pcall */
 #include "lua.h"
 
 #include "dap_server.h"
 #include "master_hook.h"
 
 #define MAX_BREAKPOINTS 256
+#define MAX_CONDITION 256
 #define MAX_FRAMES 64
 #define MAX_VARS 64
 #define MAX_SOURCE_PATH 1024
+#define MAX_SOURCES 64
 #define MAX_MSG (64 * 1024)
 
 /* ── State ─────────────────────────────────────────────────────────────────── */
@@ -46,6 +49,7 @@ typedef struct {
     char source[MAX_SOURCE_PATH];
     int line;
     int id;
+    char condition[MAX_CONDITION];
 } wdap_bp_t;
 
 static struct {
@@ -65,6 +69,12 @@ static struct {
     int pending_step_base_depth;
     int pending_pause;
     int hook_yielded; /* set by fc_dap_pause_loop; cleared by fc_dap_hook_yielded */
+
+    int restart_pending;
+    char loaded_sources[MAX_SOURCES][MAX_SOURCE_PATH];
+    int n_sources;
+    int exception_filter;
+    int hit_bp_id; /* id of the breakpoint that caused the current pause, or 0 */
 } g_wdap;
 
 /* ── JSON helpers ──────────────────────────────────────────────────────────── */
@@ -196,11 +206,18 @@ static void send_event(const char *event, const char *body) {
 
 static void handle_initialize(int seq, const char *args) {
     (void)args;
-    const char *body = "{\"supportsConfigurationDoneRequest\":true,"
-                       "\"supportsLoadedSourcesRequest\":true,"
-                       "\"supportsRestartRequest\":false,"
-                       "\"supportsStepBack\":false,"
-                       "\"supportsTerminateRequest\":true}";
+    const char *body =
+        "{\"supportsConfigurationDoneRequest\":true,"
+        "\"supportsLoadedSourcesRequest\":true,"
+        "\"supportsRestartRequest\":true,"
+        "\"supportsStepBack\":false,"
+        "\"supportsTerminateRequest\":true,"
+        "\"supportsConditionalBreakpoints\":true,"
+        "\"supportsExceptionBreakpoints\":true,"
+        "\"exceptionBreakpointFilters\":["
+        "{\"filter\":\"uncaught\",\"label\":\"Uncaught Exceptions\",\"default\":false},"
+        "{\"filter\":\"all\",\"label\":\"All Exceptions\",\"default\":false}"
+        "]}";
     send_response(seq, "initialize", 1, body);
     send_event("initialized", "{}");
 }
@@ -216,31 +233,76 @@ static void handle_configuration_done(int seq, const char *args) {
     send_response(seq, "configurationDone", 1, "{}");
 }
 
-/* Parse "breakpoints":[{"line":N},{...}] — preferred VS Code format. */
-static int json_get_bp_array_lines(const char *buf, int *out, int max) {
+/* Parse "breakpoints":[{"line":N,"condition":"..."},...] — preferred VS Code format. */
+static int json_get_bp_array(const char *buf, int *lines, char (*conds)[MAX_CONDITION], int max) {
     const char *p = strstr(buf, "\"breakpoints\"");
     if (!p)
         return 0;
     p = strchr(p, '[');
     if (!p)
         return 0;
-    const char *end = strchr(p, ']');
-    if (!end)
-        return 0;
     int n = 0;
     p++;
-    while (p < end && n < max) {
-        const char *lp = strstr(p, "\"line\"");
-        if (!lp || lp >= end)
+    while (*p && n < max) {
+        while (*p && *p != '{' && *p != ']')
+            p++;
+        if (!*p || *p == ']')
             break;
-        lp = strchr(lp, ':');
-        if (!lp || lp >= end)
-            break;
+        const char *obj = p;
+        int depth = 1;
+        p++;
+        while (*p && depth > 0) {
+            if (*p == '{')
+                depth++;
+            else if (*p == '}')
+                depth--;
+            if (depth > 0)
+                p++;
+        }
+        const char *lp = strstr(obj, "\"line\"");
+        if (!lp || lp > p) {
+            if (*p)
+                p++;
+            continue;
+        }
+        lp = strchr(lp + 6, ':');
+        if (!lp || lp > p) {
+            if (*p)
+                p++;
+            continue;
+        }
         lp++;
         while (*lp == ' ' || *lp == '\t')
             lp++;
-        out[n++] = atoi(lp);
-        p = lp;
+        lines[n] = atoi(lp);
+        if (conds) {
+            conds[n][0] = '\0';
+            const char *cp = strstr(obj, "\"condition\"");
+            if (cp && cp < p) {
+                cp = strchr(cp + 11, ':');
+                if (cp && cp < p) {
+                    cp++;
+                    while (*cp == ' ' || *cp == '\t')
+                        cp++;
+                    if (*cp == '"') {
+                        cp++;
+                        size_t i = 0;
+                        while (*cp && *cp != '"' && i + 1 < MAX_CONDITION) {
+                            if (*cp == '\\' && cp[1]) {
+                                conds[n][i++] = cp[1];
+                                cp += 2;
+                            } else {
+                                conds[n][i++] = *cp++;
+                            }
+                        }
+                        conds[n][i] = '\0';
+                    }
+                }
+            }
+        }
+        n++;
+        if (*p)
+            p++;
     }
     return n;
 }
@@ -251,9 +313,13 @@ static void handle_set_breakpoints(int seq, const char *args) {
     json_get_string(args, "path", source, sizeof source);
 
     int lines[MAX_BREAKPOINTS];
-    int n = json_get_bp_array_lines(args, lines, MAX_BREAKPOINTS);
-    if (n == 0)
+    char conds[MAX_BREAKPOINTS][MAX_CONDITION];
+    int n = json_get_bp_array(args, lines, conds, MAX_BREAKPOINTS);
+    if (n == 0) {
         n = json_get_int_array(args, "lines", lines, MAX_BREAKPOINTS);
+        for (int i = 0; i < n; i++)
+            conds[i][0] = '\0';
+    }
 
     /* Replace all breakpoints for this source. */
     int kept = 0;
@@ -270,6 +336,7 @@ static void handle_set_breakpoints(int seq, const char *args) {
         snprintf(bp->source, sizeof bp->source, "%s", source);
         bp->line = lines[i];
         bp->id = ++g_wdap.next_bp_id;
+        snprintf(bp->condition, sizeof bp->condition, "%s", conds[i]);
     }
 
     static char body[MAX_MSG];
@@ -326,13 +393,34 @@ static void handle_stack_trace(int seq, const char *args) {
     send_response(seq, "stackTrace", 1, body);
 }
 
+/* Map a DAP frame id (counting only @-source Lua frames) to the actual Lua
+ * stack level so lua_getstack/lua_getlocal see the right activation record.
+ * handle_stack_trace skips C frames when assigning DAP frame ids; without
+ * this mapping, evaluate/variables land on the wrong (C) frame and miss locals. */
+static int lua_level_for_dap_frame(lua_State *L, int dap_frame_id) {
+    lua_Debug ar;
+    int display = 0;
+    for (int level = 0; lua_getstack(L, level, &ar); level++) {
+        lua_getinfo(L, "S", &ar);
+        const char *src = ar.source ? ar.source : "";
+        if (*src != '@')
+            continue;
+        if (display == dap_frame_id)
+            return level;
+        display++;
+    }
+    return dap_frame_id; /* fallback: pass through */
+}
+
 static void handle_scopes(int seq, const char *args) {
     int frame_id = json_get_int(args, "frameId", 0);
+    lua_State *L = g_wdap.paused_L;
+    int lua_level = L ? lua_level_for_dap_frame(L, frame_id) : frame_id;
     char body[256];
     snprintf(body, sizeof body,
              "{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":%d,"
              "\"expensive\":false}]}",
-             frame_id + 1);
+             lua_level + 1);
     send_response(seq, "scopes", 1, body);
 }
 
@@ -400,6 +488,54 @@ static void handle_variables(int seq, const char *args) {
     send_response(seq, "variables", 1, body);
 }
 
+/* Format the Lua value at stack top into val[0..n-1]. Does not pop. */
+static void format_lua_val(lua_State *L, char *val, size_t n) {
+    int t = lua_type(L, -1);
+    if (t == LUA_TNIL)
+        snprintf(val, n, "nil");
+    else if (t == LUA_TBOOLEAN)
+        snprintf(val, n, "%s", lua_toboolean(L, -1) ? "true" : "false");
+    else if (t == LUA_TNUMBER || t == LUA_TSTRING)
+        snprintf(val, n, "%s", lua_tostring(L, -1));
+    else
+        snprintf(val, n, "%s", luaL_typename(L, -1));
+}
+
+/* Direct local+upvalue scan for simple identifier expressions.
+ * Used as a fallback when chunk _ENV injection is unavailable. */
+static int lookup_var(lua_State *L, lua_Debug *ar, const char *name, char *val, size_t n) {
+    /* Locals first. */
+    for (int li = 1;; li++) {
+        const char *vn = lua_getlocal(L, ar, li);
+        if (!vn)
+            break;
+        if (strcmp(vn, name) == 0) {
+            format_lua_val(L, val, n);
+            lua_pop(L, 1);
+            return 1;
+        }
+        lua_pop(L, 1);
+    }
+    /* Upvalues. */
+    lua_getinfo(L, "f", ar);
+    int fn = lua_gettop(L);
+    int found = 0;
+    for (int ui = 1;; ui++) {
+        const char *uname = lua_getupvalue(L, fn, ui);
+        if (!uname)
+            break;
+        if (strcmp(uname, name) == 0) {
+            format_lua_val(L, val, n);
+            found = 1;
+        }
+        lua_pop(L, 1);
+        if (found)
+            break;
+    }
+    lua_pop(L, 1); /* pop function */
+    return found;
+}
+
 static void handle_evaluate(int seq, const char *args) {
     char expr[256] = {0};
     json_get_string(args, "expression", expr, sizeof expr);
@@ -407,55 +543,75 @@ static void handle_evaluate(int seq, const char *args) {
 
     lua_State *L = g_wdap.paused_L;
     if (!L || expr[0] == '\0') {
-        send_response(seq, "evaluate", 1, "{\"result\":\"?\",\"variablesReference\":0}");
+        send_response(seq, "evaluate", 1, "{\"result\":\"(not paused)\",\"variablesReference\":0}");
         return;
     }
 
     lua_Debug ar;
-    if (!lua_getstack(L, frame_id, &ar)) {
-        send_response(seq, "evaluate", 1, "{\"result\":\"?\",\"variablesReference\":0}");
+    int lua_level = lua_level_for_dap_frame(L, frame_id);
+    if (!lua_getstack(L, lua_level, &ar)) {
+        send_response(seq, "evaluate", 1, "{\"result\":\"(no frame)\",\"variablesReference\":0}");
         return;
     }
 
-    /* Search locals then upvalues for a variable matching expr. */
-    const char *vn;
-    int idx = 1;
-    while ((vn = lua_getlocal(L, &ar, idx++)) != NULL) {
-        if (strcmp(vn, expr) == 0)
-            goto found;
-        lua_pop(L, 1);
-    }
-    lua_getinfo(L, "f", &ar);
-    {
-        int fn = lua_gettop(L), uvi = 1;
-        while ((vn = lua_getupvalue(L, fn, uvi++)) != NULL) {
-            if (strcmp(vn, expr) == 0) {
-                lua_remove(L, fn);
-                goto found;
-            }
-            lua_pop(L, 1);
-        }
-        lua_pop(L, 1); /* pop function */
-    }
-    send_response(seq, "evaluate", 1, "{\"result\":\"?\",\"variablesReference\":0}");
-    return;
-
-found: {
-    static char body[MAX_MSG];
+    int saved_top = lua_gettop(L);
     char val[256] = {0};
-    if (lua_isstring(L, -1) || lua_isnumber(L, -1)) {
-        const char *s = lua_tostring(L, -1);
-        snprintf(val, sizeof val, "%s", s ? s : "?");
+    char chunk[320];
+    snprintf(chunk, sizeof chunk, "return (%s)", expr);
+
+    if (luaL_loadstring(L, chunk) == LUA_OK) {
+        /* Build env = setmetatable({locals}, {__index=_G}) and set as _ENV. */
+        lua_newtable(L);
+        lua_newtable(L);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
+        lua_setfield(L, -2, "__index");
+        lua_setmetatable(L, -2);
+        {
+            int li = 1;
+            const char *vn;
+            while ((vn = lua_getlocal(L, &ar, li++)) != NULL)
+                lua_setfield(L, -2, vn);
+        }
+        lua_setupvalue(L, -2, 1); /* chunk._ENV = env */
+
+        if (1) {
+            /* Two issues to solve for pcall on a yielded coroutine:
+             *   1. L->status == LUA_YIELD from the original pause.
+             *      luaG_traceexec checks L->status after every hook call; if
+             *      it sees YIELD it throws again — so pcall returns rc=1.
+             *      Fix: temporarily clear status to LUA_OK.
+             *   2. The line hook would call fc_dap_pause_loop → lua_yield which
+             *      sets status back to YIELD and re-enters the throw path.
+             *      Fix: dap_evaluating flag makes dap_dispatch return early.
+             * After pcall we restore the status so lua_resume still works. */
+            TStatus saved_status = L->status;
+            L->status = LUA_OK;
+            fc_master_hook_cfg.dap_evaluating = 1;
+            int pcall_rc = lua_pcall(L, 0, 1, 0);
+            fc_master_hook_cfg.dap_evaluating = 0;
+            if (L->status == LUA_OK) /* pcall didn't kill the thread */
+                L->status = saved_status;
+
+            if (pcall_rc == LUA_OK) {
+                format_lua_val(L, val, sizeof val);
+            } else {
+                const char *err = lua_tostring(L, -1);
+                snprintf(val, sizeof val, "(error: %s)", err ? err : "?");
+            }
+        }
     } else {
-        snprintf(val, sizeof val, "%s", luaL_typename(L, -1));
+        const char *err = lua_tostring(L, -1);
+        snprintf(val, sizeof val, "(load: %s)", err ? err : "?");
     }
-    lua_pop(L, 1);
+
+    lua_settop(L, saved_top); /* always restore stack */
+
     for (char *q = val; *q; q++)
         if (*q == '"' || *q == '\\')
             *q = '_';
+    static char body[MAX_MSG];
     snprintf(body, sizeof body, "{\"result\":\"%s\",\"variablesReference\":0}", val);
     send_response(seq, "evaluate", 1, body);
-}
 }
 
 static void handle_continue(int seq, const char *args) {
@@ -500,8 +656,51 @@ static void handle_disconnect(int seq, const char *args) {
 }
 
 static void handle_source(int seq, const char *args) {
+    int ref = json_get_int(args, "sourceReference", -1);
+    if (ref == 0) {
+        /* sourceReference=0 means the file lives on disk at source.path.
+         * Return success with no content so VS Code continues with navigation
+         * but does NOT replace the editor buffer with an empty payload. */
+        send_response(seq, "source", 1, "{}");
+    } else {
+        send_response(seq, "source", 0, "source not available");
+    }
+}
+
+static void handle_restart(int seq, const char *args) {
     (void)args;
-    send_response(seq, "source", 0, "source not available");
+    g_wdap.n_bps = 0;
+    g_wdap.n_sources = 0;
+    g_wdap.configuration_done = 0;
+    g_wdap.restart_pending = 1;
+    g_wdap.continue_pending = 1;
+    g_wdap.pending_step_mode = 0;
+    g_wdap.pending_pause = 0;
+    send_response(seq, "restart", 1, "{}");
+    send_event("initialized", "{}");
+}
+
+static void handle_loaded_sources(int seq, const char *args) {
+    (void)args;
+    static char body[MAX_MSG];
+    int off = snprintf(body, sizeof body, "{\"sources\":[");
+    for (int i = 0; i < g_wdap.n_sources; i++) {
+        off +=
+            snprintf(body + off, sizeof(body) - (size_t)off, "%s{\"path\":\"%s\",\"name\":\"%s\"}",
+                     i ? "," : "", g_wdap.loaded_sources[i], g_wdap.loaded_sources[i]);
+    }
+    snprintf(body + off, sizeof(body) - (size_t)off, "]}");
+    send_response(seq, "loadedSources", 1, body);
+}
+
+static void handle_set_exception_breakpoints(int seq, const char *args) {
+    int filter = 0;
+    if (strstr(args, "\"all\""))
+        filter = 2;
+    else if (strstr(args, "\"uncaught\""))
+        filter = 1;
+    g_wdap.exception_filter = filter;
+    send_response(seq, "setExceptionBreakpoints", 1, "{\"breakpoints\":[]}");
 }
 
 /* ── Dispatcher ────────────────────────────────────────────────────────────── */
@@ -520,6 +719,8 @@ static void dispatch(const char *msg) {
         handle_configuration_done(seq, msg);
     else if (strcmp(cmd, "setBreakpoints") == 0)
         handle_set_breakpoints(seq, msg);
+    else if (strcmp(cmd, "setExceptionBreakpoints") == 0)
+        handle_set_exception_breakpoints(seq, msg);
     else if (strcmp(cmd, "threads") == 0)
         handle_threads(seq, msg);
     else if (strcmp(cmd, "stackTrace") == 0)
@@ -540,12 +741,16 @@ static void dispatch(const char *msg) {
         handle_step(seq, msg, DAP_STEP_OUT);
     else if (strcmp(cmd, "pause") == 0)
         handle_pause(seq, msg);
+    else if (strcmp(cmd, "restart") == 0)
+        handle_restart(seq, msg);
     else if (strcmp(cmd, "disconnect") == 0)
         handle_disconnect(seq, msg);
     else if (strcmp(cmd, "terminate") == 0)
         handle_disconnect(seq, msg);
     else if (strcmp(cmd, "source") == 0)
         handle_source(seq, msg);
+    else if (strcmp(cmd, "loadedSources") == 0)
+        handle_loaded_sources(seq, msg);
     else
         send_response(seq, cmd, 0, "unknown command");
 }
@@ -618,6 +823,52 @@ static const char *basename_of(const char *p) {
     return b;
 }
 
+/* Evaluate a Lua condition expression; returns non-zero if truthy. */
+/* Evaluate a Lua expression in the context of the paused frame (ar).
+ * Locals from the frame are injected into the chunk's _ENV so that
+ * expressions like "x > 10" work even when x is a local variable. */
+static int eval_condition(lua_State *L, lua_Debug *ar, const char *cond) {
+    char chunk[320];
+    snprintf(chunk, sizeof chunk, "return (%s)", cond);
+    if (luaL_loadstring(L, chunk) != LUA_OK) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    /* Build env = setmetatable({}, {__index=_G}) so globals still work. */
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
+    lua_setfield(L, -2, "__index");
+    lua_setmetatable(L, -2);
+    /* Inject upvalues of the paused function (skip _ENV itself). */
+    lua_getinfo(L, "f", ar);
+    {
+        int ui = 1;
+        const char *uname;
+        while ((uname = lua_getupvalue(L, -1, ui++)) != NULL) {
+            if (strcmp(uname, "_ENV") != 0)
+                lua_setfield(L, -3, uname);
+            else
+                lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    /* Inject locals (override upvalues if same name). */
+    int idx = 1;
+    const char *vn;
+    while ((vn = lua_getlocal(L, ar, idx++)) != NULL)
+        lua_setfield(L, -2, vn);
+    lua_setupvalue(L, -2, 1); /* chunk._ENV = env */
+    int result = 0;
+    if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
+        result = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+    } else {
+        lua_pop(L, 1);
+    }
+    return result;
+}
+
 bool fc_dap_should_break(lua_State *L, lua_Debug *ar) {
     if (!wdap_is_connected_js())
         return false;
@@ -627,12 +878,19 @@ bool fc_dap_should_break(lua_State *L, lua_Debug *ar) {
     const char *src = ar->source ? ar->source : "";
     if (*src == '@')
         src++;
+    fc_dap_emit_loaded_source(src);
     const char *src_base = basename_of(src);
     for (int i = 0; i < g_wdap.n_bps; i++) {
         if (g_wdap.bps[i].line != ar->currentline)
             continue;
-        if (strcmp(basename_of(g_wdap.bps[i].source), src_base) == 0)
-            return true;
+        if (strcmp(basename_of(g_wdap.bps[i].source), src_base) != 0)
+            continue;
+        if (g_wdap.bps[i].condition[0]) {
+            if (!eval_condition(L, ar, g_wdap.bps[i].condition))
+                return false;
+        }
+        g_wdap.hit_bp_id = g_wdap.bps[i].id;
+        return true;
     }
     return false;
 }
@@ -644,20 +902,21 @@ void fc_dap_pause_loop(lua_State *L, lua_Debug *ar) {
     g_wdap.continue_pending = 0;
     g_wdap.pending_pause = 0;
     g_wdap.hook_yielded = 1; /* signal to wasm_lua_loop */
-    {
-        lua_Debug info;
-        lua_getstack(L, 0, &info);
-        lua_getinfo(L, "Sl", &info);
-        printf("[dap] pause_loop: line=%d src=%s\n", info.currentline,
-               info.source ? info.source : "?");
-    }
 
     const char *reason = (fc_master_hook_cfg.dap_pending_pause)                ? "pause"
                          : (fc_master_hook_cfg.dap_step_mode != DAP_STEP_NONE) ? "step"
                                                                                : "breakpoint";
     char body[256];
-    snprintf(body, sizeof body, "{\"reason\":\"%s\",\"threadId\":1,\"allThreadsStopped\":true}",
-             reason);
+    if (strcmp(reason, "breakpoint") == 0 && g_wdap.hit_bp_id > 0) {
+        snprintf(body, sizeof body,
+                 "{\"reason\":\"breakpoint\",\"threadId\":1,\"allThreadsStopped\":true,"
+                 "\"hitBreakpointIds\":[%d]}",
+                 g_wdap.hit_bp_id);
+        g_wdap.hit_bp_id = 0;
+    } else {
+        snprintf(body, sizeof body, "{\"reason\":\"%s\",\"threadId\":1,\"allThreadsStopped\":true}",
+                 reason);
+    }
     send_event("stopped", body);
 
     /* Yield the Lua coroutine.  In the line-hook context lua_yield() returns 0
@@ -682,7 +941,6 @@ int fc_dap_continue_pending(void) {
 void fc_dap_do_resume(void) {
     int step_mode = g_wdap.pending_step_mode;
     int step_base = g_wdap.pending_step_base_depth;
-    printf("[dap] do_resume: step_mode=%d step_base=%d\n", step_mode, step_base);
     g_wdap.paused_L = NULL;
     g_wdap.paused = 0;
     g_wdap.continue_pending = 0;
@@ -723,11 +981,82 @@ void fc_dap_output(const char *msg) {
 }
 
 void fc_dap_emit_loaded_source(const char *source_path) {
+    int already = 0;
+    for (int i = 0; i < g_wdap.n_sources; i++) {
+        if (strcmp(g_wdap.loaded_sources[i], source_path) == 0) {
+            already = 1;
+            break;
+        }
+    }
+    if (!already && g_wdap.n_sources < MAX_SOURCES)
+        snprintf(g_wdap.loaded_sources[g_wdap.n_sources++], MAX_SOURCE_PATH, "%s", source_path);
+    if (already)
+        return;
     char body[MAX_SOURCE_PATH + 128];
     snprintf(body, sizeof body,
              "{\"reason\":\"changed\",\"source\":{\"path\":\"%s\",\"name\":\"%s\"}}", source_path,
              source_path);
     send_event("loadedSource", body);
+}
+
+int fc_dap_is_restart_pending(void) {
+    /* WASM: no session restart; fc_dap_handle_restart() only resets DAP state. */
+    return 0;
+}
+
+int fc_dap_get_condition(char *buf, size_t n) {
+    /* WASM: conditions are evaluated directly in fc_dap_should_break; not used. */
+    if (n > 0)
+        buf[0] = '\0';
+    return 0;
+}
+
+int fc_dap_on_condition_result(int result) {
+    (void)result;
+    return 0;
+}
+
+int fc_dap_exception_filter(void) {
+    return g_wdap.exception_filter;
+}
+
+int fc_dap_on_exception(const char *msg, int is_uncaught) {
+    if (!wdap_is_connected_js() || g_wdap.exception_filter == 0)
+        return 0;
+    if (g_wdap.exception_filter == 1 && !is_uncaught)
+        return 0;
+    g_wdap.paused_L = NULL; /* no Lua state at panic time */
+    g_wdap.paused = 1;
+    g_wdap.continue_pending = 0;
+    g_wdap.hook_yielded = 1;
+    static char body[256];
+    char esc[200] = {0};
+    if (msg) {
+        size_t j = 0;
+        for (size_t i = 0; msg[i] && j + 4 < sizeof esc; i++) {
+            if (msg[i] == '"') {
+                esc[j++] = '\\';
+                esc[j++] = '"';
+            } else if (msg[i] == '\\') {
+                esc[j++] = '\\';
+                esc[j++] = '\\';
+            } else
+                esc[j++] = msg[i];
+        }
+    }
+    snprintf(body, sizeof body,
+             "{\"reason\":\"exception\",\"description\":\"%s\","
+             "\"threadId\":1,\"allThreadsStopped\":true}",
+             esc);
+    send_event("stopped", body);
+    return 1;
+}
+
+int blyt_dap_report_exception(lua_State *L, int is_uncaught) {
+    const char *msg = lua_tostring(L, -1);
+    if (!msg)
+        msg = "(error)";
+    return fc_dap_on_exception(msg, is_uncaught);
 }
 
 /* ── ECALL stubs (RV32 ELF cart path — not used in WASM Lua builds) ───────── */

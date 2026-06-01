@@ -293,17 +293,20 @@ static void wasm_lua_loop(void) {
     g_lua_drawn = false;
     int nresults = 0;
     int status = lua_resume(g_lua_co, g_lua, 0, &nresults);
-    lua_settop(g_lua_co, 0); /* discard any yielded values */
 
     if (status == LUA_YIELD) {
 #ifdef BLYT_DAP
         /* Distinguish a DAP pause yield from the normal per-frame coroutine.yield(). */
         if (fc_dap_hook_yielded()) {
             g_lua_dap_paused = true;
+            /* Do NOT clear the coroutine stack here — the frame locals must stay
+             * intact so handle_evaluate / lua_getlocal can inspect them while
+             * the coroutine is paused. */
             blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
             return;
         }
 #endif
+        lua_settop(g_lua_co, 0); /* discard yielded values — normal frame yield */
         /* Normal frame-end yield — fall through to render. */
     } else {
         /* LUA_OK = coroutine finished (shouldn't happen with while true);
@@ -447,10 +450,25 @@ static void wasm_loop(void) {
 
 #ifdef BLYT_GDB
     /* GDB breakpoint/step pause: session polls for vCont internally each tick.
-     * Re-present the last frame unchanged until the client sends continue/step. */
+     * Re-present the last frame unchanged until the client sends continue/step.
+     *
+     * While paused, switch to setTimeout(0) so the loop polls at ~1ms instead
+     * of waiting up to 16.67ms for the next rAF.  LLDB sends vCont;c via the
+     * WebSocket onmessage handler; without this the cart wastes a full rAF
+     * frame per conditional breakpoint hit regardless of how fast LLDB
+     * evaluates the condition. */
+    static bool s_gdb_timing_polling = false;
     if (err == BLYT_RUN_GDB_PAUSED) {
+        if (!s_gdb_timing_polling) {
+            emscripten_set_main_loop_timing(EM_TIMING_SETTIMEOUT, 0);
+            s_gdb_timing_polling = true;
+        }
         blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
         return;
+    }
+    if (s_gdb_timing_polling) {
+        emscripten_set_main_loop_timing(EM_TIMING_RAF, 0);
+        s_gdb_timing_polling = false;
     }
 #endif
 
