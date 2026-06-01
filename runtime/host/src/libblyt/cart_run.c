@@ -557,12 +557,15 @@ static void blyt_ecall_handler(riscv_t *rv) {
 #ifdef BLYT_GDB
 /* Called by rv32emu when an ebreak instruction executes.  If the PC matches a
  * registered GDB software breakpoint, flag that the breakpoint fired so the
- * outer run loop can notify the client after rv_step() returns.  Otherwise
- * advance PC past the ebreak (same as the rv32emu default). */
+ * outer run loop can notify the client after rv_step() returns.  Leave PC at
+ * the ebreak address so the outer loop can restore the original instruction and
+ * execute it as a step-over (same as the check_break path).  Otherwise advance
+ * PC past the ebreak (same as the rv32emu default). */
 static void blyt_ebreak_handler(riscv_t *rv) {
     if (g_run_ctx && g_run_ctx->gdb_enabled && fc_gdb_stub_check_break(rv->PC)) {
         g_run_ctx->gdb_ebreak_pending = true;
-        rv->PC += 4; /* advance past ebreak; outer loop fires T05 */
+        /* Keep PC at the ebreak address so the outer loop can restore the
+         * original instruction and perform a proper step-over. */
         rv->halt = true; /* force rv_step() to exit so outer loop runs promptly */
         return;
     }
@@ -1313,12 +1316,17 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
         if (session->ctx.gdb_enabled && gdb_bp_step_addr != 0)
             fc_gdb_stub_repatch_bp(gdb_bp_step_addr);
         /* Breakpoint fired inside rv_step() via on_ebreak: rv->halt was set to
-         * force rv_step to return.  Clear halt and handle the GDB pause now. */
+         * force rv_step to return.  PC is at the ebreak address (the callback
+         * does not advance it) so we can perform the same step-over as the
+         * check_break path: restore the original instruction, execute it, then
+         * re-patch the breakpoint. */
         if (session->ctx.gdb_enabled && session->ctx.gdb_ebreak_pending) {
             session->ctx.gdb_ebreak_pending = false;
             session->rv->halt = false; /* restore — cart has not actually halted */
             session->ctx.debug_state = BLYT_DEBUG_PAUSED_GDB;
+            uint32_t gdb_ebreak_pc = rv_get_pc(session->rv);
 #ifdef __EMSCRIPTEN__
+            session->ctx.gdb_bp_resume_addr = gdb_ebreak_pc;
             if (fc_gdb_transport_wasm_is_connected())
                 fc_gdb_stub_notify_stopped();
             if (session->ctx.frame_done) {
@@ -1337,6 +1345,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
                 break;
             }
             session->ctx.gdb_single_step = (gdb_action == 1);
+            /* Step-over: restore original instruction so rv_step executes it,
+             * not the ebreak.  Re-patch after rv_step via gdb_bp_step_addr. */
+            fc_gdb_stub_restore_bp_temp(gdb_ebreak_pc);
+            gdb_bp_step_addr = gdb_ebreak_pc;
 #endif
         }
         /* Post-instruction single-step pause. */

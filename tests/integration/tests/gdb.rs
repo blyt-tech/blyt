@@ -349,8 +349,8 @@ const DEBUG_C: &str = r#"
 
 volatile uint32_t g_counter = 0;
 
-static void blyt_debug_bp2(void) { g_counter += 2; }
-static void blyt_debug_bp3(void) { g_counter += 3; }
+__attribute__((noinline)) static void blyt_debug_bp2(void) { g_counter += 2; }
+__attribute__((noinline)) static void blyt_debug_bp3(void) { g_counter += 3; }
 
 void blyt_debug_bp_target(void) {
     g_counter = 1;
