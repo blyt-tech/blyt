@@ -1312,15 +1312,25 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
 #endif /* BLYT_GDB */
 
 #if defined(BLYT_GDB) && defined(__EMSCRIPTEN__)
-        /* In WASM GDB mode, step one instruction at a time so check_break above
-         * fires at every PC, not just at the start of a compiled block.  rv_step
-         * is block-based (many instructions per call), which would let on_ebreak
-         * advance PC past a breakpoint before check_break can intercept it. */
+        /* On WASM, always step one instruction at a time when GDB is enabled
+         * so check_break fires at every PC (rv_step is block-based). */
         if (session->ctx.gdb_enabled)
             rv_step_debug(session->rv);
         else
-#endif
             rv_step(session->rv);
+#elif defined(BLYT_GDB)
+        /* When stepping over a software breakpoint, use rv_step_debug to
+         * bypass rv32emu's block-IR cache: restore_bp_temp wrote the original
+         * instruction to guest memory but the cached block still holds the
+         * decoded EBREAK.  rv_step_debug reads via mem_ifetch (guest RAM
+         * directly) so the restored instruction always executes. */
+        if (session->ctx.gdb_enabled && gdb_bp_step_addr != 0)
+            rv_step_debug(session->rv);
+        else
+            rv_step(session->rv);
+#else
+        rv_step(session->rv);
+#endif
 
 #ifdef BLYT_GDB
         /* Re-patch a SW BP that was temporarily removed to allow stepping over it. */
