@@ -268,11 +268,12 @@ static void wasm_lua_loop(void) {
      * client sends continue/step. */
     if (g_lua_dap_paused) {
         if (!fc_dap_continue_pending()) {
+            /* Re-present the last rendered frame unchanged — the game is
+             * suspended so neither the test card nor the Lua frame advance. */
             blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
             return;
         }
-        /* Client sent continue/step — restore rAF timing, then resume. */
-        emscripten_set_main_loop_timing(EM_TIMING_RAF, 0);
+        /* Client sent continue/step — apply step mode and send "continued". */
         fc_dap_do_resume();
         g_lua_dap_paused = false;
         /* fall through to resume the coroutine */
@@ -298,11 +299,6 @@ static void wasm_lua_loop(void) {
         /* Distinguish a DAP pause yield from the normal per-frame coroutine.yield(). */
         if (fc_dap_hook_yielded()) {
             g_lua_dap_paused = true;
-            /* Switch to ~1 ms polling so VS Code's sequential post-stop requests
-             * (threads → stackTrace → scopes → variables) are answered promptly.
-             * Without this each request waits up to 16 ms for the next rAF,
-             * making the continue button feel unresponsive. */
-            emscripten_set_main_loop_timing(EM_TIMING_SETTIMEOUT, 0);
             /* Do NOT clear the coroutine stack here — the frame locals must stay
              * intact so handle_evaluate / lua_getlocal can inspect them while
              * the coroutine is paused. */

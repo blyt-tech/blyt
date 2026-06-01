@@ -159,33 +159,14 @@ static int json_get_int_array(const char *buf, const char *key, int *out, int ma
 
 /* clang-format off */
 
-/* Open WebSocket to relay and install onopen/onmessage/onclose handlers.
- *
- * While paused (_wdap_paused flag set by fc_dap_pause_loop), messages are
- * dispatched directly from onmessage via the exported wdap_dispatch_direct
- * function, bypassing the main-loop queue entirely.  This avoids the browser's
- * background-tab setTimeout throttling (~1 s/tick), which would otherwise delay
- * VS Code's post-stop requests (threads/stackTrace/scopes/variables) by up to
- * 4 s and leave the continue button disabled for that entire window. */
+/* Open WebSocket to relay and install onopen/onmessage/onclose handlers. */
 EM_JS(void, wdap_ws_open_js, (int port), {
     var url = 'ws://127.0.0.1:' + port + '/dap';
     var ws  = new WebSocket(url);
     Module._wdap_ws      = ws;
     Module._wdap_queue   = [];
-    Module._wdap_paused  = 0;
     ws.onopen    = function()  { Module._wdap_connected = 1; };
-    ws.onmessage = function(e) {
-        var s = typeof e.data === 'string' ? e.data : e.data.toString();
-        if (Module._wdap_paused) {
-            var len = Module.lengthBytesUTF8(s) + 1;
-            var ptr = Module._malloc(len);
-            Module.stringToUTF8(s, ptr, len);
-            Module._wdap_dispatch_direct(ptr);
-            Module._free(ptr);
-        } else {
-            Module._wdap_queue.push(s);
-        }
-    };
+    ws.onmessage = function(e) { Module._wdap_queue.push(typeof e.data === 'string' ? e.data : e.data.toString()); };
     ws.onclose   = function()  { Module._wdap_connected = 0; };
     ws.onerror   = function()  { Module._wdap_connected = 0; };
 });
@@ -804,12 +785,6 @@ EM_JS(char *, wdap_dequeue_json, (void), {
 });
 /* clang-format on */
 
-/* Called directly from the JS onmessage handler while paused, bypassing the
- * main-loop queue.  Must be exported so Emscripten preserves the symbol. */
-EMSCRIPTEN_KEEPALIVE void wdap_dispatch_direct(const char *json) {
-    dispatch(json);
-}
-
 /* Drain the message queue and dispatch each JSON message. */
 static void drain_queue(void) {
     while (wdap_queue_length() > 0) {
@@ -932,7 +907,6 @@ void fc_dap_pause_loop(lua_State *L, lua_Debug *ar) {
     g_wdap.continue_pending = 0;
     g_wdap.pending_pause = 0;
     g_wdap.hook_yielded = 1; /* signal to wasm_lua_loop */
-    EM_ASM({ Module._wdap_paused = 1; }); /* enable direct-dispatch in onmessage */
 
     const char *reason = (fc_master_hook_cfg.dap_pending_pause)                ? "pause"
                          : (fc_master_hook_cfg.dap_step_mode != DAP_STEP_NONE) ? "step"
@@ -975,7 +949,6 @@ void fc_dap_do_resume(void) {
     g_wdap.paused_L = NULL;
     g_wdap.paused = 0;
     g_wdap.continue_pending = 0;
-    EM_ASM({ Module._wdap_paused = 0; }); /* restore queue-based dispatch */
 
     fc_master_hook_cfg.dap_step_mode = (dap_step_mode_t)step_mode;
     fc_master_hook_cfg.dap_step_base_depth = step_base;
