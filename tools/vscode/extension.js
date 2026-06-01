@@ -412,19 +412,22 @@ async function autoSetupVscode(output) {
  *     clearing the stale stop-reason reference. */
 class BlytGdbDapProxy {
     constructor(lldbDapBin) {
-        this._lldbSeq    = 0;
-        this._vsSeq      = 0;
-        this.sendMessage = null;   /* set by VS Code's InlineImplementation */
-        this._pending    = new Map();
-        this._buf        = Buffer.alloc(0);
+        this._lldbSeq = 0;
+        this._vsSeq   = 0;
+        this._pending = new Map();
+        this._buf     = Buffer.alloc(0);
+
+        /* VS Code's DebugAdapterInlineImplementation requires the DebugAdapter
+         * interface: onDidSendMessage must be a vscode.Event<T>, not a plain
+         * assignable property.  Use EventEmitter and expose its .event. */
+        this._emitter = new vscode.EventEmitter();
+        this.onDidSendMessage = this._emitter.event;
 
         this._proc = cp.spawn(lldbDapBin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
         this._proc.stdout.on('data', chunk => {
             this._buf = Buffer.concat([this._buf, chunk]);
             this._drain();
         });
-        /* Errors from the lldb-dap process itself go to stderr and are not
-         * DAP messages; forward them verbatim for diagnostics. */
         this._proc.stderr.on('data', () => {});
     }
 
@@ -448,7 +451,7 @@ class BlytGdbDapProxy {
                 const p = this._pending.get(msg.request_seq);
                 if (p) { this._pending.delete(msg.request_seq); p(msg); }
             } else {
-                this.sendMessage?.(msg);
+                this._emitter.fire(msg);
             }
         }
     }
@@ -472,7 +475,7 @@ class BlytGdbDapProxy {
             const vsSeq = msg.seq;
             const seq   = ++this._lldbSeq;
             this._pending.set(seq, resp =>
-                this.sendMessage?.({ ...resp, seq: ++this._vsSeq, request_seq: vsSeq }));
+                this._emitter.fire({ ...resp, seq: ++this._vsSeq, request_seq: vsSeq }));
             const json = JSON.stringify({ ...msg, seq });
             this._proc.stdin.write(
                 `Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`);
@@ -495,15 +498,14 @@ class BlytGdbDapProxy {
         /* Phase 1: clear all BPs for this source. */
         await this._ask('setBreakpoints', { source, breakpoints: [], lines: [] });
 
-        /* Phase 2: add new BPs with normalised conditions. */
+        /* Phase 2: add with normalised conditions. */
         const resp = await this._ask('setBreakpoints',
             { ...vsMsg.arguments, breakpoints: normBps });
 
-        this.sendMessage?.({ ...resp, seq: ++this._vsSeq, request_seq: vsSeq });
+        this._emitter.fire({ ...resp, seq: ++this._vsSeq, request_seq: vsSeq });
     }
 
-    onError() {}
-    onClose() { try { this._proc.kill(); } catch (_) {} }
+    dispose() { try { this._proc.kill(); } catch (_) {} }
 }
 
 /* ── Extension entry point ────────────────────────────────────────────────── */
