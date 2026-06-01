@@ -585,6 +585,19 @@ static void handle_evaluate(int seq, const char *args) {
             while ((vn = lua_getlocal(L, &ar, li++)) != NULL)
                 lua_setfield(L, -2, vn);
         }
+        /* Inject upvalues so module-level locals (captured as upvalues) resolve. */
+        lua_getinfo(L, "f", &ar);
+        {
+            int ui = 1;
+            const char *vn;
+            while ((vn = lua_getupvalue(L, -1, ui++)) != NULL) {
+                if (strcmp(vn, "_ENV") != 0)
+                    lua_setfield(L, -3, vn);
+                else
+                    lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1); /* pop function */
         lua_setupvalue(L, -2, 1); /* chunk._ENV = env */
 
         if (1) {

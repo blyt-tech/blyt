@@ -438,6 +438,92 @@ fn sdl_dap_evaluate_expr() {
         .success();
 }
 
+/// WASM DAP: evaluate upvalue — a module-level local is captured as an upvalue
+/// of update(); evaluating it in a watch while stopped inside update() must
+/// return the value (not nil).  Covers the handle_evaluate upvalue-injection fix.
+#[test]
+fn wasm_dap_evaluate_upvalue() {
+    require_wasm();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_evaluate_upvalue");
+    // counter = 7 at module scope → captured as upvalue of update().
+    // BP at line 4 (counter = counter + 1), before the increment executes.
+    CartProject::new()
+        .lua(
+            "local counter = 7\n\
+             function init() end\n\
+             function update()\n\
+             \x20   counter = counter + 1\n\
+             \x20   blyt_quit()\n\
+             end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "counter")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "7")
+        .assert()
+        .success();
+}
+
+/// SDL2 DAP: evaluate upvalue — same as wasm_dap_evaluate_upvalue but via the
+/// SDL2/TCP path.
+#[test]
+fn sdl_dap_evaluate_upvalue() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytplay().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_evaluate_upvalue");
+    CartProject::new()
+        .lua(
+            "local counter = 7\n\
+             function init() end\n\
+             function update()\n\
+             \x20   counter = counter + 1\n\
+             \x20   blyt.quit()\n\
+             end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytplay().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "counter")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "7")
+        .assert()
+        .success();
+}
+
 /// Libretro DAP handshake: load a Lua cart via the libretro API with
 /// BLYT_DAP_PORT=0, connect a TCP socket, and verify the DAP server responds
 /// to "initialize".

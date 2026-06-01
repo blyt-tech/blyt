@@ -261,16 +261,31 @@ static void on_evaluate(int seq, const char *msg, lua_State *L) {
 
     char val[256] = {0};
     if (luaL_loadstring(L, chunk) == LUA_OK) {
-        /* Inject frame locals into _ENV so expressions like "x + 1" work. */
+        /* Build env = setmetatable({upvalues+locals}, {__index=_G}). */
         lua_newtable(L);
         lua_newtable(L);
         lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
         lua_setfield(L, -2, "__index");
         lua_setmetatable(L, -2);
-        int li = 1;
-        const char *vn;
-        while ((vn = lua_getlocal(L, &ar2, li++)) != NULL)
-            lua_setfield(L, -2, vn);
+        /* Inject upvalues first (skip _ENV), then locals (locals shadow upvalues). */
+        lua_getinfo(L, "f", &ar2);
+        {
+            int ui = 1;
+            const char *vn;
+            while ((vn = lua_getupvalue(L, -1, ui++)) != NULL) {
+                if (strcmp(vn, "_ENV") != 0)
+                    lua_setfield(L, -3, vn);
+                else
+                    lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1); /* pop function */
+        {
+            int li = 1;
+            const char *vn;
+            while ((vn = lua_getlocal(L, &ar2, li++)) != NULL)
+                lua_setfield(L, -2, vn);
+        }
         lua_setupvalue(L, -2, 1);
         if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
             int t = lua_type(L, -1);
