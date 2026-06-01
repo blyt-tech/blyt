@@ -18,6 +18,7 @@
 #endif
 #ifdef BLYT_GDB
 #include "gdb_stub.h"
+#include <pthread.h>
 #ifdef __EMSCRIPTEN__
 #include "gdb_transport_wasm.h"
 #else
@@ -170,6 +171,7 @@ struct blyt_session {
 
 #ifdef BLYT_GDB
 static blyt_session_t *g_gdb_session = NULL;
+static pthread_mutex_t g_bp_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void gdb_read_regs(uint8_t out[33 * 4]) {
     if (!g_gdb_session)
@@ -228,21 +230,29 @@ static int gdb_set_bp(uint32_t addr) {
     if (!g_gdb_session)
         return -1;
     blyt_session_t *s = g_gdb_session;
-    if (s->gdb_nbp >= MAX_GDB_BREAKS)
+    pthread_mutex_lock(&g_bp_mutex);
+    if (s->gdb_nbp >= MAX_GDB_BREAKS) {
+        pthread_mutex_unlock(&g_bp_mutex);
         return -1;
+    }
     /* Read original word. */
     uint8_t orig[4];
-    if (gdb_read_mem(addr, orig, 4) != 4)
+    if (gdb_read_mem(addr, orig, 4) != 4) {
+        pthread_mutex_unlock(&g_bp_mutex);
         return -1;
+    }
     uint32_t orig_word = (uint32_t)orig[0] | ((uint32_t)orig[1] << 8) | ((uint32_t)orig[2] << 16) |
                          ((uint32_t)orig[3] << 24);
     /* Patch ebreak = 0x00100073. */
     static const uint8_t ebreak[4] = {0x73, 0x00, 0x10, 0x00};
-    if (gdb_write_mem(addr, ebreak, 4) != 4)
+    if (gdb_write_mem(addr, ebreak, 4) != 4) {
+        pthread_mutex_unlock(&g_bp_mutex);
         return -1;
+    }
     s->gdb_bps[s->gdb_nbp].addr = addr;
     s->gdb_bps[s->gdb_nbp].original_word = orig_word;
     s->gdb_nbp++;
+    pthread_mutex_unlock(&g_bp_mutex);
     return 0;
 }
 
@@ -250,6 +260,7 @@ static int gdb_clear_bp(uint32_t addr) {
     if (!g_gdb_session)
         return -1;
     blyt_session_t *s = g_gdb_session;
+    pthread_mutex_lock(&g_bp_mutex);
     for (int i = 0; i < s->gdb_nbp; i++) {
         if (s->gdb_bps[i].addr == addr) {
             uint32_t w = s->gdb_bps[i].original_word;
@@ -260,9 +271,11 @@ static int gdb_clear_bp(uint32_t addr) {
             for (int j = i; j + 1 < s->gdb_nbp; j++)
                 s->gdb_bps[j] = s->gdb_bps[j + 1];
             s->gdb_nbp--;
+            pthread_mutex_unlock(&g_bp_mutex);
             return 0;
         }
     }
+    pthread_mutex_unlock(&g_bp_mutex);
     return -1;
 }
 
