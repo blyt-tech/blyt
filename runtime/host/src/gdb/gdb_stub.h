@@ -99,6 +99,17 @@ int fc_gdb_stub_pending_action(void);
 /* Returns 1 if a GDB client is currently connected. */
 int fc_gdb_stub_has_client(void);
 
+/* Called by the transport when a client connects (val=1) or disconnects (val=0).
+ * On disconnect: clears all breakpoints and resumes the cart so the run loop
+ * is not permanently blocked waiting for a vCont that will never arrive.
+ * On reconnect: resets to initial-stop state so the new client can handshake. */
+void fc_gdb_stub_set_has_client(int val);
+
+/* Returns 1 if the CPU is currently halted (breakpoint, step boundary, or
+ * out-of-band interrupt).  Used by the WASM run loop to detect \x03 interrupts
+ * while the cart is in the RUNNING state. */
+int fc_gdb_stub_is_halted(void);
+
 /* Call transport->on_stop() — blocks for TCP, no-op for WASM. */
 void fc_gdb_stub_block_until_resume(void);
 

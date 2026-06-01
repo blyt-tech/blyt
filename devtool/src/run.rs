@@ -205,7 +205,7 @@ fn run_relay_session(mut ws: WsConn, tcp: TcpStream) {
     // interleave reads (WS→TCP) and writes (TCP→WS) without a shared mutex.
     std::thread::spawn(move || {
         ws.get_mut().set_nonblocking(true).ok();
-        let delay = std::time::Duration::from_millis(1);
+        let delay = std::time::Duration::from_micros(100);
         'relay: loop {
             // Drain all pending inbound WS frames.
             loop {
@@ -240,7 +240,17 @@ fn run_relay_session(mut ws: WsConn, tcp: TcpStream) {
                     Err(mpsc::TryRecvError::Disconnected) => break 'relay,
                 }
             }
-            std::thread::sleep(delay);
+            // Block until the TCP reader delivers the next message or 1ms elapses.
+            // This wakes immediately when LLDB data arrives instead of sleeping a full ms.
+            match tcp_to_ws_rx.recv_timeout(delay) {
+                Ok(msg) => {
+                    if ws.send(Message::Text(msg.into())).is_err() {
+                        break 'relay;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'relay,
+            }
         }
     });
 
@@ -346,6 +356,80 @@ mod tests {
         let mut tcp_read = BufReader::new(tcp_client);
         let received = read_cl(&mut tcp_read).unwrap();
         assert_eq!(received, msg_to_vscode);
+    }
+
+    #[test]
+    fn gdb_relay_session_bidirectional() {
+        // GDB relay forwards raw bytes (no Content-Length framing) in both directions.
+        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws_port = ws_listener.local_addr().unwrap().port();
+        let ws_server_thread = std::thread::spawn(move || {
+            let (stream, _) = ws_listener.accept().unwrap();
+            tungstenite::accept(stream).unwrap()
+        });
+        let (mut ws_client, _) =
+            tungstenite::connect(format!("ws://127.0.0.1:{ws_port}/")).unwrap();
+        let ws_server = ws_server_thread.join().unwrap();
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        let mut tcp_client = TcpStream::connect(format!("127.0.0.1:{tcp_port}")).unwrap();
+        let (tcp_server, _) = tcp_listener.accept().unwrap();
+
+        std::thread::spawn(move || run_gdb_relay_session(ws_server, tcp_server));
+
+        // TCP → WS: lldb-dap sends a raw GDB RSP packet; WASM receives it verbatim.
+        let rsp_from_lldb = "$qSupported:multiprocess+#df";
+        let mut tcp_write = tcp_client.try_clone().unwrap();
+        tcp_write.write_all(rsp_from_lldb.as_bytes()).unwrap();
+        tcp_write.flush().unwrap();
+        let frame = ws_client.read().unwrap();
+        assert_eq!(frame.to_text().unwrap(), rsp_from_lldb);
+
+        // WS → TCP: WASM sends a stop reply; lldb-dap receives it verbatim.
+        let rsp_from_wasm = "$T05swbreak:;thread:01;#3f";
+        ws_client.send(Message::Text(rsp_from_wasm.into())).unwrap();
+        let mut buf = [0u8; 64];
+        tcp_client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let n = tcp_client.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], rsp_from_wasm.as_bytes());
+    }
+
+    #[test]
+    fn gdb_relay_tcp_connects_before_wasm() {
+        // Verifies that when the TCP client (gdb) connects before the WASM page
+        // loads, the relay buffers the TCP connection and forwards data once the
+        // WS side eventually connects.
+        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws_port = ws_listener.local_addr().unwrap().port();
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            run_gdb_relay_loop(ws_listener, tcp_listener);
+        });
+
+        // Connect TCP first — relay accepts it in background but blocks on WS.
+        let mut tcp_client = TcpStream::connect(format!("127.0.0.1:{tcp_port}")).unwrap();
+
+        // Small delay to allow the relay's TCP accept thread to enqueue the stream.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        // Now connect the WS side — this unblocks the relay's ws_rx.recv().
+        let (mut ws_client, _) =
+            tungstenite::connect(format!("ws://127.0.0.1:{ws_port}/")).unwrap();
+
+        // Give the session a moment to start.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        // Verify bidirectional forwarding works now that both sides are connected.
+        let packet = "$qSupported#df";
+        tcp_client.write_all(packet.as_bytes()).unwrap();
+        tcp_client.flush().unwrap();
+        let frame = ws_client.read().unwrap();
+        assert_eq!(frame.to_text().unwrap(), packet);
     }
 }
 
@@ -455,6 +539,12 @@ fn run_gdb_relay_loop(ws_listener: TcpListener, tcp_listener: TcpListener) {
             Ok(ws) => ws,
             Err(_) => continue,
         };
+        /* Signal to the VS Code extension that the WASM page has connected and
+         * the relay is ready.  The extension awaits this before telling lldb-dap
+         * to run `gdb-remote`, so LLDB never sees the relay in a half-open state
+         * and the 6-second handshake timeout is eliminated. */
+        println!("GDB: WASM ready");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         let tcp = match tcp_rx.recv() {
             Ok(s) => s,
             Err(_) => continue,
@@ -498,7 +588,7 @@ fn run_gdb_relay_session(mut ws: WsConn, tcp: TcpStream) {
     // Thread: owns the WebSocket; polls non-blocking to interleave reads and writes.
     std::thread::spawn(move || {
         ws.get_mut().set_nonblocking(true).ok();
-        let delay = std::time::Duration::from_millis(1);
+        let delay = std::time::Duration::from_micros(100);
         'relay: loop {
             loop {
                 match ws.read() {
@@ -531,7 +621,17 @@ fn run_gdb_relay_session(mut ws: WsConn, tcp: TcpStream) {
                     Err(mpsc::TryRecvError::Disconnected) => break 'relay,
                 }
             }
-            std::thread::sleep(delay);
+            // Block until the TCP reader delivers the next message or 1ms elapses.
+            // This wakes immediately when LLDB data arrives instead of sleeping a full ms.
+            match tcp_to_ws_rx.recv_timeout(delay) {
+                Ok(msg) => {
+                    if ws.send(Message::Text(msg.into())).is_err() {
+                        break 'relay;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'relay,
+            }
         }
     });
 

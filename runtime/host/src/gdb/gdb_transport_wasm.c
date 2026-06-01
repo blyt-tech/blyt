@@ -42,6 +42,12 @@ EM_JS(void, wgdb_ws_open_js, (int port), {
     ws.onmessage = function(e) {
         var s = typeof e.data === 'string' ? e.data : e.data.toString();
         Module._wgdb_queue.push(s);
+        /* Process the packet immediately from the WebSocket message event
+         * instead of waiting for the next requestAnimationFrame tick.
+         * This ensures GDB handshake packets (qSupported, ?, Z0, vCont) get
+         * responses within milliseconds even when the VS Code Simple Browser
+         * tab is not focused and requestAnimationFrame is throttled. */
+        Module['_fc_gdb_poll_from_ws']();
     };
     ws.onclose   = function()  { Module._wgdb_connected = 0; };
     ws.onerror   = function()  { Module._wgdb_connected = 0; };
@@ -115,6 +121,16 @@ static int wgdb_recv_pkt(char *buf, size_t cap) {
         char *frame = wgdb_dequeue_frame();
         if (!frame)
             break;
+        /* Pass out-of-band interrupt character (\x03) through directly so
+         * handle_packet() can halt the target and send T02 (SIGINT). */
+        if (frame[0] == '\x03' && frame[1] == '\0') {
+            free(frame);
+            if (cap >= 2) {
+                buf[0] = '\x03';
+                buf[1] = '\0';
+            }
+            return 1;
+        }
         int n = wgdb_extract_payload(frame, buf, cap);
         free(frame);
         if (n >= 0)
@@ -136,6 +152,17 @@ static const fc_gdb_transport_t wasm_transport = {
 };
 
 /* ── Public API ───────────────────────────────────────────────────────────── */
+
+/* Called from the WebSocket onmessage JS handler to process one GDB RSP
+ * packet immediately, without waiting for the requestAnimationFrame tick.
+ * EMSCRIPTEN_KEEPALIVE exports the symbol so JS can call it via
+ * Module['_fc_gdb_poll_from_ws']().  JS is single-threaded so there is no
+ * re-entrancy risk; the animation-frame poll becomes a no-op when the queue
+ * is already drained here. */
+EMSCRIPTEN_KEEPALIVE
+void fc_gdb_poll_from_ws(void) {
+    fc_gdb_stub_poll();
+}
 
 void fc_gdb_transport_wasm_open(int relay_port) {
     fc_gdb_stub_set_transport(&wasm_transport);

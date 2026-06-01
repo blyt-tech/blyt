@@ -120,6 +120,7 @@ typedef struct {
     bool gdb_enabled; /* set by blyt_session_gdb_listen() */
     bool gdb_single_step; /* set when vCont;s received; cleared after one step */
     bool gdb_ebreak_pending; /* ebreak fired inside rv_step; cleared by post-step handler */
+    uint32_t gdb_bp_resume_addr; /* WASM: bp addr we paused at; cleared when stepping over */
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -158,13 +159,12 @@ struct blyt_session {
 #ifdef BLYT_GDB
     /* Library layout for GDB qXfer:libraries-svr4:read. */
     blyt_gdb_lib_t gdb_libs[MAX_GDB_LIBS];
+    fc_gdb_library_t gdb_libs_ffi[MAX_GDB_LIBS]; /* stable pointers into gdb_libs */
     int gdb_nlibs;
     char gdb_exec_path[4096]; /* cart path for qXfer:exec-file:read */
     /* Software breakpoints: saved original words. */
     blyt_gdb_bp_t gdb_bps[MAX_GDB_BREAKS];
     int gdb_nbp;
-    /* WASM only: true once T05 has been sent on initial attach. */
-    bool gdb_notified;
 #endif
 };
 
@@ -470,6 +470,70 @@ static void blyt_ecall_handler(riscv_t *rv) {
             free(buf);
         }
         rv_set_reg(rv, rv_reg_a0, (uint32_t)len);
+        rv->PC += 4;
+        return;
+    }
+
+    case 6: { /* BLYT_ECALL_DAP_EXCEPTION: guest reports a caught Lua exception. */
+        if (!g_run_ctx || !g_run_ctx->dap_enabled) {
+            rv_set_reg(rv, rv_reg_a0, 0);
+            rv->PC += 4;
+            return;
+        }
+        uint32_t msg_vaddr = rv_get_reg(rv, rv_reg_a0);
+        uint32_t msg_len = rv_get_reg(rv, rv_reg_a1);
+        int is_uncaught = (int)rv_get_reg(rv, rv_reg_a2);
+        vm_attr_t *attr6 = PRIV(rv);
+        memory_t *mem6 = attr6->mem;
+        if (msg_len > 255u)
+            msg_len = 255u;
+        char msg_buf[256];
+        uint32_t mi;
+        for (mi = 0; mi < msg_len; mi++) {
+            if (!GUEST_RAM_CONTAINS(mem6, msg_vaddr + mi, 1))
+                break;
+            uint8_t c6;
+            memory_read(mem6, &c6, msg_vaddr + mi, 1);
+            msg_buf[mi] = (char)c6;
+        }
+        msg_buf[mi] = '\0';
+        int r6 = fc_dap_on_exception(msg_buf, is_uncaught);
+        rv_set_reg(rv, rv_reg_a0, (uint32_t)r6);
+        rv->PC += 4;
+        return;
+    }
+
+    case 7: { /* BLYT_ECALL_DAP_GET_CONDITION: copy pending condition to guest. */
+        if (!g_run_ctx || !g_run_ctx->dap_enabled) {
+            rv_set_reg(rv, rv_reg_a0, 0);
+            rv->PC += 4;
+            return;
+        }
+        uint32_t buf7_vaddr = rv_get_reg(rv, rv_reg_a0);
+        uint32_t buf7_len = rv_get_reg(rv, rv_reg_a1);
+        if (buf7_len > 255u)
+            buf7_len = 255u;
+        char cond_buf[256];
+        int clen = fc_dap_get_condition(cond_buf, (size_t)buf7_len);
+        if (clen > 0) {
+            vm_attr_t *attr7 = PRIV(rv);
+            memory_t *mem7 = attr7->mem;
+            memory_write(mem7, buf7_vaddr, (const uint8_t *)cond_buf, (uint32_t)clen);
+        }
+        rv_set_reg(rv, rv_reg_a0, (uint32_t)clen);
+        rv->PC += 4;
+        return;
+    }
+
+    case 8: { /* BLYT_ECALL_DAP_CONDITION_RESULT: guest reports condition eval. */
+        if (!g_run_ctx || !g_run_ctx->dap_enabled) {
+            rv_set_reg(rv, rv_reg_a0, 0);
+            rv->PC += 4;
+            return;
+        }
+        int result8 = (int)rv_get_reg(rv, rv_reg_a0);
+        int r8 = fc_dap_on_condition_result(result8);
+        rv_set_reg(rv, rv_reg_a0, (uint32_t)r8);
         rv->PC += 4;
         return;
     }
@@ -980,7 +1044,8 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
 #ifdef BLYT_GDB
         /* Capture library layout for GDB qXfer:libraries-svr4:read. */
         if (s->gdb_nlibs < MAX_GDB_LIBS) {
-            blyt_gdb_lib_t *gl = &s->gdb_libs[s->gdb_nlibs++];
+            int idx = s->gdb_nlibs++;
+            blyt_gdb_lib_t *gl = &s->gdb_libs[idx];
             strncpy(gl->path, lib_name, sizeof(gl->path) - 1);
             gl->path[sizeof(gl->path) - 1] = '\0';
             gl->l_addr = bias;
@@ -996,6 +1061,11 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
                     break;
                 }
             }
+            /* Mirror into the stable FFI array (path pointer stays valid for
+             * the session's lifetime, avoiding a dangling pointer in layout). */
+            s->gdb_libs_ffi[idx].path = gl->path;
+            s->gdb_libs_ffi[idx].l_addr = gl->l_addr;
+            s->gdb_libs_ffi[idx].l_ld = gl->l_ld;
         }
 #endif /* BLYT_GDB */
 
@@ -1121,11 +1191,38 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     g_run_ctx = &session->ctx;
     session->ctx.frame_done = false;
 
-#if defined(BLYT_GDB) && defined(__EMSCRIPTEN__)
-    /* On WASM, drain the GDB WebSocket queue once per frame so the handshake
-     * (qSupported, Z0 breakpoint setup, vCont;c) can proceed while running. */
+#ifdef BLYT_DAP
+    if (session->ctx.dap_enabled && fc_dap_is_restart_pending()) {
+        g_run_ctx = NULL;
+        return BLYT_RUN_RESTART;
+    }
+#endif
+
+#ifdef BLYT_GDB
     if (session->ctx.gdb_enabled && session->ctx.debug_state == BLYT_DEBUG_RUNNING) {
+#ifdef __EMSCRIPTEN__
+        /* On WASM, drain the GDB WebSocket queue once per frame. */
         fc_gdb_stub_poll();
+#endif
+        /* If the stub was halted externally (WASM poll or TCP \x03 interrupt),
+         * T02 has already been sent.  Stop executing until vCont arrives. */
+        if (fc_gdb_stub_is_halted()) {
+#ifdef __EMSCRIPTEN__
+            session->ctx.debug_state = BLYT_DEBUG_PAUSED_GDB;
+            g_run_ctx = NULL;
+            return BLYT_RUN_GDB_PAUSED;
+#else
+            /* Native (TCP): block in the transport thread's poll loop. */
+            fc_gdb_stub_block_until_resume();
+            int ext_action = fc_gdb_stub_pending_action();
+            if (ext_action == 2) {
+                rv_halt(session->rv);
+                g_run_ctx = NULL;
+                return BLYT_RUN_OK;
+            }
+            session->ctx.gdb_single_step = (ext_action == 1);
+#endif
+        }
     }
 #endif
 
@@ -1137,12 +1234,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             /* If already paused waiting for vCont, poll for a resume packet. */
             if (session->ctx.debug_state == BLYT_DEBUG_PAUSED_GDB) {
 #ifdef __EMSCRIPTEN__
-                /* Send T05 once the WebSocket relay connection is established. */
-                if (!session->gdb_notified && fc_gdb_transport_wasm_is_connected()) {
-                    session->gdb_notified = true;
-                    fc_gdb_stub_notify_stopped();
-                }
-                /* WASM: non-blocking poll — process one queued packet if any. */
+                /* WASM: non-blocking poll — process one queued packet if any.
+                 * T05 is NOT sent here proactively; LLDB will query the stop
+                 * reason with '?' and the packet handler responds with T05 then.
+                 * Sending T05 before the qSupported ACK corrupts the protocol. */
                 fc_gdb_stub_poll();
                 int _reentry_action = fc_gdb_stub_pending_action();
                 if (_reentry_action < 0) {
@@ -1155,6 +1250,15 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
                     break;
                 }
                 session->ctx.gdb_single_step = (_reentry_action == 1);
+                /* Step-over: if we were paused at a software breakpoint, temporarily
+                 * restore the original instruction so rv_step executes it (not the
+                 * ebreak).  gdb_bp_step_addr != 0 will suppress check_break below
+                 * (preventing an immediate re-stop) and trigger repatch after rv_step. */
+                if (session->ctx.gdb_bp_resume_addr != 0) {
+                    fc_gdb_stub_restore_bp_temp(session->ctx.gdb_bp_resume_addr);
+                    gdb_bp_step_addr = session->ctx.gdb_bp_resume_addr;
+                    session->ctx.gdb_bp_resume_addr = 0;
+                }
                 /* fall through to execute next instruction */
 #else
                 /* Native: this path should not be reached — TCP path blocks. */
@@ -1162,17 +1266,16 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
                 return BLYT_RUN_GDB_PAUSED;
 #endif
             }
-            /* Check for software breakpoint at current PC. */
+            /* Check for software breakpoint at current PC.
+             * Skip if gdb_bp_step_addr is set — that means we just restored the
+             * original instruction for a step-over and must not re-stop here. */
             uint32_t gdb_pc = rv_get_pc(session->rv);
-            if (fc_gdb_stub_check_break(gdb_pc)) {
+            if (gdb_bp_step_addr == 0 && fc_gdb_stub_check_break(gdb_pc)) {
                 session->ctx.debug_state = BLYT_DEBUG_PAUSED_GDB;
 #ifdef __EMSCRIPTEN__
-                /* Only send T05 if the relay is connected; set gdb_notified
-                 * so the re-entry path does not send a duplicate T05. */
-                if (fc_gdb_transport_wasm_is_connected()) {
-                    session->gdb_notified = true;
+                session->ctx.gdb_bp_resume_addr = gdb_pc;
+                if (fc_gdb_transport_wasm_is_connected())
                     fc_gdb_stub_notify_stopped();
-                }
                 g_run_ctx = NULL;
                 return BLYT_RUN_GDB_PAUSED;
 #else
@@ -1194,7 +1297,16 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
         }
 #endif /* BLYT_GDB */
 
-        rv_step(session->rv);
+#if defined(BLYT_GDB) && defined(__EMSCRIPTEN__)
+        /* In WASM GDB mode, step one instruction at a time so check_break above
+         * fires at every PC, not just at the start of a compiled block.  rv_step
+         * is block-based (many instructions per call), which would let on_ebreak
+         * advance PC past a breakpoint before check_break can intercept it. */
+        if (session->ctx.gdb_enabled)
+            rv_step_debug(session->rv);
+        else
+#endif
+            rv_step(session->rv);
 
 #ifdef BLYT_GDB
         /* Re-patch a SW BP that was temporarily removed to allow stepping over it. */
@@ -1207,10 +1319,8 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             session->rv->halt = false; /* restore — cart has not actually halted */
             session->ctx.debug_state = BLYT_DEBUG_PAUSED_GDB;
 #ifdef __EMSCRIPTEN__
-            if (fc_gdb_transport_wasm_is_connected()) {
-                session->gdb_notified = true;
+            if (fc_gdb_transport_wasm_is_connected())
                 fc_gdb_stub_notify_stopped();
-            }
             if (session->ctx.frame_done) {
                 if (!session->cart_has_drawn)
                     blyt_testcard_draw(session->frame_count++, session->pixels);
@@ -1327,6 +1437,15 @@ void blyt_session_dap_shutdown(blyt_session_t *s) {
 #endif
 }
 
+void blyt_session_dap_reattach(blyt_session_t *s) {
+#ifdef BLYT_DAP
+    if (s)
+        s->ctx.dap_enabled = true;
+#else
+    (void)s;
+#endif
+}
+
 int blyt_session_dap_wait_ready(blyt_session_t *s) {
 #ifdef BLYT_DAP
     if (!s || !s->ctx.dap_enabled)
@@ -1347,23 +1466,17 @@ int blyt_session_gdb_listen(blyt_session_t *s, int *port_out) {
     if (!s)
         return -1;
 
-    /* Register layout with the stub. */
-    fc_gdb_library_t libs[MAX_GDB_LIBS];
-    for (int i = 0; i < s->gdb_nlibs; i++) {
-        libs[i].path = s->gdb_libs[i].path;
-        libs[i].l_addr = s->gdb_libs[i].l_addr;
-        libs[i].l_ld = s->gdb_libs[i].l_ld;
-    }
+    /* Register layout with the stub.  Use the stable gdb_libs_ffi array whose
+     * path pointers remain valid for the session's lifetime. */
     fc_gdb_layout_t layout = {
         .exec_path = s->gdb_exec_path,
-        .libraries = libs,
+        .libraries = s->gdb_libs_ffi,
         .n_libraries = s->gdb_nlibs,
     };
     fc_gdb_stub_set_layout(&layout);
 
     g_gdb_session = s;
     s->ctx.gdb_enabled = true;
-    s->gdb_notified = false;
 
     int actual_port = port_out ? *port_out : 0;
 #ifdef __EMSCRIPTEN__

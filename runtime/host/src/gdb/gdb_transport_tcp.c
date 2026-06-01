@@ -30,9 +30,6 @@ static struct {
     int running;
 } g_tcp = {.listen_fd = -1, .client_fd = -1};
 
-/* Forward-declare internal gdb_stub helper (not in the public header). */
-extern void fc_gdb_stub_set_has_client(int val);
-
 /* ── GDB RSP framing ──────────────────────────────────────────────────────── */
 
 static int tcp_send_pkt(const char *payload) {
@@ -61,7 +58,15 @@ static int tcp_recv_pkt_fd(int fd, char *buf, size_t cap) {
             return -1;
         if (c == '$')
             break;
-        /* Ctrl-C (0x03): not handled — ignore. */
+        if ((unsigned char)c == 0x03) {
+            /* Out-of-band interrupt: pass directly to the stub as a 1-byte pkt. */
+            if (cap > 1) {
+                buf[0] = '\x03';
+                buf[1] = '\0';
+            }
+            return 1;
+        }
+        /* Other non-packet bytes (acks, etc.): discard. */
     }
     size_t i = 0;
     while (i + 1 < cap) {
@@ -91,8 +96,15 @@ static int tcp_recv_pkt(char *buf, size_t cap) {
 }
 
 /* on_stop: called from the main run loop when the CPU hits a breakpoint.
- * Blocks until the GDB client sends vCont (pending_action ≥ 0). */
+ * Blocks until the GDB client sends vCont (pending_action ≥ 0).
+ * If no client has ever connected, clears the halted state and returns
+ * immediately so the cart is not blocked waiting for a client that may
+ * never arrive (e.g. GDB port opened but no debugger attached). */
 static void tcp_on_stop(void) {
+    if (!fc_gdb_stub_has_client()) {
+        fc_gdb_stub_set_has_client(0); /* clears halted + pending_action */
+        return;
+    }
     while (g_tcp.running) {
         if (fc_gdb_stub_pending_action() >= 0)
             break;
