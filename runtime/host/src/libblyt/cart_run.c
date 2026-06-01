@@ -1271,9 +1271,20 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             }
             /* Check for software breakpoint at current PC.
              * Skip if gdb_bp_step_addr is set — that means we just restored the
-             * original instruction for a step-over and must not re-stop here. */
+             * original instruction for a step-over and must not re-stop here.
+             * On the native path, gdb_bp_resume_addr carries the same signal
+             * across loop iterations (for mid-block ebreak step-overs). */
             uint32_t gdb_pc = rv_get_pc(session->rv);
-            if (gdb_bp_step_addr == 0 && fc_gdb_stub_check_break(gdb_pc)) {
+#ifndef __EMSCRIPTEN__
+            if (session->ctx.gdb_bp_resume_addr != 0) {
+                /* Mid-block ebreak step-over: original instruction was already
+                 * restored in the ebreak_pending handler.  Set gdb_bp_step_addr
+                 * so repatch fires after rv_step, and suppress check_break. */
+                gdb_bp_step_addr = session->ctx.gdb_bp_resume_addr;
+                session->ctx.gdb_bp_resume_addr = 0;
+            } else
+#endif
+                if (gdb_bp_step_addr == 0 && fc_gdb_stub_check_break(gdb_pc)) {
                 session->ctx.debug_state = BLYT_DEBUG_PAUSED_GDB;
 #ifdef __EMSCRIPTEN__
                 session->ctx.gdb_bp_resume_addr = gdb_pc;
@@ -1345,10 +1356,14 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
                 break;
             }
             session->ctx.gdb_single_step = (gdb_action == 1);
-            /* Step-over: restore original instruction so rv_step executes it,
-             * not the ebreak.  Re-patch after rv_step via gdb_bp_step_addr. */
+            /* Step-over: restore original instruction so the next rv_step call
+             * executes it instead of the ebreak.  Use gdb_bp_resume_addr (a
+             * session-level field) rather than the local gdb_bp_step_addr
+             * because the local is reset at the top of each loop iteration;
+             * the gdb_bp_resume_addr → gdb_bp_step_addr transfer in the
+             * check_break section will then trigger repatch after rv_step. */
             fc_gdb_stub_restore_bp_temp(gdb_ebreak_pc);
-            gdb_bp_step_addr = gdb_ebreak_pc;
+            session->ctx.gdb_bp_resume_addr = gdb_ebreak_pc;
 #endif
         }
         /* Post-instruction single-step pause. */
