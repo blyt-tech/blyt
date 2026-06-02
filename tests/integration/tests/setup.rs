@@ -5,8 +5,8 @@ use common::{CartProject, blyt_bin};
 use std::fs;
 use tempfile::TempDir;
 
-/// `blyt setup vscode` on a C cart writes a launch.json with a
-/// `blyt-native-gdb` configuration only.
+/// `blyt setup vscode` on a C cart writes a launch.json with the single
+/// auto-detecting `blyt` configuration.
 #[test]
 fn setup_vscode_native_cart() {
     let tmp = TempDir::new().unwrap();
@@ -25,21 +25,17 @@ fn setup_vscode_native_cart() {
     let content = fs::read_to_string(&launch_path).unwrap();
 
     assert!(
-        content.contains("blyt-native-gdb"),
-        "launch.json missing blyt-native-gdb config:\n{content}"
+        content.contains("\"type\": \"blyt\""),
+        "launch.json missing blyt config:\n{content}"
     );
     assert!(
-        !content.contains("blyt-lua"),
-        "launch.json should not contain blyt-lua for a native cart:\n{content}"
-    );
-    assert!(
-        content.contains("Debug Native (LLDB)"),
-        "launch.json missing 'Debug Native (LLDB)' name:\n{content}"
+        !content.contains("blyt-run"),
+        "launch.json should not contain the removed blyt-run type:\n{content}"
     );
 }
 
-/// `blyt setup vscode` on a Lua cart writes a launch.json with both a
-/// `blyt-lua` and a `blyt-native-gdb` configuration.
+/// `blyt setup vscode` on a Lua cart writes the same single auto-detecting
+/// `blyt` configuration as any other cart.
 #[test]
 fn setup_vscode_lua_cart() {
     let tmp = TempDir::new().unwrap();
@@ -58,20 +54,8 @@ fn setup_vscode_lua_cart() {
     let content = fs::read_to_string(&launch_path).unwrap();
 
     assert!(
-        content.contains("blyt-lua"),
-        "launch.json missing blyt-lua config:\n{content}"
-    );
-    assert!(
-        content.contains("blyt-native-gdb"),
-        "launch.json missing blyt-native-gdb config:\n{content}"
-    );
-    assert!(
-        content.contains("Debug Lua"),
-        "launch.json missing 'Debug Lua' name:\n{content}"
-    );
-    assert!(
-        content.contains("Debug Native (LLDB)"),
-        "launch.json missing 'Debug Native (LLDB)' name:\n{content}"
+        content.contains("\"type\": \"blyt\""),
+        "launch.json missing blyt config:\n{content}"
     );
 }
 
@@ -124,7 +108,7 @@ fn setup_vscode_does_not_clobber() {
 
     let content = fs::read_to_string(&launch_path).unwrap();
     assert!(
-        content.contains("blyt-native-gdb"),
+        content.contains("\"type\": \"blyt\""),
         "expected overwrite with --force"
     );
 }

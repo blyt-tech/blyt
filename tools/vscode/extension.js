@@ -113,25 +113,29 @@ function findLldbDap() {
     return 'lldb-dap'; // fallback: rely on PATH
 }
 
-/* ── Inline debug adapter for blyt-run (no debug ports) ─────────────────── */
+/* ── Inline debug adapter for Run Without Debugging (no debug ports) ────── */
 
 /* Minimal DAP adapter: accepts the VS Code handshake, manages the process
  * lifecycle, and sends `terminated` when the process exits.  No breakpoints,
  * no stack frames — this is purely a process wrapper so VS Code's stop button
- * kills the cart server. */
+ * kills the cart server.  Used by the `blyt` descriptor factory when
+ * config.noDebug is set (Ctrl+F5 / Run Without Debugging). */
 class BlytRunAdapter {
     constructor(proc, output) {
         this._proc  = proc;
         this._output = output;
         this._seq   = 0;
-        this.sendMessage = null; /* set by VS Code's DebugAdapterInlineImplementation */
+        /* VS Code's DebugAdapterInlineImplementation requires the DebugAdapter
+         * interface: onDidSendMessage must be a vscode.Event<T>.  Expose an
+         * EventEmitter's .event and fire it to send messages to VS Code. */
+        this._emitter = new vscode.EventEmitter();
+        this.onDidSendMessage = this._emitter.event;
         proc.on('exit', () => {
-            if (this.sendMessage)
-                this.sendMessage({ seq: ++this._seq, type: 'event', event: 'terminated', body: {} });
+            this._emitter.fire({ seq: ++this._seq, type: 'event', event: 'terminated', body: {} });
         });
     }
     _respond(req, body) {
-        this.sendMessage({
+        this._emitter.fire({
             seq: ++this._seq, type: 'response',
             request_seq: req.seq, success: true,
             command: req.command, body: body || {},
@@ -144,7 +148,7 @@ class BlytRunAdapter {
         switch (msg.command) {
             case 'initialize':
                 this._respond(msg, {});
-                this.sendMessage({ seq: ++this._seq, type: 'event', event: 'initialized', body: {} });
+                this._emitter.fire({ seq: ++this._seq, type: 'event', event: 'initialized', body: {} });
                 break;
             case 'launch':
             case 'configurationDone':
@@ -167,13 +171,14 @@ class BlytRunAdapter {
                 this._respond(msg, {});
                 break;
             default:
-                this.sendMessage({
+                this._emitter.fire({
                     seq: ++this._seq, type: 'response',
                     request_seq: msg.seq, success: false,
                     command: msg.command, message: 'not supported',
                 });
         }
     }
+    dispose() { try { this._proc.kill(); } catch (_) {} }
 }
 
 /* ── Start blyt build ────────────────────────────────────────────────────── */
@@ -323,26 +328,6 @@ function isLuaCart(projectDir) {
     return fs.existsSync(path.join(projectDir, 'src', 'game', 'lua'));
 }
 
-/* Find the blyt cart project for the current context: active editor first,
- * then workspace folder.  Returns { projectDir, cart } for a Lua cart,
- * or null. */
-function detectCart(folder) {
-    const candidates = [];
-    const activeFile = vscode.window.activeTextEditor?.document.uri.fsPath;
-    if (activeFile) candidates.push(activeFile);
-    if (folder) candidates.push(folder.uri.fsPath);
-
-    for (const start of candidates) {
-        const projectDir = findCartProject(start);
-        if (projectDir && isLuaCart(projectDir)) {
-            const name = path.basename(projectDir);
-            const cart = path.join(projectDir, 'build', `${name}.blyt`);
-            return { projectDir, cart };
-        }
-    }
-    return null;
-}
-
 /* Find any blyt cart project (Lua or native) for the current context.
  * Returns { projectDir, cart } or null. */
 function detectAnyCart(folder) {
@@ -395,7 +380,7 @@ async function autoSetupVscode(output) {
     }
 }
 
-/* ── blyt-native-gdb: DAP proxy for lldb-dap ─────────────────────────────── */
+/* ── Native (RISC-V guest) DAP proxy for lldb-dap ────────────────────────── */
 
 /* Wraps lldb-dap as a child process and proxies DAP messages, with two
  * workarounds for LLDB's conditional-breakpoint update bug:
@@ -546,95 +531,147 @@ function activate(context) {
 
     autoSetupVscode(output);
 
-    /* ── blyt-lua: Lua DAP debugger ─────────────────────────────────────── */
+    /* ── blyt: unified cart debugger ────────────────────────────────────── */
 
-    /* Connect VS Code's built-in DAP client to the blyt relay TCP port. */
+    /* A single debug type serves every cart.  `blyt run --debug` always opens
+     * both a Lua DAP relay and a GDB relay, so one launch exposes both
+     * backends; we choose which to connect by cart type:
+     *   Lua cart    → VS Code's DAP client connects to the Lua DAP TCP port.
+     *   native cart → lldb-dap connects to the GDB relay (RISC-V guest).
+     * Ctrl+F5 (config.noDebug) runs the cart with no relay at all.
+     * Host-engine debugging is out of scope here (see the repo .vscode/). */
+
+    /* Resolve { cart, cwd, isLua } from a launch config, falling back to
+     * project detection.  Returns null (after an error) if no cart is found. */
+    function resolveTarget(folder, config) {
+        let cart = config.cart;
+        let cwd  = folder?.uri.fsPath;
+        let projectDir = null;
+        if (!cart) {
+            const found = detectAnyCart(folder);
+            if (!found) {
+                vscode.window.showErrorMessage(
+                    'Blyt: open a file inside a blyt cart project, or add "cart" to your launch configuration.'
+                );
+                return null;
+            }
+            cart = found.cart;
+            cwd  = found.projectDir;
+            projectDir = found.projectDir;
+        } else {
+            projectDir = findCartProject(cart);
+        }
+        cwd = cwd ?? path.dirname(cart);
+        return { cart, cwd, isLua: projectDir ? isLuaCart(projectDir) : false };
+    }
+
+    /* Build the cart, surfacing failures as an error notification.  Returns
+     * false on failure.  `debug` forces a --debug (DWARF) rebuild. */
+    async function build(cwd, debug) {
+        output.appendLine(debug ? `\n── blyt build --debug` : `\n── blyt build`);
+        try {
+            await buildCart(cwd, output, debug);
+            return true;
+        } catch (e) {
+            vscode.window.showErrorMessage(`Blyt: ${e.message}`);
+            return false;
+        }
+    }
+
+    /* Stash a freshly-started blyt process for the upcoming session and open
+     * the cart game panel if it announced an HTTP port.  Returns the temp ID
+     * to put in the resolved config under _blytTempId. */
+    async function trackProc(proc, httpPort) {
+        const tempId = nextId++;
+        pendingProcs.set(tempId, proc);
+        if (httpPort) {
+            const cartUrl = `http://127.0.0.1:${httpPort}/`;
+            pendingUrls.set(tempId, cartUrl);
+            await openCartPage(cartUrl);
+        }
+        return tempId;
+    }
+
+    /* Offer a single "Debug" config when the workspace is a blyt cart project.
+     * Registered for both Initial (F5 with no launch.json) and Dynamic (Add
+     * Configuration button). */
+    function provideDebugConfigurations(folder) {
+        const found = detectAnyCart(folder);
+        if (!found) return [];
+        return [{ type: 'blyt', request: 'launch', name: 'Debug', cart: found.cart }];
+    }
+
+    function resolveDebugConfiguration(folder, config) {
+        return { type: 'blyt', request: 'launch', name: 'Debug', ...config };
+    }
+
+    /* Pick the adapter for the resolved session by the mode the resolver chose. */
     context.subscriptions.push(
-        vscode.debug.registerDebugAdapterDescriptorFactory('blyt-lua', {
+        vscode.debug.registerDebugAdapterDescriptorFactory('blyt', {
             createDebugAdapterDescriptor(session) {
-                const { _blytTempId, _blytDapPort } = session.configuration;
-                const proc = pendingProcs.get(_blytTempId);
-                pendingProcs.delete(_blytTempId);
-                const url = pendingUrls.get(_blytTempId);
-                pendingUrls.delete(_blytTempId);
+                const cfg = session.configuration;
+                const proc = pendingProcs.get(cfg._blytTempId);
+                pendingProcs.delete(cfg._blytTempId);
+                const url = pendingUrls.get(cfg._blytTempId);
+                pendingUrls.delete(cfg._blytTempId);
                 if (proc) sessionProcs.set(session.id, proc);
                 if (url)  sessionUrls.set(session.id, url);
-                return new vscode.DebugAdapterServer(_blytDapPort, '127.0.0.1');
+                if (cfg._blytMode === 'lua')
+                    return new vscode.DebugAdapterServer(cfg._blytDapPort, '127.0.0.1');
+                if (cfg._blytMode === 'native')
+                    return new vscode.DebugAdapterInlineImplementation(new BlytGdbDapProxy(findLldbDap()));
+                /* 'run' — Run Without Debugging: no relay, just a process wrapper. */
+                return new vscode.DebugAdapterInlineImplementation(new BlytRunAdapter(proc, output));
             },
         })
     );
 
-    /* Offer a "Blyt: Debug Lua Cart" config when the workspace looks like a
-     * blyt Lua project.  Registered for both Initial (F5 with no launch.json)
-     * and Dynamic (Add Configuration button).  Cart path mirrors blyt build's
-     * output convention: <project-dir>/build/<project-dir-name>.blyt. */
-    function provideDebugConfigurations(folder) {
-        console.error('[blyt] provideDebugConfigurations', folder?.uri.fsPath);
-        output.show(true);
-        output.appendLine(`[diag] provideDebugConfigurations folder=${folder?.uri.fsPath}`);
-        const found = detectCart(folder);
-        output.appendLine(`[diag] detectCart => ${JSON.stringify(found)}`);
-        if (!found) return [];
-        return [{ type: 'blyt-lua', request: 'launch', name: 'Debug Lua', cart: found.cart }];
-    }
-
-    function resolveDebugConfiguration(folder, config) {
-        console.error('[blyt] resolveDebugConfiguration', folder?.uri.fsPath, config);
-        return {
-            type: 'blyt-lua',
-            request: 'launch',
-            name: 'Debug Lua',
-            ...config,
-        };
-    }
-
     context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-lua',
+        vscode.debug.registerDebugConfigurationProvider('blyt',
             { provideDebugConfigurations, resolveDebugConfiguration })
     );
     context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-lua',
+        vscode.debug.registerDebugConfigurationProvider('blyt',
             { provideDebugConfigurations },
             vscode.DebugConfigurationProviderTriggerKind.Dynamic)
     );
 
-    /* Start blyt run --debug before the session begins; inject the DAP port
-     * into the config so createDebugAdapterDescriptor can use it. */
+    /* Start blyt (run/--debug) before the session begins and stash the ports /
+     * mode in the config so createDebugAdapterDescriptor can wire up the right
+     * adapter. */
     context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-lua', {
+        vscode.debug.registerDebugConfigurationProvider('blyt', {
             resolveDebugConfiguration,
             async resolveDebugConfigurationWithSubstitutedVariables(folder, config) {
-                console.error('[blyt] resolveDebugConfigurationWithSubstitutedVariables', folder?.uri.fsPath, config);
                 output.show(true);
-                output.appendLine(`[diag] resolveWithSubstitutedVars folder=${folder?.uri.fsPath} cart=${config.cart}`);
-                let cart = config.cart;
-                let cwd  = folder?.uri.fsPath;
-                if (!cart) {
-                    const found = detectCart(folder);
-                    if (!found) {
-                        vscode.window.showErrorMessage(
-                            'Blyt: open a file inside a blyt cart project, or add "cart" to your launch configuration.'
-                        );
-                        return undefined;
-                    }
-                    cart = found.cart;
-                    cwd  = found.projectDir;
-                }
-                cwd = cwd ?? path.dirname(cart);
-                output.show(true);
+                const target = resolveTarget(folder, config);
+                if (!target) return undefined;
+                const { cart, cwd, isLua } = target;
 
-                if (!fs.existsSync(cart)) {
-                    output.appendLine(`\n── blyt build`);
+                /* Run Without Debugging (Ctrl+F5): plain `blyt run`, no relay. */
+                if (config.noDebug) {
+                    if (!fs.existsSync(cart) && !(await build(cwd, false))) return undefined;
+                    output.appendLine(`\n── blyt run ${cart}`);
+                    let result;
                     try {
-                        await buildCart(cwd, output);
+                        result = await startBlytRunSimple(cart, cwd, output);
                     } catch (e) {
                         vscode.window.showErrorMessage(`Blyt: ${e.message}`);
                         return undefined;
                     }
+                    const tempId = await trackProc(result.proc, result.httpPort);
+                    return { ...config, cart, _blytMode: 'run', _blytTempId: tempId };
+                }
+
+                /* Native guest debugging needs DWARF line info, so always build
+                 * with --debug.  Lua only needs the cart present. */
+                if (isLua) {
+                    if (!fs.existsSync(cart) && !(await build(cwd, false))) return undefined;
+                } else if (!(await build(cwd, true))) {
+                    return undefined;
                 }
 
                 output.appendLine(`\n── blyt run --debug ${cart}`);
-
                 let result;
                 try {
                     result = await startBlytRun(cart, cwd, output);
@@ -642,119 +679,16 @@ function activate(context) {
                     vscode.window.showErrorMessage(`Blyt: ${e.message}`);
                     return undefined;
                 }
+                const { proc, httpPort, dapPort, gdbPort } = result;
 
-                const { proc, httpPort, dapPort } = result;
-
-                const tempId = nextId++;
-                pendingProcs.set(tempId, proc);
-                if (httpPort) {
-                    const cartUrl = `http://127.0.0.1:${httpPort}/`;
-                    pendingUrls.set(tempId, cartUrl);
-                    await openCartPage(cartUrl);
-                }
-                return { ...config, cart, _blytTempId: tempId, _blytDapPort: dapPort };
-            },
-        })
-    );
-
-    /* ── blyt-native-gdb: native RISC-V debugger via LLDB ──────────────── */
-
-    /* Uses lldb-dap (the LLDB Debug Adapter Protocol server) from the same
-     * Homebrew LLVM tree as blyt-clang.  The cart runs in the WASM frontend
-     * via `blyt run --debug`, which starts a GDB RSP relay alongside the DAP
-     * relay.  LLDB connects to that relay via `gdb-remote`. */
-
-    context.subscriptions.push(
-        vscode.debug.registerDebugAdapterDescriptorFactory('blyt-native-gdb', {
-            createDebugAdapterDescriptor(session) {
-                const { _blytGdbTempId } = session.configuration;
-                const proc = pendingProcs.get(_blytGdbTempId);
-                pendingProcs.delete(_blytGdbTempId);
-                const url = pendingUrls.get(_blytGdbTempId);
-                pendingUrls.delete(_blytGdbTempId);
-                if (proc) sessionProcs.set(session.id, proc);
-                if (url)  sessionUrls.set(session.id, url);
-                return new vscode.DebugAdapterInlineImplementation(new BlytGdbDapProxy(findLldbDap()));
-            },
-        })
-    );
-
-    function provideGdbDebugConfigurations(folder) {
-        const found = detectAnyCart(folder);
-        if (!found) return [];
-        return [{
-            type: 'blyt-native-gdb',
-            request: 'launch',
-            name: 'Debug Native (GDB)',
-            cart: found.cart,
-        }];
-    }
-
-    function resolveGdbDebugConfiguration(folder, config) {
-        return {
-            type: 'blyt-native-gdb',
-            request: 'launch',
-            name: 'Debug Native (GDB)',
-            ...config,
-        };
-    }
-
-    context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-native-gdb',
-            { provideDebugConfigurations: provideGdbDebugConfigurations,
-              resolveDebugConfiguration: resolveGdbDebugConfiguration })
-    );
-    context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-native-gdb',
-            { provideDebugConfigurations: provideGdbDebugConfigurations },
-            vscode.DebugConfigurationProviderTriggerKind.Dynamic)
-    );
-
-    context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-native-gdb', {
-            resolveDebugConfiguration: resolveGdbDebugConfiguration,
-            async resolveDebugConfigurationWithSubstitutedVariables(folder, config) {
-                output.show(true);
-                output.appendLine(`[diag] gdb resolveWithSubstitutedVars folder=${folder?.uri.fsPath} cart=${config.cart}`);
-                let cart = config.cart;
-                let cwd  = folder?.uri.fsPath;
-                if (!cart) {
-                    const found = detectAnyCart(folder);
-                    if (!found) {
-                        vscode.window.showErrorMessage(
-                            'Blyt: open a file inside a blyt cart project, or add "cart" to your launch configuration.'
-                        );
-                        return undefined;
-                    }
-                    cart = found.cart;
-                    cwd  = found.projectDir;
-                }
-                cwd = cwd ?? path.dirname(cart);
-
-                /* Always build with --debug so the cart contains DWARF line info
-                 * for source-level breakpoints.  The build is incremental (fast
-                 * if sources haven't changed since the last debug build). */
-                output.appendLine(`\n── blyt build --debug`);
-                try {
-                    await buildCart(cwd, output, true);
-                } catch (e) {
-                    vscode.window.showErrorMessage(`Blyt: ${e.message}`);
-                    return undefined;
+                /* Lua cart: connect VS Code's DAP client straight to the relay. */
+                if (isLua) {
+                    const tempId = await trackProc(proc, httpPort);
+                    return { ...config, cart, _blytMode: 'lua', _blytTempId: tempId, _blytDapPort: dapPort };
                 }
 
-                output.appendLine(`\n── blyt run --debug ${cart}`);
-
-                let result;
-                try {
-                    result = await startBlytRun(cart, cwd, output);
-                } catch (e) {
-                    vscode.window.showErrorMessage(`Blyt: ${e.message}`);
-                    return undefined;
-                }
-
-                const { proc, httpPort, gdbPort } = result;
+                /* Native cart: lldb-dap connects to the GDB relay (RISC-V guest). */
                 const cartUrl = httpPort ? `http://127.0.0.1:${httpPort}/` : null;
-
                 if (!gdbPort) {
                     proc.kill();
                     vscode.window.showErrorMessage(
@@ -821,114 +755,32 @@ function activate(context) {
                  * back to the actual files on disk. */
                 return {
                     ...config,
+                    _blytMode: 'native',
                     program: cart,
                     stopOnEntry: false,
                     launchCommands: [
                         `settings set target.source-map /blyt/src ${JSON.stringify(cwd)}`,
                         `gdb-remote 127.0.0.1:${gdbPort}`,
                     ],
-                    _blytGdbTempId: tempId,
+                    _blytTempId: tempId,
                 };
-            },
-        })
-    );
-
-    /* ── blyt-run: run without debug ───────────────────────────────────── */
-
-    context.subscriptions.push(
-        vscode.debug.registerDebugAdapterDescriptorFactory('blyt-run', {
-            createDebugAdapterDescriptor(session) {
-                const { _blytRunTempId } = session.configuration;
-                const proc = pendingProcs.get(_blytRunTempId);
-                pendingProcs.delete(_blytRunTempId);
-                const url = pendingUrls.get(_blytRunTempId);
-                pendingUrls.delete(_blytRunTempId);
-                if (proc) sessionProcs.set(session.id, proc);
-                if (url)  sessionUrls.set(session.id, url);
-                return new vscode.DebugAdapterInlineImplementation(
-                    new BlytRunAdapter(proc, output)
-                );
-            },
-        })
-    );
-
-    function provideRunConfigurations(folder) {
-        const found = detectAnyCart(folder);
-        if (!found) return [];
-        return [{ type: 'blyt-run', request: 'launch', name: 'Run' }];
-    }
-
-    context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-run',
-            { provideDebugConfigurations: provideRunConfigurations,
-              resolveDebugConfiguration(folder, config) {
-                  return { type: 'blyt-run', request: 'launch', name: 'Run', ...config };
-              } })
-    );
-    context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-run',
-            { provideDebugConfigurations: provideRunConfigurations },
-            vscode.DebugConfigurationProviderTriggerKind.Dynamic)
-    );
-    context.subscriptions.push(
-        vscode.debug.registerDebugConfigurationProvider('blyt-run', {
-            async resolveDebugConfigurationWithSubstitutedVariables(folder, config) {
-                let cart = config.cart;
-                let cwd  = folder?.uri.fsPath;
-                if (!cart) {
-                    const found = detectAnyCart(folder);
-                    if (!found) {
-                        vscode.window.showErrorMessage(
-                            'Blyt: open a file inside a blyt cart project, or add "cart" to your launch configuration.'
-                        );
-                        return undefined;
-                    }
-                    cart = found.cart;
-                    cwd  = found.projectDir;
-                }
-                cwd = cwd ?? path.dirname(cart);
-                output.show(true);
-
-                if (!fs.existsSync(cart)) {
-                    output.appendLine(`\n── blyt build`);
-                    try {
-                        await buildCart(cwd, output);
-                    } catch (e) {
-                        vscode.window.showErrorMessage(`Blyt: ${e.message}`);
-                        return undefined;
-                    }
-                }
-
-                output.appendLine(`\n── blyt run ${cart}`);
-                let result;
-                try {
-                    result = await startBlytRunSimple(cart, cwd, output);
-                } catch (e) {
-                    vscode.window.showErrorMessage(`Blyt: ${e.message}`);
-                    return undefined;
-                }
-
-                const { proc, httpPort } = result;
-                const tempId = nextId++;
-                pendingProcs.set(tempId, proc);
-                if (httpPort) {
-                    const cartUrl = `http://127.0.0.1:${httpPort}/`;
-                    pendingUrls.set(tempId, cartUrl);
-                    await openCartPage(cartUrl);
-                }
-                return { ...config, cart, _blytRunTempId: tempId };
             },
         })
     );
 
     /* ── Session cleanup ────────────────────────────────────────────────── */
 
-    /* DAP message tracer: logs events/commands (type only) so we can see
-     * whether lldb-dap emits "stopped", "initialized", etc. to VS Code.
-     * Also handles the delayed kill on disconnect/terminate. */
+    /* DAP message tracer for the unified `blyt` type.  Handles, for whichever
+     * backend is active:
+     *   - delayed process kill on disconnect/terminate (gives lldb-dap time to
+     *     finish its GDB handshake),
+     *   - WASM page reload on restart (native lldb-dap GDB reconnect flow),
+     *   - setBreakpoints / lldb output logging,
+     *   - revealing the source line on stop (the game panel can cover it). */
     context.subscriptions.push(
-        vscode.debug.registerDebugAdapterTrackerFactory('blyt-native-gdb', {
+        vscode.debug.registerDebugAdapterTrackerFactory('blyt', {
             createDebugAdapterTracker(session) {
+                let pendingReveal = false;
                 return {
                     onWillReceiveMessage(msg) {
                         const tag = msg.command || msg.event || '?';
@@ -978,24 +830,6 @@ function activate(context) {
                             const text = (msg.body?.output ?? '').trimEnd();
                             if (text && (cat === 'stderr' || cat === 'console'))
                                 output.appendLine(`[lldb] ${text.slice(0, 200)}`);
-                        }
-                    },
-                };
-            },
-        })
-    );
-
-    context.subscriptions.push(
-        vscode.debug.registerDebugAdapterTrackerFactory('blyt-lua', {
-            createDebugAdapterTracker(_session) {
-                let pendingReveal = false;
-                return {
-                    onDidSendMessage(msg) {
-                        if (msg.type === 'response' && msg.command === 'setBreakpoints') {
-                            const bps = (msg.body?.breakpoints ?? []).map(b =>
-                                b.verified ? `✓${b.id}` : `✗${b.id}(${b.message ?? 'unverified'})`
-                            ).join(' ');
-                            if (bps) output.appendLine(`setBreakpoints: ${bps}`);
                         }
                         if (msg.type === 'event' && msg.event === 'stopped') {
                             pendingReveal = true;

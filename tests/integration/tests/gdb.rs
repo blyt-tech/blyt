@@ -607,7 +607,7 @@ fn sdl_c_cart_gdb_library_list() {
 /// The run_gdb_test.mjs orchestrator prints "[run_gdb_test] WASM runtime
 /// connected" once the WASM cart's WebSocket GDB transport connects to the
 /// relay.  This is the WASM-path equivalent of the "GDB: WASM ready" signal
-/// that the VS Code extension waits for in the blyt-run relay.
+/// that the VS Code extension waits for in the `blyt run` GDB relay.
 ///
 /// Requires: WASM build with BLYT_GDB=ON.
 #[test]

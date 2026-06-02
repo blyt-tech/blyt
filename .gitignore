@@ -4,6 +4,7 @@ target/
 devtool/target/
 tests/wasm/node_modules/
 tools/vscode/node_modules/
+examples/*/.vscode/
 .cache/
 qemu-images/*
 !qemu-images/.gitkeep

@@ -10,12 +10,8 @@
     "workspaceContains:blyt.info.yaml",
     "onStartupFinished",
     "onDebugInitialConfigurations",
-    "onDebugResolve:blyt-lua",
-    "onDebugDynamicConfigurations:blyt-lua",
-    "onDebugResolve:blyt-native-gdb",
-    "onDebugDynamicConfigurations:blyt-native-gdb",
-    "onDebugResolve:blyt-run",
-    "onDebugDynamicConfigurations:blyt-run"
+    "onDebugResolve:blyt",
+    "onDebugDynamicConfigurations:blyt"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -37,42 +33,14 @@
     ],
     "debuggers": [
       {
-        "type": "blyt-lua",
-        "label": "Blyt Lua",
+        "type": "blyt",
+        "label": "Blyt",
         "configurationAttributes": {
           "launch": {
             "properties": {
               "cart": {
                 "type": "string",
-                "description": "Path to the compiled .blyt cart file."
-              }
-            }
-          }
-        }
-      },
-      {
-        "type": "blyt-native-gdb",
-        "label": "Blyt Native (LLDB)",
-        "configurationAttributes": {
-          "launch": {
-            "properties": {
-              "cart": {
-                "type": "string",
-                "description": "Path to the compiled .blyt cart file. Auto-detected from the workspace if omitted."
-              }
-            }
-          }
-        }
-      },
-      {
-        "type": "blyt-run",
-        "label": "Blyt Run",
-        "configurationAttributes": {
-          "launch": {
-            "properties": {
-              "cart": {
-                "type": "string",
-                "description": "Path to the compiled .blyt cart file. Auto-detected from the workspace if omitted."
+                "description": "Path to the compiled .blyt cart file. Auto-detected from the workspace if omitted. The debugger auto-detects Lua vs native carts."
               }
             }
           }
