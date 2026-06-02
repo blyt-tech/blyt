@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# Standalone workspace boundary: a blyt cart is built on its own by
+# `blyt build`, so stop cargo from walking up and adopting it into a
+# surrounding workspace (the blyt repo, or a user's monorepo).
+[workspace]
+
 [lib]
 crate-type = ["staticlib"]
 
