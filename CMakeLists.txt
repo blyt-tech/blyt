@@ -1152,7 +1152,7 @@ file(
   "${CMAKE_SOURCE_DIR}/runtime/host/include/*.h"
   "${CMAKE_SOURCE_DIR}/tests/unit/*.c"
   "${CMAKE_SOURCE_DIR}/tests/tools/*.c"
-  "${CMAKE_SOURCE_DIR}/tests/game/hello-c/src/game/c/*.c"
+  "${CMAKE_SOURCE_DIR}/examples/hello-c/src/game/c/*.c"
   "${CMAKE_SOURCE_DIR}/frontends/player/main.c"
   "${CMAKE_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
   "${CMAKE_SOURCE_DIR}/frontends/wasm/wasm_main.c"

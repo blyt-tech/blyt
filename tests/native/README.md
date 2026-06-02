@@ -10,12 +10,12 @@ Native RISC-V gate tests for trusted native cart execution on RISC-V ILP32.
 
 ## Gate 1 — blyt_console_debug via write(2)
 
-Builds a minimal cart from `tests/game/hello/` and runs it through the
-launcher.  Expects "init", "update", "draw" in stderr output (from
-`blyt_console_debug` in the hello cart).  Build first:
+Builds a minimal cart from `examples/hello/` and runs it through the
+launcher.  Expects "hello from lua", "update 60", "draw 60" in stderr output
+(from `blyt_console_debug` in the hello cart).  Build first:
 
 ```sh
-build/sdk/bin/blyt build tests/game/hello
+build/sdk/bin/blyt build examples/hello
 ```
 
 ## Gate 2 — restricted seccomp blocks socket(2)

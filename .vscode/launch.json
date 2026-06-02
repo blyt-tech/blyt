@@ -6,12 +6,12 @@
         {
             // Run the hello cart headlessly — fastest way to verify blyt_console_debug
             // output without opening an SDL2 window.
-            // Cart is built by blyt into tests/game/hello.blyt (gitignored).
+            // Cart is built by blyt into examples/hello/build/hello.blyt (gitignored).
             "name": "blytplay: hello cart (headless)",
             "type": "lldb",
             "request": "launch",
             "program": "${workspaceFolder}/build/blytplay",
-            "args": ["--headless", "${workspaceFolder}/tests/game/hello.blyt"],
+            "args": ["--headless", "${workspaceFolder}/examples/hello/build/hello.blyt"],
             "env": {
                 "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib"
             },
@@ -30,7 +30,7 @@
             "type": "lldb",
             "request": "launch",
             "program": "${workspaceFolder}/build/blytplay",
-            "args": ["${workspaceFolder}/tests/game/hello.blyt"],
+            "args": ["${workspaceFolder}/examples/hello/build/hello.blyt"],
             "env": {
                 "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib"
             },
@@ -48,7 +48,7 @@
             "type": "lldb",
             "request": "launch",
             "program": "${workspaceFolder}/target/debug/blyt",
-            "args": ["build", "${workspaceFolder}/tests/game/hello"],
+            "args": ["build", "${workspaceFolder}/examples/hello"],
             "env": {
                 "BLYT_SDK_DIR": "${workspaceFolder}",
                 "BLYT_LIB_DIR": "${workspaceFolder}/build/sdk/lib"

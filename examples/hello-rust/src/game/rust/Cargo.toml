@@ -1,0 +1,11 @@
+[package]
+name = "cart"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+blyt = "0.1"

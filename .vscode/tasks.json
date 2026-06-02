@@ -27,11 +27,11 @@
             "problemMatcher": []
         },
         {
-            // Builds tests/game/hello.blyt using the SDK's blyt binary.
+            // Builds examples/hello/build/hello.blyt using the SDK's blyt binary.
             // The SDK blyt auto-discovers its toolchain and libraries from its own location.
             "label": "build: hello cart",
             "type": "shell",
-            "command": "${workspaceFolder}/build/sdk/bin/blyt build ${workspaceFolder}/tests/game/hello",
+            "command": "${workspaceFolder}/build/sdk/bin/blyt build ${workspaceFolder}/examples/hello",
             "options": { "cwd": "${workspaceFolder}" },
             "dependsOn": ["cmake: build sdk"],
             "dependsOrder": "sequence",
