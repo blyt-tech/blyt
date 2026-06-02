@@ -429,6 +429,22 @@ pub fn require_libretro_core() {
     );
 }
 
+pub fn libretro_runner() -> PathBuf {
+    build_dir().join("blyt-libretro-runner")
+}
+
+pub fn require_libretro_runner() {
+    assert!(
+        libretro_so().exists(),
+        "blyt_libretro.so not built — run `cmake --build build` first"
+    );
+    assert!(
+        libretro_runner().exists(),
+        "blyt-libretro-runner not built — run `cmake --build build` first \
+         (requires RV32 toolchain for LIBBLYTC_OUT)"
+    );
+}
+
 // -------------------------------------------------------------------------
 // Cart build helpers
 // -------------------------------------------------------------------------

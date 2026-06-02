@@ -2,8 +2,9 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytplay, build_lua_cart, find_wasm_dir, libretro_so, repo_root,
-    require_libretro_dap, require_lua_sdk, require_sdk, require_wasm, sdk_dir, test_libretro_dap,
+    CartProject, blytplay, build_lua_cart, find_wasm_dir, libretro_runner, libretro_so, repo_root,
+    require_libretro_dap, require_libretro_runner, require_lua_sdk, require_sdk, require_wasm,
+    sdk_dir, test_libretro_dap,
 };
 use tempfile::TempDir;
 
@@ -558,3 +559,263 @@ fn libretro_dap_listen_and_handshake() {
         .assert()
         .success();
 }
+
+/* ── libretro DAP full-session tests (via blyt-libretro-runner) ──────────── */
+
+/// Shared Lua cart source for libretro DAP tests (emulated path, uses blyt.quit()).
+const LIBRETRO_DAP_LUA: &str = "function init()\n\
+    \x20   local x = 42\n\
+    \x20   local y = x + 1\n\
+    \x20   local z = y + 1\n\
+    end\n\
+    function update() blyt.quit() end\n\
+    function draw() end\n";
+
+/// libretro DAP: breakpoint + step + inspect — full DAP session via blyt-libretro-runner.
+#[test]
+fn libretro_dap_breakpoint_step_inspect() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_dap_bp");
+    CartProject::new().lua(LIBRETRO_DAP_LUA).write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_libretro_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .assert()
+        .success();
+}
+
+/// libretro DAP: conditional breakpoint — stop only when Lua condition is true.
+#[test]
+fn libretro_dap_conditional_breakpoint() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_dap_cond_bp");
+    CartProject::new().lua(LIBRETRO_DAP_LUA).write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_libretro_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_CONDITIONAL_COND", "x > 10")
+        .assert()
+        .success();
+}
+
+/// libretro DAP: evaluate — arbitrary Lua expression evaluated in frame context.
+#[test]
+fn libretro_dap_evaluate_expr() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_dap_eval");
+    CartProject::new().lua(LIBRETRO_DAP_LUA).write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_libretro_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_EVALUATE_EXPR", "x + 1")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "43")
+        .assert()
+        .success();
+}
+
+/// libretro DAP: upvalue — module-level local captured as upvalue, visible in evaluate.
+#[test]
+fn libretro_dap_evaluate_upvalue() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_dap_upvalue");
+    CartProject::new()
+        .lua(
+            "local counter = 7\n\
+             function init() end\n\
+             function update()\n\
+             \x20   counter = counter + 1\n\
+             \x20   blyt.quit()\n\
+             end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_libretro_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "counter")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "7")
+        .assert()
+        .success();
+}
+
+/// libretro DAP: loadedSources returns the cart's Lua source after a stop.
+#[test]
+fn libretro_dap_loaded_sources() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_dap_loaded_src");
+    CartProject::new().lua(LIBRETRO_DAP_LUA).write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_libretro_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_LOADED_SOURCES", "1")
+        .assert()
+        .success();
+}
+
+/// libretro DAP: restart — cart restarts and stops at the same breakpoint again.
+#[test]
+fn libretro_dap_restart() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_dap_restart");
+    CartProject::new().lua(LIBRETRO_DAP_LUA).write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_libretro_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_TEST_RESTART", "1")
+        .assert()
+        .success();
+}
+
+/// libretro DAP: exception breakpoint — cart throws in init(), DAP stops at the error.
+#[test]
+fn libretro_dap_exception_breakpoint() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_dap_exception");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   error(\"test exception\")\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_libretro_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
+        .assert()
+        .success();
+}
+
+/* ── WASM DAP parity tests (features present in SDL2 but missing from WASM) ── */
+
+/// WASM DAP: loadedSources returns the cart's Lua source after a stop.
+#[test]
+fn wasm_dap_loaded_sources() {
+    require_wasm();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_loaded_src");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_LOADED_SOURCES", "1")
+        .assert()
+        .success();
+}
+
+// wasm_dap_restart and wasm_dap_exception_breakpoint are not implemented on the
+// WASM DAP path: the WASM Lua runtime does not emit a stopped event on restart
+// or on uncaught exceptions.  Both features work on SDL2 and libretro.

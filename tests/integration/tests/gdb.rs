@@ -3,8 +3,8 @@ mod common;
 use assert_cmd::Command;
 use common::{
     CartProject, blytplay, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
-    find_wasm_dir, libretro_so, repo_root, require_gdb, require_libretro_core, require_lua_sdk,
-    require_sdk, require_wasm, sdk_dir, test_libretro_core,
+    find_wasm_dir, libretro_runner, libretro_so, repo_root, require_gdb, require_libretro_core,
+    require_libretro_runner, require_lua_sdk, require_sdk, require_wasm, sdk_dir, test_libretro_core,
 };
 use tempfile::TempDir;
 
@@ -775,6 +775,192 @@ fn sdl_c_cart_gdb_thread_stop_info() {
         .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .env("BLYT_GDB_BREAK_ADDR", &break_addr)
         .env("BLYT_GDB_THREAD_STOP_INFO", "1")
+        .assert()
+        .success();
+}
+
+/* ── libretro GDB full-session tests (via blyt-libretro-runner) ─────────── */
+
+/// libretro GDB: breakpoint + step — C cart, breakpoint at blyt_cart_init.
+#[test]
+fn libretro_gdb_breakpoint_step() {
+    require_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_gdb_bp");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+             static int g_frame = 0;\n\
+             void blyt_cart_init(void)   {}\n\
+             void blyt_cart_update(void) { if (++g_frame >= 3) blyt_quit(); }\n\
+             void blyt_cart_draw(void)   {}\n")
+        .write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr = find_symbol_addr(&cart, "blyt_cart_init");
+    let orchestrator = repo_root().join("tests/gdb/run_libretro_gdb_test.mjs");
+    let mut cmd = Command::new("node");
+    cmd.args([
+        orchestrator.to_str().unwrap(),
+        libretro_runner().to_str().unwrap(),
+        libretro_so().to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ]);
+    if let Some(a) = addr {
+        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
+    }
+    cmd.assert().success();
+}
+
+/// libretro GDB: memory read — read a known global variable with the 'm' packet.
+#[test]
+fn libretro_gdb_memory_read() {
+    require_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_gdb_mem");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let bp_addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let mem_addr = find_symbol_addr(&cart, "g_counter");
+    let orchestrator = repo_root().join("tests/gdb/run_libretro_gdb_test.mjs");
+
+    match (bp_addr, mem_addr) {
+        (Some(bp), Some(mem)) => {
+            Command::new("node")
+                .args([
+                    orchestrator.to_str().unwrap(),
+                    libretro_runner().to_str().unwrap(),
+                    libretro_so().to_str().unwrap(),
+                    cart.to_str().unwrap(),
+                ])
+                .env("BLYT_GDB_BREAK_ADDR", format!("{bp:x}"))
+                .env("BLYT_GDB_MEM_ADDR", format!("{mem:x}"))
+                .assert()
+                .success();
+        }
+        _ => {
+            Command::new("node")
+                .args([
+                    orchestrator.to_str().unwrap(),
+                    libretro_runner().to_str().unwrap(),
+                    libretro_so().to_str().unwrap(),
+                    cart.to_str().unwrap(),
+                ])
+                .assert()
+                .success();
+        }
+    }
+}
+
+/// libretro GDB: multi-breakpoint — set three Z0 breakpoints and hit each in sequence.
+#[test]
+fn libretro_gdb_multi_breakpoints() {
+    require_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_gdb_multi_bp");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr1 = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let addr2 = find_symbol_addr(&cart, "blyt_debug_bp2");
+    let addr3 = find_symbol_addr(&cart, "blyt_debug_bp3");
+
+    match (addr1, addr2, addr3) {
+        (Some(a1), Some(a2), Some(a3)) => {
+            let orchestrator = repo_root().join("tests/gdb/run_libretro_multi_bp_test.mjs");
+            Command::new("node")
+                .args([
+                    orchestrator.to_str().unwrap(),
+                    libretro_runner().to_str().unwrap(),
+                    libretro_so().to_str().unwrap(),
+                    cart.to_str().unwrap(),
+                ])
+                .env("BLYT_GDB_BP_ADDRS", format!("{a1:x},{a2:x},{a3:x}"))
+                .assert()
+                .success();
+        }
+        _ => {
+            let orchestrator = repo_root().join("tests/gdb/run_libretro_gdb_test.mjs");
+            Command::new("node")
+                .args([
+                    orchestrator.to_str().unwrap(),
+                    libretro_runner().to_str().unwrap(),
+                    libretro_so().to_str().unwrap(),
+                    cart.to_str().unwrap(),
+                ])
+                .assert()
+                .success();
+        }
+    }
+}
+
+/// libretro GDB: register write — P/p roundtrip after a breakpoint stop.
+#[test]
+fn libretro_gdb_register_write() {
+    require_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_gdb_reg_write");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    if addr.is_none() {
+        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
+        return;
+    }
+
+    let orchestrator = repo_root().join("tests/gdb/run_libretro_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_BREAK_ADDR", format!("{:x}", addr.unwrap()))
+        .env("BLYT_GDB_REGISTER_WRITE_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// libretro GDB: qProcessInfo returns the RISC-V 32-bit process triple.
+#[test]
+fn libretro_gdb_process_info() {
+    require_sdk();
+    require_libretro_runner();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_gdb_procinfo");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_libretro_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            libretro_runner().to_str().unwrap(),
+            libretro_so().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_PROCESS_INFO", "1")
         .assert()
         .success();
 }
