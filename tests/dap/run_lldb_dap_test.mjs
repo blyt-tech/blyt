@@ -240,8 +240,9 @@ async function testStackTrace() {
             source: { path: `/blyt/src/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
+        const stoppedP = waitEvent('stopped', 15000);
         await send('configurationDone');
-        const ev = await waitEvent('stopped', 15000);
+        const ev = await stoppedP;
         const threadId = ev.body.threadId;
 
         /* Continue past entry stop if needed. */
@@ -276,8 +277,9 @@ async function testVariables() {
             source: { path: `/blyt/src/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
+        const stoppedP = waitEvent('stopped', 15000);
         await send('configurationDone');
-        const ev = await waitEvent('stopped', 15000);
+        const ev = await stoppedP;
 
         let stopped = ev;
         if (ev.body.reason === 'entry') {
@@ -320,8 +322,9 @@ async function testSourceMap() {
             source: { path: `/blyt/src/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
+        const stoppedP = waitEvent('stopped', 15000);
         await send('configurationDone');
-        const ev = await waitEvent('stopped', 15000);
+        const ev = await stoppedP;
 
         let stopped = ev;
         if (ev.body.reason === 'entry') {

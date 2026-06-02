@@ -24,7 +24,7 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/llvm-22.list
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libsdl2-dev \
-            clang-22 lld-22 llvm-22 \
+            clang-22 lld-22 llvm-22 lldb-22 \
             qemu-system-misc gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
             libc6-dev-riscv64-cross libgcc-s1-riscv64-cross
           sudo update-alternatives --install /usr/bin/clang        clang        /usr/bin/clang-22        100
@@ -32,6 +32,7 @@ jobs:
           sudo update-alternatives --install /usr/bin/ld.lld        ld.lld        /usr/bin/ld.lld-22        100
           sudo update-alternatives --install /usr/bin/llvm-objcopy  llvm-objcopy  /usr/bin/llvm-objcopy-22  100
           sudo update-alternatives --install /usr/bin/llvm-ar       llvm-ar       /usr/bin/llvm-ar-22       100
+          sudo update-alternatives --install /usr/bin/lldb-dap      lldb-dap      /usr/bin/lldb-dap-22      100
           pip3 install clang-format==22.1.5 cmakelang yamllint
           rustup target add riscv32imafc-unknown-none-elf
 

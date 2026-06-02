@@ -102,7 +102,7 @@ fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::pat
             test_name,
         ])
         .env("BLYT_GDB_BREAK_LINE", BREAK_LINE.to_string())
-        .env("BLYT_SOURCE_FILE", "main.c")
+        .env("BLYT_SOURCE_FILE", "src/game/c/main.c")
         .timeout(Duration::from_secs(30))
         .assert();
 

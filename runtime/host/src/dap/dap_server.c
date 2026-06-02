@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -642,6 +643,12 @@ static void *dap_thread_main(void *arg) {
     (void)arg;
     static char buf[MAX_MSG];
     while (g_dap.running) {
+        /* poll() with a short timeout so the running flag is checked periodically.
+         * close(listen_fd) does not reliably interrupt a blocked accept() on
+         * Linux, so we poll-then-accept to allow clean shutdown without races. */
+        struct pollfd pfd = {.fd = g_dap.listen_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 100) <= 0)
+            continue;
         struct sockaddr_in cli;
         socklen_t cl = sizeof cli;
         int fd = accept(g_dap.listen_fd, (struct sockaddr *)&cli, &cl);

@@ -199,7 +199,6 @@ if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblytcommon.so")
 endif()
 
-message(STATUS "Building libblytc.so…")
 # libblytc.so — trimmed musl-based C library (ADR-0120). Curated musl source
 # subsets + our arena allocator and internal stubs.
 set(MUSL_DIR "${BLYT_SOURCE_DIR}/third_party/musl")
@@ -303,12 +302,17 @@ set(LIBBLYTC_CFLAGS
     -Wno-unused-variable
     -Wno-deprecated-non-prototype)
 
-execute_process(
-  COMMAND "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-          -Wl,-soname,libblytc.so -o "${SDK_LIB}/libblytc.so" ${LIBBLYTC_SRCS}
-  RESULT_VARIABLE R)
-if(NOT R EQUAL 0)
-  message(FATAL_ERROR "Failed to build libblytc.so")
+if(NOT EXISTS "${SDK_LIB}/libblytc.so")
+  message(STATUS "Building libblytc.so…")
+  execute_process(
+    COMMAND "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
+            -Wl,-soname,libblytc.so -o "${SDK_LIB}/libblytc.so" ${LIBBLYTC_SRCS}
+    RESULT_VARIABLE R)
+  if(NOT R EQUAL 0)
+    message(FATAL_ERROR "Failed to build libblytc.so")
+  endif()
+else()
+  message(STATUS "libblytc.so already built — skipping")
 endif()
 
 message(STATUS "Building libblyt32.so…")
@@ -804,6 +808,9 @@ if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build blyt devtool")
 endif()
 file(COPY "${_cargo_target_dir}/debug/blyt" DESTINATION "${SDK_BIN}")
+
+# Copy Rust SDK crate so blyt can find it via sdk_root_from_exe().
+file(COPY "${BLYT_SOURCE_DIR}/sdk/rust" DESTINATION "${SDK_DIR}")
 
 # Expose toolchain binaries under blyt-prefixed names in bin/.
 #
