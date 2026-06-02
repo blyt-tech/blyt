@@ -243,11 +243,20 @@ static int gdb_set_bp(uint32_t addr) {
     }
     uint32_t orig_word = (uint32_t)orig[0] | ((uint32_t)orig[1] << 8) | ((uint32_t)orig[2] << 16) |
                          ((uint32_t)orig[3] << 24);
-    /* Patch ebreak = 0x00100073. */
-    static const uint8_t ebreak[4] = {0x73, 0x00, 0x10, 0x00};
-    if (gdb_write_mem(addr, ebreak, 4) != 4) {
-        pthread_mutex_unlock(&g_bp_mutex);
-        return -1;
+    /* Use C.EBREAK (2-byte) for compressed instructions to avoid overwriting adjacent bytes. */
+    bool is_compressed = (orig_word & 0x3) != 0x3;
+    if (is_compressed) {
+        static const uint8_t cebreak[2] = {0x02, 0x90}; /* C.EBREAK = 0x9002 */
+        if (gdb_write_mem(addr, cebreak, 2) != 2) {
+            pthread_mutex_unlock(&g_bp_mutex);
+            return -1;
+        }
+    } else {
+        static const uint8_t ebreak[4] = {0x73, 0x00, 0x10, 0x00};
+        if (gdb_write_mem(addr, ebreak, 4) != 4) {
+            pthread_mutex_unlock(&g_bp_mutex);
+            return -1;
+        }
     }
     s->gdb_bps[s->gdb_nbp].addr = addr;
     s->gdb_bps[s->gdb_nbp].original_word = orig_word;
@@ -266,7 +275,8 @@ static int gdb_clear_bp(uint32_t addr) {
             uint32_t w = s->gdb_bps[i].original_word;
             uint8_t bytes[4] = {(uint8_t)w, (uint8_t)(w >> 8), (uint8_t)(w >> 16),
                                 (uint8_t)(w >> 24)};
-            gdb_write_mem(addr, bytes, 4);
+            bool compressed = (w & 0x3) != 0x3;
+            gdb_write_mem(addr, bytes, compressed ? 2 : 4);
             /* Remove entry by shifting. */
             for (int j = i; j + 1 < s->gdb_nbp; j++)
                 s->gdb_bps[j] = s->gdb_bps[j + 1];
