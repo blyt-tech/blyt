@@ -1018,8 +1018,9 @@ void fc_dap_emit_loaded_source(const char *source_path) {
 }
 
 int fc_dap_is_restart_pending(void) {
-    /* WASM: no session restart; fc_dap_handle_restart() only resets DAP state. */
-    return 0;
+    int v = g_wdap.restart_pending;
+    g_wdap.restart_pending = 0;
+    return v;
 }
 
 int fc_dap_get_condition(char *buf, size_t n) {

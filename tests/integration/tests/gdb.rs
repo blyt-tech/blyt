@@ -4,7 +4,8 @@ use assert_cmd::Command;
 use common::{
     CartProject, blytplay, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
     find_wasm_dir, libretro_runner, libretro_so, repo_root, require_gdb, require_libretro_core,
-    require_libretro_runner, require_lua_sdk, require_sdk, require_wasm, sdk_dir, test_libretro_core,
+    require_libretro_runner, require_lua_sdk, require_sdk, require_wasm, sdk_dir,
+    test_libretro_core,
 };
 use tempfile::TempDir;
 

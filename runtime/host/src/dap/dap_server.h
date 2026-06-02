@@ -107,6 +107,11 @@ int fc_dap_exception_filter(void);
  * Returns 1 if the debugger paused; 0 if execution should continue normally. */
 int fc_dap_on_exception(const char *msg, int is_uncaught);
 
+/* Convenience wrapper: reads the error message from the top of L's stack and
+ * calls fc_dap_on_exception.  Returns 1 if the debugger paused. */
+struct lua_State;
+int blyt_dap_report_exception(struct lua_State *L, int is_uncaught);
+
 #ifdef __cplusplus
 }
 #endif

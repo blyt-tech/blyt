@@ -816,6 +816,71 @@ fn wasm_dap_loaded_sources() {
         .success();
 }
 
-// wasm_dap_restart and wasm_dap_exception_breakpoint are not implemented on the
-// WASM DAP path: the WASM Lua runtime does not emit a stopped event on restart
-// or on uncaught exceptions.  Both features work on SDL2 and libretro.
+/// WASM DAP: restart — cart restarts and stops at the same breakpoint again.
+#[test]
+fn wasm_dap_restart() {
+    require_wasm();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_restart");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_TEST_RESTART", "1")
+        .assert()
+        .success();
+}
+
+/// WASM DAP: exception breakpoint — cart throws in init(), DAP stops at the error.
+#[test]
+fn wasm_dap_exception_breakpoint() {
+    require_wasm();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_exception");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   error(\"test exception\")\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
+        .assert()
+        .success();
+}

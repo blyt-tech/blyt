@@ -31,8 +31,7 @@
 
 /* ── Log callback ───────────────────────────────────────────────────────── */
 
-static void RETRO_CALLCONV runner_log(enum retro_log_level level,
-                                      const char *fmt, ...) {
+static void RETRO_CALLCONV runner_log(enum retro_log_level level, const char *fmt, ...) {
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
@@ -60,25 +59,38 @@ static bool env_cb(unsigned cmd, void *data) {
 }
 
 static void video_refresh(const void *d, unsigned w, unsigned h, size_t p) {
-    (void)d; (void)w; (void)h; (void)p;
+    (void)d;
+    (void)w;
+    (void)h;
+    (void)p;
 }
-static void audio_sample(int16_t l, int16_t r) { (void)l; (void)r; }
-static size_t audio_batch(const int16_t *d, size_t f) { (void)d; return f; }
-static void input_poll(void) {}
+static void audio_sample(int16_t l, int16_t r) {
+    (void)l;
+    (void)r;
+}
+static size_t audio_batch(const int16_t *d, size_t f) {
+    (void)d;
+    return f;
+}
+static void input_poll(void) {
+}
 static int16_t input_state(unsigned p, unsigned d, unsigned i, unsigned id) {
-    (void)p; (void)d; (void)i; (void)id; return 0;
+    (void)p;
+    (void)d;
+    (void)i;
+    (void)id;
+    return 0;
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr,
-                "usage: blyt-libretro-runner <blyt_libretro.so> <cart.blyt>\n"
-                "\n"
-                "Environment:\n"
-                "  BLYT_DAP_PORT=0  enable DAP debug server\n"
-                "  BLYT_GDB_PORT=0  enable GDB debug server\n");
+        fprintf(stderr, "usage: blyt-libretro-runner <blyt_libretro.so> <cart.blyt>\n"
+                        "\n"
+                        "Environment:\n"
+                        "  BLYT_DAP_PORT=0  enable DAP debug server\n"
+                        "  BLYT_GDB_PORT=0  enable GDB debug server\n");
         return 1;
     }
 
@@ -88,12 +100,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-#define LOAD(name)                                                            \
-    __typeof__(name) *p_##name = (__typeof__(name) *)dlsym(lib, #name);       \
-    if (!p_##name) {                                                          \
-        fprintf(stderr, "dlsym(%s): %s\n", #name, dlerror());                 \
-        dlclose(lib);                                                         \
-        return 1;                                                             \
+#define LOAD(name)                                                                                 \
+    __typeof__(name) *p_##name = (__typeof__(name) *)dlsym(lib, #name);                            \
+    if (!p_##name) {                                                                               \
+        fprintf(stderr, "dlsym(%s): %s\n", #name, dlerror());                                      \
+        dlclose(lib);                                                                              \
+        return 1;                                                                                  \
     }
 
     LOAD(retro_set_environment)
@@ -110,12 +122,9 @@ int main(int argc, char *argv[]) {
 #undef LOAD
 
     /* blyt-specific non-standard exports. */
-    bool (*p_is_done)(void) =
-        (bool (*)(void))dlsym(lib, "blyt_libretro_is_done");
-    bool (*p_dap_wait)(void) =
-        (bool (*)(void))dlsym(lib, "blyt_libretro_dap_wait_ready");
-    bool (*p_gdb_wait)(void) =
-        (bool (*)(void))dlsym(lib, "blyt_libretro_gdb_wait_attached");
+    bool (*p_is_done)(void) = (bool (*)(void))dlsym(lib, "blyt_libretro_is_done");
+    bool (*p_dap_wait)(void) = (bool (*)(void))dlsym(lib, "blyt_libretro_dap_wait_ready");
+    bool (*p_gdb_wait)(void) = (bool (*)(void))dlsym(lib, "blyt_libretro_gdb_wait_attached");
 
     if (!p_is_done) {
         fprintf(stderr, "dlsym(blyt_libretro_is_done): %s\n", dlerror());

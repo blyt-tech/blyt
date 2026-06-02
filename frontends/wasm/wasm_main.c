@@ -252,6 +252,30 @@ static void wasm_lua_loop(void) {
      * Must be called outside the Lua hook to avoid interfering with step state. */
     fc_dap_poll_messages();
 
+    if (fc_dap_is_restart_pending()) {
+        /* Release old coroutine and start a fresh one from the same g_lua state.
+         * Cart globals (init/update/draw) are still registered; the new coroutine
+         * calls init() again from the top. */
+        if (g_lua_co_ref != LUA_NOREF) {
+            luaL_unref(g_lua, LUA_REGISTRYINDEX, g_lua_co_ref);
+            g_lua_co_ref = LUA_NOREF;
+        }
+        g_lua_co = lua_newthread(g_lua);
+        g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
+        static const char co_body[] = "init() "
+                                      "while true do "
+                                      "  update() "
+                                      "  if type(draw) == 'function' then draw() end "
+                                      "  coroutine.yield() "
+                                      "end";
+        luaL_loadstring(g_lua_co, co_body);
+        g_lua_quit = false;
+        g_lua_dap_paused = false;
+        g_lua_needs_start = true; /* wait for new configurationDone */
+        blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+        return;
+    }
+
     /* If DAP is active, wait for the client to finish configuration (setBreakpoints,
      * configurationDone) before calling init() and starting the game. */
     if (g_lua_needs_start) {
@@ -313,6 +337,15 @@ static void wasm_lua_loop(void) {
          * anything else = Lua error. */
         if (status != LUA_OK) {
             const char *msg = lua_tostring(g_lua_co, -1);
+#ifdef BLYT_DAP
+            if (blyt_dap_report_exception(g_lua_co, 1)) {
+                /* Exception breakpoint active: pause for DAP inspect, quit on continue. */
+                g_lua_dap_paused = true;
+                g_lua_quit = true;
+                blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+                return;
+            }
+#endif
             blyt_js_error(msg ? msg : "Lua runtime error");
         }
         g_lua_quit = true;

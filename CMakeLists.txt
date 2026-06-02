@@ -1035,8 +1035,8 @@ if(LIBBLYTC_OUT)
 
   # blyt-libretro-runner: general-purpose libretro frontend for debug test
   # orchestration.  Echoes port announcements to stdout so that
-  # run_libretro_dap_test.mjs / run_libretro_gdb_test.mjs can parse them
-  # with the same regex used for blytplay.
+  # run_libretro_dap_test.mjs / run_libretro_gdb_test.mjs can parse them with
+  # the same regex used for blytplay.
   add_executable(blyt-libretro-runner frontends/libretro/runner.c)
   target_include_directories(blyt-libretro-runner
                              PRIVATE third_party/libretro-common/include)
