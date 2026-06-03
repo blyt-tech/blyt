@@ -660,6 +660,9 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
     const Elf32_Shdr *sect_dynsym = NULL;
     const Elf32_Shdr *sect_dynstr_sh = NULL;
 
+    int has_dwarf = 0;     /* set when a .debug_* section is present (ADR-0129) */
+    int cart_is_debug = 0; /* .cart.info `debug` flag (read below) */
+
     for (uint16_t i = 0; i < eh->e_shnum; i++) {
         const Elf32_Shdr *sh = &shdrs[i];
 
@@ -681,6 +684,8 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
             }
         }
 
+        if (strncmp(name, ".debug_", 7) == 0 || strncmp(name, ".zdebug_", 8) == 0)
+            has_dwarf = 1;
         if (strcmp(name, ".cart.info") == 0)
             sect_cart_info = sh;
         if (strcmp(name, ".cart.config") == 0)
@@ -832,6 +837,8 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         uint16_t api_major = (verify_result == flatcc_verify_ok && info)
                                  ? blyt_CartInfo_api_version_major(info)
                                  : BLYT_API_VERSION_MAJOR + 1;
+        if (verify_result == flatcc_verify_ok && info)
+            cart_is_debug = blyt_CartInfo_debug(info) ? 1 : 0;
         free(fb_aligned);
 
         if (verify_result != flatcc_verify_ok) {
@@ -931,6 +938,8 @@ success: {
     cart->fd = fd;
     cart->map = map;
     cart->map_size = map_size;
+    cart->is_debug = cart_is_debug;
+    cart->has_dwarf = has_dwarf;
     cart->path = strdup(path);
     if (!cart->path) {
         free(cart);
@@ -961,6 +970,14 @@ const void *blyt_cart_find_section(const blyt_cart_t *cart, const char *name, si
         }
     }
     return NULL;
+}
+
+int blyt_cart_is_debug(const blyt_cart_t *cart) {
+    return cart ? cart->is_debug : 0;
+}
+
+int blyt_cart_has_dwarf(const blyt_cart_t *cart) {
+    return cart ? cart->has_dwarf : 0;
 }
 
 void blyt_cart_close(blyt_cart_t *cart) {

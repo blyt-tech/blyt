@@ -9,6 +9,7 @@ table CartInfo {
     title:             string;
     author:            string;
     console:           string;  // "blyt32", "blytty", etc.; defaults to "blyt32" if absent
+    debug:             bool;     // true for `blyt build --debug` carts (DWARF, unstripped); ADR-0129
 }
 
 root_type CartInfo;

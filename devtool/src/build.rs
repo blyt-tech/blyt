@@ -3,17 +3,44 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::cart_info_generated::blyt::{CartInfo, CartInfoArgs};
+use flatbuffers::FlatBufferBuilder;
+
 /* -------------------------------------------------------------------------
- * .cart.info section data
+ * .cart.info section data (ADR-0073, ADR-0129)
  *
- * 8-byte preamble (ADR-0073): "CINF" + format_major(u16le=0) + format_minor(u16le=0)
- * followed by the FlatBuffers CartInfo table with api_version_major=0 and
- * api_version_minor=0 (12 bytes as produced by flatcc for this schema).
+ * 8-byte preamble: "CINF" + format_major(u16le=0) + format_minor(u16le=0),
+ * followed by a FlatBuffers CartInfo table.  The body is written with the
+ * `flatbuffers` crate from schemas/cart_info.fbs; the runtime reads it with the
+ * flatcc-generated reader — the wire format is identical for both codegens.
+ *
+ * `debug` records whether this is a `blyt build --debug` cart (DWARF, unstripped).
+ * api_version_major/minor stay 0/0 (validated at load); title/author/console are
+ * left unset for now — wire them from blyt.info.yaml when that file grows fields.
  * ------------------------------------------------------------------------- */
-const CART_INFO: &[u8] = &[
-    b'C', b'I', b'N', b'F', 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0xfc, 0xff, 0xff, 0xff,
-    0x04, 0x00, 0x04, 0x00,
-];
+fn cart_info_bytes(debug: bool) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let info = CartInfo::create(
+        &mut fbb,
+        &CartInfoArgs {
+            api_version_major: 0,
+            api_version_minor: 0,
+            title: None,
+            author: None,
+            console: None,
+            debug,
+        },
+    );
+    fbb.finish(info, None);
+    let body = fbb.finished_data();
+
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(b"CINF");
+    out.extend_from_slice(&0u16.to_le_bytes()); // format_major
+    out.extend_from_slice(&0u16.to_le_bytes()); // format_minor
+    out.extend_from_slice(body);
+    out
+}
 
 /* -------------------------------------------------------------------------
  * Linker script (ADR-0024, ADR-0112)
@@ -175,16 +202,19 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         CartLanguage::Rust => {}
     }
 
-    // Compute debug flags once; passed to all compile_c/compile_cpp invocations
-    // for user source files.  Generated stubs (_blyt_entry.c etc.) are excluded.
-    let debug_c_flags: Vec<String> = if debug {
+    // Per-variant optimisation/debug flags, computed once and passed to every
+    // compile_c/compile_cpp invocation for user source files (generated stubs
+    // like _blyt_entry.c are excluded).  Debug: -O0 -g + path remap for clean
+    // stepping.  Release: -O2 (ADR-0129).  Determinism flags (ADR-0007) live in
+    // compile_c/compile_cpp and apply to both variants, so -O2 must not drop them.
+    let opt_c_flags: Vec<String> = if debug {
         vec![
             "-g".to_string(),
             "-O0".to_string(),
             format!("-ffile-prefix-map={}=/blyt/src", project_dir.display()),
         ]
     } else {
-        vec![]
+        vec!["-O2".to_string()]
     };
     // -C opt-level=0 mirrors the C path's -O0 so cart Rust *and* the std crates
     // rebuilt by build-std step cleanly line-by-line (no inlining / reordering /
@@ -222,7 +252,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             name,
             &sdk_include,
             &lua_lib_defines,
-            &debug_c_flags,
+            &opt_c_flags,
         )?);
     }
     let lib_include_paths: Vec<PathBuf> =
@@ -261,7 +291,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     fs::write(&ld_script, LINKER_SCRIPT)?;
 
     let cart_info_file = build_dir.join("cart.info.bin");
-    fs::write(&cart_info_file, CART_INFO)?;
+    fs::write(&cart_info_file, cart_info_bytes(debug))?;
 
     /* Generate the cart entry point stub.  _blyt_entry is the ELF e_entry:
      *   - On native RISC-V hardware: ld.so jumps here after loading
@@ -334,7 +364,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                     &sdk_include,
                     &lib_include_refs,
                     &[],
-                    &debug_c_flags,
+                    &opt_c_flags,
                 )?);
             }
             None
@@ -379,7 +409,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                     &sdk_include,
                     &libcxx_include,
                     &lib_include_refs,
-                    &debug_c_flags,
+                    &opt_c_flags,
                 )?);
             }
             None
@@ -450,7 +480,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                         &sdk_include,
                         &lib_include_refs,
                         &lua_lib_defines,
-                        &debug_c_flags,
+                        &opt_c_flags,
                     )?);
                 }
             }
@@ -479,7 +509,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                             &sdk_include,
                             &libcxx_include,
                             &lib_include_refs,
-                            &debug_c_flags,
+                            &opt_c_flags,
                         )?);
                     }
                 }
@@ -526,7 +556,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
 
     let output_path = output
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_output(project_dir));
+        .unwrap_or_else(|| default_output(project_dir, debug));
 
     let lua_bytecode_path = if language == CartLanguage::Lua {
         Some(build_dir.join("bytecode.luac"))
@@ -541,9 +571,10 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             &cart_info_file,
             &output_path,
             &[(".cart.lua", bytecode.as_path())],
+            debug,
         )?;
     } else {
-        finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path, &[])?;
+        finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path, &[], debug)?;
     }
 
     println!("built: {}", output_path.display());
@@ -603,12 +634,19 @@ pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, B
     Ok(built.archive)
 }
 
-fn default_output(project_dir: &Path) -> PathBuf {
+fn default_output(project_dir: &Path, debug: bool) -> PathBuf {
     let name = project_dir
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("cart");
-    project_dir.join("build").join(format!("{name}.blyt"))
+    // ADR-0129: debug carts get a `.dbg.blyt` suffix so they never collide with
+    // a release `.blyt` and so `blyt debug` / tooling can tell them apart.
+    let file = if debug {
+        format!("{name}.dbg.blyt")
+    } else {
+        format!("{name}.blyt")
+    };
+    project_dir.join("build").join(file)
 }
 
 /* -------------------------------------------------------------------------
@@ -1493,7 +1531,12 @@ fn link_cart(
 /* -------------------------------------------------------------------------
  * Cart finalisation: inject .cart.info, strip toolchain metadata
  *
- * .riscv.attributes and .comment are toolchain metadata with no runtime use.
+ * .riscv.attributes and .comment are toolchain metadata with no runtime use and
+ * are stripped from both variants.
+ *
+ * Release carts (ADR-0129) are additionally fully stripped: DWARF (.debug_*) and
+ * the symbol table (.symtab/.strtab) are removed so distributables carry zero
+ * debug machinery.  Debug carts keep everything for source-level debugging.
  * ------------------------------------------------------------------------- */
 
 fn finalise_cart(
@@ -1502,6 +1545,7 @@ fn finalise_cart(
     cart_info_file: &Path,
     output: &Path,
     extra_sections: &[(&str, &Path)],
+    debug: bool,
 ) -> Result<(), BuildError> {
     let mut cmd = Command::new(objcopy);
     cmd.arg("--add-section")
@@ -1516,9 +1560,18 @@ fn finalise_cart(
             .arg(format!("{name}=alloc,readonly"));
     }
 
+    cmd.arg("--remove-section=.riscv.attributes")
+        .arg("--remove-section=.comment");
+
+    if !debug {
+        // Full strip for release: drop DWARF + symbol table.
+        cmd.arg("--strip-debug")
+            .arg("--strip-unneeded")
+            .arg("--remove-section=.symtab")
+            .arg("--remove-section=.strtab");
+    }
+
     let status = cmd
-        .arg("--remove-section=.riscv.attributes")
-        .arg("--remove-section=.comment")
         .arg(raw_elf)
         .arg(output)
         .status()
@@ -1528,4 +1581,34 @@ fn finalise_cart(
         return Err(err("objcopy (finalise) failed"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cart_info_generated::blyt::root_as_cart_info;
+
+    // The .cart.info writer (flatbuffers crate) and the runtime reader
+    // (flatcc) share one wire format; this round-trips the writer against the
+    // matching flatbuffers reader to lock the `debug` field (ADR-0129).
+    fn read_debug(bytes: &[u8]) -> bool {
+        // Strip the 8-byte "CINF" preamble, then read the FlatBuffer body.
+        assert_eq!(&bytes[0..4], b"CINF");
+        let info = root_as_cart_info(&bytes[8..]).expect("valid CartInfo");
+        info.debug()
+    }
+
+    #[test]
+    fn cart_info_debug_flag_round_trips() {
+        assert!(read_debug(&cart_info_bytes(true)), "debug cart -> debug=true");
+        assert!(!read_debug(&cart_info_bytes(false)), "release cart -> debug=false");
+    }
+
+    #[test]
+    fn cart_info_preamble_is_well_formed() {
+        let b = cart_info_bytes(false);
+        assert_eq!(&b[0..4], b"CINF");
+        assert_eq!(&b[4..6], &[0, 0], "format_major = 0");
+        assert_eq!(&b[6..8], &[0, 0], "format_minor = 0");
+    }
 }
