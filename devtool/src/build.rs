@@ -186,9 +186,13 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     } else {
         vec![]
     };
+    // -C opt-level=0 mirrors the C path's -O0 so cart Rust *and* the std crates
+    // rebuilt by build-std step cleanly line-by-line (no inlining / reordering /
+    // <optimized out> locals).  RUSTFLAGS are appended after cargo's release
+    // profile flags, so this opt-level wins over the profile's.
     let debug_rust_flags: String = if debug {
         format!(
-            " -g --remap-path-prefix={}=/blyt/src",
+            " -g -C opt-level=0 --remap-path-prefix={}=/blyt/src",
             project_dir.display()
         )
     } else {
