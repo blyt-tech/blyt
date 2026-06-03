@@ -102,12 +102,18 @@ jobs:
         run: cmake -B build -G Ninja
 
       - name: Build
+        # Builds both player variants: blytplay (release) and blytdebug (debug,
+        # GDB/DAP) — ADR-0129.
         run: cmake --build build
 
       - name: C unit tests
         run: ctest --test-dir build --output-on-failure
 
       - name: Build SDK
+        # Assembles release + debug RV32 libs (lib/ + lib/debug/), both libc++
+        # variants, and both WASM runtimes (share/wasm + share/wasm-debug).
+        # The debug-variant builds (esp. debug libc++) roughly double SDK build
+        # time; kept in this step for now (ADR-0129).
         run: cmake --build build --target sdk
 
       - name: Cross-compile blyt_native for riscv64

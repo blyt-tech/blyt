@@ -2,9 +2,9 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytplay, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
-    find_wasm_dir, libretro_runner, libretro_so, repo_root, require_gdb, require_libretro_core,
-    require_libretro_runner, require_lua_sdk, require_sdk, require_wasm, sdk_dir,
+    CartProject, blytdebug, build_cart, build_debug_cart, build_debug_lua_cart, debug_lib_dir,
+    find_symbol_addr, find_wasm_dir, libretro_runner, libretro_so, repo_root, require_gdb,
+    require_libretro_core, require_libretro_runner, require_lua_sdk, require_sdk, require_wasm,
     test_libretro_core,
 };
 use tempfile::TempDir;
@@ -37,10 +37,10 @@ fn sdl_gdb_handshake() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .assert()
         .success();
 }
@@ -75,10 +75,10 @@ fn sdl_gdb_breakpoint_step() {
         Command::new("node")
             .args([
                 orchestrator.to_str().unwrap(),
-                blytplay().to_str().unwrap(),
+                blytdebug().to_str().unwrap(),
                 cart.to_str().unwrap(),
             ])
-            .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+            .env("BLYT_LIB_DIR", debug_lib_dir())
             .assert()
             .success();
         return;
@@ -89,10 +89,10 @@ fn sdl_gdb_breakpoint_step() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"))
         .assert()
         .success();
@@ -138,10 +138,10 @@ fn sdl_gdb_rust_cart() {
     let mut cmd = Command::new("node");
     cmd.args([
         orchestrator.to_str().unwrap(),
-        blytplay().to_str().unwrap(),
+        blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
     ])
-    .env("BLYT_LIB_DIR", sdk_dir().join("lib"));
+    .env("BLYT_LIB_DIR", debug_lib_dir());
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
     }
@@ -157,6 +157,7 @@ fn sdl_gdb_rust_cart() {
 ///
 /// Requires: blyt_libretro.so built with BLYT_GDB=ON, test_libretro_core binary.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_gdb_listen_and_handshake() {
     require_sdk();
     require_libretro_core();
@@ -328,10 +329,10 @@ function draw()   end\n";
     let mut cmd = Command::new("node");
     cmd.args([
         orchestrator.to_str().unwrap(),
-        blytplay().to_str().unwrap(),
+        blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
     ])
-    .env("BLYT_LIB_DIR", sdk_dir().join("lib"));
+    .env("BLYT_LIB_DIR", debug_lib_dir());
 
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
@@ -391,10 +392,10 @@ fn sdl_c_cart_gdb_memory_read() {
         Command::new("node")
             .args([
                 orchestrator.to_str().unwrap(),
-                blytplay().to_str().unwrap(),
+                blytdebug().to_str().unwrap(),
                 cart.to_str().unwrap(),
             ])
-            .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+            .env("BLYT_LIB_DIR", debug_lib_dir())
             .assert()
             .success();
         return;
@@ -404,10 +405,10 @@ fn sdl_c_cart_gdb_memory_read() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_BREAK_ADDR", format!("{:x}", bp_addr.unwrap()))
         .env("BLYT_GDB_MEM_ADDR", format!("{:x}", mem_addr.unwrap()))
         .assert()
@@ -442,10 +443,10 @@ fn sdl_c_cart_gdb_multi_breakpoints() {
             Command::new("node")
                 .args([
                     orchestrator.to_str().unwrap(),
-                    blytplay().to_str().unwrap(),
+                    blytdebug().to_str().unwrap(),
                     cart.to_str().unwrap(),
                 ])
-                .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+                .env("BLYT_LIB_DIR", debug_lib_dir())
                 .env("BLYT_GDB_BP_ADDRS", format!("{a1:x},{a2:x},{a3:x}"))
                 .assert()
                 .success();
@@ -456,10 +457,10 @@ fn sdl_c_cart_gdb_multi_breakpoints() {
             Command::new("node")
                 .args([
                     orchestrator.to_str().unwrap(),
-                    blytplay().to_str().unwrap(),
+                    blytdebug().to_str().unwrap(),
                     cart.to_str().unwrap(),
                 ])
-                .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+                .env("BLYT_LIB_DIR", debug_lib_dir())
                 .assert()
                 .success();
         }
@@ -489,10 +490,10 @@ fn sdl_c_cart_gdb_detach() {
     let mut cmd = Command::new("node");
     cmd.args([
         orchestrator.to_str().unwrap(),
-        blytplay().to_str().unwrap(),
+        blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
     ])
-    .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+    .env("BLYT_LIB_DIR", debug_lib_dir())
     .env("BLYT_GDB_DETACH", "1");
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
@@ -531,10 +532,10 @@ fn sdl_c_cart_gdb_interrupt() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .assert()
         .success();
 }
@@ -561,10 +562,10 @@ fn sdl_c_cart_gdb_exec_file_query() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_EXEC_FILE_CHECK", "1")
         .assert()
         .success();
@@ -593,10 +594,10 @@ fn sdl_c_cart_gdb_library_list() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_LIBRARY_CHECK", "1")
         .assert()
         .success();
@@ -665,10 +666,10 @@ fn sdl_c_cart_gdb_features_query() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_FEATURES_CHECK", "1")
         .assert()
         .success();
@@ -695,10 +696,10 @@ fn sdl_c_cart_gdb_process_info() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_PROCESS_INFO", "1")
         .assert()
         .success();
@@ -732,10 +733,10 @@ fn sdl_c_cart_gdb_register_write() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_BREAK_ADDR", &break_addr)
         .env("BLYT_GDB_REGISTER_WRITE_CHECK", "1")
         .assert()
@@ -770,10 +771,10 @@ fn sdl_c_cart_gdb_thread_stop_info() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_BREAK_ADDR", &break_addr)
         .env("BLYT_GDB_THREAD_STOP_INFO", "1")
         .assert()
@@ -784,6 +785,7 @@ fn sdl_c_cart_gdb_thread_stop_info() {
 
 /// libretro GDB: breakpoint + step — C cart, breakpoint at blyt_cart_init.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_gdb_breakpoint_step() {
     require_sdk();
     require_libretro_runner();
@@ -818,6 +820,7 @@ fn libretro_gdb_breakpoint_step() {
 
 /// libretro GDB: memory read — read a known global variable with the 'm' packet.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_gdb_memory_read() {
     require_sdk();
     require_libretro_runner();
@@ -863,6 +866,7 @@ fn libretro_gdb_memory_read() {
 
 /// libretro GDB: multi-breakpoint — set three Z0 breakpoints and hit each in sequence.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_gdb_multi_breakpoints() {
     require_sdk();
     require_libretro_runner();
@@ -909,6 +913,7 @@ fn libretro_gdb_multi_breakpoints() {
 
 /// libretro GDB: register write — P/p roundtrip after a breakpoint stop.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_gdb_register_write() {
     require_sdk();
     require_libretro_runner();
@@ -942,6 +947,7 @@ fn libretro_gdb_register_write() {
 
 /// libretro GDB: qProcessInfo returns the RISC-V 32-bit process triple.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_gdb_process_info() {
     require_sdk();
     require_libretro_runner();

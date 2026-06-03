@@ -2,9 +2,9 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytplay, build_lua_cart, find_wasm_dir, libretro_runner, libretro_so, repo_root,
-    require_libretro_dap, require_libretro_runner, require_lua_sdk, require_sdk, require_wasm,
-    sdk_dir, test_libretro_dap,
+    CartProject, blytdebug, build_lua_cart, debug_lib_dir, find_wasm_dir, libretro_runner,
+    libretro_so, repo_root, require_libretro_dap, require_libretro_runner, require_lua_sdk,
+    require_sdk, require_wasm, test_libretro_dap,
 };
 use tempfile::TempDir;
 
@@ -196,7 +196,7 @@ fn sdl_dap_breakpoint_step_inspect() {
     require_sdk();
     require_lua_sdk();
     assert!(
-        blytplay().exists(),
+        blytdebug().exists(),
         "blytplay not built — run `cmake --build build` first"
     );
 
@@ -221,10 +221,10 @@ fn sdl_dap_breakpoint_step_inspect() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .assert()
         .success();
@@ -236,7 +236,7 @@ fn sdl_dap_loaded_sources() {
     require_sdk();
     require_lua_sdk();
     assert!(
-        blytplay().exists(),
+        blytdebug().exists(),
         "blytplay not built — run `cmake --build build` first"
     );
 
@@ -261,10 +261,10 @@ fn sdl_dap_loaded_sources() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .env("BLYT_DAP_LOADED_SOURCES", "1")
         .assert()
@@ -279,7 +279,7 @@ fn sdl_dap_conditional_breakpoint() {
     require_sdk();
     require_lua_sdk();
     assert!(
-        blytplay().exists(),
+        blytdebug().exists(),
         "blytplay not built — run `cmake --build build` first"
     );
 
@@ -304,10 +304,10 @@ fn sdl_dap_conditional_breakpoint() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .env("BLYT_DAP_CONDITIONAL_COND", "x > 10")
         .assert()
@@ -321,7 +321,7 @@ fn sdl_dap_restart() {
     require_sdk();
     require_lua_sdk();
     assert!(
-        blytplay().exists(),
+        blytdebug().exists(),
         "blytplay not built — run `cmake --build build` first"
     );
 
@@ -346,10 +346,10 @@ fn sdl_dap_restart() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .env("BLYT_DAP_TEST_RESTART", "1")
         .assert()
@@ -363,7 +363,7 @@ fn sdl_dap_exception_breakpoint() {
     require_sdk();
     require_lua_sdk();
     assert!(
-        blytplay().exists(),
+        blytdebug().exists(),
         "blytplay not built — run `cmake --build build` first"
     );
 
@@ -386,10 +386,10 @@ fn sdl_dap_exception_breakpoint() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
         .assert()
         .success();
@@ -403,7 +403,7 @@ fn sdl_dap_evaluate_expr() {
     require_sdk();
     require_lua_sdk();
     assert!(
-        blytplay().exists(),
+        blytdebug().exists(),
         "blytplay not built — run `cmake --build build` first"
     );
 
@@ -428,10 +428,10 @@ fn sdl_dap_evaluate_expr() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .env("BLYT_DAP_EVALUATE_EXPR", "x + 1")
         .env("BLYT_DAP_EVALUATE_EXPECT", "43")
@@ -489,7 +489,7 @@ fn sdl_dap_evaluate_upvalue() {
     require_sdk();
     require_lua_sdk();
     assert!(
-        blytplay().exists(),
+        blytdebug().exists(),
         "blytplay not built — run `cmake --build build` first"
     );
 
@@ -514,10 +514,10 @@ fn sdl_dap_evaluate_upvalue() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            blytplay().to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "4")
         .env("BLYT_DAP_EVALUATE_EXPR", "counter")
         .env("BLYT_DAP_EVALUATE_EXPECT", "7")
@@ -537,6 +537,7 @@ fn sdl_dap_evaluate_upvalue() {
 ///
 /// Requires: blyt_libretro.so, test_libretro_dap binary, and Lua SDK.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_dap_listen_and_handshake() {
     require_sdk();
     require_lua_sdk();
@@ -573,6 +574,7 @@ const LIBRETRO_DAP_LUA: &str = "function init()\n\
 
 /// libretro DAP: breakpoint + step + inspect — full DAP session via blyt-libretro-runner.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_dap_breakpoint_step_inspect() {
     require_sdk();
     require_lua_sdk();
@@ -599,6 +601,7 @@ fn libretro_dap_breakpoint_step_inspect() {
 
 /// libretro DAP: conditional breakpoint — stop only when Lua condition is true.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_dap_conditional_breakpoint() {
     require_sdk();
     require_lua_sdk();
@@ -626,6 +629,7 @@ fn libretro_dap_conditional_breakpoint() {
 
 /// libretro DAP: evaluate — arbitrary Lua expression evaluated in frame context.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_dap_evaluate_expr() {
     require_sdk();
     require_lua_sdk();
@@ -654,6 +658,7 @@ fn libretro_dap_evaluate_expr() {
 
 /// libretro DAP: upvalue — module-level local captured as upvalue, visible in evaluate.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_dap_evaluate_upvalue() {
     require_sdk();
     require_lua_sdk();
@@ -692,6 +697,7 @@ fn libretro_dap_evaluate_upvalue() {
 
 /// libretro DAP: loadedSources returns the cart's Lua source after a stop.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_dap_loaded_sources() {
     require_sdk();
     require_lua_sdk();
@@ -719,6 +725,7 @@ fn libretro_dap_loaded_sources() {
 
 /// libretro DAP: restart — cart restarts and stops at the same breakpoint again.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_dap_restart() {
     require_sdk();
     require_lua_sdk();
@@ -746,6 +753,7 @@ fn libretro_dap_restart() {
 
 /// libretro DAP: exception breakpoint — cart throws in init(), DAP stops at the error.
 #[test]
+#[ignore = "ADR-0129: libretro core is release-only; debug moved to blytdebug/WASM"]
 fn libretro_dap_exception_breakpoint() {
     require_sdk();
     require_lua_sdk();

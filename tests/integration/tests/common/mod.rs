@@ -34,6 +34,22 @@ pub fn blytplay() -> PathBuf {
     build_dir().join("blytplay")
 }
 
+/// The debug player (ADR-0129): GDB/DAP on, loads the debug guest libs.
+pub fn blytdebug() -> PathBuf {
+    build_dir().join("blytdebug")
+}
+
+/// SDK release guest-lib dir (stripped, -O2).
+pub fn lib_dir() -> PathBuf {
+    sdk_dir().join("lib")
+}
+
+/// SDK debug guest-lib dir (DWARF, with the DAP/GDB master hook) — what
+/// blytdebug and the debug WASM load (ADR-0129).
+pub fn debug_lib_dir() -> PathBuf {
+    sdk_dir().join("lib").join("debug")
+}
+
 /// Path to the `blyt` devtool binary.
 ///
 /// Uses `CARGO_BIN_EXE_blyt` when Cargo sets it (same-package tests), then
@@ -531,16 +547,17 @@ pub fn find_wasm_dir() -> PathBuf {
 // -------------------------------------------------------------------------
 
 pub fn require_gdb() {
+    // ADR-0129: GDB/DAP debugging lives in blytdebug, not the release blytplay.
     assert!(
-        blytplay().exists(),
-        "blytplay not built — run `cmake --build build` first"
+        blytdebug().exists(),
+        "blytdebug not built — run `cmake --build build` first"
     );
-    let out = std::process::Command::new(blytplay())
+    let out = std::process::Command::new(blytdebug())
         .arg("--help")
         .output()
         .unwrap_or_else(|_| {
-            // blytplay exits non-zero for --help; capture output anyway
-            std::process::Command::new(blytplay())
+            // blytdebug exits non-zero for --help; capture output anyway
+            std::process::Command::new(blytdebug())
                 .args(["--gdb", "0"])
                 .output()
                 .unwrap()
@@ -587,8 +604,9 @@ pub fn build_debug_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     }
     cmd.assert().success();
 
+    // ADR-0129: debug builds are named <name>.dbg.blyt.
     project_dir.join("build").join(format!(
-        "{}.blyt",
+        "{}.dbg.blyt",
         project_dir.file_name().unwrap().to_str().unwrap()
     ))
 }
@@ -618,8 +636,9 @@ pub fn build_debug_cart(project_dir: &std::path::Path) -> PathBuf {
     }
     cmd.assert().success();
 
+    // ADR-0129: debug builds are named <name>.dbg.blyt.
     project_dir.join("build").join(format!(
-        "{}.blyt",
+        "{}.dbg.blyt",
         project_dir.file_name().unwrap().to_str().unwrap()
     ))
 }

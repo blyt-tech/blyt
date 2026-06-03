@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytplay, build_debug_cart, find_symbol_addr, lldb_dap_bin, repo_root,
-    require_gdb, require_lldb_dap, require_sdk, sdk_dir,
+    CartProject, blytdebug, build_debug_cart, debug_lib_dir, find_symbol_addr, lldb_dap_bin,
+    repo_root, require_gdb, require_lldb_dap, require_sdk,
 };
 use std::time::Duration;
 use tempfile::TempDir;
@@ -39,9 +39,9 @@ fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::pat
 
     // Spawn blytplay --gdb 0 --headless <cart> with piped stdout/stderr so we
     // can extract the GDB port, then keep it alive for the lldb-dap session.
-    let mut blytplay_proc = std::process::Command::new(blytplay())
+    let mut blytplay_proc = std::process::Command::new(blytdebug())
         .args(["--gdb", "0", "--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
+        .env("BLYT_LIB_DIR", debug_lib_dir())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
