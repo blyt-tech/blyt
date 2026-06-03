@@ -166,6 +166,12 @@ float __floatdisf(long long a) {
     return u2f(f64_to_f32(i64_to_f64(a)));
 }
 
+/* uint64 → float (single precision) — emitted by clang at -O2 for some
+ * unsigned-64-to-float conversions in the Lua VM. */
+float __floatundisf(unsigned long long a) {
+    return u2f(f64_to_f32(ui64_to_f64(a)));
+}
+
 /* -------------------------------------------------------------------------
  * Float → int64
  * ------------------------------------------------------------------------- */

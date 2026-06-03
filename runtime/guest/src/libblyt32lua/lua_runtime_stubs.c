@@ -136,6 +136,19 @@ int fprintf(void *f, const char *fmt, ...) {
     return 0;
 }
 
+/* At -O2 clang folds fprintf(stderr, "%s", s) → fputs and single-char prints →
+ * fputc.  Mirror the fprintf stub: route text to the cart console, no-op chars. */
+int fputs(const char *s, void *f) {
+    (void)f;
+    if (blyt_console_debug)
+        blyt_console_debug(s);
+    return 0;
+}
+int fputc(int c, void *f) {
+    (void)f;
+    return c;
+}
+
 /* -------------------------------------------------------------------------
  * Excluded Lua standard library openers
  *
