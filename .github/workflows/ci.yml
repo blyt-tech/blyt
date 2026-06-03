@@ -158,3 +158,30 @@ jobs:
         run: |
           cargo build -p blyt
           cargo test --workspace
+
+      # Build every example cart with the assembled SDK to validate that the
+      # examples stay buildable. Runs last so it gates on a working SDK. The
+      # SDK-installed blyt auto-discovers its tools (blyt-clang, blyt-luac, …)
+      # and the pinned nightly for Rust carts. All examples are attempted so
+      # every failure is reported, then the step fails if any did not build.
+      - name: Build examples
+        env:
+          BLYT_SDK_DIR: ${{ github.workspace }}/build/sdk
+        run: |
+          failed=()
+          for ex in examples/*/; do
+            [ -f "${ex}blyt.info.yaml" ] || continue
+            name="${ex%/}"
+            echo "::group::blyt build ${name}"
+            if build/sdk/bin/blyt build "${ex}"; then
+              echo "ok: ${name}"
+            else
+              echo "::error::example failed to build: ${name}"
+              failed+=("${name}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Examples failed to build: ${failed[*]}"
+            exit 1
+          fi
