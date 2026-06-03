@@ -62,7 +62,11 @@ ENV RUSTUP_HOME=/opt/rustup \
     PATH=/opt/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --default-toolchain stable \
-    && rustup target add riscv32imafc-unknown-none-elf
+    && rustup target add riscv32imafc-unknown-none-elf \
+    # Cart Rust builds use -Z build-std (nightly + rust-src) to recompile
+    # core/alloc as PIC for the PIE cart ELF (ADR-0108). Keep this dated nightly
+    # in sync with CART_RUST_TOOLCHAIN in devtool/src/build.rs (and ci.yml).
+    && rustup toolchain install nightly-2026-06-01 --profile minimal --component rust-src
 
 # ── Emscripten SDK ─────────────────────────────────────────────────────────────
 RUN git clone --depth 1 https://github.com/emscripten-core/emsdk.git /opt/emsdk \
