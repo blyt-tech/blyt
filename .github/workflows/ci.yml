@@ -36,8 +36,9 @@ jobs:
           pip3 install clang-format==22.1.5 cmakelang yamllint
           # Cart Rust builds use -Z build-std (nightly + rust-src) to recompile
           # core/alloc as PIC for the PIE cart ELF (ADR-0108). The host devtool
-          # still builds on stable.
-          rustup toolchain install nightly --profile minimal --component rust-src
+          # still builds on stable. Keep this dated nightly in sync with
+          # CART_RUST_TOOLCHAIN in devtool/src/build.rs.
+          rustup toolchain install nightly-2026-06-01 --profile minimal --component rust-src
 
       - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v14

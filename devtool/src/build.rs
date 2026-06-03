@@ -902,8 +902,13 @@ const RUST_TARGET: &str = "riscv32imafc-unknown-none-elf";
 /// cargo feature, so cart Rust builds require nightly + the `rust-src`
 /// component.  The host devtool still builds on stable; only the cart cargo
 /// invocation is pinned here.  Override with `$BLYT_RUST_TOOLCHAIN`.
+///
+/// Pinned to a dated nightly for reproducible cart builds; keep this in sync
+/// with the toolchain CI installs (.github/workflows/ci.yml).
+const CART_RUST_TOOLCHAIN: &str = "nightly-2026-06-01";
+
 fn rust_toolchain() -> String {
-    std::env::var("BLYT_RUST_TOOLCHAIN").unwrap_or_else(|_| "nightly".to_string())
+    std::env::var("BLYT_RUST_TOOLCHAIN").unwrap_or_else(|_| CART_RUST_TOOLCHAIN.to_string())
 }
 
 /// Build the RUSTFLAGS for a cart Rust build.
