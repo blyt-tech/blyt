@@ -54,6 +54,7 @@ static const char *const KNOWN_SECTIONS_EXACT[] = {
     ".cart.lua",
     ".cart.layouts",
     ".lua_exports",
+    "__lcxx_override", /* libc++ replaceable global operator new/delete (C++ carts) */
     NULL,
 };
 
@@ -111,6 +112,7 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "free",
     "realloc",
     "calloc",
+    "aligned_alloc", /* C++ over-aligned operator new (libc++) */
     "abort",
 
     /* libblytc.so — string */
@@ -137,6 +139,7 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "bcopy",
     "bzero",
     "bcmp",
+    "strerror", /* libc++ std::error_code diagnostics (C++ carts) */
 
     /* libblytc.so — stdlib */
     "strtol",

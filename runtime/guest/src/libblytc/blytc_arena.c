@@ -203,3 +203,14 @@ void *calloc(size_t nmemb, size_t sz) {
         memset(p, 0, total);
     return p;
 }
+
+/* C++ over-aligned operator new (libc++ stdlib_new_delete) calls aligned_alloc.
+ * Every arena block is already BLYTC_ALIGN (16-byte) aligned, which satisfies
+ * any alignment up to 16 — covering __STDCPP_DEFAULT_NEW_ALIGNMENT__ on rv32
+ * ilp32. Larger over-alignment is unsupported: free() requires the exact
+ * malloc() pointer, so we cannot hand back an offset (interior) block. */
+void *aligned_alloc(size_t alignment, size_t size) {
+    if (alignment > BLYTC_ALIGN)
+        return NULL;
+    return malloc(size);
+}

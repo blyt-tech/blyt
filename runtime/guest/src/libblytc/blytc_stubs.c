@@ -213,3 +213,14 @@ static struct lconv c_locale_conv = {
 struct lconv *localeconv(void) {
     return &c_locale_conv;
 }
+
+/* ---- strerror stub ----
+ * libc++'s diagnostic paths (e.g. std::error_code messages) reference strerror.
+ * The cart sandbox has no errno-rich syscalls, so return a generic, non-NULL,
+ * writable static string (musl returns char*, not const char*). */
+static char strerror_msg[] = "error";
+
+char *strerror(int errnum) {
+    (void)errnum;
+    return strerror_msg;
+}

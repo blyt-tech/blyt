@@ -315,6 +315,77 @@ else()
   message(STATUS "libblytc.so already built — skipping")
 endif()
 
+# -------------------------------------------------------------------------
+# Berkeley SoftFloat for RV32 — compiler-rt soft-double/quad ABI builtins.
+#
+# clang emits calls to __adddf3/__muldf3/__divdf3/__udivdi3/__extendsfdf2/etc.
+# for any cart C/C++/Rust code doing double or 64-bit-integer arithmetic on this
+# hardware-single-float target.  musl does NOT provide these.  We compile
+# SoftFloat + softfloat_builtins.c into BOTH libblyt32.so (C/C++ carts) and
+# libblyt32lua.so (Lua carts) so every cart resolves them from the .so's .dynsym
+# — the cart_load.c import allowlist (ADR-0112) already permits these symbols.
+# Uses the same RISC-V NaN-propagation specialisation rv32emu uses on the host
+# so behaviour is bit-identical to the emulator.  Defined here (not in the Lua
+# block) so C/C++ support does not depend on the Lua submodule.
+# -------------------------------------------------------------------------
+set(SF_SRC "${BLYT_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
+if(NOT EXISTS "${SF_SRC}/f64_add.c")
+  message(
+    FATAL_ERROR
+      "third_party/rv32emu SoftFloat sources not found at ${SF_SRC}. "
+      "Run: git submodule update --init third_party/rv32emu")
+endif()
+set(SF_INC "${SF_SRC}/include")
+set(SF_PLATFORM_DIR "${BLYT_BINARY_DIR}/softfloat-rv32")
+file(MAKE_DIRECTORY "${SF_PLATFORM_DIR}")
+# Minimal platform.h: disable thread-local so softfloat_roundingMode is global.
+file(WRITE "${SF_PLATFORM_DIR}/platform.h" "#define THREAD_LOCAL\n")
+
+# Core SoftFloat: all s_*.c and f32/f64/f128/conversion files. Exclude: extF80
+# (80-bit), M-variant (multi-word array), bf16, f16.
+file(GLOB SF_ALL "${SF_SRC}/*.c")
+foreach(
+  _EXCL_PATTERN
+  "${SF_SRC}/extF80*"
+  "${SF_SRC}/*M_*"
+  "${SF_SRC}/*M.*"
+  "${SF_SRC}/bf16*"
+  "${SF_SRC}/f16*"
+  "${SF_SRC}/f32_to_extF80*"
+  "${SF_SRC}/f64_to_extF80*"
+  "${SF_SRC}/f128_to_extF80*")
+  file(GLOB _EXCL_FILES "${_EXCL_PATTERN}")
+  list(REMOVE_ITEM SF_ALL ${_EXCL_FILES})
+endforeach()
+# RISC-V NaN propagation specialisations (specialize.h declares them all).
+file(
+  GLOB
+  SF_RISCV
+  "${SF_SRC}/RISCV/s_propagateNaNF16UI.c"
+  "${SF_SRC}/RISCV/s_propagateNaNF32UI.c"
+  "${SF_SRC}/RISCV/s_propagateNaNF64UI.c"
+  "${SF_SRC}/RISCV/s_propagateNaNF128UI.c"
+  "${SF_SRC}/RISCV/s_propagateNaNExtF80UI.c"
+  "${SF_SRC}/RISCV/s_f16UIToCommonNaN.c"
+  "${SF_SRC}/RISCV/s_f32UIToCommonNaN.c"
+  "${SF_SRC}/RISCV/s_f64UIToCommonNaN.c"
+  "${SF_SRC}/RISCV/s_f128UIToCommonNaN.c"
+  "${SF_SRC}/RISCV/s_extF80UIToCommonNaN.c"
+  "${SF_SRC}/RISCV/s_commonNaNToF16UI.c"
+  "${SF_SRC}/RISCV/s_commonNaNToF32UI.c"
+  "${SF_SRC}/RISCV/s_commonNaNToF64UI.c"
+  "${SF_SRC}/RISCV/s_commonNaNToF128UI.c"
+  "${SF_SRC}/RISCV/s_commonNaNToExtF80UI.c"
+  "${SF_SRC}/RISCV/softfloat_raiseFlags.c")
+# Multi-word-array helpers needed by f128_mul even with SOFTFLOAT_FAST_INT64.
+set(SF_MWORD "${SF_SRC}/s_add256M.c" "${SF_SRC}/s_sub256M.c"
+             "${SF_SRC}/s_mul128To256M.c" "${SF_SRC}/s_shiftRightJam256M.c")
+# Shared flags/sources for any library that bakes in the soft-float builtins.
+set(SF_INCLUDES -I "${SF_INC}" -I "${SF_SRC}/RISCV" -I "${SF_PLATFORM_DIR}")
+set(SF_DEFINES -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_ROUND_ODD=1)
+set(SF_BUILTINS
+    "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/softfloat_builtins.c")
+
 message(STATUS "Building libblyt32.so…")
 # libblyt32.so (emulated path) — Blyt32 ECALL stubs.
 #
@@ -332,11 +403,15 @@ message(STATUS "Building libblyt32.so…")
 execute_process(
   COMMAND
     "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
+    ${SF_INCLUDES} ${SF_DEFINES}
     -Wl,-soname,libblyt32.so -Wl,--no-as-needed "${SDK_LIB}/libblytc.so"
     -Wl,--as-needed -o "${SDK_LIB}/libblyt32.so"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     ${LIBBLYTC_SRCS}
+    # Soft-float / 64-bit-int compiler-rt builtins (__*df3, __udivdi3, …) so
+    # C/C++ carts that do double / 64-bit math resolve them from libblyt32.so.
+    ${SF_ALL} ${SF_RISCV} ${SF_MWORD} ${SF_BUILTINS}
   RESULT_VARIABLE R)
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build libblyt32.so")
@@ -441,61 +516,11 @@ else()
   #
   # Uses LUA_MUSL_INCLUDES (not LIBBLYTC_INCLUDES) to avoid the `#define weak
   # __attribute__((__weak__))` macro in musl/src/include/ clashing with Lua's
-  # `GCObject *weak` field in lstate.h. Cross-compile Berkeley SoftFloat for
-  # RV32.
+  # `GCObject *weak` field in lstate.h.
   #
-  # All floating-point ops needed by the compiler-rt ABI (f64_add, f128_add,
-  # etc.) are implemented in SoftFloat using pure integer arithmetic.  We use
-  # the same RISCV/ NaN-propagation specialisation that rv32emu uses on the host
-  # so the behaviour is identical to what the emulator simulates.
-  set(SF_SRC "${BLYT_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
-  set(SF_INC "${SF_SRC}/include")
-  set(SF_PLATFORM_DIR "${BLYT_BINARY_DIR}/softfloat-rv32")
-  file(MAKE_DIRECTORY "${SF_PLATFORM_DIR}")
-  # Minimal platform.h: disable thread-local so softfloat_roundingMode is
-  # global.
-  file(WRITE "${SF_PLATFORM_DIR}/platform.h" "#define THREAD_LOCAL\n")
-
-  # Core SoftFloat: all s_*.c and f32/f64/f128/conversion files. Exclude: extF80
-  # (80-bit), M-variant (multi-word array), bf16, f16.
-  file(GLOB SF_ALL "${SF_SRC}/*.c")
-  foreach(
-    _EXCL_PATTERN
-    "${SF_SRC}/extF80*"
-    "${SF_SRC}/*M_*"
-    "${SF_SRC}/*M.*"
-    "${SF_SRC}/bf16*"
-    "${SF_SRC}/f16*"
-    "${SF_SRC}/f32_to_extF80*"
-    "${SF_SRC}/f64_to_extF80*"
-    "${SF_SRC}/f128_to_extF80*")
-    file(GLOB _EXCL_FILES "${_EXCL_PATTERN}")
-    list(REMOVE_ITEM SF_ALL ${_EXCL_FILES})
-  endforeach()
-  # RISC-V NaN propagation specialisations (all variants; specialize.h declares
-  # them all)
-  file(
-    GLOB
-    SF_RISCV
-    "${SF_SRC}/RISCV/s_propagateNaNF16UI.c"
-    "${SF_SRC}/RISCV/s_propagateNaNF32UI.c"
-    "${SF_SRC}/RISCV/s_propagateNaNF64UI.c"
-    "${SF_SRC}/RISCV/s_propagateNaNF128UI.c"
-    "${SF_SRC}/RISCV/s_propagateNaNExtF80UI.c"
-    "${SF_SRC}/RISCV/s_f16UIToCommonNaN.c"
-    "${SF_SRC}/RISCV/s_f32UIToCommonNaN.c"
-    "${SF_SRC}/RISCV/s_f64UIToCommonNaN.c"
-    "${SF_SRC}/RISCV/s_f128UIToCommonNaN.c"
-    "${SF_SRC}/RISCV/s_extF80UIToCommonNaN.c"
-    "${SF_SRC}/RISCV/s_commonNaNToF16UI.c"
-    "${SF_SRC}/RISCV/s_commonNaNToF32UI.c"
-    "${SF_SRC}/RISCV/s_commonNaNToF64UI.c"
-    "${SF_SRC}/RISCV/s_commonNaNToF128UI.c"
-    "${SF_SRC}/RISCV/s_commonNaNToExtF80UI.c"
-    "${SF_SRC}/RISCV/softfloat_raiseFlags.c")
-  # Multi-word-array helpers needed by f128_mul even with SOFTFLOAT_FAST_INT64
-  set(SF_MWORD "${SF_SRC}/s_add256M.c" "${SF_SRC}/s_sub256M.c"
-               "${SF_SRC}/s_mul128To256M.c" "${SF_SRC}/s_shiftRightJam256M.c")
+  # SoftFloat sources/vars (SF_SRC, SF_INC, SF_ALL, SF_RISCV, SF_MWORD,
+  # SF_INCLUDES, SF_DEFINES, SF_BUILTINS) are set once above the libblyt32.so
+  # build and reused here.
 
   # libblyt32lua.so embeds the Lua VM sources directly (analogous to how
   # libblyt32.so embeds blyt_common.c), so its .dynsym exports all Lua C API
@@ -609,11 +634,18 @@ else()
       "-isystem ${MUSL_DIR}/include -isystem ${MUSL_DIR}/arch/riscv32 -isystem ${MUSL_DIR}/arch/generic -isystem ${MUSL_DIR}/src/internal -isystem ${LIBBLYTC_BITS_DIR}/.."
   )
 
+  # -ffunction-sections/-fdata-sections put each libc++ function/datum in its own
+  # section so the cart link's --gc-sections can drop unused std-lib code (e.g.
+  # the wide-char std::to_wstring/wcsto* path and aligned operator new pulled in
+  # transitively by std::string but never used). Required for debug cart builds,
+  # which don't use LTO. (ADR-0121 mandates LTO for release; gc-sections covers
+  # both modes.)
+  set(_LXX_SECTION_FLAGS "-ffunction-sections -fdata-sections")
   set(_LXX_C_FLAGS
-      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib ${_LXX_MUSL_FLAGS}"
+      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib ${_LXX_SECTION_FLAGS} ${_LXX_MUSL_FLAGS}"
   )
   set(_LXX_CXX_FLAGS
-      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti ${_LXX_MUSL_FLAGS}"
+      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti ${_LXX_SECTION_FLAGS} ${_LXX_MUSL_FLAGS}"
   )
 
   if(FOUND_LLD)

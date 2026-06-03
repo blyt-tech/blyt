@@ -103,11 +103,27 @@ int __ledf2(double a, double b) {
     float64_t ua = d2u(a), ub = d2u(b);
     return f64_le(ua, ub) ? -1 : 1;
 }
+/* The compiler tests `__gtdf2(a,b) > 0` for `a > b` and `__gedf2(a,b) >= 0`
+ * for `a >= b`, so these must return POSITIVE on the high side — not the
+ * negative that __ltdf2(b,a)/__ledf2(b,a) yield. NaN (unordered) → negative so
+ * the comparison reports false. */
 int __gtdf2(double a, double b) {
-    return __ltdf2(b, a);
+    float64_t ua = d2u(a), ub = d2u(b);
+    if (f64_lt(ub, ua))
+        return 1; /* a > b */
+    if (f64_eq(ua, ub))
+        return 0; /* a == b → not > 0 */
+    return -1;    /* a < b or unordered */
 }
 int __gedf2(double a, double b) {
-    return __ledf2(b, a);
+    float64_t ua = d2u(a), ub = d2u(b);
+    if (f64_lt(ua, ub))
+        return -1; /* a < b */
+    if (f64_eq(ua, ub))
+        return 0; /* a == b → >= 0 */
+    if (f64_lt(ub, ua))
+        return 1; /* a > b → > 0 */
+    return -1;    /* unordered (NaN) → not >= */
 }
 int __eqdf2(double a, double b) {
     return f64_eq(d2u(a), d2u(b)) ? 0 : 1;
@@ -190,11 +206,22 @@ int __lttf2(const float128_t *a, const float128_t *b) {
 int __letf2(const float128_t *a, const float128_t *b) {
     return f128_le(*a, *b) ? -1 : 1;
 }
+/* Same high-side-positive convention as __gtdf2/__gedf2 (see note above). */
 int __gttf2(const float128_t *a, const float128_t *b) {
-    return __lttf2(b, a);
+    if (f128_lt(*b, *a))
+        return 1; /* a > b */
+    if (f128_eq(*a, *b))
+        return 0; /* a == b → not > 0 */
+    return -1;    /* a < b or unordered */
 }
 int __getf2(const float128_t *a, const float128_t *b) {
-    return __letf2(b, a);
+    if (f128_lt(*a, *b))
+        return -1; /* a < b */
+    if (f128_eq(*a, *b))
+        return 0; /* a == b → >= 0 */
+    if (f128_lt(*b, *a))
+        return 1; /* a > b → > 0 */
+    return -1;    /* unordered (NaN) → not >= */
 }
 int __eqtf2(const float128_t *a, const float128_t *b) {
     return f128_eq(*a, *b) ? 0 : 1;
