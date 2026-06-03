@@ -258,6 +258,12 @@ if(CLANG_RV32
       # libs (embedded into blyt_libretro); determinism flags live in the
       # per-lib CFLAGS so -O2 does not change numeric results (ADR-0007).
       -O2
+      # The emulated↔native split overrides libblytcommon's ECALL stubs (e.g.
+      # blyt_frame_done) via symbol preemption. -O2 defaults to
+      # -fno-semantic-interposition, which binds libblytcommon's *intra-module*
+      # calls (blyt_main → blyt_frame_done) directly to its own stub, bypassing
+      # the native override and ecall'ing on the native path. Keep interposition.
+      -fsemantic-interposition
       -shared
       # -Wl,--shared explicitly tells lld to produce ET_DYN; clang may inject
       # -Bstatic for bare-metal riscv targets which overrides -shared otherwise.
@@ -616,8 +622,12 @@ if(CLANG_RV32
   add_custom_command(
     OUTPUT "${LIBBLYT32_NATIVE_OUT}"
     COMMAND
-      "${CLANG_RV32}" ${RV32_FLAGS} -Wl,-soname,libblyt32.so ${RV32_INCLUDE} -I
-      "${LIBBLYT32_NATIVE_INC}" ${LIBBLYT32_NATIVE_LINK} -o
+      # The native lib is trusted-exec, links no libc, and implements its own
+      # string ops. Match the SDK native build (no -O): trailing -O0 overrides
+      # RV32_FLAGS' release -O2, and -fno-builtin stops loop-idiom recognition
+      # from rewriting hand-rolled routines into unresolved libcalls (ADR-0129).
+      "${CLANG_RV32}" ${RV32_FLAGS} -O0 -fno-builtin -Wl,-soname,libblyt32.so
+      ${RV32_INCLUDE} -I "${LIBBLYT32_NATIVE_INC}" ${LIBBLYT32_NATIVE_LINK} -o
       "${LIBBLYT32_NATIVE_OUT}" "${LIBBLYT32_NATIVE_SRC}"
     DEPENDS ${LIBBLYT32_NATIVE_DEPS}
     COMMENT "Cross-compiling libblyt32.so (RV32IMAFC, native build)"

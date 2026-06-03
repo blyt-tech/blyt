@@ -179,6 +179,13 @@ set(RV32_BASE
     -shared
     -fPIC
     -nostdlib
+    # The emulated↔native split overrides libblytcommon's ECALL stubs (e.g.
+    # blyt_frame_done) via symbol preemption.  -O2 defaults to
+    # -fno-semantic-interposition, which would bind libblytcommon's intra-module
+    # calls (blyt_main → blyt_frame_done) directly to its own stub and ecall on
+    # the native path (SIGSYS under the restricted seccomp filter).  Keep
+    # interposition so the native libblyt32.so override binds (ADR-0129).
+    -fsemantic-interposition
     -Wl,--shared
     -I
     "${BLYT_SOURCE_DIR}/runtime/guest/include")
@@ -469,7 +476,9 @@ set(SDK_LIB_NATIVE "${SDK_LIB}/native")
 file(MAKE_DIRECTORY "${SDK_LIB_NATIVE}")
 execute_process(
   COMMAND
-    "${FOUND_CLANG}" ${RV32_BASE} -I
+    # -fno-builtin: native lib implements its own string ops and links no libc,
+    # so optimisation must not rewrite them into unresolved libcalls (ADR-0129).
+    "${FOUND_CLANG}" ${RV32_BASE} -fno-builtin -I
     "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32" -Wl,-soname,libblyt32.so
     -Wl,--no-as-needed "${SDK_LIB}/libblytcommon.so" -Wl,--as-needed -o
     "${SDK_LIB_NATIVE}/libblyt32.so"
