@@ -234,18 +234,8 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         for (lib_name, lib_path) in discover_rust_libs(project_dir)? {
             let lib_build_dir = project_dir.join("build/lib").join(&lib_name);
             fs::create_dir_all(&lib_build_dir)?;
-            let status = Command::new(&cargo)
-                .args(["build", "--release"])
-                .arg("--target")
-                .arg(RUST_TARGET)
-                .arg("--manifest-path")
-                .arg(lib_path.join("Cargo.toml"))
-                .arg("--target-dir")
-                .arg(&lib_build_dir)
-                .env(
-                    "RUSTFLAGS",
-                    format!("-C relocation-model=pic -C panic=abort{debug_rust_flags}"),
-                )
+            let status = cargo_cart_cmd(&cargo, &lib_path.join("Cargo.toml"), &lib_build_dir)
+                .env("RUSTFLAGS", cart_rustflags(&debug_rust_flags))
                 .status()
                 .map_err(|e| err(format!("failed to run cargo for Rust lib {lib_name}: {e}")))?;
             if !status.success() {
@@ -253,7 +243,6 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             }
             let archive_dir = lib_build_dir.join(RUST_TARGET).join("release");
             let archive = find_rust_staticlib(&archive_dir)?;
-            strip_compiler_builtins(&ar, &archive)?;
             lib_archives.push(archive);
         }
     }
@@ -577,15 +566,8 @@ pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, B
         let cargo = find_cargo();
         let build_dir = project_dir.join("build/lib").join(lib_name);
         fs::create_dir_all(&build_dir)?;
-        let status = Command::new(&cargo)
-            .args(["build", "--release"])
-            .arg("--target")
-            .arg(RUST_TARGET)
-            .arg("--manifest-path")
-            .arg(&cargo_toml)
-            .arg("--target-dir")
-            .arg(&build_dir)
-            .env("RUSTFLAGS", "-C relocation-model=pic -C panic=abort")
+        let status = cargo_cart_cmd(&cargo, &cargo_toml, &build_dir)
+            .env("RUSTFLAGS", cart_rustflags(""))
             .status()
             .map_err(|e| err(format!("failed to run {cargo}: {e}")))?;
         if !status.success() {
@@ -916,6 +898,49 @@ fn find_rust_sdk(sdk_include: &Path) -> Result<PathBuf, BuildError> {
 
 const RUST_TARGET: &str = "riscv32imafc-unknown-none-elf";
 
+/// Rust toolchain used to build cart code.  `-Z build-std` is an unstable
+/// cargo feature, so cart Rust builds require nightly + the `rust-src`
+/// component.  The host devtool still builds on stable; only the cart cargo
+/// invocation is pinned here.  Override with `$BLYT_RUST_TOOLCHAIN`.
+fn rust_toolchain() -> String {
+    std::env::var("BLYT_RUST_TOOLCHAIN").unwrap_or_else(|_| "nightly".to_string())
+}
+
+/// Build the RUSTFLAGS for a cart Rust build.
+///
+/// `relocation-model=pic`: the cart ELF is ET_DYN (PIE), so every object —
+/// including `core`/`alloc` rebuilt by build-std — must be position
+/// independent.  `panic=abort`: no unwinding runtime; matches the SDK crate.
+fn cart_rustflags(extra: &str) -> String {
+    format!("-C relocation-model=pic -C panic=abort{extra}")
+}
+
+/// Configure a `cargo build --release` command for a RISC-V cart Rust crate.
+///
+/// Pins the nightly toolchain and passes `-Z build-std=core,alloc` so the
+/// standard library is recompiled from source as PIC.  Without build-std the
+/// prebuilt `core`/`alloc` rlibs carry non-PIC relocations that lld rejects
+/// when linking the PIE cart — which breaks any cart that uses `alloc`
+/// (`Vec`/`String`/`Box`).  This is the production approach recorded in
+/// ADR-0108 and the Spike O results ("invoke cargo build with build-std").
+///
+/// Callers may append crate-specific args (e.g. `--config` patches) and must
+/// set `RUSTFLAGS` via `cart_rustflags`.
+fn cargo_cart_cmd(cargo: &str, manifest: &Path, target_dir: &Path) -> Command {
+    let mut cmd = Command::new(cargo);
+    cmd.env("RUSTUP_TOOLCHAIN", rust_toolchain())
+        .args(["build", "--release"])
+        .arg("--target")
+        .arg(RUST_TARGET)
+        .arg("-Z")
+        .arg("build-std=core,alloc")
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("--target-dir")
+        .arg(target_dir);
+    cmd
+}
+
 fn build_rust_archive(
     cargo: &str,
     rust_manifest: &Path,
@@ -928,19 +953,11 @@ fn build_rust_archive(
     // the game's Cargo.toml needs only version constraints and cargo resolves to
     // the local source at build time.  TOML dotted-key form:
     //   patch."crates-io".<name>.path = "<abs-path>"
-    let mut cmd = Command::new(cargo);
-    cmd.args(["build", "--release"])
-        .arg("--target")
-        .arg(RUST_TARGET)
-        .arg("--manifest-path")
-        .arg(rust_manifest)
-        .arg("--target-dir")
-        .arg(build_dir)
-        .arg("--config")
-        .arg(format!(
-            r#"patch."crates-io".blyt.path = "{}""#,
-            rust_sdk_path.display()
-        ));
+    let mut cmd = cargo_cart_cmd(cargo, rust_manifest, build_dir);
+    cmd.arg("--config").arg(format!(
+        r#"patch."crates-io".blyt.path = "{}""#,
+        rust_sdk_path.display()
+    ));
 
     for (name, path) in rust_lib_patches {
         cmd.arg("--config").arg(format!(
@@ -949,13 +966,8 @@ fn build_rust_archive(
         ));
     }
 
-    // relocation-model=pic: cart ELF is ET_DYN (PIE); Rust objects must be PIC.
-    // panic=abort: no unwinding runtime; matches profile setting in the SDK crate.
     let status = cmd
-        .env(
-            "RUSTFLAGS",
-            format!("-C relocation-model=pic -C panic=abort{extra_rustflags}"),
-        )
+        .env("RUSTFLAGS", cart_rustflags(extra_rustflags))
         .status()
         .map_err(|e| err(format!("failed to run {cargo}: {e}")))?;
 
@@ -967,56 +979,12 @@ fn build_rust_archive(
     let out_dir = build_dir.join(RUST_TARGET).join("release");
     let archive = find_rust_staticlib(&out_dir)?;
 
-    // Strip compiler_builtins CGU objects from the archive.  These objects are
-    // compiled without -C relocation-model=pic (from the prebuilt rust-std
-    // component) and contain non-PIC relocations in libm math implementations.
-    // The runtime already provides memcpy/memset via libblyt32.so, and the
-    // RISC-V imafc hardware handles 32-bit integer and float operations natively.
-    let ar = find_ar();
-    strip_compiler_builtins(&ar, &archive)?;
-
+    // No compiler_builtins stripping: with build-std those objects are rebuilt
+    // from source as PIC, so they no longer carry non-PIC relocations, and they
+    // supply the f64 soft-float intrinsics (__divdf3, __muldf3, …) that core's
+    // float formatting needs on this hardware-single-float target.  mem* still
+    // comes from libblyt32.so (build-std's compiler_builtins omits it by default).
     Ok(archive)
-}
-
-/// Remove `compiler_builtins` codegen-unit objects from a Rust staticlib archive.
-///
-/// The prebuilt `rust-std` component compiles `compiler_builtins` without
-/// `-C relocation-model=pic`.  Its libm math implementations use absolute
-/// addressing for constant pools and jump tables (R_RISCV_HI20, R_RISCV_32),
-/// which lld rejects when linking a PIC cart ELF.
-///
-/// All functions those objects provide are either:
-///   - supplied by `libblyt32.so` at runtime (memcpy, memset, memmove), or
-///   - handled by RISC-V imafc hardware (32-bit int/float), or
-///   - not used by blyt Rust carts (double-precision libm math).
-fn strip_compiler_builtins(ar: &str, archive: &Path) -> Result<(), BuildError> {
-    let list_out = Command::new(ar)
-        .arg("t")
-        .arg(archive)
-        .output()
-        .map_err(|e| err(format!("failed to run {ar} t: {e}")))?;
-    let members_to_remove: Vec<String> = String::from_utf8_lossy(&list_out.stdout)
-        .lines()
-        .filter(|name| name.starts_with("compiler_builtins-"))
-        .map(String::from)
-        .collect();
-    if members_to_remove.is_empty() {
-        return Ok(());
-    }
-    let mut del_cmd = Command::new(ar);
-    del_cmd.arg("d").arg(archive);
-    for member in &members_to_remove {
-        del_cmd.arg(member);
-    }
-    let status = del_cmd
-        .status()
-        .map_err(|e| err(format!("failed to run {ar} d: {e}")))?;
-    if !status.success() {
-        return Err(err(
-            "failed to remove compiler_builtins objects from Rust archive",
-        ));
-    }
-    Ok(())
 }
 
 fn find_rust_staticlib(dir: &Path) -> Result<PathBuf, BuildError> {

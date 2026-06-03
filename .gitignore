@@ -5,6 +5,9 @@ devtool/target/
 tests/wasm/node_modules/
 tools/vscode/node_modules/
 examples/*/.vscode/
+# Cart Cargo.lock is regenerated per build; the SDK crate is injected via a
+# build-time --config patch, so a committed lock just drifts.
+examples/**/Cargo.lock
 .cache/
 qemu-images/*
 !qemu-images/.gitkeep
