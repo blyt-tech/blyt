@@ -400,6 +400,16 @@ pub fn require_wasm() {
     );
 }
 
+/// Require the debug WASM runtime (blytdebug.*, DAP/GDB enabled) for the WASM
+/// DAP/GDB tests (ADR-0129).
+pub fn require_wasm_debug() {
+    assert!(
+        find_wasm_debug_dir().join("blytdebug.js").exists(),
+        "debug WASM runtime not built — run `cmake --build build --target sdk` \
+         (builds share/wasm-debug/blytdebug.* with BLYT_DAP/BLYT_GDB)"
+    );
+}
+
 pub fn require_playwright() {
     let pkg = repo_root().join("tests/wasm/node_modules/playwright");
     assert!(
@@ -508,6 +518,17 @@ pub fn find_wasm_dir() -> PathBuf {
         return direct;
     }
     build_dir().join("sdk/share/wasm")
+}
+
+/// Locate the DEBUG WASM runtime dir (blytdebug.*, built with BLYT_DAP/BLYT_GDB).
+/// The release blytplay has DAP/GDB compiled out (ADR-0129), so the WASM DAP/GDB
+/// tests must use this variant.
+pub fn find_wasm_debug_dir() -> PathBuf {
+    let direct = repo_root().join("build-wasm-debug");
+    if direct.join("blytdebug.js").exists() {
+        return direct;
+    }
+    build_dir().join("sdk/share/wasm-debug")
 }
 
 // -------------------------------------------------------------------------

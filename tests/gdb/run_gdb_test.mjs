@@ -25,7 +25,7 @@ import { createHash }    from 'crypto';
 import { createRequire } from 'module';
 import { execFile }      from 'child_process';
 import { fileURLToPath } from 'url';
-import { readFileSync }  from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import path              from 'path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -196,7 +196,12 @@ function loadWasmRuntime(wasmDir, cartPath, gdbPort) {
         };
         try {
             const require = createRequire(import.meta.url);
-            require(path.join(wasmDir, 'blytplay.js'));
+            // GDB requires the debug runtime (blytdebug.*, built with BLYT_GDB);
+            // the release blytplay has GDB compiled out (ADR-0129).
+            const wasmJs = existsSync(path.join(wasmDir, 'blytdebug.js'))
+                ? 'blytdebug.js'
+                : 'blytplay.js';
+            require(path.join(wasmDir, wasmJs));
         } catch (e) {
             reject(e);
         }

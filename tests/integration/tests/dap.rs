@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytdebug, build_lua_cart, debug_lib_dir, find_wasm_dir, repo_root,
-    require_lua_sdk, require_sdk, require_wasm,
+    CartProject, blytdebug, build_lua_cart, debug_lib_dir, find_wasm_debug_dir, repo_root,
+    require_lua_sdk, require_sdk, require_wasm_debug,
 };
 use tempfile::TempDir;
 
@@ -17,7 +17,7 @@ use tempfile::TempDir;
 /// Silently asserts on missing WASM runtime or Lua SDK.
 #[test]
 fn wasm_dap_breakpoint_step_inspect() {
-    require_wasm();
+    require_wasm_debug();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
@@ -42,7 +42,7 @@ fn wasm_dap_breakpoint_step_inspect() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let wasm_dir = find_wasm_dir();
+    let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
 
     Command::new("node")
@@ -60,7 +60,7 @@ fn wasm_dap_breakpoint_step_inspect() {
 /// and expects "43".  Covers the handle_evaluate / dap_evaluating fix.
 #[test]
 fn wasm_dap_evaluate_expr() {
-    require_wasm();
+    require_wasm_debug();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
@@ -80,7 +80,7 @@ fn wasm_dap_evaluate_expr() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let wasm_dir = find_wasm_dir();
+    let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
 
     Command::new("node")
@@ -100,7 +100,7 @@ fn wasm_dap_evaluate_expr() {
 /// Stops at line 3 only when x > 10 (x = 42, so it fires on the first pass).
 #[test]
 fn wasm_dap_conditional_breakpoint() {
-    require_wasm();
+    require_wasm_debug();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
@@ -120,7 +120,7 @@ fn wasm_dap_conditional_breakpoint() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let wasm_dir = find_wasm_dir();
+    let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
 
     Command::new("node")
@@ -143,7 +143,7 @@ fn wasm_dap_conditional_breakpoint() {
 /// Edited condition: `x == 7` → second stop at i=7; verifies the edit took effect.
 #[test]
 fn wasm_dap_conditional_breakpoint_edit() {
-    require_wasm();
+    require_wasm_debug();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
@@ -167,7 +167,7 @@ fn wasm_dap_conditional_breakpoint_edit() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let wasm_dir = find_wasm_dir();
+    let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
 
     Command::new("node")
@@ -443,7 +443,7 @@ fn sdl_dap_evaluate_expr() {
 /// return the value (not nil).  Covers the handle_evaluate upvalue-injection fix.
 #[test]
 fn wasm_dap_evaluate_upvalue() {
-    require_wasm();
+    require_wasm_debug();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
@@ -465,7 +465,7 @@ fn wasm_dap_evaluate_upvalue() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let wasm_dir = find_wasm_dir();
+    let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
 
     Command::new("node")
@@ -529,7 +529,7 @@ fn sdl_dap_evaluate_upvalue() {
 /// WASM DAP: loadedSources returns the cart's Lua source after a stop.
 #[test]
 fn wasm_dap_loaded_sources() {
-    require_wasm();
+    require_wasm_debug();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
@@ -548,7 +548,7 @@ fn wasm_dap_loaded_sources() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let wasm_dir = find_wasm_dir();
+    let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
     Command::new("node")
         .args([
@@ -565,7 +565,7 @@ fn wasm_dap_loaded_sources() {
 /// WASM DAP: restart — cart restarts and stops at the same breakpoint again.
 #[test]
 fn wasm_dap_restart() {
-    require_wasm();
+    require_wasm_debug();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
@@ -584,7 +584,7 @@ fn wasm_dap_restart() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let wasm_dir = find_wasm_dir();
+    let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
     Command::new("node")
         .args([
@@ -601,7 +601,7 @@ fn wasm_dap_restart() {
 /// WASM DAP: exception breakpoint — cart throws in init(), DAP stops at the error.
 #[test]
 fn wasm_dap_exception_breakpoint() {
-    require_wasm();
+    require_wasm_debug();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
@@ -618,7 +618,7 @@ fn wasm_dap_exception_breakpoint() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let wasm_dir = find_wasm_dir();
+    let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
     Command::new("node")
         .args([

@@ -3,8 +3,8 @@ mod common;
 use assert_cmd::Command;
 use common::{
     CartProject, blytdebug, build_cart, build_debug_cart, build_debug_lua_cart, debug_lib_dir,
-    find_symbol_addr, find_wasm_dir, repo_root, require_gdb, require_lua_sdk, require_sdk,
-    require_wasm,
+    find_symbol_addr, find_wasm_debug_dir, repo_root, require_gdb, require_lua_sdk, require_sdk,
+    require_wasm_debug,
 };
 use tempfile::TempDir;
 
@@ -155,7 +155,7 @@ fn sdl_gdb_rust_cart() {
 #[test]
 fn wasm_gdb_handshake() {
     require_sdk();
-    require_wasm();
+    require_wasm_debug();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("wasm_gdb_c");
@@ -174,7 +174,7 @@ fn wasm_gdb_handshake() {
     Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            find_wasm_dir().to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
         .assert()
@@ -187,7 +187,7 @@ fn wasm_gdb_handshake() {
 #[test]
 fn wasm_gdb_breakpoint_step() {
     require_sdk();
-    require_wasm();
+    require_wasm_debug();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("wasm_gdb_bp");
@@ -207,7 +207,7 @@ fn wasm_gdb_breakpoint_step() {
     let mut cmd = Command::new("node");
     cmd.args([
         orchestrator.to_str().unwrap(),
-        find_wasm_dir().to_str().unwrap(),
+        find_wasm_debug_dir().to_str().unwrap(),
         cart.to_str().unwrap(),
     ]);
     if let Some(a) = addr {
@@ -576,7 +576,7 @@ fn sdl_c_cart_gdb_library_list() {
 #[test]
 fn wasm_c_cart_gdb_runtime_connected_signal() {
     require_sdk();
-    require_wasm();
+    require_wasm_debug();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("wasm_gdb_signal");
@@ -589,7 +589,7 @@ fn wasm_c_cart_gdb_runtime_connected_signal() {
     let out = std::process::Command::new("node")
         .args([
             orchestrator.to_str().unwrap(),
-            find_wasm_dir().to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
         .output()
