@@ -1093,28 +1093,18 @@ add_executable(test_session_api tests/unit/test_session_api.c)
 target_include_directories(test_session_api PRIVATE runtime/host/include)
 target_link_libraries(test_session_api PRIVATE libblyt)
 
-# test_libretro_dap: dlopens blyt_libretro.so and verifies the DAP TCP server
-# starts and responds to an "initialize" request.  Built only when the libretro
-# core is available (LIBBLYTC_OUT set → blyt_libretro.so will be built).
+# test_libretro_core: dlopens blyt_libretro.so and runs a cart through the
+# libretro API (functional core test).  Built only when the libretro core is
+# available (LIBBLYTC_OUT set → blyt_libretro.so will be built).
+#
+# ADR-0129: the libretro core is release-only — there is no debugging through it,
+# so the former test_libretro_dap probe and blyt-libretro-runner orchestration
+# frontend were removed (debugging is served by blytdebug / the debug WASM).
 if(LIBBLYTC_OUT)
-  add_executable(test_libretro_dap tests/unit/test_libretro_dap.c)
-  target_include_directories(test_libretro_dap
-                             PRIVATE third_party/libretro-common/include)
-  target_link_libraries(test_libretro_dap PRIVATE ${CMAKE_DL_LIBS})
-
   add_executable(test_libretro_core tests/unit/test_libretro_core.c)
   target_include_directories(test_libretro_core
                              PRIVATE third_party/libretro-common/include)
   target_link_libraries(test_libretro_core PRIVATE ${CMAKE_DL_LIBS})
-
-  # blyt-libretro-runner: general-purpose libretro frontend for debug test
-  # orchestration.  Echoes port announcements to stdout so that
-  # run_libretro_dap_test.mjs / run_libretro_gdb_test.mjs can parse them with
-  # the same regex used for blytplay.
-  add_executable(blyt-libretro-runner frontends/libretro/runner.c)
-  target_include_directories(blyt-libretro-runner
-                             PRIVATE third_party/libretro-common/include)
-  target_link_libraries(blyt-libretro-runner PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # -------------------------------------------------------------------------
