@@ -599,58 +599,73 @@ if(CLANG_RV32
   # blyt_console_debug → write(2,...), seccomp constructor, and future API
   # functions. Placed in build/native/ alongside libblytcommon.so + libblytc.so
   # so the launcher can use a single LD_LIBRARY_PATH=build/native.
+  #
+  # Only exercised by the native RISC-V QEMU gate (native_qemu.rs).  Gated by
+  # BLYT_BUILD_NATIVE so environments that don't run that gate (e.g. the Linux
+  # Docker test image, which skips it) can avoid the work.
   # -------------------------------------------------------------------------
-  set(LIBBLYT32_NATIVE_SRC
-      "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c")
-  set(LIBBLYT32_NATIVE_INC "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32")
-  set(LIBBLYT32_NATIVE_OUT "${CMAKE_BINARY_DIR}/native/libblyt32.so")
-  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/native")
+  option(BLYT_BUILD_NATIVE
+         "Build the native trusted-exec libblyt32.so (RISC-V QEMU gate)" ON)
+  if(BLYT_BUILD_NATIVE)
+    set(LIBBLYT32_NATIVE_SRC
+        "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c")
+    set(LIBBLYT32_NATIVE_INC
+        "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32")
+    set(LIBBLYT32_NATIVE_OUT "${CMAKE_BINARY_DIR}/native/libblyt32.so")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/native")
 
-  set(LIBBLYT32_NATIVE_DEPS
-      "${LIBBLYT32_NATIVE_SRC}" "${LIBBLYT32_NATIVE_INC}/seccomp_restricted.h"
-      "${BLYT_H}" "${LIBBLYTCOMMON_OUT}")
+    set(LIBBLYT32_NATIVE_DEPS
+        "${LIBBLYT32_NATIVE_SRC}"
+        "${LIBBLYT32_NATIVE_INC}/seccomp_restricted.h" "${BLYT_H}"
+        "${LIBBLYTCOMMON_OUT}")
 
-  # Native link flags: --no-as-needed forces libblytcommon.so into DT_NEEDED.
-  # Without it, --as-needed (the default) would silently drop libblytcommon.so
-  # because native blyt32.c uses no symbols from it directly; blyt_main and
-  # other libblytcommon exports would then be unresolvable at cart load time,
-  # causing a crash before any constructor fires.  libblytc.so is intentionally
-  # omitted — the native process C library comes from the musl ld.so
-  # interpreter.  Use full path to avoid lld -Bstatic on bare-metal targets.
-  set(LIBBLYT32_NATIVE_LINK -Wl,-Bdynamic -Wl,--no-as-needed
-                            "${LIBBLYTCOMMON_OUT}" -Wl,--as-needed)
+    # Native link flags: --no-as-needed forces libblytcommon.so into DT_NEEDED.
+    # Without it, --as-needed (the default) would silently drop libblytcommon.so
+    # because native blyt32.c uses no symbols from it directly; blyt_main and
+    # other libblytcommon exports would then be unresolvable at cart load time,
+    # causing a crash before any constructor fires.  libblytc.so is
+    # intentionally omitted — the native process C library comes from the musl
+    # ld.so interpreter.  Use full path to avoid lld -Bstatic on bare-metal
+    # targets.
+    set(LIBBLYT32_NATIVE_LINK -Wl,-Bdynamic -Wl,--no-as-needed
+                              "${LIBBLYTCOMMON_OUT}" -Wl,--as-needed)
 
-  add_custom_command(
-    OUTPUT "${LIBBLYT32_NATIVE_OUT}"
-    COMMAND
-      # The native lib is trusted-exec, links no libc, and implements its own
-      # string ops. Match the SDK native build (no -O): trailing -O0 overrides
-      # RV32_FLAGS' release -O2, and -fno-builtin stops loop-idiom recognition
-      # from rewriting hand-rolled routines into unresolved libcalls (ADR-0129).
-      "${CLANG_RV32}" ${RV32_FLAGS} -O0 -fno-builtin -Wl,-soname,libblyt32.so
-      ${RV32_INCLUDE} -I "${LIBBLYT32_NATIVE_INC}" ${LIBBLYT32_NATIVE_LINK} -o
-      "${LIBBLYT32_NATIVE_OUT}" "${LIBBLYT32_NATIVE_SRC}"
-    DEPENDS ${LIBBLYT32_NATIVE_DEPS}
-    COMMENT "Cross-compiling libblyt32.so (RV32IMAFC, native build)"
-    VERBATIM)
+    add_custom_command(
+      OUTPUT "${LIBBLYT32_NATIVE_OUT}"
+      COMMAND
+        # The native lib is trusted-exec, links no libc, and implements its own
+        # string ops. Match the SDK native build (no -O): trailing -O0 overrides
+        # RV32_FLAGS' release -O2, and -fno-builtin stops loop-idiom recognition
+        # from rewriting hand-rolled routines into unresolved libcalls
+        # (ADR-0129).
+        "${CLANG_RV32}" ${RV32_FLAGS} -O0 -fno-builtin -Wl,-soname,libblyt32.so
+        ${RV32_INCLUDE} -I "${LIBBLYT32_NATIVE_INC}" ${LIBBLYT32_NATIVE_LINK} -o
+        "${LIBBLYT32_NATIVE_OUT}" "${LIBBLYT32_NATIVE_SRC}"
+      DEPENDS ${LIBBLYT32_NATIVE_DEPS}
+      COMMENT "Cross-compiling libblyt32.so (RV32IMAFC, native build)"
+      VERBATIM)
 
-  # Stage libblytcommon.so alongside native libblyt32.so. libblytc.so is
-  # intentionally NOT staged: the native cart process gets its C library from
-  # the musl ld.so interpreter; staging libblytc.so (our musl subset) would load
-  # a second musl instance, conflicting with the interpreter.
-  add_custom_command(
-    OUTPUT "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
-    COMMAND "${CMAKE_COMMAND}" -E copy "${LIBBLYTCOMMON_OUT}"
-            "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
-    DEPENDS "${LIBBLYTCOMMON_OUT}"
-    COMMENT "Staging libblytcommon.so to native/"
-    VERBATIM)
+    # Stage libblytcommon.so alongside native libblyt32.so. libblytc.so is
+    # intentionally NOT staged: the native cart process gets its C library from
+    # the musl ld.so interpreter; staging libblytc.so (our musl subset) would
+    # load a second musl instance, conflicting with the interpreter.
+    add_custom_command(
+      OUTPUT "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
+      COMMAND "${CMAKE_COMMAND}" -E copy "${LIBBLYTCOMMON_OUT}"
+              "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
+      DEPENDS "${LIBBLYTCOMMON_OUT}"
+      COMMENT "Staging libblytcommon.so to native/"
+      VERBATIM)
 
-  add_custom_target(
-    libblyt32_native_so ALL
-    DEPENDS "${LIBBLYT32_NATIVE_OUT}"
-            "${CMAKE_BINARY_DIR}/native/libblytcommon.so")
-  message(STATUS "libblyt32.so (native build): will be built → build/native/")
+    add_custom_target(
+      libblyt32_native_so ALL
+      DEPENDS "${LIBBLYT32_NATIVE_OUT}"
+              "${CMAKE_BINARY_DIR}/native/libblytcommon.so")
+    message(STATUS "libblyt32.so (native build): will be built → build/native/")
+  else()
+    message(
+      STATUS "libblyt32.so (native build): skipped (BLYT_BUILD_NATIVE=OFF)")
+  endif()
 
 else()
   message(STATUS "libblytcommon.so + libblyt32.so + libblytc.so: skipping \
@@ -1139,6 +1154,7 @@ add_custom_target(
   COMMAND
     ${CMAKE_COMMAND} -DBLYT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
     -DBLYT_BINARY_DIR=${CMAKE_BINARY_DIR} -DBLYT_VERSION=${BLYT_VERSION}
+    -DBLYT_BUILD_NATIVE=${BLYT_BUILD_NATIVE}
     -DCMAKE_HOST_SYSTEM_NAME=${CMAKE_HOST_SYSTEM_NAME}
     -DCMAKE_HOST_SYSTEM_PROCESSOR=${CMAKE_HOST_SYSTEM_PROCESSOR} -P
     ${CMAKE_SOURCE_DIR}/cmake/blyt_sdk.cmake
@@ -1292,7 +1308,7 @@ if(_BLYT_DOCKER)
       # The native RISC-V QEMU gate is host-independent and would run nested
       # under Rosetta here; skip it in the Docker image (runs natively + in CI).
       -e BLYT_SKIP_QEMU_GATE=1 blyt-testing-${BLYT_LINUX_ARCH} bash -c
-      "source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1; set -e && cmake -B /build -G Ninja /repo && cmake --build /build --parallel && cmake --build /build --target sdk && BLYT_BUILD_DIR=/build CARGO_HOME=/build/cargo-home CARGO_TARGET_DIR=/build/cargo-target cargo test --workspace -- ${BLYT_LINUX_TEST_FILTER} --nocapture"
+      "source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1; set -e && cmake -B /build -G Ninja -DBLYT_BUILD_NATIVE=OFF /repo && cmake --build /build --parallel && cmake --build /build --target sdk && BLYT_BUILD_DIR=/build CARGO_HOME=/build/cargo-home CARGO_TARGET_DIR=/build/cargo-target cargo test --workspace -- ${BLYT_LINUX_TEST_FILTER} --nocapture"
     COMMENT "Building and running integration tests in Linux Docker container"
     USES_TERMINAL VERBATIM)
 else()

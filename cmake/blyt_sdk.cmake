@@ -465,34 +465,41 @@ foreach(_var release debug)
     ${SF_ALL} ${SF_RISCV} ${SF_MWORD} ${SF_BUILTINS})
 endforeach()
 
-message(STATUS "Building libblyt32.so (native build)…")
 # libblyt32.so (native path) — real API implementations for trusted native exec.
-#
-# Compiled from frontends/native/src/libblyt32/blyt32.c.  Provides real Linux
-# syscall implementations (blyt_console_debug → write(2,...)) and the restricted
-# seccomp constructor.  Placed in sdk/lib/native/ so the launcher can set
-# LD_LIBRARY_PATH=<sdk>/lib/native to load this over the emulated version.
-set(SDK_LIB_NATIVE "${SDK_LIB}/native")
-file(MAKE_DIRECTORY "${SDK_LIB_NATIVE}")
-execute_process(
-  COMMAND
-    # -fno-builtin: native lib implements its own string ops and links no libc,
-    # so optimisation must not rewrite them into unresolved libcalls (ADR-0129).
-    "${FOUND_CLANG}" ${RV32_BASE} -fno-builtin -I
-    "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32" -Wl,-soname,libblyt32.so
-    -Wl,--no-as-needed "${SDK_LIB}/libblytcommon.so" -Wl,--as-needed -o
-    "${SDK_LIB_NATIVE}/libblyt32.so"
-    "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c"
-  RESULT_VARIABLE R)
-# Note: libblytc.so is intentionally NOT linked here.  On native execution the
-# cart process already has musl from the ld.so interpreter; loading libblytc.so
-# (our musl subset) would create two conflicting musl instances → SIGSEGV.
-if(NOT R EQUAL 0)
-  message(FATAL_ERROR "Failed to build libblyt32.so (native build)")
+# Only used by the native RISC-V QEMU gate; gated by BLYT_BUILD_NATIVE (default
+# ON, passed through from the sdk target) so environments that skip that gate
+# (e.g. the Linux Docker test image) can avoid building it.
+if(NOT DEFINED BLYT_BUILD_NATIVE OR BLYT_BUILD_NATIVE)
+  message(STATUS "Building libblyt32.so (native build)…")
+  # Compiled from frontends/native/src/libblyt32/blyt32.c.  Provides real Linux
+  # syscall implementations (blyt_console_debug → write(2,...)) and the
+  # restricted seccomp constructor.  Placed in sdk/lib/native/ so the launcher
+  # can set LD_LIBRARY_PATH=<sdk>/lib/native to load this over the emulated one.
+  set(SDK_LIB_NATIVE "${SDK_LIB}/native")
+  file(MAKE_DIRECTORY "${SDK_LIB_NATIVE}")
+  execute_process(
+    COMMAND
+      # -fno-builtin: native lib implements its own string ops and links no
+      # libc, so optimisation must not rewrite them into unresolved libcalls
+      # (ADR-0129).
+      "${FOUND_CLANG}" ${RV32_BASE} -fno-builtin -I
+      "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32"
+      -Wl,-soname,libblyt32.so -Wl,--no-as-needed "${SDK_LIB}/libblytcommon.so"
+      -Wl,--as-needed -o "${SDK_LIB_NATIVE}/libblyt32.so"
+      "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c"
+    RESULT_VARIABLE R)
+  # Note: libblytc.so is intentionally NOT linked here.  On native execution the
+  # cart process already has musl from the ld.so interpreter; loading libblytc.so
+  # (our musl subset) would create two conflicting musl instances → SIGSEGV.
+  if(NOT R EQUAL 0)
+    message(FATAL_ERROR "Failed to build libblyt32.so (native build)")
+  endif()
+  # Stage libblytcommon.so into native/ so one LD_LIBRARY_PATH covers it.
+  # libblytc.so is NOT staged: it must not be loaded on the native path.
+  file(COPY "${SDK_LIB}/libblytcommon.so" DESTINATION "${SDK_LIB_NATIVE}")
+else()
+  message(STATUS "libblyt32.so (native build): skipped (BLYT_BUILD_NATIVE=OFF)")
 endif()
-# Stage libblytcommon.so into native/ so one LD_LIBRARY_PATH covers it.
-# libblytc.so is NOT staged: it must not be loaded on the native path.
-file(COPY "${SDK_LIB}/libblytcommon.so" DESTINATION "${SDK_LIB_NATIVE}")
 
 # -------------------------------------------------------------------------
 # Step 2c: Build Lua libraries for RV32IMAFC (Lua cart support)
