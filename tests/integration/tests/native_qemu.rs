@@ -198,6 +198,16 @@ fn build_cart(project_dir: &Path) -> PathBuf {
 
 #[test]
 fn native_riscv_qemu_gate() {
+    // The RISC-V trusted-exec behaviour this gate verifies is host-independent
+    // (it runs inside a RISC-V VM), so it adds nothing in the Linux Docker test
+    // image — where booting qemu-system-riscv64 would itself be nested under
+    // Rosetta x86 translation and time out.  The Docker target sets this to skip
+    // it; the gate still runs natively (local dev + GitHub CI).
+    if std::env::var_os("BLYT_SKIP_QEMU_GATE").is_some() {
+        eprintln!("native_riscv_qemu_gate: skipped (BLYT_SKIP_QEMU_GATE set)");
+        return;
+    }
+
     // ── Prerequisites ──────────────────────────────────────────────────
 
     let kernel = std::env::var("BLYT_QEMU_KERNEL")
