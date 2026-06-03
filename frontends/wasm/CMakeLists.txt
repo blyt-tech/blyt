@@ -309,8 +309,14 @@ add_executable(
   ${BLYT_DAP_SOURCES}
   ${BLYT_GDB_SOURCES})
 
-# Produce blytplay.html + blytplay.js + blytplay.wasm
-set_target_properties(blytplay PROPERTIES SUFFIX ".html")
+# Produce <name>.html + <name>.js + <name>.wasm.  ADR-0129: the SDK builds this
+# twice — release as "blytplay" (DAP/GDB off, release libs) and debug as
+# "blytdebug" (DAP/GDB on, debug libs) — via -DBLYT_WASM_NAME.
+set(BLYT_WASM_NAME
+    "blytplay"
+    CACHE STRING "Output base name for the WASM player (.html/.js/.wasm)")
+set_target_properties(blytplay PROPERTIES OUTPUT_NAME "${BLYT_WASM_NAME}"
+                                          SUFFIX ".html")
 
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)

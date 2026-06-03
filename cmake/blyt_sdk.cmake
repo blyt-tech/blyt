@@ -1029,6 +1029,11 @@ endif()
 if(EXISTS "${BLYT_BINARY_DIR}/blytplay")
   file(COPY "${BLYT_BINARY_DIR}/blytplay" DESTINATION "${SDK_BIN}")
 endif()
+# ADR-0129: ship the debug player (blytdebug) in the SDK too.  It is SDK-only —
+# never embedded in / shipped with the production runtime.
+if(EXISTS "${BLYT_BINARY_DIR}/blytdebug")
+  file(COPY "${BLYT_BINARY_DIR}/blytdebug" DESTINATION "${SDK_BIN}")
+endif()
 
 # -------------------------------------------------------------------------
 # Step 6: blyt_libretro.so — host-side libretro core
@@ -1129,49 +1134,61 @@ endif()
 # -------------------------------------------------------------------------
 
 set(SDK_SHARE_WASM "${SDK_DIR}/share/wasm")
+set(SDK_SHARE_WASM_DEBUG "${SDK_DIR}/share/wasm-debug")
 
 find_program(EMCC emcc)
 if(EMCC)
-  message(STATUS "Building blytplay WASM runtime (emcc found at ${EMCC})…")
-
+  message(STATUS "Building WASM runtimes (emcc found at ${EMCC})…")
   file(MAKE_DIRECTORY "${SDK_SHARE_WASM}")
+  file(MAKE_DIRECTORY "${SDK_SHARE_WASM_DEBUG}")
 
-  # Configure the WASM cmake project pointing at the SDK guest libs.
-  execute_process(
-    COMMAND
-      emcmake ${CMAKE_COMMAND} -B "${BLYT_BINARY_DIR}/build-wasm" -S
-      "${BLYT_SOURCE_DIR}/frontends/wasm" "-DBLYT_GUEST_LIB_DIR=${SDK_LIB}"
-      "-DBLYT_VERSION=${BLYT_VERSION}" -G Ninja
-    RESULT_VARIABLE R
-    OUTPUT_QUIET)
-  if(NOT R EQUAL 0)
-    message(
-      WARNING
-        "blytplay WASM: emcmake cmake configure failed — skipping WASM step")
-    set(EMCC "")
-  endif()
-endif()
+  # ADR-0129: build the WASM player twice.
+  #   release → blytplay.*  (DAP/GDB OFF, release libs) → share/wasm
+  #   debug   → blytdebug.* (DAP/GDB ON,  debug libs)   → share/wasm-debug
+  # `blyt run` serves the release set; `blyt debug` serves the debug set.
+  foreach(_w release debug)
+    if("${_w}" STREQUAL "debug")
+      set(_WDIR "${BLYT_BINARY_DIR}/build-wasm-debug")
+      set(_WLIBS "${SDK_LIB_DEBUG}")
+      set(_WNAME "blytdebug")
+      set(_WDEST "${SDK_SHARE_WASM_DEBUG}")
+      set(_WDBG ON)
+    else()
+      set(_WDIR "${BLYT_BINARY_DIR}/build-wasm")
+      set(_WLIBS "${SDK_LIB}")
+      set(_WNAME "blytplay")
+      set(_WDEST "${SDK_SHARE_WASM}")
+      set(_WDBG OFF)
+    endif()
 
-if(EMCC)
-  execute_process(COMMAND ${CMAKE_COMMAND} --build
-                          "${BLYT_BINARY_DIR}/build-wasm" RESULT_VARIABLE R)
-  if(NOT R EQUAL 0)
-    message(WARNING "blytplay WASM: build failed — skipping WASM step")
-    set(EMCC "")
-  endif()
-endif()
-
-if(EMCC)
-  # Ship blytplay.js + blytplay.wasm.  The dev shell (blytplay.html) is kept
-  # internal to `blyt run`; developers write their own page using the README.
-  foreach(_F blytplay.js blytplay.wasm blytplay.html)
-    if(EXISTS "${BLYT_BINARY_DIR}/build-wasm/${_F}")
-      file(COPY "${BLYT_BINARY_DIR}/build-wasm/${_F}"
-           DESTINATION "${SDK_SHARE_WASM}")
+    message(STATUS "Building ${_WNAME} WASM runtime (${_w})…")
+    execute_process(
+      COMMAND
+        emcmake ${CMAKE_COMMAND} -B "${_WDIR}" -S
+        "${BLYT_SOURCE_DIR}/frontends/wasm" "-DBLYT_GUEST_LIB_DIR=${_WLIBS}"
+        "-DBLYT_VERSION=${BLYT_VERSION}" "-DBLYT_WASM_NAME=${_WNAME}"
+        "-DBLYT_DAP=${_WDBG}" "-DBLYT_GDB=${_WDBG}" -G Ninja
+      RESULT_VARIABLE R
+      OUTPUT_QUIET)
+    if(NOT R EQUAL 0)
+      message(WARNING "${_WNAME} WASM: configure failed — skipping")
+    else()
+      execute_process(COMMAND ${CMAKE_COMMAND} --build "${_WDIR}"
+                      RESULT_VARIABLE R)
+      if(NOT R EQUAL 0)
+        message(WARNING "${_WNAME} WASM: build failed — skipping")
+      else()
+        foreach(_ext js wasm html)
+          if(EXISTS "${_WDIR}/${_WNAME}.${_ext}")
+            file(COPY "${_WDIR}/${_WNAME}.${_ext}" DESTINATION "${_WDEST}")
+          endif()
+        endforeach()
+        message(STATUS "${_WNAME} WASM assembled at ${_WDEST}")
+      endif()
     endif()
   endforeach()
 
-  # Write the embedding README alongside the runtime files.
+  # Write the embedding README alongside the release runtime files.
   file(
     WRITE "${SDK_SHARE_WASM}/README.md"
     "# blytplay WASM runtime\n\
@@ -1231,9 +1248,10 @@ and opens the correct URL.  It uses an internal shell page; for a\n\
 production-ready page use the template above as a starting point.\n\
 ")
 
-  message(STATUS "blytplay WASM runtime assembled at ${SDK_SHARE_WASM}")
+  message(STATUS "WASM runtimes assembled:")
+  message(STATUS "  release: ${SDK_SHARE_WASM} (blyt run)")
+  message(STATUS "  debug:   ${SDK_SHARE_WASM_DEBUG} (blyt debug)")
   message(STATUS "  Embed in a page: see ${SDK_SHARE_WASM}/README.md")
-  message(STATUS "  Run a cart:      ${SDK_BIN}/blyt run <cart.blyt>")
 else()
   message(
     STATUS

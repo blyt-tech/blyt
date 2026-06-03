@@ -254,6 +254,10 @@ if(CLANG_RV32
       --target=riscv32
       -march=rv32imafc
       -mabi=ilp32f
+      # Release optimisation (ADR-0129): the host build produces release guest
+      # libs (embedded into blyt_libretro); determinism flags live in the
+      # per-lib CFLAGS so -O2 does not change numeric results (ADR-0007).
+      -O2
       -shared
       # -Wl,--shared explicitly tells lld to produce ET_DYN; clang may inject
       # -Bstatic for bare-metal riscv targets which overrides -shared otherwise.
@@ -694,11 +698,9 @@ if(BLYT_DAP)
     PUBLIC "${BLYT_DAP_DIR}"
     PRIVATE "${CMAKE_SOURCE_DIR}/runtime/host/include")
   target_compile_definitions(dap PRIVATE BLYT_DAP=1)
-
-  target_compile_definitions(libblyt PRIVATE BLYT_DAP=1)
-  target_include_directories(libblyt PRIVATE "${BLYT_DAP_DIR}")
-  target_link_libraries(libblyt PRIVATE dap)
-  message(STATUS "BLYT_DAP: DAP debugging enabled (TCP transport)")
+  # ADR-0129: dap is linked into the debug runtime (libblyt_debug) only — the
+  # release libblyt / blytplay / blyt_libretro carry no DAP machinery.
+  message(STATUS "BLYT_DAP: DAP debugging available (debug frontend only)")
 else()
   message(STATUS "BLYT_DAP: DAP debugging disabled")
 endif()
@@ -724,11 +726,8 @@ if(BLYT_GDB AND Threads_FOUND)
                      "${CMAKE_SOURCE_DIR}/runtime/host/include")
   target_compile_definitions(gdb_stub PRIVATE BLYT_GDB=1 BLYT_GDB_TCP=1)
   target_link_libraries(gdb_stub PRIVATE Threads::Threads)
-
-  target_compile_definitions(libblyt PRIVATE BLYT_GDB=1)
-  target_include_directories(libblyt PRIVATE "${BLYT_GDB_DIR}")
-  target_link_libraries(libblyt PRIVATE gdb_stub)
-  message(STATUS "BLYT_GDB: GDB RSP debugging enabled (TCP transport)")
+  # ADR-0129: gdb_stub is linked into the debug runtime (libblyt_debug) only.
+  message(STATUS "BLYT_GDB: GDB RSP debugging available (debug frontend only)")
 elseif(BLYT_GDB)
   message(STATUS "BLYT_GDB: disabled (Threads not found)")
 else()
@@ -736,63 +735,141 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
-# SDL2 frontend — try find_package, then pkg-config, then sdl2-config
+# libblyt_debug — debug variant of the host runtime (ADR-0129)
+#
+# Same sources as libblyt but compiled with BLYT_DAP/BLYT_GDB so cart_run.c's
+# debugger hooks are present, and linked against the dap / gdb_stub transports.
+# Consumed only by the blytdebug frontend; the release libblyt (and blytplay /
+# blyt_libretro) stay free of all debug machinery.
 # -------------------------------------------------------------------------
+set(BLYT_DEBUG_RUNTIME OFF)
+if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
+  set(BLYT_DEBUG_RUNTIME ON)
+  add_library(
+    libblyt_debug STATIC
+    runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
+    runtime/host/src/libblyt/testcard.c)
+  set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
+                                                 POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(
+    libblyt_debug
+    PUBLIC runtime/host/include
+    PRIVATE runtime/host/src/libblyt third_party/flatcc/include
+            "${GENERATED_DIR}" ${RV32EMU_DIR})
+  target_compile_definitions(libblyt_debug PRIVATE ${RV32EMU_FEATURE_DEFS})
+  target_link_libraries(
+    libblyt_debug
+    PUBLIC flatccrt
+    PRIVATE libblytemu)
+  add_dependencies(libblyt_debug flatbuffers_generated)
+  if(BLYT_DAP AND TARGET dap)
+    target_compile_definitions(libblyt_debug PRIVATE BLYT_DAP=1)
+    target_include_directories(libblyt_debug PRIVATE "${BLYT_DAP_DIR}")
+    target_link_libraries(libblyt_debug PRIVATE dap)
+  endif()
+  if(BLYT_GDB AND TARGET gdb_stub)
+    target_compile_definitions(libblyt_debug PRIVATE BLYT_GDB=1)
+    target_include_directories(libblyt_debug PRIVATE "${BLYT_GDB_DIR}")
+    target_link_libraries(libblyt_debug PRIVATE gdb_stub)
+  endif()
+  message(STATUS "libblyt_debug: debug runtime will be built (blytdebug)")
+endif()
+
+# -------------------------------------------------------------------------
+# SDL2 frontends — try find_package, then pkg-config, then sdl2-config.
+#
+# Normalise whichever method succeeds into SDL2_OK plus a small set of vars,
+# then build two executables (ADR-0129):
+#   blytplay  — release player, no GDB/DAP, loads release guest libs
+#   blytdebug — debug player, GDB/DAP on, loads debug guest libs (BLYT_LIB_DIR)
+# -------------------------------------------------------------------------
+set(SDL2_OK OFF)
+set(_SDL2_TARGET "")
+set(_SDL2_INCLUDE "")
+set(_SDL2_LIBS "")
+set(_SDL2_CFLAGS "")
+set(_SDL2_LDFLAGS "")
+
 find_package(SDL2 QUIET)
 if(SDL2_FOUND OR TARGET SDL2::SDL2)
-  add_executable(blytplay frontends/player/main.c)
-  target_link_libraries(blytplay PRIVATE libblyt SDL2::SDL2)
-  message(STATUS "SDL2 found via find_package — blytplay (SDL2) will be built")
+  set(SDL2_OK ON)
+  set(_SDL2_TARGET SDL2::SDL2)
+  message(STATUS "SDL2 found via find_package — blytplay/blytdebug will be built")
 else()
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
     pkg_check_modules(SDL2 QUIET sdl2)
   endif()
   if(SDL2_FOUND)
-    add_executable(blytplay frontends/player/main.c)
-    target_include_directories(blytplay PRIVATE ${SDL2_INCLUDE_DIRS})
-    target_compile_options(blytplay PRIVATE ${SDL2_CFLAGS_OTHER})
-    target_link_libraries(blytplay PRIVATE libblyt ${SDL2_LIBRARIES})
-    message(STATUS "SDL2 found via pkg-config — blytplay (SDL2) will be built")
+    set(SDL2_OK ON)
+    set(_SDL2_INCLUDE ${SDL2_INCLUDE_DIRS})
+    set(_SDL2_LIBS ${SDL2_LIBRARIES})
+    set(_SDL2_CFLAGS ${SDL2_CFLAGS_OTHER})
+    message(STATUS "SDL2 found via pkg-config — blytplay/blytdebug will be built")
   else()
-    # Last resort: try sdl2-config
     find_program(SDL2_CONFIG sdl2-config)
     if(SDL2_CONFIG)
       execute_process(
         COMMAND ${SDL2_CONFIG} --cflags
-        OUTPUT_VARIABLE SDL2_CFLAGS
+        OUTPUT_VARIABLE _sdl2_cflags_raw
         OUTPUT_STRIP_TRAILING_WHITESPACE)
       execute_process(
         COMMAND ${SDL2_CONFIG} --libs
-        OUTPUT_VARIABLE SDL2_LDFLAGS
+        OUTPUT_VARIABLE _sdl2_ldflags_raw
         OUTPUT_STRIP_TRAILING_WHITESPACE)
-      separate_arguments(SDL2_CFLAGS_LIST UNIX_COMMAND "${SDL2_CFLAGS}")
-      separate_arguments(SDL2_LDFLAGS_LIST UNIX_COMMAND "${SDL2_LDFLAGS}")
-      add_executable(blytplay frontends/player/main.c)
-      target_compile_options(blytplay PRIVATE ${SDL2_CFLAGS_LIST})
-      target_link_options(blytplay PRIVATE ${SDL2_LDFLAGS_LIST})
-      target_link_libraries(blytplay PRIVATE libblyt)
-      message(
-        STATUS "SDL2 found via sdl2-config — blytplay (SDL2) will be built")
+      separate_arguments(_SDL2_CFLAGS UNIX_COMMAND "${_sdl2_cflags_raw}")
+      separate_arguments(_SDL2_LDFLAGS UNIX_COMMAND "${_sdl2_ldflags_raw}")
+      set(SDL2_OK ON)
+      message(STATUS "SDL2 found via sdl2-config — blytplay/blytdebug will be built")
     else()
-      message(STATUS "SDL2 not found — blytplay (SDL2) will not be built")
+      message(STATUS "SDL2 not found — blytplay/blytdebug will not be built")
     endif()
   endif()
 endif()
 
-# blytplay drives the runtime via the libretro API (blyt_libretro.c compiled in
-# directly, without BLYT_EMBED_LIBS so dynlink uses BLYT_LIB_DIR as usual).
-if(TARGET blytplay)
-  target_sources(blytplay PRIVATE frontends/libretro/blyt_libretro.c)
-  target_include_directories(
-    blytplay PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
-                     "${CMAKE_SOURCE_DIR}/runtime/host/include")
-  target_compile_definitions(blytplay PRIVATE BLYT_VERSION="${BLYT_VERSION}")
-  if(BLYT_DAP)
-    target_compile_definitions(blytplay PRIVATE BLYT_DAP=1)
+# Define an SDL2 player executable linking the given host runtime lib.  Drives
+# the runtime via the libretro API (blyt_libretro.c compiled in directly,
+# without BLYT_EMBED_LIBS so dynlink falls back to BLYT_LIB_DIR).
+function(blyt_add_player target runtime_lib)
+  add_executable(${target} frontends/player/main.c
+                           frontends/libretro/blyt_libretro.c)
+  target_link_libraries(${target} PRIVATE ${runtime_lib})
+  if(_SDL2_TARGET)
+    target_link_libraries(${target} PRIVATE ${_SDL2_TARGET})
   endif()
-  if(BLYT_GDB AND Threads_FOUND)
-    target_compile_definitions(blytplay PRIVATE BLYT_GDB=1)
+  if(_SDL2_LIBS)
+    target_link_libraries(${target} PRIVATE ${_SDL2_LIBS})
+  endif()
+  if(_SDL2_INCLUDE)
+    target_include_directories(${target} PRIVATE ${_SDL2_INCLUDE})
+  endif()
+  if(_SDL2_CFLAGS)
+    target_compile_options(${target} PRIVATE ${_SDL2_CFLAGS})
+  endif()
+  if(_SDL2_LDFLAGS)
+    target_link_options(${target} PRIVATE ${_SDL2_LDFLAGS})
+  endif()
+  target_include_directories(
+    ${target} PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
+                      "${CMAKE_SOURCE_DIR}/runtime/host/include")
+  target_compile_definitions(${target} PRIVATE BLYT_VERSION="${BLYT_VERSION}")
+endfunction()
+
+if(SDL2_OK)
+  # Release player: no debug machinery.
+  blyt_add_player(blytplay libblyt)
+
+  # Debug player: GDB/DAP on, links the debug runtime.  At runtime it loads the
+  # debug guest libs via BLYT_LIB_DIR=<sdk>/lib/debug.
+  if(BLYT_DEBUG_RUNTIME)
+    blyt_add_player(blytdebug libblyt_debug)
+    if(BLYT_DAP AND TARGET dap)
+      target_compile_definitions(blytdebug PRIVATE BLYT_DAP=1)
+    endif()
+    if(BLYT_GDB AND TARGET gdb_stub)
+      target_compile_definitions(blytdebug PRIVATE BLYT_GDB=1)
+    endif()
+    message(STATUS "blytdebug: debug player will be built")
   endif()
 endif()
 
@@ -827,15 +904,12 @@ if(LIBBLYTC_OUT)
     blyt_libretro
     PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
             "${CMAKE_SOURCE_DIR}/runtime/host/include")
+  # ADR-0129: the shipped libretro core is release-only — no GDB/DAP, embeds the
+  # optimized release guest libs.  Debug stepping is served via blyt debug (WASM)
+  # and the native blytdebug player, not the libretro core.
   set(_blyt_libretro_defs BLYT_VERSION="${BLYT_VERSION}" BLYT_EMBED_LIBS)
   if(LIBBLYT32LUA_OUT)
     list(APPEND _blyt_libretro_defs BLYT_EMBED_LUA)
-  endif()
-  if(BLYT_DAP)
-    list(APPEND _blyt_libretro_defs BLYT_DAP=1)
-  endif()
-  if(BLYT_GDB AND Threads_FOUND)
-    list(APPEND _blyt_libretro_defs BLYT_GDB=1)
   endif()
   target_compile_definitions(blyt_libretro PRIVATE ${_blyt_libretro_defs})
   set_target_properties(blyt_libretro PROPERTIES PREFIX "" SUFFIX ".so")
