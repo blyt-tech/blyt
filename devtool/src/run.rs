@@ -32,26 +32,69 @@ fn err(msg: impl Into<String>) -> RunError {
 }
 
 /* -------------------------------------------------------------------------
- * Public entry point
+ * Public entry points (ADR-0129)
+ *
+ * `run` serves a release cart with the release WASM runtime and no debugger.
+ * `debug` serves a debug (.dbg.blyt) cart with the debug WASM runtime and the
+ * DAP + GDB relays.  The two artifacts are fully separate (share/wasm vs
+ * share/wasm-debug, blytplay.* vs blytdebug.*) so a release page carries zero
+ * debug machinery.
  * ------------------------------------------------------------------------- */
 
-pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
+#[derive(Clone, Copy)]
+enum Mode {
+    Release,
+    Debug,
+}
+
+impl Mode {
+    /// WASM artifact basename (blytplay.* / blytdebug.*).
+    fn wasm_name(self) -> &'static str {
+        match self {
+            Mode::Release => "blytplay",
+            Mode::Debug => "blytdebug",
+        }
+    }
+    fn is_debug(self) -> bool {
+        matches!(self, Mode::Debug)
+    }
+}
+
+/// Serve a release cart in the browser (no debugger).
+pub fn run(cart_path: &Path) -> Result<(), RunError> {
+    serve_cart(cart_path, Mode::Release)
+}
+
+/// Serve a debug cart with the DAP/GDB debug runtime.
+pub fn debug(cart_path: &Path) -> Result<(), RunError> {
+    serve_cart(cart_path, Mode::Debug)
+}
+
+fn serve_cart(cart_path: &Path, mode: Mode) -> Result<(), RunError> {
     let cart_path = cart_path
         .canonicalize()
         .map_err(|e| err(format!("cannot open cart '{}': {}", cart_path.display(), e)))?;
 
-    let wasm_dir = find_wasm_dir()?;
+    // Debug mode requires a debug build: source-level stepping needs DWARF, and
+    // the debug WASM/libs assume a `blyt build --debug` cart (ADR-0129).
+    if mode.is_debug() && !cart_has_dwarf(&cart_path)? {
+        return Err(err(format!(
+            "cart is not a debug build — rebuild with `blyt build --debug`:\n  {}",
+            cart_path.display()
+        )));
+    }
+
+    let name = mode.wasm_name();
+    let wasm_dir = find_wasm_dir_for(mode)?;
 
     // Validate that required WASM files are present.
-    for name in &["blytplay.js", "blytplay.wasm", "blytplay.html"] {
-        if !wasm_dir.join(name).exists() {
+    for ext in ["js", "wasm", "html"] {
+        let file = format!("{name}.{ext}");
+        if !wasm_dir.join(&file).exists() {
             return Err(err(format!(
-                "WASM runtime file missing: {}/{}\n\
-                 Rebuild with:\n\
-                 \x20 emcmake cmake -B build-wasm -S frontends/wasm\n\
-                 \x20 cmake --build build-wasm",
+                "WASM runtime file missing: {}/{file}\n\
+                 Rebuild the SDK (cmake --build build --target sdk).",
                 wasm_dir.display(),
-                name
             )));
         }
     }
@@ -60,16 +103,16 @@ pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
 
+    let debug = mode.is_debug();
+
     // DAP relay: WebSocket on PORT+1 (WASM runtime), raw TCP on PORT+2 (VS Code).
-    // Only started when --debug is passed.
+    // GDB relay: WebSocket on PORT+3 (WASM runtime), raw TCP on PORT+4 (gdb).
+    // Only started in debug mode.
     let (dap_ws_port, dap_tcp_port) = if debug {
         start_dap_relay(port.wrapping_add(1), port.wrapping_add(2))
     } else {
         (0, 0)
     };
-
-    // GDB relay: WebSocket on PORT+3 (WASM runtime), raw TCP on PORT+4 (gdb-multiarch).
-    // Only started when --debug is passed.
     let (gdb_ws_port, gdb_tcp_port) = if debug {
         start_gdb_relay(port.wrapping_add(3), port.wrapping_add(4))
     } else {
@@ -93,9 +136,63 @@ pub fn run(cart_path: &Path, debug: bool) -> Result<(), RunError> {
         listener,
         Arc::new(wasm_dir),
         Arc::new(cart_path),
+        Arc::new(name.to_string()),
         dap_ws_port,
         gdb_ws_port,
     )
+}
+
+/* -------------------------------------------------------------------------
+ * Debug-cart verification: a debug cart carries DWARF (.debug_* sections).
+ * Minimal ELF32 (little-endian) section-name scan — no external tools.
+ * ------------------------------------------------------------------------- */
+
+fn cart_has_dwarf(cart_path: &Path) -> Result<bool, RunError> {
+    let data = fs::read(cart_path)
+        .map_err(|e| err(format!("cannot read cart '{}': {}", cart_path.display(), e)))?;
+
+    // ELF32 header offsets (little-endian).
+    if data.len() < 52 || &data[0..4] != b"\x7fELF" || data[4] != 1 {
+        return Err(err(format!(
+            "not a valid ELF32 cart: {}",
+            cart_path.display()
+        )));
+    }
+    let rd_u32 = |off: usize| -> u32 {
+        u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+    };
+    let rd_u16 = |off: usize| -> u16 { u16::from_le_bytes([data[off], data[off + 1]]) };
+
+    let e_shoff = rd_u32(0x20) as usize;
+    let e_shentsize = rd_u16(0x2e) as usize;
+    let e_shnum = rd_u16(0x30) as usize;
+    let e_shstrndx = rd_u16(0x32) as usize;
+    if e_shoff == 0 || e_shnum == 0 || e_shstrndx >= e_shnum {
+        return Ok(false);
+    }
+
+    // .shstrtab section header → its file offset.
+    let strtab_hdr = e_shoff + e_shstrndx * e_shentsize;
+    if strtab_hdr + 0x18 > data.len() {
+        return Ok(false);
+    }
+    let strtab_off = rd_u32(strtab_hdr + 0x10) as usize;
+
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        if sh + 4 > data.len() {
+            break;
+        }
+        let name_off = strtab_off + rd_u32(sh) as usize;
+        // Read the NUL-terminated section name.
+        if let Some(end) = data[name_off..].iter().position(|&b| b == 0) {
+            let name = &data[name_off..name_off + end];
+            if name.starts_with(b".debug_") || name.starts_with(b".zdebug_") {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /* -------------------------------------------------------------------------
@@ -442,41 +539,53 @@ mod tests {
  *   3. <repo>/build-wasm/        — manual emcmake cmake invocation
  * ------------------------------------------------------------------------- */
 
+/// Locate the release WASM runtime dir (used by `blyt build wasm` packaging).
 pub(crate) fn find_wasm_dir() -> Result<PathBuf, RunError> {
-    if let Ok(d) = std::env::var("BLYT_WASM_DIR") {
+    find_wasm_dir_for(Mode::Release)
+}
+
+/// Locate the WASM runtime dir for the given build variant (ADR-0129):
+///   release → $BLYT_WASM_DIR       → <sdk>/share/wasm       → build-wasm
+///   debug   → $BLYT_WASM_DEBUG_DIR → <sdk>/share/wasm-debug → build-wasm-debug
+fn find_wasm_dir_for(mode: Mode) -> Result<PathBuf, RunError> {
+    let name = mode.wasm_name();
+    let js = format!("{name}.js");
+    let (env_var, share_sub, dev_sub) = match mode {
+        Mode::Release => ("BLYT_WASM_DIR", "wasm", "build-wasm"),
+        Mode::Debug => ("BLYT_WASM_DEBUG_DIR", "wasm-debug", "build-wasm-debug"),
+    };
+
+    if let Ok(d) = std::env::var(env_var) {
         let p = PathBuf::from(&d);
-        if p.join("blytplay.js").exists() {
+        if p.join(&js).exists() {
             return Ok(p);
         }
-        return Err(err(format!(
-            "BLYT_WASM_DIR={d} does not contain blytplay.js"
-        )));
+        return Err(err(format!("{env_var}={d} does not contain {js}")));
     }
 
-    // SDK layout: <sdk>/share/wasm/blytplay.js  (binary lives in <sdk>/bin/blyt)
+    // SDK layout: <sdk>/share/<share_sub>/<name>.js  (binary lives in <sdk>/bin/blyt)
     if let Some(sdk) = sdk_root_from_exe() {
-        let p = sdk.join("share").join("wasm");
-        if p.join("blytplay.js").exists() {
+        let p = sdk.join("share").join(share_sub);
+        if p.join(&js).exists() {
             return Ok(p);
         }
     }
 
-    // Dev layout: walk up from the binary looking for build-wasm/
+    // Dev layout: walk up from the binary looking for <dev_sub>/
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().skip(1) {
-            let candidate = ancestor.join("build-wasm");
-            if candidate.join("blytplay.js").exists() {
+            let candidate = ancestor.join(dev_sub);
+            if candidate.join(&js).exists() {
                 return Ok(candidate);
             }
         }
     }
 
-    Err(err(
-        "cannot find blytplay.js — build the WASM runtime first:\n\
-         \x20 emcmake cmake -B build-wasm -S frontends/wasm\n\
-         \x20 cmake --build build-wasm\n\
-         or set BLYT_WASM_DIR to the directory containing blytplay.js.",
-    ))
+    Err(err(format!(
+        "cannot find {js} — build the SDK first \
+         (cmake --build build --target sdk) or set {env_var} to the directory \
+         containing {js}.",
+    )))
 }
 
 /* -------------------------------------------------------------------------
@@ -653,6 +762,7 @@ fn serve(
     listener: TcpListener,
     wasm_dir: Arc<PathBuf>,
     cart_path: Arc<PathBuf>,
+    wasm_name: Arc<String>,
     dap_port: u16,
     gdb_port: u16,
 ) -> Result<(), RunError> {
@@ -663,8 +773,9 @@ fn serve(
         };
         let wasm_dir = Arc::clone(&wasm_dir);
         let cart_path = Arc::clone(&cart_path);
+        let wasm_name = Arc::clone(&wasm_name);
         std::thread::spawn(move || {
-            handle_connection(stream, &wasm_dir, &cart_path, dap_port, gdb_port);
+            handle_connection(stream, &wasm_dir, &cart_path, &wasm_name, dap_port, gdb_port);
         });
     }
     Ok(())
@@ -674,6 +785,7 @@ fn handle_connection(
     mut stream: TcpStream,
     wasm_dir: &Path,
     cart_path: &Path,
+    wasm_name: &str,
     dap_port: u16,
     gdb_port: u16,
 ) {
@@ -685,18 +797,27 @@ fn handle_connection(
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
     let path = request_path(request);
 
+    // The emscripten .html references <name>.js, which fetches <name>.wasm, so
+    // the served paths are variant-specific (blytplay.* vs blytdebug.*).
+    let js_path = format!("/{wasm_name}.js");
+    let wasm_path = format!("/{wasm_name}.wasm");
+
     let (file_path, content_type, inject_dap): (PathBuf, &str, bool) = match path {
         "/" | "/index.html" => (
-            wasm_dir.join("blytplay.html"),
+            wasm_dir.join(format!("{wasm_name}.html")),
             "text/html; charset=utf-8",
             true,
         ),
-        "/blytplay.js" => (
-            wasm_dir.join("blytplay.js"),
+        p if p == js_path => (
+            wasm_dir.join(format!("{wasm_name}.js")),
             "application/javascript",
             false,
         ),
-        "/blytplay.wasm" => (wasm_dir.join("blytplay.wasm"), "application/wasm", false),
+        p if p == wasm_path => (
+            wasm_dir.join(format!("{wasm_name}.wasm")),
+            "application/wasm",
+            false,
+        ),
         "/cart.blyt" => (cart_path.to_path_buf(), "application/octet-stream", false),
         _ => {
             respond(&mut stream, 404, "text/plain", b"Not Found");

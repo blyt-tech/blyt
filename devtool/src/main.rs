@@ -20,14 +20,16 @@ enum Commands {
     /// Compile a cart project or package it for a specific target
     Build(BuildArgs),
 
-    /// Serve a .blyt cart in the browser via the WASM runtime
+    /// Serve a release .blyt cart in the browser via the WASM runtime
     Run {
         /// Path to the .blyt cart file to run
         cart: PathBuf,
+    },
 
-        /// Enable debugging (DAP, GDB, frame stepping)
-        #[arg(long)]
-        debug: bool,
+    /// Serve a debug .dbg.blyt cart with the DAP/GDB debug runtime (ADR-0129)
+    Debug {
+        /// Path to the debug .dbg.blyt cart file to debug
+        cart: PathBuf,
     },
 
     /// Configure IDE and tooling integration for a cart project
@@ -146,7 +148,9 @@ fn main() {
                 .map_err(|e| e.to_string())
         }
 
-        Commands::Run { cart, debug } => run::run(&cart, debug).map_err(|e| e.to_string()),
+        Commands::Run { cart } => run::run(&cart).map_err(|e| e.to_string()),
+
+        Commands::Debug { cart } => run::debug(&cart).map_err(|e| e.to_string()),
 
         Commands::Setup {
             sub: SetupSubcommand::Vscode { project_dir, force },
