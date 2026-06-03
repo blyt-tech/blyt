@@ -75,4 +75,17 @@ RUN git clone --depth 1 https://github.com/emscripten-core/emsdk.git /opt/emsdk 
 ENV EMSDK=/opt/emsdk \
     EM_CONFIG=/opt/emsdk/.emscripten
 
+# ── Playwright headless chromium (WASM browser-render test) ─────────────────────
+# The wasm_canvas_renders_in_browser test launches headless chromium via
+# Playwright.  node_modules is gitignored, so at runtime the test resolves the
+# Playwright JS from the mounted repo's node_modules; only the browser binary
+# must be present in the image cache (/root/.cache/ms-playwright).  Install it
+# from tests/wasm's lockfile so the chromium revision matches the pinned
+# playwright (mirrors ci.yml's "Install Playwright" step).
+COPY tests/wasm/package.json tests/wasm/package-lock.json /opt/playwright/
+RUN cd /opt/playwright \
+    && npm ci \
+    && npx playwright install --with-deps chromium \
+    && rm -rf /opt/playwright/node_modules
+
 WORKDIR /repo
