@@ -203,15 +203,17 @@ function buildCart(cwd, output, debug = false) {
     });
 }
 
-/* ── Start blyt run --debug ───────────────────────────────────────────────── */
+/* ── Start blyt debug ─────────────────────────────────────────────────────── */
 
-/* Spawns `blyt run --debug <cartPath>` and resolves once the process prints
- * both the HTTP and DAP ports.  All stdout/stderr is forwarded to `output`. */
+/* Spawns `blyt debug <cartPath>` (ADR-0129) and resolves once the process
+ * prints both the HTTP and DAP ports.  All stdout/stderr is forwarded to
+ * `output`.  The announce text is unchanged from the old `blyt run --debug`,
+ * so the port regexes below still match. */
 function startBlytRun(cartPath, cwd, output) {
     const blyt = findBlyt();
     if (!blyt) return Promise.reject(new Error('blyt SDK not configured'));
     return new Promise((resolve, reject) => {
-        const proc = cp.spawn(blyt, ['run', '--debug', cartPath], {
+        const proc = cp.spawn(blyt, ['debug', cartPath], {
             cwd,
             stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -267,7 +269,7 @@ function startBlytRun(cartPath, cwd, output) {
         setTimeout(() => {
             if (!resolved) {
                 proc.kill();
-                reject(new Error('blyt run --debug did not start within 15 s'));
+                reject(new Error('blyt debug did not start within 15 s'));
             }
         }, 15000);
     });
@@ -533,7 +535,7 @@ function activate(context) {
 
     /* ── blyt: unified cart debugger ────────────────────────────────────── */
 
-    /* A single debug type serves every cart.  `blyt run --debug` always opens
+    /* A single debug type serves every cart.  `blyt debug` always opens
      * both a Lua DAP relay and a GDB relay, so one launch exposes both
      * backends; we choose which to connect by cart type:
      *   Lua cart    → VS Code's DAP client connects to the Lua DAP TCP port.
@@ -664,17 +666,21 @@ function activate(context) {
                 }
 
                 /* Native guest debugging needs DWARF line info, so always build
-                 * with --debug.  Lua only needs the cart present. */
+                 * with --debug — which emits <name>.dbg.blyt (ADR-0129).  Lua
+                 * steps via the debug runtime, so it only needs the cart present
+                 * and keeps the plain <name>.blyt name. */
+                let debugCart = cart;
                 if (isLua) {
                     if (!fs.existsSync(cart) && !(await build(cwd, false))) return undefined;
-                } else if (!(await build(cwd, true))) {
-                    return undefined;
+                } else {
+                    if (!(await build(cwd, true))) return undefined;
+                    debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
                 }
 
-                output.appendLine(`\n── blyt run --debug ${cart}`);
+                output.appendLine(`\n── blyt debug ${debugCart}`);
                 let result;
                 try {
-                    result = await startBlytRun(cart, cwd, output);
+                    result = await startBlytRun(debugCart, cwd, output);
                 } catch (e) {
                     vscode.window.showErrorMessage(`Blyt: ${e.message}`);
                     return undefined;
@@ -692,8 +698,8 @@ function activate(context) {
                 if (!gdbPort) {
                     proc.kill();
                     vscode.window.showErrorMessage(
-                        'Blyt: blyt run --debug did not announce a GDB port. ' +
-                        'Ensure the WASM build includes BLYT_GDB=ON.'
+                        'Blyt: blyt debug did not announce a GDB port. ' +
+                        'Ensure the debug WASM build includes BLYT_GDB=ON.'
                     );
                     return undefined;
                 }
@@ -756,7 +762,7 @@ function activate(context) {
                 return {
                     ...config,
                     _blytMode: 'native',
-                    program: cart,
+                    program: debugCart,
                     stopOnEntry: false,
                     launchCommands: [
                         `settings set target.source-map /blyt/src ${JSON.stringify(cwd)}`,

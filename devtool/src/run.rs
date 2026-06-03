@@ -75,9 +75,10 @@ fn serve_cart(cart_path: &Path, mode: Mode) -> Result<(), RunError> {
         .canonicalize()
         .map_err(|e| err(format!("cannot open cart '{}': {}", cart_path.display(), e)))?;
 
-    // Debug mode requires a debug build: source-level stepping needs DWARF, and
-    // the debug WASM/libs assume a `blyt build --debug` cart (ADR-0129).
-    if mode.is_debug() && !cart_has_dwarf(&cart_path)? {
+    // Debug mode requires a debuggable cart: native (C/Rust/C++) carts need DWARF
+    // (a `blyt build --debug` build); Lua carts step via the debug runtime's
+    // master hook, so any Lua cart (`.cart.lua` section) is fine (ADR-0129).
+    if mode.is_debug() && !cart_is_debuggable(&cart_path)? {
         return Err(err(format!(
             "cart is not a debug build — rebuild with `blyt build --debug`:\n  {}",
             cart_path.display()
@@ -143,11 +144,13 @@ fn serve_cart(cart_path: &Path, mode: Mode) -> Result<(), RunError> {
 }
 
 /* -------------------------------------------------------------------------
- * Debug-cart verification: a debug cart carries DWARF (.debug_* sections).
+ * Debug-cart verification.  A cart is debuggable under `blyt debug` if it
+ * carries DWARF (.debug_* — native debug build) or is a Lua cart (.cart.lua,
+ * which steps via the debug runtime master hook regardless of cart build).
  * Minimal ELF32 (little-endian) section-name scan — no external tools.
  * ------------------------------------------------------------------------- */
 
-fn cart_has_dwarf(cart_path: &Path) -> Result<bool, RunError> {
+fn cart_is_debuggable(cart_path: &Path) -> Result<bool, RunError> {
     let data = fs::read(cart_path)
         .map_err(|e| err(format!("cannot read cart '{}': {}", cart_path.display(), e)))?;
 
@@ -187,7 +190,10 @@ fn cart_has_dwarf(cart_path: &Path) -> Result<bool, RunError> {
         // Read the NUL-terminated section name.
         if let Some(end) = data[name_off..].iter().position(|&b| b == 0) {
             let name = &data[name_off..name_off + end];
-            if name.starts_with(b".debug_") || name.starts_with(b".zdebug_") {
+            if name.starts_with(b".debug_")
+                || name.starts_with(b".zdebug_")
+                || name == b".cart.lua"
+            {
                 return Ok(true);
             }
         }
