@@ -190,9 +190,7 @@ fn cart_is_debuggable(cart_path: &Path) -> Result<bool, RunError> {
         // Read the NUL-terminated section name.
         if let Some(end) = data[name_off..].iter().position(|&b| b == 0) {
             let name = &data[name_off..name_off + end];
-            if name.starts_with(b".debug_")
-                || name.starts_with(b".zdebug_")
-                || name == b".cart.lua"
+            if name.starts_with(b".debug_") || name.starts_with(b".zdebug_") || name == b".cart.lua"
             {
                 return Ok(true);
             }
@@ -781,7 +779,9 @@ fn serve(
         let cart_path = Arc::clone(&cart_path);
         let wasm_name = Arc::clone(&wasm_name);
         std::thread::spawn(move || {
-            handle_connection(stream, &wasm_dir, &cart_path, &wasm_name, dap_port, gdb_port);
+            handle_connection(
+                stream, &wasm_dir, &cart_path, &wasm_name, dap_port, gdb_port,
+            );
         });
     }
     Ok(())

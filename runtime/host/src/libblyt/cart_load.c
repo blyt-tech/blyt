@@ -660,7 +660,7 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
     const Elf32_Shdr *sect_dynsym = NULL;
     const Elf32_Shdr *sect_dynstr_sh = NULL;
 
-    int has_dwarf = 0;     /* set when a .debug_* section is present (ADR-0129) */
+    int has_dwarf = 0; /* set when a .debug_* section is present (ADR-0129) */
     int cart_is_debug = 0; /* .cart.info `debug` flag (read below) */
 
     for (uint16_t i = 0; i < eh->e_shnum; i++) {

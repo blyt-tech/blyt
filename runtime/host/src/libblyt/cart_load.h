@@ -26,7 +26,7 @@ struct blyt_cart {
     void *map;
     size_t map_size;
     char *path; /* heap-allocated copy of the path passed to blyt_cart_open */
-    int is_debug;  /* .cart.info `debug` flag (ADR-0129): declared debug build */
+    int is_debug; /* .cart.info `debug` flag (ADR-0129): declared debug build */
     int has_dwarf; /* a .debug_* section is present (DWARF, unstripped) */
 };
 

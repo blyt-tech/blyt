@@ -574,7 +574,14 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             debug,
         )?;
     } else {
-        finalise_cart(&objcopy, &raw_elf, &cart_info_file, &output_path, &[], debug)?;
+        finalise_cart(
+            &objcopy,
+            &raw_elf,
+            &cart_info_file,
+            &output_path,
+            &[],
+            debug,
+        )?;
     }
 
     println!("built: {}", output_path.display());
@@ -1600,8 +1607,14 @@ mod tests {
 
     #[test]
     fn cart_info_debug_flag_round_trips() {
-        assert!(read_debug(&cart_info_bytes(true)), "debug cart -> debug=true");
-        assert!(!read_debug(&cart_info_bytes(false)), "release cart -> debug=false");
+        assert!(
+            read_debug(&cart_info_bytes(true)),
+            "debug cart -> debug=true"
+        );
+        assert!(
+            !read_debug(&cart_info_bytes(false)),
+            "release cart -> debug=false"
+        );
     }
 
     #[test]

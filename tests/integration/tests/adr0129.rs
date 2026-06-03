@@ -25,7 +25,10 @@ void blyt_cart_draw(void)   {}
 /// Minimal ELF32 little-endian section-name reader (no external tools).
 fn elf_section_names(path: &Path) -> Vec<String> {
     let data = std::fs::read(path).expect("read cart ELF");
-    assert!(data.len() > 52 && &data[0..4] == b"\x7fELF" && data[4] == 1, "not ELF32");
+    assert!(
+        data.len() > 52 && &data[0..4] == b"\x7fELF" && data[4] == 1,
+        "not ELF32"
+    );
     let rd_u32 = |o: usize| u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
     let rd_u16 = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]);
 
@@ -58,7 +61,11 @@ fn debug_cart_has_dwarf_and_dbg_name() {
         "debug cart should be <name>.dbg.blyt, got {}",
         cart.display()
     );
-    assert!(cart.exists(), "debug cart not produced at {}", cart.display());
+    assert!(
+        cart.exists(),
+        "debug cart not produced at {}",
+        cart.display()
+    );
 
     let sections = elf_section_names(&cart);
     assert!(
@@ -108,7 +115,10 @@ fn blyt_debug_rejects_release_native_cart() {
         .env("BLYT_SDK_DIR", sdk_dir())
         .output()
         .expect("run blyt debug");
-    assert!(!out.status.success(), "blyt debug must fail on a release native cart");
+    assert!(
+        !out.status.success(),
+        "blyt debug must fail on a release native cart"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("not a debug build"),

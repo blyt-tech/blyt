@@ -262,7 +262,8 @@ if(CLANG_RV32
       # blyt_frame_done) via symbol preemption. -O2 defaults to
       # -fno-semantic-interposition, which binds libblytcommon's *intra-module*
       # calls (blyt_main → blyt_frame_done) directly to its own stub, bypassing
-      # the native override and ecall'ing on the native path. Keep interposition.
+      # the native override and ecall'ing on the native path. Keep
+      # interposition.
       -fsemantic-interposition
       -shared
       # -Wl,--shared explicitly tells lld to produce ET_DYN; clang may inject
@@ -789,9 +790,9 @@ endif()
 # SDL2 frontends — try find_package, then pkg-config, then sdl2-config.
 #
 # Normalise whichever method succeeds into SDL2_OK plus a small set of vars,
-# then build two executables (ADR-0129):
-#   blytplay  — release player, no GDB/DAP, loads release guest libs
-#   blytdebug — debug player, GDB/DAP on, loads debug guest libs (BLYT_LIB_DIR)
+# then build two executables (ADR-0129): blytplay  — release player, no GDB/DAP,
+# loads release guest libs blytdebug — debug player, GDB/DAP on, loads debug
+# guest libs (BLYT_LIB_DIR)
 # -------------------------------------------------------------------------
 set(SDL2_OK OFF)
 set(_SDL2_TARGET "")
@@ -804,7 +805,8 @@ find_package(SDL2 QUIET)
 if(SDL2_FOUND OR TARGET SDL2::SDL2)
   set(SDL2_OK ON)
   set(_SDL2_TARGET SDL2::SDL2)
-  message(STATUS "SDL2 found via find_package — blytplay/blytdebug will be built")
+  message(
+    STATUS "SDL2 found via find_package — blytplay/blytdebug will be built")
 else()
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
@@ -815,7 +817,8 @@ else()
     set(_SDL2_INCLUDE ${SDL2_INCLUDE_DIRS})
     set(_SDL2_LIBS ${SDL2_LIBRARIES})
     set(_SDL2_CFLAGS ${SDL2_CFLAGS_OTHER})
-    message(STATUS "SDL2 found via pkg-config — blytplay/blytdebug will be built")
+    message(
+      STATUS "SDL2 found via pkg-config — blytplay/blytdebug will be built")
   else()
     find_program(SDL2_CONFIG sdl2-config)
     if(SDL2_CONFIG)
@@ -830,7 +833,8 @@ else()
       separate_arguments(_SDL2_CFLAGS UNIX_COMMAND "${_sdl2_cflags_raw}")
       separate_arguments(_SDL2_LDFLAGS UNIX_COMMAND "${_sdl2_ldflags_raw}")
       set(SDL2_OK ON)
-      message(STATUS "SDL2 found via sdl2-config — blytplay/blytdebug will be built")
+      message(
+        STATUS "SDL2 found via sdl2-config — blytplay/blytdebug will be built")
     else()
       message(STATUS "SDL2 not found — blytplay/blytdebug will not be built")
     endif()
@@ -915,8 +919,8 @@ if(LIBBLYTC_OUT)
     PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
             "${CMAKE_SOURCE_DIR}/runtime/host/include")
   # ADR-0129: the shipped libretro core is release-only — no GDB/DAP, embeds the
-  # optimized release guest libs.  Debug stepping is served via blyt debug (WASM)
-  # and the native blytdebug player, not the libretro core.
+  # optimized release guest libs.  Debug stepping is served via blyt debug
+  # (WASM) and the native blytdebug player, not the libretro core.
   set(_blyt_libretro_defs BLYT_VERSION="${BLYT_VERSION}" BLYT_EMBED_LIBS)
   if(LIBBLYT32LUA_OUT)
     list(APPEND _blyt_libretro_defs BLYT_EMBED_LUA)
@@ -1107,9 +1111,10 @@ target_link_libraries(test_session_api PRIVATE libblyt)
 # libretro API (functional core test).  Built only when the libretro core is
 # available (LIBBLYTC_OUT set → blyt_libretro.so will be built).
 #
-# ADR-0129: the libretro core is release-only — there is no debugging through it,
-# so the former test_libretro_dap probe and blyt-libretro-runner orchestration
-# frontend were removed (debugging is served by blytdebug / the debug WASM).
+# ADR-0129: the libretro core is release-only — there is no debugging through
+# it, so the former test_libretro_dap probe and blyt-libretro-runner
+# orchestration frontend were removed (debugging is served by blytdebug / the
+# debug WASM).
 if(LIBBLYTC_OUT)
   add_executable(test_libretro_core tests/unit/test_libretro_core.c)
   target_include_directories(test_libretro_core

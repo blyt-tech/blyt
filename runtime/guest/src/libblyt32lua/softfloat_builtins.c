@@ -113,7 +113,7 @@ int __gtdf2(double a, double b) {
         return 1; /* a > b */
     if (f64_eq(ua, ub))
         return 0; /* a == b → not > 0 */
-    return -1;    /* a < b or unordered */
+    return -1; /* a < b or unordered */
 }
 int __gedf2(double a, double b) {
     float64_t ua = d2u(a), ub = d2u(b);
@@ -123,7 +123,7 @@ int __gedf2(double a, double b) {
         return 0; /* a == b → >= 0 */
     if (f64_lt(ub, ua))
         return 1; /* a > b → > 0 */
-    return -1;    /* unordered (NaN) → not >= */
+    return -1; /* unordered (NaN) → not >= */
 }
 int __eqdf2(double a, double b) {
     return f64_eq(d2u(a), d2u(b)) ? 0 : 1;
@@ -218,7 +218,7 @@ int __gttf2(const float128_t *a, const float128_t *b) {
         return 1; /* a > b */
     if (f128_eq(*a, *b))
         return 0; /* a == b → not > 0 */
-    return -1;    /* a < b or unordered */
+    return -1; /* a < b or unordered */
 }
 int __getf2(const float128_t *a, const float128_t *b) {
     if (f128_lt(*a, *b))
@@ -227,7 +227,7 @@ int __getf2(const float128_t *a, const float128_t *b) {
         return 0; /* a == b → >= 0 */
     if (f128_lt(*b, *a))
         return 1; /* a > b → > 0 */
-    return -1;    /* unordered (NaN) → not >= */
+    return -1; /* unordered (NaN) → not >= */
 }
 int __eqtf2(const float128_t *a, const float128_t *b) {
     return f128_eq(*a, *b) ? 0 : 1;
