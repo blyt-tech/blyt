@@ -194,10 +194,13 @@ void blyt_cart_init(void) {
         }
     }
 
-    /* --- 4. OOM: request more than the 16 MiB arena --- */
-    void *big = malloc(17u * 1024u * 1024u); /* 17 MiB > 16 MiB arena */
+    /* --- 4. OOM: request more than the 16 MiB arena ---
+     * `volatile` so the release (-O2) cart build cannot elide this dead
+     * allocation and assume a non-null pointer (ADR-0129): we are specifically
+     * testing the runtime's behaviour for an over-arena request. */
+    void *volatile big = malloc(17u * 1024u * 1024u); /* 17 MiB > 16 MiB arena */
     check(big == NULL, "FAIL: over-arena malloc should return NULL");
-    if (big) free(big);
+    if (big) free((void *)big);
 
     /* --- 5. Coalescing: free two adjacent blocks, then allocate merged size.
      *
