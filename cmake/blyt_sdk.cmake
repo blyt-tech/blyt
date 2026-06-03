@@ -186,18 +186,60 @@ if(FOUND_LLD)
   list(APPEND RV32_BASE "-fuse-ld=${FOUND_LLD}")
 endif()
 
-message(STATUS "Building libblytcommon.so…")
-# --allow-undefined: blyt_cart_init/update/draw are provided by the cart at
-# runtime (reverse symbol lookup); lld requires explicit permission for this.
-execute_process(
-  COMMAND
-    "${FOUND_CLANG}" ${RV32_BASE} -Wl,-soname,libblytcommon.so -o
-    "${SDK_LIB}/libblytcommon.so"
-    "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
-  RESULT_VARIABLE R)
-if(NOT R EQUAL 0)
-  message(FATAL_ERROR "Failed to build libblytcommon.so")
-endif()
+# -------------------------------------------------------------------------
+# Debug/release library variants (ADR-0129)
+#
+# Each guest .so is built twice:
+#   release → ${SDK_LIB}        (-O2, stripped: no DWARF, no .symtab)
+#   debug   → ${SDK_LIB}/debug  (-O0 -g, unstripped — full source debugging)
+# Determinism flags (ADR-0007) live in LIBBLYTC_CFLAGS / RV32_BASE and apply to
+# both variants; only -O/-g differ.  Release dynamic libs are what the runtime
+# embeds/ships; debug libs are SDK-only and loaded via BLYT_LIB_DIR by the
+# debug frontends.
+# -------------------------------------------------------------------------
+set(SDK_LIB_DEBUG "${SDK_LIB}/debug")
+file(MAKE_DIRECTORY "${SDK_LIB_DEBUG}")
+
+# Set _VDIR (output dir), _VOPT (opt/-g flags) and _VSTRIP (strip release) for
+# the named variant.  A macro (not a function) so it writes to the caller scope.
+macro(blyt_set_variant _var)
+  if("${_var}" STREQUAL "debug")
+    set(_VDIR "${SDK_LIB_DEBUG}")
+    set(_VOPT -O0 -g)
+    set(_VSTRIP FALSE)
+  else()
+    set(_VDIR "${SDK_LIB}")
+    set(_VOPT -O2)
+    set(_VSTRIP TRUE)
+  endif()
+endmacro()
+
+# Link one RV32 guest .so (ARGN = clang args after RV32_BASE) and, for release
+# variants, strip DWARF + the symbol table.  --strip-unneeded keeps .dynsym so
+# the library's exports (which carts link against) survive.
+function(blyt_link_guest_so out_so strip)
+  execute_process(COMMAND "${FOUND_CLANG}" ${RV32_BASE} ${ARGN} RESULT_VARIABLE _r)
+  if(NOT _r EQUAL 0)
+    message(FATAL_ERROR "Failed to build ${out_so}")
+  endif()
+  if(strip AND FOUND_OBJCOPY)
+    execute_process(
+      COMMAND "${FOUND_OBJCOPY}" --strip-debug --strip-unneeded "${out_so}"
+      RESULT_VARIABLE _sr)
+    if(NOT _sr EQUAL 0)
+      message(FATAL_ERROR "Failed to strip ${out_so}")
+    endif()
+  endif()
+endfunction()
+
+message(STATUS "Building libblytcommon.so (release + debug)…")
+foreach(_var release debug)
+  blyt_set_variant(${_var})
+  blyt_link_guest_so(
+    "${_VDIR}/libblytcommon.so" ${_VSTRIP} ${_VOPT}
+    -Wl,-soname,libblytcommon.so -o "${_VDIR}/libblytcommon.so"
+    "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c")
+endforeach()
 
 # libblytc.so — trimmed musl-based C library (ADR-0120). Curated musl source
 # subsets + our arena allocator and internal stubs.
@@ -302,18 +344,18 @@ set(LIBBLYTC_CFLAGS
     -Wno-unused-variable
     -Wno-deprecated-non-prototype)
 
-if(NOT EXISTS "${SDK_LIB}/libblytc.so")
-  message(STATUS "Building libblytc.so…")
-  execute_process(
-    COMMAND "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-            -Wl,-soname,libblytc.so -o "${SDK_LIB}/libblytc.so" ${LIBBLYTC_SRCS}
-    RESULT_VARIABLE R)
-  if(NOT R EQUAL 0)
-    message(FATAL_ERROR "Failed to build libblytc.so")
+foreach(_var release debug)
+  blyt_set_variant(${_var})
+  if(NOT EXISTS "${_VDIR}/libblytc.so")
+    message(STATUS "Building libblytc.so (${_var})…")
+    blyt_link_guest_so(
+      "${_VDIR}/libblytc.so" ${_VSTRIP} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
+      ${_VOPT} -Wl,-soname,libblytc.so -o "${_VDIR}/libblytc.so"
+      ${LIBBLYTC_SRCS})
+  else()
+    message(STATUS "libblytc.so (${_var}) already built — skipping")
   endif()
-else()
-  message(STATUS "libblytc.so already built — skipping")
-endif()
+endforeach()
 
 # -------------------------------------------------------------------------
 # Berkeley SoftFloat for RV32 — compiler-rt soft-double/quad ABI builtins.
@@ -400,22 +442,21 @@ message(STATUS "Building libblyt32.so…")
 # of malloc etc. are used on the emulated/libretro path; libblytc.so's copies
 # are shadowed but the library is present for the hardware trusted-exec path
 # where ld.so resolves against it directly.
-execute_process(
-  COMMAND
-    "${FOUND_CLANG}" ${RV32_BASE} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-    ${SF_INCLUDES} ${SF_DEFINES}
-    -Wl,-soname,libblyt32.so -Wl,--no-as-needed "${SDK_LIB}/libblytc.so"
-    -Wl,--as-needed -o "${SDK_LIB}/libblyt32.so"
+foreach(_var release debug)
+  blyt_set_variant(${_var})
+  message(STATUS "Building libblyt32.so (${_var})…")
+  blyt_link_guest_so(
+    "${_VDIR}/libblyt32.so" ${_VSTRIP} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
+    ${SF_INCLUDES} ${SF_DEFINES} ${_VOPT}
+    -Wl,-soname,libblyt32.so -Wl,--no-as-needed "${_VDIR}/libblytc.so"
+    -Wl,--as-needed -o "${_VDIR}/libblyt32.so"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     ${LIBBLYTC_SRCS}
     # Soft-float / 64-bit-int compiler-rt builtins (__*df3, __udivdi3, …) so
     # C/C++ carts that do double / 64-bit math resolve them from libblyt32.so.
-    ${SF_ALL} ${SF_RISCV} ${SF_MWORD} ${SF_BUILTINS}
-  RESULT_VARIABLE R)
-if(NOT R EQUAL 0)
-  message(FATAL_ERROR "Failed to build libblyt32.so")
-endif()
+    ${SF_ALL} ${SF_RISCV} ${SF_MWORD} ${SF_BUILTINS})
+endforeach()
 
 message(STATUS "Building libblyt32.so (native build)…")
 # libblyt32.so (native path) — real API implementations for trusted native exec.
@@ -528,15 +569,30 @@ else()
   # resolve them through libblyt32lua.so; no DT_NEEDED: libblytcommonlua.so is
   # added to the cart.  libblytcommonlua.so is still built above for standalone
   # / tooling use.
-  message(STATUS "Building libblyt32lua.so…")
-  execute_process(
-    COMMAND
-      "${FOUND_CLANG}" ${RV32_BASE} ${LUA_MUSL_INCLUDES} ${LIBBLYTC_CFLAGS}
-      -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -DBLYT_DAP=1 -I "${LUA_DIR}" -I
-      "${SF_INC}" -I "${SF_SRC}/RISCV" -I "${SF_PLATFORM_DIR}" -I
-      "${BLYT_SOURCE_DIR}/runtime/host/src/dap" -DSOFTFLOAT_FAST_INT64=1
-      -DSOFTFLOAT_ROUND_ODD=1 -Wl,-soname,libblyt32lua.so -Wl,--as-needed
-      "${SDK_LIB}/libblyt32.so" -o "${SDK_LIB}/libblyt32lua.so"
+  # ADR-0129: the guest-side DAP master hook (per-instruction stepping support)
+  # is debug-only.  The debug variant defines BLYT_DAP=1 and links the master
+  # hook sources; the release variant drops both — blyt32lua.c's hook install is
+  # `#ifdef BLYT_DAP`, so the master_hook sources are unreferenced in release.
+  foreach(_var release debug)
+    blyt_set_variant(${_var})
+    if("${_var}" STREQUAL "debug")
+      set(_VLUA_DAP_FLAGS -DBLYT_DAP=1 -I
+                          "${BLYT_SOURCE_DIR}/runtime/host/src/dap")
+      set(_VLUA_DAP_SRCS
+          "${BLYT_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"
+          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/master_hook_ecall.c")
+    else()
+      set(_VLUA_DAP_FLAGS "")
+      set(_VLUA_DAP_SRCS "")
+    endif()
+    message(STATUS "Building libblyt32lua.so (${_var})…")
+    blyt_link_guest_so(
+      "${_VDIR}/libblyt32lua.so" ${_VSTRIP} ${LUA_MUSL_INCLUDES}
+      ${LIBBLYTC_CFLAGS} ${_VOPT} -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1
+      ${_VLUA_DAP_FLAGS} -I "${LUA_DIR}" -I "${SF_INC}" -I "${SF_SRC}/RISCV" -I
+      "${SF_PLATFORM_DIR}" -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_ROUND_ODD=1
+      -Wl,-soname,libblyt32lua.so -Wl,--as-needed "${_VDIR}/libblyt32.so" -o
+      "${_VDIR}/libblyt32lua.so"
       # Lua VM sources embedded directly (exports lua_*/luaL_* in .dynsym)
       ${LUA_ALL_SRCS}
       # musl riscv32 setjmp/longjmp (not in libblytc)
@@ -549,13 +605,9 @@ else()
       "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/lua_runtime_stubs.c"
       # blyt32 API Lua bindings + cart lifecycle
       "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.c"
-      # DAP master hook dispatcher + ECALL stubs (compiled for RV32 guest)
-      "${BLYT_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"
-      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/master_hook_ecall.c"
-    RESULT_VARIABLE R)
-  if(NOT R EQUAL 0)
-    message(FATAL_ERROR "Failed to build libblyt32lua.so")
-  endif()
+      # DAP master hook dispatcher + ECALL stubs (debug variant only)
+      ${_VLUA_DAP_SRCS})
+  endforeach()
 
   message(STATUS "Lua libraries built: libblytcommonlua.so + libblyt32lua.so")
 
@@ -719,6 +771,87 @@ else()
 
   message(
     STATUS "libc++ built: ${SDK_LIB}/libc++.a + headers at ${SDK_INC_LIBCXX}")
+endif()
+
+# -------------------------------------------------------------------------
+# Step 2b-debug: debug libc++ / libc++abi (ADR-0129)
+#
+# A second, unoptimised (-O0 -g) build of the static libc++ for source-level
+# debugging of cart C++ code.  Same musl/cross flags as the release build
+# (LTO is a separate ADR-0127 follow-up); only the archives land in
+# ${SDK_LIB}/debug — headers are shared with the release build above.
+# -------------------------------------------------------------------------
+set(LIBCXX_DEBUG_BUILD_DIR "${BLYT_BINARY_DIR}/build-libcxx-rv32-debug")
+
+if(NOT EXISTS "${LIBCXX_SOURCE_DIR}/runtimes/CMakeLists.txt"
+   OR NOT FOUND_CLANGPP)
+  # Skipped: same conditions as the release build warn above.
+elseif(EXISTS "${SDK_LIB_DEBUG}/libc++.a")
+  message(
+    STATUS
+      "debug libc++ already built — skipping (delete ${SDK_LIB_DEBUG}/libc++.a to rebuild)"
+  )
+else()
+  message(STATUS "Building debug libc++ for RV32IMAFC (-O0 -g)…")
+
+  set(_LXXD_MUSL_FLAGS
+      "-isystem ${MUSL_DIR}/include -isystem ${MUSL_DIR}/arch/riscv32 -isystem ${MUSL_DIR}/arch/generic -isystem ${MUSL_DIR}/src/internal -isystem ${LIBBLYTC_BITS_DIR}/.."
+  )
+  set(_LXXD_SECTION_FLAGS "-ffunction-sections -fdata-sections -O0 -g")
+  set(_LXXD_C_FLAGS
+      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib ${_LXXD_SECTION_FLAGS} ${_LXXD_MUSL_FLAGS}"
+  )
+  set(_LXXD_CXX_FLAGS
+      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti ${_LXXD_SECTION_FLAGS} ${_LXXD_MUSL_FLAGS}"
+  )
+  if(FOUND_LLD)
+    string(APPEND _LXXD_C_FLAGS " -fuse-ld=${FOUND_LLD}")
+    string(APPEND _LXXD_CXX_FLAGS " -fuse-ld=${FOUND_LLD}")
+  endif()
+
+  execute_process(
+    COMMAND
+      ${CMAKE_COMMAND} -S "${LIBCXX_SOURCE_DIR}/runtimes" -B
+      "${LIBCXX_DEBUG_BUILD_DIR}" -G Ninja
+      "-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi"
+      "-DCMAKE_C_COMPILER=${FOUND_CLANG}"
+      "-DCMAKE_CXX_COMPILER=${FOUND_CLANGPP}" "-DCMAKE_C_FLAGS=${_LXXD_C_FLAGS}"
+      "-DCMAKE_CXX_FLAGS=${_LXXD_CXX_FLAGS}" -DCMAKE_BUILD_TYPE=Debug
+      -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXX_ENABLE_EXCEPTIONS=OFF
+      -DLIBCXX_ENABLE_RTTI=OFF -DLIBCXX_ENABLE_THREADS=OFF
+      -DLIBCXX_ENABLE_FILESYSTEM=OFF -DLIBCXX_ENABLE_LOCALIZATION=OFF
+      -DLIBCXX_HAS_MUSL_LIBC=ON -DLIBCXX_USE_COMPILER_RT=ON
+      -DLIBCXX_CXX_ABI=libcxxabi -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON
+      -DLIBCXXABI_ENABLE_SHARED=OFF -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF
+      -DLIBCXXABI_ENABLE_THREADS=OFF -DLIBCXXABI_USE_COMPILER_RT=ON
+      -DLIBCXXABI_USE_LLVM_UNWINDER=OFF -DLIBCXX_INCLUDE_TESTS=OFF
+      -DLIBCXXABI_INCLUDE_TESTS=OFF -DCMAKE_SYSTEM_NAME=Linux
+      -DCMAKE_SYSTEM_PROCESSOR=riscv32
+    RESULT_VARIABLE _LXXD_CFG_R
+    OUTPUT_QUIET)
+  if(NOT _LXXD_CFG_R EQUAL 0)
+    message(FATAL_ERROR "debug libc++ cmake configure failed (exit ${_LXXD_CFG_R})")
+  endif()
+
+  execute_process(COMMAND ${CMAKE_COMMAND} --build "${LIBCXX_DEBUG_BUILD_DIR}"
+                          --target cxx cxxabi RESULT_VARIABLE _LXXD_BUILD_R)
+  if(NOT _LXXD_BUILD_R EQUAL 0)
+    message(FATAL_ERROR "debug libc++ build failed (exit ${_LXXD_BUILD_R})")
+  endif()
+
+  foreach(_lib libc++.a libc++abi.a)
+    if(EXISTS "${LIBCXX_DEBUG_BUILD_DIR}/lib/${_lib}")
+      file(COPY "${LIBCXX_DEBUG_BUILD_DIR}/lib/${_lib}"
+           DESTINATION "${SDK_LIB_DEBUG}")
+    else()
+      message(
+        FATAL_ERROR
+          "debug libc++ build succeeded but ${_lib} not found in ${LIBCXX_DEBUG_BUILD_DIR}/lib/"
+      )
+    endif()
+  endforeach()
+
+  message(STATUS "debug libc++ built: ${SDK_LIB_DEBUG}/libc++.a")
 endif()
 
 # -------------------------------------------------------------------------
