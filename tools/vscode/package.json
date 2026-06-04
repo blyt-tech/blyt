@@ -4,8 +4,13 @@
   "description": "Blyt fantasy console — build, run, and debug carts in VS Code",
   "version": "0.1.0",
   "publisher": "blyt",
-  "engines": { "vscode": "^1.80.0" },
-  "categories": ["Debuggers", "Other"],
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
   "activationEvents": [
     "workspaceContains:blyt.info.yaml",
     "onStartupFinished",
@@ -26,10 +31,18 @@
       }
     },
     "breakpoints": [
-      { "language": "lua" },
-      { "language": "c" },
-      { "language": "cpp" },
-      { "language": "rust" }
+      {
+        "language": "lua"
+      },
+      {
+        "language": "c"
+      },
+      {
+        "language": "cpp"
+      },
+      {
+        "language": "rust"
+      }
     ],
     "debuggers": [
       {
@@ -44,7 +57,11 @@
               },
               "mode": {
                 "type": "string",
-                "enum": ["native", "build", "build-debug"],
+                "enum": [
+                  "native",
+                  "build",
+                  "build-debug"
+                ],
                 "description": "Run mode. Omit for WASM (default): cart opens in a VS Code panel. native: cart opens in an external SDL2 window (Ctrl+F5 = blytplay, F5 = blytdebug). build/build-debug: compile without launching."
               }
             }
@@ -55,7 +72,9 @@
     "taskDefinitions": [
       {
         "type": "blyt",
-        "required": ["command"],
+        "required": [
+          "command"
+        ],
         "properties": {
           "command": {
             "type": "string",
@@ -64,5 +83,8 @@
         }
       }
     ]
+  },
+  "dependencies": {
+    "js-yaml": "^4.2.0"
   }
 }

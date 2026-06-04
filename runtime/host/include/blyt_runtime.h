@@ -212,6 +212,16 @@ void blyt_session_gdb_shutdown(blyt_session_t *s);
  */
 int blyt_session_gdb_wait_attached(blyt_session_t *s);
 
+/*
+ * In hybrid (DAP+GDB) mode, clear the initial GDB halt so the cart runs
+ * without waiting for a vCont;c from the GDB client.  Call this after both
+ * blyt_session_dap_wait_ready() and blyt_session_gdb_wait_attached() return,
+ * so Lua breakpoints are already registered before the cart executes.
+ * No-op when BLYT_GDB is not compiled in, or if the stub is not in the
+ * initial-halt state.
+ */
+void blyt_session_gdb_continue_initial_halt(blyt_session_t *s);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1611,6 +1611,15 @@ int blyt_session_gdb_wait_attached(blyt_session_t *s) {
 #endif
 }
 
+void blyt_session_gdb_continue_initial_halt(blyt_session_t *s) {
+#ifdef BLYT_GDB
+    if (s && s->ctx.gdb_enabled)
+        fc_gdb_stub_continue_initial_halt();
+#else
+    (void)s;
+#endif
+}
+
 /* -------------------------------------------------------------------------
  * blyt_cart_run — blocking wrapper around the session API
  * ------------------------------------------------------------------------- */

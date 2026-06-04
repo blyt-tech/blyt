@@ -341,6 +341,14 @@ bool blyt_libretro_dap_wait_ready(void) {
 bool blyt_libretro_gdb_wait_attached(void) {
     return g_session && blyt_session_gdb_wait_attached(g_session) != 0;
 }
+
+/* In hybrid (DAP+GDB) mode, clear the initial GDB halt so the cart can run
+ * without waiting for a vCont;c from lldb-dap.  The Lua DAP session has
+ * already registered its breakpoints by the time this is called. */
+void blyt_libretro_gdb_continue_initial_halt(void) {
+    if (g_session)
+        blyt_session_gdb_continue_initial_halt(g_session);
+}
 #endif
 
 blyt_cart_run_err_t blyt_libretro_run_err(void) {

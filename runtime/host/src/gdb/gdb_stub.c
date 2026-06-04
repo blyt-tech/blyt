@@ -644,6 +644,21 @@ int fc_gdb_stub_is_halted(void) {
     return h;
 }
 
+/* In hybrid (DAP+GDB) mode the Lua DAP session has already received its
+ * breakpoints before the frame loop starts.  Clear the initial halt so the
+ * cart can run without waiting for a vCont;c from lldb-dap.  Only clears
+ * if still in the initial-connection state (pending_action == -1); a real
+ * breakpoint or interrupt that set halted=1 with pending_action >= 0 is
+ * left alone. */
+void fc_gdb_stub_continue_initial_halt(void) {
+    GDB_LOCK();
+    if (g_gdb.halted && g_gdb.pending_action < 0) {
+        g_gdb.pending_action = 0;
+        g_gdb.halted = 0;
+    }
+    GDB_UNLOCK();
+}
+
 #ifdef BLYT_GDB_TEST
 /* Reset all stub state; used by unit tests between test cases. */
 void fc_gdb_stub_test_reset(void) {

@@ -4,6 +4,7 @@ const vscode = require('vscode');
 const cp     = require('child_process');
 const path   = require('path');
 const fs     = require('fs');
+const yaml   = require('js-yaml');
 
 /* ── Process tracking ─────────────────────────────────────────────────────── */
 
@@ -450,20 +451,37 @@ function findCartProject(startPath) {
     }
 }
 
+/* Read and parse blyt.build.yaml, returning the YAML object or null.
+ * A missing file is normal (pure Lua carts may omit it); parse errors are
+ * swallowed so a malformed manifest does not prevent the extension from
+ * launching the cart. */
+function readBuildManifest(projectDir) {
+    const p = path.join(projectDir, 'blyt.build.yaml');
+    if (!fs.existsSync(p)) return null;
+    try { return yaml.load(fs.readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+/* Return the declared language set for a cart project.  Handles both the
+ * singular `language: lua` shorthand and the map form `languages: { lua:, c: }`.
+ * Falls back to {'lua'} when no manifest exists (pure-Lua default). */
+function cartLanguages(projectDir) {
+    const manifest = readBuildManifest(projectDir);
+    if (!manifest) return new Set(['lua']);
+    if (typeof manifest.language === 'string')
+        return new Set([manifest.language]);
+    if (manifest.languages && typeof manifest.languages === 'object')
+        return new Set(Object.keys(manifest.languages));
+    return new Set(['lua']);
+}
+
 function isLuaCart(projectDir) {
-    if (!fs.existsSync(path.join(projectDir, 'src', 'game', 'lua'))) return false;
-    const hasNative =
-        fs.existsSync(path.join(projectDir, 'src', 'game', 'c')) ||
-        fs.existsSync(path.join(projectDir, 'src', 'game', 'c++')) ||
-        fs.existsSync(path.join(projectDir, 'src', 'game', 'rust'));
-    return !hasNative;
+    const langs = cartLanguages(projectDir);
+    return langs.has('lua') && langs.size === 1;
 }
 
 function isHybridCart(projectDir) {
-    if (!fs.existsSync(path.join(projectDir, 'src', 'game', 'lua'))) return false;
-    return fs.existsSync(path.join(projectDir, 'src', 'game', 'c')) ||
-           fs.existsSync(path.join(projectDir, 'src', 'game', 'c++')) ||
-           fs.existsSync(path.join(projectDir, 'src', 'game', 'rust'));
+    const langs = cartLanguages(projectDir);
+    return langs.has('lua') && langs.size > 1;
 }
 
 /* Find any blyt cart project (Lua or native) for the current context.

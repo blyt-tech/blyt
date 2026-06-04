@@ -41,6 +41,7 @@ bool blyt_libretro_dap_wait_ready(void);
 #endif
 #ifdef BLYT_GDB
 bool blyt_libretro_gdb_wait_attached(void);
+void blyt_libretro_gdb_continue_initial_halt(void);
 #endif
 
 /* -------------------------------------------------------------------------
@@ -283,6 +284,14 @@ int main(int argc, char *argv[]) {
      * client can set breakpoints before blyt_cart_init() executes. */
     if (g_gdb_port >= 0)
         blyt_libretro_gdb_wait_attached();
+#endif
+#if defined(BLYT_DAP) && defined(BLYT_GDB)
+    /* Hybrid mode (both DAP and GDB active): Lua breakpoints are already
+     * registered (DAP configurationDone received above).  Clear the GDB
+     * initial halt so the cart can run immediately — we don't need lldb-dap
+     * to send vCont;c before Lua code executes. */
+    if (g_dap_port >= 0 && g_gdb_port >= 0)
+        blyt_libretro_gdb_continue_initial_halt();
 #endif
 
     SDL_Window *win = NULL;

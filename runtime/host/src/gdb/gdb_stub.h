@@ -113,6 +113,12 @@ int fc_gdb_stub_is_halted(void);
 /* Call transport->on_stop() — blocks for TCP, no-op for WASM. */
 void fc_gdb_stub_block_until_resume(void);
 
+/* Clear the initial halt that set_has_client(1) arms on client connection,
+ * but only when still in the initial-halt state (pending_action < 0).
+ * Called in hybrid (DAP+GDB) mode so the cart can run without waiting for
+ * the GDB client to send vCont;c. */
+void fc_gdb_stub_continue_initial_halt(void);
+
 /* Temporarily restore the original instruction at addr (for stepping through
  * a software breakpoint) without removing addr from the breaks[] table.
  * Call fc_gdb_stub_repatch_bp() after rv_step() to re-install the ebreak. */
