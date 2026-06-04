@@ -235,8 +235,12 @@ impl CartProject {
         .unwrap();
 
         // blyt.build.yaml — language declaration (ADR-0073).
-        // Lua carts omit the file; the absent manifest signals Lua to blyt build.
-        if !has_lua {
+        // Pure Lua carts omit the file; all other combinations require explicit declaration.
+        let native_count = [has_c, has_cpp, has_rust].iter().filter(|&&b| b).count();
+        if has_lua && native_count == 0 {
+            // pure Lua: no blyt.build.yaml needed
+        } else if !has_lua && native_count == 1 {
+            // pure native: singular `language:` form
             let manifest = if has_c {
                 "language: c\n"
             } else if has_cpp {
@@ -244,6 +248,22 @@ impl CartProject {
             } else {
                 "language: rust\n"
             };
+            fs::write(dir.join("blyt.build.yaml"), manifest).unwrap();
+        } else {
+            // hybrid Lua + native: `languages:` map
+            let mut manifest = String::from("languages:\n");
+            if has_lua {
+                manifest.push_str("  lua:\n");
+            }
+            if has_c {
+                manifest.push_str("  c:\n");
+            }
+            if has_cpp {
+                manifest.push_str("  \"c++\":\n");
+            }
+            if has_rust {
+                manifest.push_str("  rust:\n");
+            }
             fs::write(dir.join("blyt.build.yaml"), manifest).unwrap();
         }
 

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -99,49 +100,77 @@ fn err(msg: impl Into<String>) -> BuildError {
  * Build manifest (blyt.build.yaml)
  *
  * ADR-0073: Lua is the default cart language and does not need to be declared.
- * Native languages (C, Rust) require explicit declaration via `language: <lang>`
- * in blyt.build.yaml.  Future: `languages: [c, rust]` for hybrid carts.
+ * Native languages (C, C++, Rust) require explicit declaration via `language:`
+ * (singular, one language) or `languages:` (plural map, for hybrid carts).
+ *
+ * Hybrid Lua + native example:
+ *   languages:
+ *     lua:
+ *     c:
+ *
+ * If blyt.build.yaml is present but has neither `language:` nor `languages:`,
+ * the build errors rather than guessing (ADR-0073).
+ * Per-language sub-keys (`codegen`, `sources`) are parsed but not yet acted on.
  * ------------------------------------------------------------------------- */
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum CartLanguage {
     C,
     Cpp,
-    Rust,
     Lua,
+    Rust,
 }
 
-fn read_cart_language(project_dir: &Path) -> Result<CartLanguage, BuildError> {
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildManifest {
+    language: Option<String>,
+    languages: Option<BTreeMap<String, Option<LanguageConfig>>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // codegen/sources parsed for validation; not yet acted on
+struct LanguageConfig {
+    codegen: Option<bool>,
+    sources: Option<Vec<String>>,
+}
+
+fn parse_language_str(s: &str) -> Result<CartLanguage, BuildError> {
+    match s {
+        "c" => Ok(CartLanguage::C),
+        "c++" => Ok(CartLanguage::Cpp),
+        "rust" => Ok(CartLanguage::Rust),
+        "lua" => Ok(CartLanguage::Lua),
+        other => Err(err(format!(
+            "blyt.build.yaml: unknown language {other:?} — \
+             expected `c`, `c++`, `rust`, or `lua`"
+        ))),
+    }
+}
+
+fn read_cart_languages(project_dir: &Path) -> Result<BTreeSet<CartLanguage>, BuildError> {
     let manifest_path = project_dir.join("blyt.build.yaml");
     if !manifest_path.exists() {
-        // Absent manifest → Lua default (ADR-0073).
-        return Ok(CartLanguage::Lua);
+        return Ok(BTreeSet::from([CartLanguage::Lua]));
     }
     let text = fs::read_to_string(&manifest_path)?;
-    // Minimal parse: find first non-comment `language: <value>` line.
-    // YAML allows quoting: `language: "c++"` and `language: c++` both work.
-    // TODO(phase-9): replace with serde_yaml once blyt.build.yaml grows more fields.
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("language:") {
-            let val = rest.trim().trim_matches('"');
-            return match val {
-                "c" => Ok(CartLanguage::C),
-                "c++" => Ok(CartLanguage::Cpp),
-                "rust" => Ok(CartLanguage::Rust),
-                "lua" => Ok(CartLanguage::Lua),
-                other => Err(err(format!(
-                    "blyt.build.yaml: unknown language {other:?} — \
-                     expected `c`, `\"c++\"`, `rust`, or `lua`"
-                ))),
-            };
+    let manifest: BuildManifest =
+        serde_yaml::from_str(&text).map_err(|e| err(format!("blyt.build.yaml: {e}")))?;
+    match (manifest.language, manifest.languages) {
+        (None, None) => Err(err("blyt.build.yaml: no language declaration — \
+             add `language: lua` (or other language) or a `languages:` map")),
+        (Some(_), Some(_)) => Err(err(
+            "blyt.build.yaml: `language` and `languages` cannot both be set",
+        )),
+        (Some(lang), None) => Ok(BTreeSet::from([parse_language_str(&lang)?])),
+        (None, Some(map)) => {
+            if map.is_empty() {
+                return Err(err("blyt.build.yaml: `languages:` map is empty"));
+            }
+            map.keys().map(|k| parse_language_str(k)).collect()
         }
     }
-    // No language field → Lua default.
-    Ok(CartLanguage::Lua)
 }
 
 /* -------------------------------------------------------------------------
@@ -166,40 +195,86 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     let sdk_include = find_sdk_include()?;
     let lib_dir = find_lib_dir(&sdk_include)?;
 
-    let language = read_cart_language(project_dir)?;
+    let languages = read_cart_languages(project_dir)?;
+    let is_lua = languages.contains(&CartLanguage::Lua);
+
+    // At most one native language alongside Lua is supported for now.
+    let native_count = languages
+        .iter()
+        .filter(|&&l| l != CartLanguage::Lua)
+        .count();
+    if native_count > 1 {
+        return Err(err(
+            "blyt.build.yaml: combining more than one native language is not yet supported",
+        ));
+    }
 
     // Early validation: check source files exist before doing any build work.
-    match language {
-        CartLanguage::Lua => {
-            let lua_src_dir = project_dir.join("src/game/lua");
-            if collect_lua_files(&lua_src_dir)?.is_empty() {
-                return Err(err(format!(
-                    "no .lua files found under {} — \
-                     for a C or Rust cart add `language: c` or `language: rust` \
-                     to blyt.build.yaml",
-                    lua_src_dir.display()
-                )));
+    if is_lua {
+        let lua_src_dir = project_dir.join("src/game/lua");
+        if collect_lua_files(&lua_src_dir)?.is_empty() {
+            return Err(err(format!(
+                "no .lua files found under {} — \
+                 for a C or Rust cart add `language: c` or `language: rust` \
+                 to blyt.build.yaml",
+                lua_src_dir.display()
+            )));
+        }
+        // When Lua is the only declared language, check that no undeclared
+        // native game code exists in the conventional directories.
+        if native_count == 0 {
+            if !collect_c_files(&project_dir.join("src/game/c"))?.is_empty() {
+                return Err(err(
+                    "src/game/c/ contains .c files but no native language is declared — \
+                     add a `languages:` block to blyt.build.yaml, e.g.:\n\
+                     \x20 languages:\n\
+                     \x20   lua:\n\
+                     \x20   c:",
+                ));
+            }
+            if !collect_cpp_files(&project_dir.join("src/game/c++"))?.is_empty() {
+                return Err(err(
+                    "src/game/c++/ contains C++ files but no native language is declared — \
+                     add a `languages:` block to blyt.build.yaml",
+                ));
+            }
+            if project_dir.join("src/game/rust/Cargo.toml").exists() {
+                return Err(err(
+                    "src/game/rust/Cargo.toml exists but no native language is declared — \
+                     add a `languages:` block to blyt.build.yaml, e.g.:\n\
+                     \x20 languages:\n\
+                     \x20   lua:\n\
+                     \x20   rust:",
+                ));
             }
         }
-        CartLanguage::C => {
-            let c_src_dir = project_dir.join("src/game/c");
-            if collect_c_files(&c_src_dir)?.is_empty() {
-                return Err(err(format!(
-                    "no .c files found under {}",
-                    c_src_dir.display()
-                )));
-            }
+    }
+    if languages.contains(&CartLanguage::C) {
+        let c_src_dir = project_dir.join("src/game/c");
+        if collect_c_files(&c_src_dir)?.is_empty() {
+            return Err(err(format!(
+                "no .c files found under {}",
+                c_src_dir.display()
+            )));
         }
-        CartLanguage::Cpp => {
-            let cpp_src_dir = project_dir.join("src/game/c++");
-            if collect_cpp_files(&cpp_src_dir)?.is_empty() {
-                return Err(err(format!(
-                    "no .cpp/.cxx/.cc files found under {}",
-                    cpp_src_dir.display()
-                )));
-            }
+    }
+    if languages.contains(&CartLanguage::Cpp) {
+        let cpp_src_dir = project_dir.join("src/game/c++");
+        if collect_cpp_files(&cpp_src_dir)?.is_empty() {
+            return Err(err(format!(
+                "no .cpp/.cxx/.cc files found under {}",
+                cpp_src_dir.display()
+            )));
         }
-        CartLanguage::Rust => {}
+    }
+    if languages.contains(&CartLanguage::Rust) {
+        let rust_manifest = project_dir.join("src/game/rust/Cargo.toml");
+        if !rust_manifest.exists() {
+            return Err(err(format!(
+                "language: rust but no Cargo.toml found at {}",
+                rust_manifest.display()
+            )));
+        }
     }
 
     // Per-variant optimisation/debug flags, computed once and passed to every
@@ -235,7 +310,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     // Lua carts: pass LUA_32BITS=1 and LUA_USE_LONGJMP=1 so that src/lib/ C
     // code calling the Lua C API uses the same numeric types and error-handling
     // path as the blyt Lua VM compiled with these flags.
-    let lua_lib_defines: Vec<String> = if language == CartLanguage::Lua {
+    let lua_lib_defines: Vec<String> = if is_lua {
         vec![
             "-DLUA_32BITS=1".to_string(),
             "-DLUA_USE_LONGJMP=1".to_string(),
@@ -263,7 +338,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     // Lua carts may have standalone Rust libs in src/lib/ (Cargo.toml present).
     // Build each independently; the resulting archives are appended to lib_archives
     // and linked before -lblyt32lua so cart_lua_modules overrides the weak symbol.
-    if language == CartLanguage::Lua {
+    if is_lua {
         let cargo = find_cargo();
         for (lib_name, lib_path) in discover_rust_libs(project_dir)? {
             let lib_build_dir = project_dir.join("build/lib").join(&lib_name);
@@ -281,9 +356,10 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         }
     }
 
-    let build_dir = match language {
-        CartLanguage::Lua => project_dir.join("build/game/lua"),
-        _ => project_dir.join("build/game/c"),
+    let build_dir = if is_lua {
+        project_dir.join("build/game/lua")
+    } else {
+        project_dir.join("build/game/c")
     };
     fs::create_dir_all(&build_dir)?;
 
@@ -351,195 +427,112 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         &[],
     )?);
 
-    // Language-specific compilation.  C/C++ game files receive lib include paths.
-    let rust_archive = match language {
-        CartLanguage::C => {
-            let c_src_dir = project_dir.join("src/game/c");
-            let c_files = collect_c_files(&c_src_dir)?;
-            for src in &c_files {
-                obj_files.push(compile_c(
-                    &clang,
-                    src,
-                    &build_dir,
-                    &sdk_include,
-                    &lib_include_refs,
-                    &[],
-                    &opt_c_flags,
-                )?);
-            }
-            None
-        }
-        CartLanguage::Cpp => {
-            let cpp_src_dir = project_dir.join("src/game/c++");
-            let cpp_files = collect_cpp_files(&cpp_src_dir)?;
-            if cpp_files.is_empty() {
-                return Err(err(format!(
-                    "no .cpp/.cxx/.cc files found under {}",
-                    cpp_src_dir.display()
-                )));
-            }
-            // libc++ headers live at <sdk>/include/c++/v1/ (put there by cmake sdk step)
-            let libcxx_include = sdk_include.join("c++/v1");
-            if !libcxx_include.exists() {
-                return Err(err(
-                    "libc++ headers not found — run `cmake --build build --target sdk` \
-                     to build C++ support",
-                ));
-            }
-            // Add libc++ static archives to the link step (before -lblyt32).
-            // libc++abi is optional — link it only when present.
-            let libc_a = lib_dir.join("libc++.a");
-            if !libc_a.exists() {
-                return Err(err(
-                    "libc++.a not found — run `cmake --build build --target sdk` \
-                     to build C++ support",
-                ));
-            }
-            lib_archives.push(libc_a);
-            let libcxxabi_a = lib_dir.join("libc++abi.a");
-            if libcxxabi_a.exists() {
-                lib_archives.push(libcxxabi_a);
-            }
+    // Step 1: Lua bytecode — shared for all carts that include Lua.
+    if is_lua {
+        let luac = find_luac();
+        let lua_files = collect_lua_files(&project_dir.join("src/game/lua"))?;
 
-            for src in &cpp_files {
-                obj_files.push(compile_cpp(
-                    &clangpp,
-                    src,
-                    &build_dir,
-                    &sdk_include,
-                    &libcxx_include,
-                    &lib_include_refs,
-                    &opt_c_flags,
-                )?);
-            }
-            None
+        let bytecode_path = build_dir.join("bytecode.luac");
+        let mut luac_cmd = Command::new(&luac);
+        luac_cmd.arg("-o").arg(&bytecode_path);
+        for f in &lua_files {
+            luac_cmd.arg(f);
         }
-        CartLanguage::Rust => {
-            let cargo = find_cargo();
-            let rust_sdk = find_rust_sdk(&sdk_include)?;
-            let rust_manifest = project_dir.join("src/game/rust/Cargo.toml");
-            if !rust_manifest.exists() {
-                return Err(err(format!(
-                    "language: rust but no Cargo.toml found at {}",
-                    rust_manifest.display()
-                )));
-            }
-            let rust_build_dir = project_dir.join("build/game/rust");
-            fs::create_dir_all(&rust_build_dir)?;
-            let rust_libs = discover_rust_libs(project_dir)?;
-            Some(build_rust_archive(
-                &cargo,
-                &rust_manifest,
-                &rust_build_dir,
-                &rust_sdk,
-                &rust_libs,
-                &debug_rust_flags,
-            )?)
+        let status = luac_cmd
+            .status()
+            .map_err(|e| err(format!("failed to run {luac}: {e}")))?;
+        if !status.success() {
+            return Err(err("luac compilation failed"));
         }
-        CartLanguage::Lua => {
-            let luac = find_luac();
-            // Files already validated non-empty by the early check above.
-            let lua_files = collect_lua_files(&project_dir.join("src/game/lua"))?;
 
-            let bytecode_path = build_dir.join("bytecode.luac");
-            let mut luac_cmd = Command::new(&luac);
-            luac_cmd.arg("-o").arg(&bytecode_path);
-            for f in &lua_files {
-                luac_cmd.arg(f);
-            }
-            let status = luac_cmd
-                .status()
-                .map_err(|e| err(format!("failed to run {luac}: {e}")))?;
-            if !status.success() {
-                return Err(err("luac compilation failed"));
-            }
+        let data_c = build_dir.join("cart_lua_data.c");
+        generate_lua_data_c(&bytecode_path, &data_c)?;
+        obj_files.push(compile_c(
+            &clang,
+            &data_c,
+            &build_dir,
+            &sdk_include,
+            &[],
+            &[],
+            &[],
+        )?);
+    }
 
-            let data_c = build_dir.join("cart_lua_data.c");
-            generate_lua_data_c(&bytecode_path, &data_c)?;
-            // Generated file — no debug info needed.
+    // Step 2: Native game code.  Exactly one native language may be declared.
+    // For Lua+Rust: the archive goes into lib_archives so the linker emits
+    // -u,cart_lua_modules (not -u,blyt_cart_init — those come from libblyt32lua.so).
+    let rust_archive = if languages.contains(&CartLanguage::C) {
+        let extra_defines: &[String] = if is_lua { &lua_lib_defines } else { &[] };
+        for src in collect_c_files(&project_dir.join("src/game/c"))? {
             obj_files.push(compile_c(
                 &clang,
-                &data_c,
+                &src,
                 &build_dir,
                 &sdk_include,
-                &[],
-                &[],
-                &[],
+                &lib_include_refs,
+                extra_defines,
+                &opt_c_flags,
             )?);
-
-            // Compile game-level C files alongside the Lua bytecode.  These can
-            // define cart_lua_modules to register Lua modules from game C code,
-            // providing a flatter layout than the src/lib/ library system.
-            let game_c_dir = project_dir.join("src/game/c");
-            if game_c_dir.exists() {
-                for src in collect_c_files(&game_c_dir)? {
-                    obj_files.push(compile_c(
-                        &clang,
-                        &src,
-                        &build_dir,
-                        &sdk_include,
-                        &lib_include_refs,
-                        &lua_lib_defines,
-                        &opt_c_flags,
-                    )?);
-                }
-            }
-
-            // Compile game-level C++ files.  Lua headers have no extern "C" guards
-            // so callers must wrap includes manually (same constraint as src/lib/ C++).
-            let game_cpp_dir = project_dir.join("src/game/c++");
-            if game_cpp_dir.exists() {
-                let cpp_files = collect_cpp_files(&game_cpp_dir)?;
-                if !cpp_files.is_empty() {
-                    let libcxx_include = sdk_include.join("c++/v1");
-                    // Add libc++ when present; harmless if code does not use the STL.
-                    let libc_a = lib_dir.join("libc++.a");
-                    if libc_a.exists() {
-                        lib_archives.push(libc_a);
-                    }
-                    let libcxxabi_a = lib_dir.join("libc++abi.a");
-                    if libcxxabi_a.exists() {
-                        lib_archives.push(libcxxabi_a);
-                    }
-                    for src in &cpp_files {
-                        obj_files.push(compile_cpp(
-                            &clangpp,
-                            src,
-                            &build_dir,
-                            &sdk_include,
-                            &libcxx_include,
-                            &lib_include_refs,
-                            &opt_c_flags,
-                        )?);
-                    }
-                }
-            }
-
-            // Build Rust game code in src/game/rust/ when a Cargo.toml is present.
-            // The resulting archive is added to lib_archives (not rust_archive) so
-            // the linker does not inject -u,blyt_cart_init — those symbols come from
-            // libblyt32lua.so.  -u,cart_lua_modules is added by link_cart when
-            // lib_archives is non-empty.
-            let rust_game_manifest = project_dir.join("src/game/rust/Cargo.toml");
-            if rust_game_manifest.exists() {
-                let cargo = find_cargo();
-                let rust_sdk = find_rust_sdk(&sdk_include)?;
-                let rust_build_dir = project_dir.join("build/game/rust");
-                fs::create_dir_all(&rust_build_dir)?;
-                let rust_libs = discover_rust_libs(project_dir)?;
-                let archive = build_rust_archive(
-                    &cargo,
-                    &rust_game_manifest,
-                    &rust_build_dir,
-                    &rust_sdk,
-                    &rust_libs,
-                    &debug_rust_flags,
-                )?;
-                lib_archives.push(archive);
-            }
-
-            None
         }
+        None
+    } else if languages.contains(&CartLanguage::Cpp) {
+        // libc++ headers live at <sdk>/include/c++/v1/ (put there by cmake sdk step)
+        let libcxx_include = sdk_include.join("c++/v1");
+        if !libcxx_include.exists() {
+            return Err(err(
+                "libc++ headers not found — run `cmake --build build --target sdk` \
+                 to build C++ support",
+            ));
+        }
+        // Add libc++ static archives to the link step (before -lblyt32).
+        // libc++abi is optional — link it only when present.
+        let libc_a = lib_dir.join("libc++.a");
+        if !libc_a.exists() {
+            return Err(err(
+                "libc++.a not found — run `cmake --build build --target sdk` \
+                 to build C++ support",
+            ));
+        }
+        lib_archives.push(libc_a);
+        let libcxxabi_a = lib_dir.join("libc++abi.a");
+        if libcxxabi_a.exists() {
+            lib_archives.push(libcxxabi_a);
+        }
+        for src in collect_cpp_files(&project_dir.join("src/game/c++"))? {
+            obj_files.push(compile_cpp(
+                &clangpp,
+                &src,
+                &build_dir,
+                &sdk_include,
+                &libcxx_include,
+                &lib_include_refs,
+                &opt_c_flags,
+            )?);
+        }
+        None
+    } else if languages.contains(&CartLanguage::Rust) {
+        let cargo = find_cargo();
+        let rust_sdk = find_rust_sdk(&sdk_include)?;
+        let rust_manifest = project_dir.join("src/game/rust/Cargo.toml");
+        let rust_build_dir = project_dir.join("build/game/rust");
+        fs::create_dir_all(&rust_build_dir)?;
+        let rust_libs = discover_rust_libs(project_dir)?;
+        let archive = build_rust_archive(
+            &cargo,
+            &rust_manifest,
+            &rust_build_dir,
+            &rust_sdk,
+            &rust_libs,
+            &debug_rust_flags,
+        )?;
+        if is_lua {
+            lib_archives.push(archive);
+            None
+        } else {
+            Some(archive)
+        }
+    } else {
+        None // pure Lua
     };
 
     let raw_elf = build_dir.join("cart.elf");
@@ -551,14 +544,14 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         &ld_script,
         &lib_dir,
         &raw_elf,
-        language == CartLanguage::Lua,
+        is_lua,
     )?;
 
     let output_path = output
         .map(PathBuf::from)
         .unwrap_or_else(|| default_output(project_dir, debug));
 
-    let lua_bytecode_path = if language == CartLanguage::Lua {
+    let lua_bytecode_path = if is_lua {
         Some(build_dir.join("bytecode.luac"))
     } else {
         None
