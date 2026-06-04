@@ -4,8 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(BLYT_DAP) || defined(BLYT_GDB)
-#include <unistd.h> /* setenv */
+#include <unistd.h> /* setenv, readlink */
+#ifdef __APPLE__
+#include <mach-o/dyld.h> /* _NSGetExecutablePath */
 #endif
 
 #include "blyt_runtime.h"
@@ -142,6 +143,55 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index, unsig
 static int g_dap_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static int g_gdb_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 
+/* If BLYT_LIB_DIR is unset, try to infer it as <binary_dir>/../lib.
+ * This lets blytplay/blytdebug work without any environment setup when
+ * installed in an SDK whose layout is bin/ and lib/ side by side. */
+static void maybe_setenv_lib_dir(void) {
+    if (getenv("BLYT_LIB_DIR") && getenv("BLYT_LIB_DIR")[0] != '\0')
+        return;
+
+    char exe[4096];
+#ifdef __APPLE__
+    uint32_t size = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &size) != 0)
+        return;
+#else
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (len <= 0)
+        return;
+    exe[len] = '\0';
+#endif
+
+    char resolved[4096];
+    if (!realpath(exe, resolved))
+        return;
+
+    /* resolved = /path/to/bin/blytplay; go up two levels: dirname + "/../lib" */
+    char *slash = strrchr(resolved, '/');
+    if (!slash)
+        return;
+    *slash = '\0'; /* resolved is now the bin/ directory */
+
+    char lib_dir[4096];
+    int n = snprintf(lib_dir, sizeof(lib_dir), "%s/../lib", resolved);
+    if (n <= 0 || (size_t)n >= sizeof(lib_dir))
+        return;
+
+    char lib_dir_real[4096];
+    if (!realpath(lib_dir, lib_dir_real))
+        return;
+
+    /* Verify libblyt32.so is present before committing. */
+    char probe[4096];
+    n = snprintf(probe, sizeof(probe), "%s/libblyt32.so", lib_dir_real);
+    if (n <= 0 || (size_t)n >= sizeof(probe))
+        return;
+    if (access(probe, R_OK) != 0)
+        return;
+
+    setenv("BLYT_LIB_DIR", lib_dir_real, /* overwrite */ 0);
+}
+
 static const char *parse_args(int argc, char *argv[], bool *headless) {
     const char *cart = NULL;
     *headless = false;
@@ -174,6 +224,8 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
 }
 
 int main(int argc, char *argv[]) {
+    maybe_setenv_lib_dir();
+
     bool headless;
     const char *cart_path = parse_args(argc, argv, &headless);
     if (!cart_path) {

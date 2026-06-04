@@ -8,8 +8,7 @@ use tempfile::TempDir;
 /// SDK end-to-end: use the assembled SDK (build/sdk/) to build and run a cart.
 ///
 /// The SDK binary auto-discovers its toolchain and libraries from its own
-/// location in build/sdk/bin/ — no env vars required for blyt build.
-/// blytplay needs BLYT_LIB_DIR since it cannot yet auto-discover its libraries.
+/// location in build/sdk/bin/ — no env vars required for blyt build or blytplay.
 ///
 /// Requires `cmake --build build --target sdk` to have completed.
 /// Silently skipped if the SDK has not been assembled.
