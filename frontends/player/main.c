@@ -147,8 +147,10 @@ static int g_quit_after = -1; /* -1 = disabled; >=0 = exit after N frames */
 
 /* If BLYT_LIB_DIR is unset, try to infer it as <binary_dir>/../lib.
  * This lets blytplay/blytdebug work without any environment setup when
- * installed in an SDK whose layout is bin/ and lib/ side by side. */
-static void maybe_setenv_lib_dir(void) {
+ * installed in an SDK whose layout is bin/ and lib/ side by side.
+ * When prefer_debug is true (DAP or GDB enabled), prefer lib/debug/ if it
+ * contains libblyt32.so — that variant includes the DAP ECALL hook code. */
+static void maybe_setenv_lib_dir(bool prefer_debug) {
     if (getenv("BLYT_LIB_DIR") && getenv("BLYT_LIB_DIR")[0] != '\0')
         return;
 
@@ -175,16 +177,31 @@ static void maybe_setenv_lib_dir(void) {
     *slash = '\0'; /* resolved is now the bin/ directory */
 
     char lib_dir[4096];
-    int n = snprintf(lib_dir, sizeof(lib_dir), "%s/../lib", resolved);
+    char lib_dir_real[4096];
+    char probe[4096];
+    int n;
+
+    /* When running with DAP or GDB enabled, prefer lib/debug/ — it contains the
+     * guest libraries built with BLYT_DAP=1 (master_hook_ecall ECALL stubs). */
+    if (prefer_debug) {
+        n = snprintf(lib_dir, sizeof(lib_dir), "%s/../lib/debug", resolved);
+        if (n > 0 && (size_t)n < sizeof(lib_dir) && realpath(lib_dir, lib_dir_real)) {
+            n = snprintf(probe, sizeof(probe), "%s/libblyt32.so", lib_dir_real);
+            if (n > 0 && (size_t)n < sizeof(probe) && access(probe, R_OK) == 0) {
+                setenv("BLYT_LIB_DIR", lib_dir_real, /* overwrite */ 0);
+                return;
+            }
+        }
+    }
+
+    n = snprintf(lib_dir, sizeof(lib_dir), "%s/../lib", resolved);
     if (n <= 0 || (size_t)n >= sizeof(lib_dir))
         return;
 
-    char lib_dir_real[4096];
     if (!realpath(lib_dir, lib_dir_real))
         return;
 
     /* Verify libblyt32.so is present before committing. */
-    char probe[4096];
     n = snprintf(probe, sizeof(probe), "%s/libblyt32.so", lib_dir_real);
     if (n <= 0 || (size_t)n >= sizeof(probe))
         return;
@@ -228,14 +245,15 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
 }
 
 int main(int argc, char *argv[]) {
-    maybe_setenv_lib_dir();
-
     bool headless;
     const char *cart_path = parse_args(argc, argv, &headless);
     if (!cart_path) {
         fprintf(stderr, "usage: blytplay [--headless] <cart.blyt>\n");
         return 1;
     }
+
+    bool debug_mode = (g_dap_port >= 0 || g_gdb_port >= 0);
+    maybe_setenv_lib_dir(debug_mode);
 
 #ifdef BLYT_DAP
     if (g_dap_port >= 0) {
