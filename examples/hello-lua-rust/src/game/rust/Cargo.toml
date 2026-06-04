@@ -1,0 +1,15 @@
+[package]
+name = "cart"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace boundary so `blyt build` can compile this crate
+# independently without it being adopted by a surrounding workspace.
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+blyt = "0.1"
