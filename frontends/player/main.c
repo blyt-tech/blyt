@@ -142,6 +142,7 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index, unsig
 
 static int g_dap_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static int g_gdb_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
+static int g_quit_after = -1; /* -1 = disabled; >=0 = exit after N frames */
 
 /* If BLYT_LIB_DIR is unset, try to infer it as <binary_dir>/../lib.
  * This lets blytplay/blytdebug work without any environment setup when
@@ -213,6 +214,8 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
                 g_gdb_port = atoi(argv[++i]);
             else
                 g_gdb_port = 0;
+        } else if (strcmp(argv[i], "--quit-after") == 0 && i + 1 < argc) {
+            g_quit_after = atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             cart = argv[i];
         } else {
@@ -308,9 +311,12 @@ int main(int argc, char *argv[]) {
                                   (int)av.geometry.base_width, (int)av.geometry.base_height);
     }
 
+    int frame_count = 0;
     while (!g_quit && !blyt_libretro_is_done()) {
         uint32_t t0 = g_sdl_ready ? SDL_GetTicks() : 0;
         retro_run();
+        if (g_quit_after >= 0 && ++frame_count >= g_quit_after)
+            g_quit = true;
         if (g_sdl_ready) {
             uint32_t elapsed = SDL_GetTicks() - t0;
             if (elapsed < frame_ms)
