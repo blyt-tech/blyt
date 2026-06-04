@@ -41,6 +41,11 @@
               "cart": {
                 "type": "string",
                 "description": "Path to the compiled .blyt cart file. Auto-detected from the workspace if omitted. The debugger auto-detects Lua vs native carts."
+              },
+              "mode": {
+                "type": "string",
+                "enum": ["native", "build", "build-debug"],
+                "description": "Run mode. Omit for WASM (default): cart opens in a VS Code panel. native: cart opens in an external SDL2 window (Ctrl+F5 = blytplay, F5 = blytdebug). build/build-debug: compile without launching."
               }
             }
           }

@@ -102,6 +102,19 @@ function findBlyt() {
     return blyt;
 }
 
+/* Returns the path to an SDK binary by name (e.g. 'blytplay', 'blytdebug'),
+ * or null after showing an error notification if the SDK is not configured. */
+function findSdkBin(name) {
+    const sdk = sdkDir();
+    if (!sdk) {
+        vscode.window.showErrorMessage(
+            'Blyt: set blyt.sdkDir in VS Code settings (or BLYT_SDK_DIR env var) to the blyt SDK directory.'
+        );
+        return null;
+    }
+    return path.join(sdk, 'bin', name);
+}
+
 /* Find blyt-lldb-dap, the SDK-bundled LLDB Debug Adapter Protocol server.
  * Assembled by `cmake --build build --target sdk` alongside blyt-clang. */
 function findLldbDap() {
@@ -305,6 +318,62 @@ function startBlytRunSimple(cartPath, cwd, output) {
         });
         setTimeout(() => {
             if (!resolved) { proc.kill(); reject(new Error('blyt run did not start within 15 s')); }
+        }, 15000);
+    });
+}
+
+/* Spawns `blytdebug --gdb 0 <cartPath>` (native cart) or
+ * `blytdebug --debug 0 <cartPath>` (Lua cart) and resolves once the process
+ * announces a debug port on stdout.  SDK binaries locate their own lib dir
+ * relative to themselves so no BLYT_LIB_DIR is needed. */
+function startNativeDebug(cartPath, cwd, output, isLua) {
+    const blytdebug = findSdkBin('blytdebug');
+    if (!blytdebug) return Promise.reject(new Error('blytdebug not found in SDK'));
+    const flag = isLua ? '--debug' : '--gdb';
+    return new Promise((resolve, reject) => {
+        const proc = cp.spawn(blytdebug, [flag, '0', cartPath], {
+            cwd,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+
+        let buf = '', resolved = false;
+
+        function check(data) {
+            buf += data.toString();
+            output.append(data.toString());
+            if (isLua) {
+                const m = buf.match(/blyt: DAP listening on port (\d+)/);
+                if (m && !resolved) {
+                    resolved = true;
+                    resolve({ proc, dapPort: parseInt(m[1], 10) });
+                }
+            } else {
+                const m = buf.match(/blyt: GDB listening on port (\d+)/);
+                if (m && !resolved) {
+                    resolved = true;
+                    resolve({ proc, gdbPort: parseInt(m[1], 10) });
+                }
+            }
+        }
+
+        proc.stdout.on('data', check);
+        proc.stderr.on('data', d => output.append(d.toString()));
+
+        proc.on('error', err => {
+            if (!resolved)
+                reject(new Error(`Could not start blytdebug: ${err.message}`));
+        });
+
+        proc.on('exit', code => {
+            if (!resolved)
+                reject(new Error(`blytdebug exited (code ${code}) before the debug port was ready`));
+        });
+
+        setTimeout(() => {
+            if (!resolved) {
+                proc.kill();
+                reject(new Error('blytdebug did not announce a debug port within 15 s'));
+            }
         }, 15000);
     });
 }
@@ -649,6 +718,85 @@ function activate(context) {
                 const target = resolveTarget(folder, config);
                 if (!target) return undefined;
                 const { cart, cwd, isLua } = target;
+
+                /* Build-only modes: compile the cart, then cancel the launch. */
+                if (config.mode === 'build' || config.mode === 'build-debug') {
+                    const isDbg = config.mode === 'build-debug';
+                    if (await build(cwd, isDbg)) {
+                        vscode.window.showInformationMessage(
+                            `blyt build${isDbg ? ' --debug' : ''} succeeded`
+                        );
+                    }
+                    return undefined;
+                }
+
+                /* Native mode: blytplay (Ctrl+F5) or blytdebug (F5) in an SDL2 window.
+                 * Mirrors the WASM path but spawns native binaries directly — no HTTP
+                 * server, no webview panel, no WebSocket relay. */
+                if (config.mode === 'native') {
+                    if (config.noDebug) {
+                        /* Ctrl+F5: run with blytplay (release, no debugger). */
+                        if (!fs.existsSync(cart) && !(await build(cwd, false))) return undefined;
+                        const blytplay = findSdkBin('blytplay');
+                        if (!blytplay) return undefined;
+                        output.appendLine(`\n── blytplay ${cart}`);
+                        const proc = cp.spawn(blytplay, [cart], {
+                            cwd,
+                            stdio: ['ignore', 'pipe', 'pipe'],
+                        });
+                        proc.stdout.on('data', d => output.append(d.toString()));
+                        proc.stderr.on('data', d => output.append(d.toString()));
+                        proc.on('error', err =>
+                            vscode.window.showErrorMessage(`Blyt: ${err.message}`)
+                        );
+                        const tempId = await trackProc(proc, null);
+                        return { ...config, cart, _blytMode: 'run', _blytTempId: tempId };
+                    }
+
+                    /* F5: run with blytdebug and connect the IDE debugger. */
+                    let debugCart = cart;
+                    if (isLua) {
+                        if (!fs.existsSync(cart) && !(await build(cwd, false))) return undefined;
+                    } else {
+                        if (!(await build(cwd, true))) return undefined;
+                        debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
+                    }
+                    output.appendLine(
+                        `\n── blytdebug ${isLua ? '--debug' : '--gdb'} 0 ${debugCart}`
+                    );
+                    let nativeResult;
+                    try {
+                        nativeResult = await startNativeDebug(debugCart, cwd, output, isLua);
+                    } catch (e) {
+                        vscode.window.showErrorMessage(`Blyt: ${e.message}`);
+                        return undefined;
+                    }
+                    const { proc: nativeProc, gdbPort, dapPort } = nativeResult;
+
+                    if (isLua) {
+                        const tempId = await trackProc(nativeProc, null);
+                        return {
+                            ...config, cart,
+                            _blytMode: 'lua', _blytTempId: tempId, _blytDapPort: dapPort,
+                        };
+                    }
+
+                    /* Native cart: lldb-dap connects directly to the GDB RSP port.
+                     * No WebSocket relay or "wait for WASM ready" step needed. */
+                    const nativeTempId = nextId++;
+                    pendingProcs.set(nativeTempId, nativeProc);
+                    return {
+                        ...config,
+                        _blytMode: 'native',
+                        program: debugCart,
+                        stopOnEntry: false,
+                        launchCommands: [
+                            `settings set target.source-map /blyt/src ${JSON.stringify(cwd)}`,
+                            `gdb-remote 127.0.0.1:${gdbPort}`,
+                        ],
+                        _blytTempId: nativeTempId,
+                    };
+                }
 
                 /* Run Without Debugging (Ctrl+F5): plain `blyt run`, no relay. */
                 if (config.noDebug) {
