@@ -5,7 +5,6 @@ use common::{
     CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_lua_sdk,
     require_rust_riscv_target, require_sdk, sdk_dir,
 };
-use predicates::prelude::*;
 use tempfile::TempDir;
 
 /// `blyt build` with no blyt.build.yaml defaults to Lua; without Lua source
@@ -764,6 +763,115 @@ function draw() end
     assert!(
         String::from_utf8_lossy(&output).contains("lua+rust-game ok"),
         "expected 'lua+rust-game ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// Lua → Rust → C three-language call chain.
+///
+/// C provides `c_double(x)`; Rust calls it and exposes the result via a Lua module;
+/// Lua calls the module and verifies the answer.  This test exercises the
+/// `languages: { lua:, c:, rust: }` multi-language declaration path end-to-end.
+#[test]
+fn lua_rust_c_call_chain() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    let sdk = sdk_dir();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_rust_c_chain");
+
+    let c_src = r#"
+int c_double(int x) { return x * 2; }
+"#;
+
+    let rust_game_src = r#"#![no_std]
+extern crate blyt;
+
+use core::ffi::{c_int, c_void};
+
+type LuaState = c_void;
+
+extern "C" {
+    fn c_double(x: c_int) -> c_int;
+    fn lua_createtable(L: *mut LuaState, narr: c_int, nrec: c_int);
+    fn lua_pushcclosure(
+        L: *mut LuaState,
+        f: unsafe extern "C" fn(*mut LuaState) -> c_int,
+        n: c_int,
+    );
+    fn lua_setfield(L: *mut LuaState, idx: c_int, k: *const u8);
+    fn lua_pushinteger(L: *mut LuaState, n: c_int);
+    fn luaL_checkinteger(L: *mut LuaState, arg: c_int) -> c_int;
+    fn luaL_requiref(
+        L: *mut LuaState,
+        modname: *const u8,
+        openf: unsafe extern "C" fn(*mut LuaState) -> c_int,
+        glb: c_int,
+    );
+    fn lua_settop(L: *mut LuaState, idx: c_int);
+}
+
+unsafe extern "C" fn l_compute(L: *mut LuaState) -> c_int {
+    let x = luaL_checkinteger(L, 1);
+    lua_pushinteger(L, c_double(x));
+    1
+}
+
+unsafe extern "C" fn luaopen_bridge(L: *mut LuaState) -> c_int {
+    lua_createtable(L, 0, 1);
+    lua_pushcclosure(L, l_compute, 0);
+    lua_setfield(L, -2, b"compute\0".as_ptr());
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
+    luaL_requiref(L, b"bridge\0".as_ptr(), luaopen_bridge, 1);
+    lua_settop(L, -2);
+}
+"#;
+
+    CartProject::new()
+        .c(c_src)
+        .rust(rust_game_src)
+        .lua(
+            r#"
+function init()
+    local bridge = require("bridge")
+    local result = bridge.compute(21)
+    if result == 42 then
+        blyt32.debug.print("lua->rust->c ok")
+    else
+        blyt32.debug.print("lua->rust->c wrong: " .. tostring(result))
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytplay())
+        .args(["--headless", cart.to_str().unwrap()])
+        .env("BLYT_LIB_DIR", sdk.join("lib"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lua->rust->c ok"),
+        "expected 'lua->rust->c ok' in output, got: {}",
         String::from_utf8_lossy(&output)
     );
 }

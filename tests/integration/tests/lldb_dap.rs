@@ -49,7 +49,6 @@ fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::pat
 
     // Read lines until "GDB listening on port N" or timeout.
     use std::io::{BufRead, BufReader};
-    let mut gdb_port: Option<u16> = None;
     let stdout = blytplay_proc.stdout.take().unwrap();
     let mut stderr = blytplay_proc.stderr.take().unwrap();
 
@@ -79,15 +78,13 @@ fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::pat
     });
 
     // Wait up to 10s for the port.
-    match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(p) => gdb_port = Some(p),
+    let port = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(p) => p,
         Err(_) => {
             let _ = blytplay_proc.kill();
             panic!("blytplay did not announce GDB port within 10s");
         }
-    }
-
-    let port = gdb_port.unwrap();
+    };
 
     // Run the Node.js DAP test client.
     let orchestrator = repo_root().join("tests/dap/run_lldb_dap_test.mjs");
