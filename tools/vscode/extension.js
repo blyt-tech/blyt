@@ -378,6 +378,61 @@ function startNativeDebug(cartPath, cwd, output, isLua) {
     });
 }
 
+/* Spawns `blytdebug --debug 0 --gdb 0 <cartPath>` for hybrid Lua+native carts
+ * and resolves once BOTH the DAP port (Lua) and GDB port (native) are announced.
+ * The caller starts two debug sessions that share this process. */
+function startHybridNativeDebug(cartPath, cwd, output) {
+    const blytdebug = findSdkBin('blytdebug');
+    if (!blytdebug) return Promise.reject(new Error('blytdebug not found in SDK'));
+    return new Promise((resolve, reject) => {
+        const proc = cp.spawn(blytdebug, ['--debug', '0', '--gdb', '0', cartPath], {
+            cwd,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+
+        let buf = '', dapPort = 0, gdbPort = 0, resolved = false;
+
+        function tryResolve() {
+            if (dapPort && gdbPort && !resolved) {
+                resolved = true;
+                resolve({ proc, dapPort, gdbPort });
+            }
+        }
+
+        function check(data) {
+            buf += data.toString();
+            output.append(data.toString());
+            if (!dapPort) {
+                const m = buf.match(/blyt: DAP listening on port (\d+)/);
+                if (m) dapPort = parseInt(m[1], 10);
+            }
+            if (!gdbPort) {
+                const m = buf.match(/blyt: GDB listening on port (\d+)/);
+                if (m) gdbPort = parseInt(m[1], 10);
+            }
+            tryResolve();
+        }
+
+        proc.stdout.on('data', check);
+        proc.stderr.on('data', d => output.append(d.toString()));
+
+        proc.on('error', err => {
+            if (!resolved)
+                reject(new Error(`Could not start blytdebug: ${err.message}`));
+        });
+        proc.on('exit', code => {
+            if (!resolved)
+                reject(new Error(`blytdebug exited (code ${code}) before debug ports were ready`));
+        });
+        setTimeout(() => {
+            if (!resolved) {
+                proc.kill();
+                reject(new Error('blytdebug did not announce both debug ports within 15 s'));
+            }
+        }, 15000);
+    });
+}
+
 /* ── Cart project detection ───────────────────────────────────────────────── */
 
 /* Walk up from startPath to find the nearest directory containing
@@ -397,12 +452,18 @@ function findCartProject(startPath) {
 
 function isLuaCart(projectDir) {
     if (!fs.existsSync(path.join(projectDir, 'src', 'game', 'lua'))) return false;
-    // Hybrid carts (Lua + native) use the GDB path so C/C++/Rust breakpoints work.
     const hasNative =
         fs.existsSync(path.join(projectDir, 'src', 'game', 'c')) ||
         fs.existsSync(path.join(projectDir, 'src', 'game', 'c++')) ||
         fs.existsSync(path.join(projectDir, 'src', 'game', 'rust'));
     return !hasNative;
+}
+
+function isHybridCart(projectDir) {
+    if (!fs.existsSync(path.join(projectDir, 'src', 'game', 'lua'))) return false;
+    return fs.existsSync(path.join(projectDir, 'src', 'game', 'c')) ||
+           fs.existsSync(path.join(projectDir, 'src', 'game', 'c++')) ||
+           fs.existsSync(path.join(projectDir, 'src', 'game', 'rust'));
 }
 
 /* Find any blyt cart project (Lua or native) for the current context.
@@ -618,8 +679,8 @@ function activate(context) {
      * Ctrl+F5 (config.noDebug) runs the cart with no relay at all.
      * Host-engine debugging is out of scope here (see the repo .vscode/). */
 
-    /* Resolve { cart, cwd, isLua } from a launch config, falling back to
-     * project detection.  Returns null (after an error) if no cart is found. */
+    /* Resolve { cart, cwd, isLua, isHybrid } from a launch config, falling back
+     * to project detection.  Returns null (after an error) if no cart is found. */
     function resolveTarget(folder, config) {
         let cart = config.cart;
         let cwd  = folder?.uri.fsPath;
@@ -639,7 +700,11 @@ function activate(context) {
             projectDir = findCartProject(cart);
         }
         cwd = cwd ?? path.dirname(cart);
-        return { cart, cwd, isLua: projectDir ? isLuaCart(projectDir) : false };
+        return {
+            cart, cwd,
+            isLua:    projectDir ? isLuaCart(projectDir)    : false,
+            isHybrid: projectDir ? isHybridCart(projectDir) : false,
+        };
     }
 
     /* Build the cart, surfacing failures as an error notification.  Returns
@@ -720,10 +785,14 @@ function activate(context) {
         vscode.debug.registerDebugConfigurationProvider('blyt', {
             resolveDebugConfiguration,
             async resolveDebugConfigurationWithSubstitutedVariables(folder, config) {
+                /* Pre-resolved configs (e.g. the Lua DAP companion in a hybrid
+                 * compound launch) are fully formed — skip all setup. */
+                if (config._blytPreresolved) return config;
+
                 output.show(true);
                 const target = resolveTarget(folder, config);
                 if (!target) return undefined;
-                const { cart, cwd, isLua } = target;
+                const { cart, cwd, isLua, isHybrid } = target;
 
                 /* Build-only modes: compile the cart, then cancel the launch. */
                 if (config.mode === 'build' || config.mode === 'build-debug') {
@@ -767,6 +836,47 @@ function activate(context) {
                         if (!(await build(cwd, true))) return undefined;
                         debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
                     }
+
+                    /* Hybrid cart: spawn blytdebug with both --debug and --gdb, then
+                     * start a companion Lua DAP session programmatically.  The GDB
+                     * (native) session owns the process; the Lua session holds no proc
+                     * reference so terminating Lua alone leaves native running. */
+                    if (isHybrid) {
+                        output.appendLine(`\n── blytdebug --debug 0 --gdb 0 ${debugCart}`);
+                        let hybridResult;
+                        try {
+                            hybridResult = await startHybridNativeDebug(debugCart, cwd, output);
+                        } catch (e) {
+                            vscode.window.showErrorMessage(`Blyt: ${e.message}`);
+                            return undefined;
+                        }
+                        const { proc: hybridProc, dapPort: hybridDap, gdbPort: hybridGdb } = hybridResult;
+                        const hybridTempId = nextId++;
+                        pendingProcs.set(hybridTempId, hybridProc);
+                        /* Fire and forget: VS Code resolves the Lua session in parallel.
+                         * _blytPreresolved skips re-detection; no _blytTempId so the
+                         * companion session does not take ownership of the process. */
+                        vscode.debug.startDebugging(folder, {
+                            type: 'blyt',
+                            request: 'launch',
+                            name: 'Lua (blyt hybrid)',
+                            _blytMode: 'lua',
+                            _blytDapPort: hybridDap,
+                            _blytPreresolved: true,
+                        });
+                        return {
+                            ...config,
+                            _blytMode: 'native',
+                            program: debugCart,
+                            stopOnEntry: false,
+                            launchCommands: [
+                                `settings set target.source-map /blyt/src ${JSON.stringify(cwd)}`,
+                                `gdb-remote 127.0.0.1:${hybridGdb}`,
+                            ],
+                            _blytTempId: hybridTempId,
+                        };
+                    }
+
                     output.appendLine(
                         `\n── blytdebug ${isLua ? '--debug' : '--gdb'} 0 ${debugCart}`
                     );
