@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytdebug, build_lua_cart, debug_lib_dir, find_wasm_debug_dir, repo_root,
-    require_lua_sdk, require_sdk, require_wasm_debug,
+    CartProject, blytdebug, build_debug_lua_cart, build_lua_cart, debug_lib_dir,
+    find_wasm_debug_dir, repo_root, require_gdb, require_lua_sdk, require_sdk, require_wasm_debug,
 };
 use tempfile::TempDir;
 
@@ -627,6 +627,104 @@ fn wasm_dap_exception_breakpoint() {
             cart.to_str().unwrap(),
         ])
         .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
+        .assert()
+        .success();
+}
+
+/// SDL2 DAP: Lua breakpoint in a hybrid (Lua+C) cart — DAP only, no GDB.
+///
+/// Builds a Lua+C hybrid cart (has both src/game/lua/ and src/game/c/) and
+/// verifies that Lua breakpoints still fire when running under blytdebug
+/// with only the DAP debug server active.  This isolates whether the Lua DAP
+/// hook works correctly in hybrid carts independent of GDB interaction.
+#[test]
+fn sdl_hybrid_lua_c_dap_no_gdb() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytdebug().exists(),
+        "blytdebug not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hybrid_lua_c_no_gdb");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .c("#include \"blyt.h\"\n\
+             void c_helper(void) { (void)0; }\n")
+        .write(&project);
+
+    let cart = build_debug_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", debug_lib_dir())
+        .env("BLYT_DAP_BP_LINE", "3")
+        .assert()
+        .success();
+}
+
+/// SDL2 DAP: Lua breakpoint in a hybrid (Lua+C) cart — full hybrid mode.
+///
+/// Builds a Lua+C hybrid debug cart and runs blytdebug with both DAP and GDB
+/// active (--debug 0 --gdb 0 --headless).  A minimal GDB RSP stub connects to
+/// the GDB port to unblock blyt_session_gdb_wait_attached; dap_test.mjs
+/// connects to the Lua DAP port and verifies the Lua breakpoint fires.
+///
+/// This is the exact scenario reported as failing: Lua BPs don't stop in
+/// hybrid mode while C BPs (via lldb-dap) do.
+#[test]
+fn sdl_hybrid_lua_c_dap_with_gdb() {
+    require_sdk();
+    require_lua_sdk();
+    require_gdb();
+    assert!(
+        blytdebug().exists(),
+        "blytdebug not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hybrid_lua_c_with_gdb");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .c("#include \"blyt.h\"\n\
+             void c_helper(void) { (void)0; }\n")
+        .write(&project);
+
+    let cart = build_debug_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_hybrid_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_LIB_DIR", debug_lib_dir())
+        .env("BLYT_DAP_BP_LINE", "3")
         .assert()
         .success();
 }

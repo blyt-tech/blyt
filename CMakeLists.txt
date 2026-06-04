@@ -1162,9 +1162,9 @@ add_custom_target(
   COMMENT "Assembling blyt SDK in build/sdk/"
   VERBATIM)
 
-# The sdk script copies blytplay and blytdebug from the build directory.
-# Declare them as dependencies so `cmake --build build --target sdk` rebuilds
-# the binaries before assembling the SDK.
+# The sdk script copies blytplay and blytdebug from the build directory. Declare
+# them as dependencies so `cmake --build build --target sdk` rebuilds the
+# binaries before assembling the SDK.
 foreach(_sdk_bin blytplay blytdebug)
   if(TARGET ${_sdk_bin})
     add_dependencies(sdk ${_sdk_bin})
