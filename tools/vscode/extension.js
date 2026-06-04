@@ -396,7 +396,13 @@ function findCartProject(startPath) {
 }
 
 function isLuaCart(projectDir) {
-    return fs.existsSync(path.join(projectDir, 'src', 'game', 'lua'));
+    if (!fs.existsSync(path.join(projectDir, 'src', 'game', 'lua'))) return false;
+    // Hybrid carts (Lua + native) use the GDB path so C/C++/Rust breakpoints work.
+    const hasNative =
+        fs.existsSync(path.join(projectDir, 'src', 'game', 'c')) ||
+        fs.existsSync(path.join(projectDir, 'src', 'game', 'c++')) ||
+        fs.existsSync(path.join(projectDir, 'src', 'game', 'rust'));
+    return !hasNative;
 }
 
 /* Find any blyt cart project (Lua or native) for the current context.

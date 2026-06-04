@@ -387,6 +387,13 @@ static void blyt_ecall_handler(riscv_t *rv) {
         rv->csr_fcsr = 0;
         if (g_run_ctx)
             g_run_ctx->frame_done = true;
+        /* Halt the emulator so rv_step() returns immediately.  Without this,
+         * rv_step() continues running the next frame's instructions within the
+         * same cycle budget (BLYT_CYCLE_PER_STEP), causing multiple game frames
+         * to execute per outer-loop iteration while only one testcard draw
+         * occurs.  blyt_session_run_frame() clears halt at the start of each
+         * new frame. */
+        rv_halt(rv);
         return;
     }
 
@@ -1216,6 +1223,10 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
 blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     g_run_ctx = &session->ctx;
     session->ctx.frame_done = false;
+    /* Clear any halt set by the previous BLYT_ECALL_FRAME_DONE so the while
+     * loop below can execute the new frame.  A halt from blyt_exit/abort would
+     * have caused the caller to stop resubmitting frames entirely. */
+    session->rv->halt = false;
 
 #ifdef BLYT_DAP
     if (session->ctx.dap_enabled && fc_dap_is_restart_pending()) {
