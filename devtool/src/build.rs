@@ -198,16 +198,10 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     let languages = read_cart_languages(project_dir)?;
     let is_lua = languages.contains(&CartLanguage::Lua);
 
-    // At most one native language alongside Lua is supported for now.
     let native_count = languages
         .iter()
         .filter(|&&l| l != CartLanguage::Lua)
         .count();
-    if native_count > 1 {
-        return Err(err(
-            "blyt.build.yaml: combining more than one native language is not yet supported",
-        ));
-    }
 
     // Early validation: check source files exist before doing any build work.
     if is_lua {
@@ -458,10 +452,12 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         )?);
     }
 
-    // Step 2: Native game code.  Exactly one native language may be declared.
+    // Step 2: Native game code.  Each declared native language is compiled;
+    // all communicate at link time via extern "C" ABI.
     // For Lua+Rust: the archive goes into lib_archives so the linker emits
     // -u,cart_lua_modules (not -u,blyt_cart_init — those come from libblyt32lua.so).
-    let rust_archive = if languages.contains(&CartLanguage::C) {
+    // For a pure Rust cart (no Lua): rust_archive carries lifecycle symbols.
+    if languages.contains(&CartLanguage::C) {
         let extra_defines: &[String] = if is_lua { &lua_lib_defines } else { &[] };
         for src in collect_c_files(&project_dir.join("src/game/c"))? {
             obj_files.push(compile_c(
@@ -474,8 +470,8 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                 &opt_c_flags,
             )?);
         }
-        None
-    } else if languages.contains(&CartLanguage::Cpp) {
+    }
+    if languages.contains(&CartLanguage::Cpp) {
         // libc++ headers live at <sdk>/include/c++/v1/ (put there by cmake sdk step)
         let libcxx_include = sdk_include.join("c++/v1");
         if !libcxx_include.exists() {
@@ -509,8 +505,8 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                 &opt_c_flags,
             )?);
         }
-        None
-    } else if languages.contains(&CartLanguage::Rust) {
+    }
+    let rust_archive = if languages.contains(&CartLanguage::Rust) {
         let cargo = find_cargo();
         let rust_sdk = find_rust_sdk(&sdk_include)?;
         let rust_manifest = project_dir.join("src/game/rust/Cargo.toml");
@@ -532,7 +528,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             Some(archive)
         }
     } else {
-        None // pure Lua
+        None
     };
 
     let raw_elf = build_dir.join("cart.elf");
