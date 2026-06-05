@@ -14,6 +14,9 @@
 extern "C" {
 #endif
 
+/* Matches lua.h: -(INT_MAX/2 + 1000) for 32-bit int (RV32 ABI). */
+#define LUA_REGISTRYINDEX (-1073742823)
+
 typedef struct lua_State lua_State; /* opaque */
 typedef int (*lua_CFunction)(lua_State *L);
 
@@ -57,6 +60,9 @@ extern void lua_pushcclosure(lua_State *L, lua_CFunction f, int n);
 
 /* Error reporting. */
 extern int luaL_error(lua_State *L, const char *fmt, ...);
+
+/* Module table helper — gets or creates registry[fname]; used by cart_lua_modules. */
+extern int luaL_getsubtable(lua_State *L, int idx, const char *fname);
 
 #ifdef __cplusplus
 }

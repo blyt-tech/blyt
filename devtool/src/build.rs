@@ -374,7 +374,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     fs::create_dir_all(&build_dir)?;
 
     let ld_script = build_dir.join("blyt_cart.ld");
-    let ld_content = if is_lua && native_count > 0 {
+    let ld_content = if is_lua {
         HYBRID_LUA_LINKER_SCRIPT
     } else {
         LINKER_SCRIPT
@@ -501,15 +501,9 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                 "                lua_newtable(L);\n",
                 "                lua_pushvalue(L, -1);\n",
                 "                lua_setglobal(L, e->module_name);\n",
-                "                lua_getglobal(L, \"package\");\n",
-                "                if (lua_istable(L, -1)) {\n",
-                "                    lua_getfield(L, -1, \"loaded\");\n",
-                "                    if (lua_istable(L, -1)) {\n",
-                "                        lua_pushvalue(L, -3);\n",
-                "                        lua_setfield(L, -2, e->module_name);\n",
-                "                    }\n",
-                "                    lua_pop(L, 1);\n",
-                "                }\n",
+                "                luaL_getsubtable(L, LUA_REGISTRYINDEX, \"_LOADED\");\n",
+                "                lua_pushvalue(L, -2);\n",
+                "                lua_setfield(L, -2, e->module_name);\n",
                 "                lua_pop(L, 1);\n",
                 "            }\n",
                 "            lua_pushcfunction(L, e->wrapper);\n",
@@ -1589,7 +1583,13 @@ fn link_cart(
     // .lua_regtab/.lua_exports are preserved even when no C game code calls
     // the exported function by name.  Same rationale as the Rust archive above.
     for archive in lib_archives {
-        if lua_cart {
+        // C++ runtime archives have overlapping symbols — never wrap with
+        // --whole-archive or the linker will reject duplicate definitions.
+        let is_cpp_rt = archive
+            .file_name()
+            .map(|n| n == "libc++.a" || n == "libc++abi.a")
+            .unwrap_or(false);
+        if lua_cart && !is_cpp_rt {
             cmd.arg("-Wl,--whole-archive")
                 .arg(archive)
                 .arg("-Wl,--no-whole-archive");

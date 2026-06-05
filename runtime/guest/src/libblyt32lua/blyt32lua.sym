@@ -7,26 +7,26 @@
     lua_pushinteger;
     lua_pushnumber;
     lua_pushboolean;
-    /* Lua API used by SDK-generated cart_lua_modules glue */
-    lua_pushcfunction;
+    /* Lua API used by SDK-generated cart_lua_modules glue
+     * (lua_pushcfunction/lua_newtable/lua_istable/lua_pop are macros over these) */
+    lua_pushcclosure;
+    lua_createtable;
+    lua_type;
+    lua_settop;
     lua_setglobal;
     lua_setfield;
-    lua_newtable;
     lua_pushvalue;
     lua_getglobal;
-    lua_istable;
     lua_getfield;
-    lua_pop;
-    /* Error reporting */
+    /* Error reporting and arg checking */
     luaL_error;
     luaL_checkinteger;
     luaL_checknumber;
-    /* Lua C function registration (used by Rust #[lua_export] wrappers) */
-    lua_pushcclosure;
-    /* blyt32 cart lifecycle (called by libblytcommon.so) */
+    luaL_getsubtable;
+    /* blyt32 cart lifecycle (called by libblytcommon.so);
+     * cart_lua_modules is provided by the devtool-generated __blyt_lua_glue.c */
     blyt_cart_init;
     blyt_cart_update;
     blyt_cart_draw;
-    cart_lua_modules;
   local: *;
 };

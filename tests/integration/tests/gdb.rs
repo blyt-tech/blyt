@@ -288,8 +288,6 @@ fn sdl_hybrid_gdb_and_dap() {
     // generation (native_count > 0) so cart_lua_modules iterates .lua_regtab.
     // Volatile assignments give GDB two distinct PCs.
     const C_SOURCE: &str = r#"
-#include "lua.h"
-#include "lauxlib.h"
 #include "blyt.h"
 
 BLYT_LUA_EXPORT_VOID(blyt_native_work) {
@@ -356,8 +354,6 @@ fn wasm_hybrid_gdb_and_dap() {
     let project = tmp.path().join("wasm_hybrid_gdb_dap");
 
     const C_SOURCE: &str = r#"
-#include "lua.h"
-#include "lauxlib.h"
 #include "blyt.h"
 
 BLYT_LUA_EXPORT_VOID(blyt_native_work) {

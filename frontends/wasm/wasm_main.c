@@ -289,6 +289,21 @@ static int wasm_make_trampoline(lua_State *L) {
     return lua_yieldk(L, 0, (lua_KContext)(uintptr_t)fn_addr, wasm_trampoline_cont);
 }
 
+/* Sandboxed require() for WASM Lua carts: looks up pre-registered modules in
+ * the registry _LOADED table.  Mirrors lua_blyt_require in blyt32lua.c. */
+static int wasm_lua_require(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+    lua_getfield(L, -1, name);
+    if (!lua_isnil(L, -1)) {
+        lua_remove(L, -2);
+        return 1;
+    }
+    lua_pop(L, 2);
+    return luaL_error(L, "module '%s' not found (blyt sandbox: only native exports available)",
+                      name);
+}
+
 static void wasm_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr, uint8_t nargs,
                                  const uint8_t arg_types[4], uint8_t ret_type, void *userdata) {
     lua_State *L = (lua_State *)userdata;
@@ -314,24 +329,17 @@ static void wasm_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr, u
         mod[mod_len] = '\0';
         const char *fn = dot + 1;
 
-        /* Get or create the module table. */
+        /* Get or create the module table in globals and _LOADED. */
         lua_getglobal(L, mod);
         if (!lua_istable(L, -1)) {
             lua_pop(L, 1);
             lua_newtable(L);
             lua_pushvalue(L, -1);
             lua_setglobal(L, mod);
-            /* Register in package.loaded so require() works. */
-            lua_getglobal(L, "package");
-            if (lua_istable(L, -1)) {
-                lua_getfield(L, -1, "loaded");
-                if (lua_istable(L, -1)) {
-                    lua_pushvalue(L, -3);
-                    lua_setfield(L, -2, mod);
-                }
-                lua_pop(L, 1);
-            }
-            lua_pop(L, 1);
+            luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+            lua_pushvalue(L, -2);
+            lua_setfield(L, -2, mod);
+            lua_pop(L, 1); /* pop _LOADED */
         }
         /* The trampoline closure is at stack index -2 (module table is -1). */
         lua_pushvalue(L, -2);
@@ -582,6 +590,33 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     lua_pushcfunction(g_lua, lua_wasm_quit);
     lua_setglobal(g_lua, "blyt_quit");
 
+    /* Register sandboxed require() so top-level Lua code can call it. */
+    lua_pushcfunction(g_lua, wasm_lua_require);
+    lua_setglobal(g_lua, "require");
+
+    /* Hybrid cart: create rv32emu session and register trampolines BEFORE the
+     * Lua bytecode runs so top-level require() calls resolve correctly. */
+    {
+        size_t exports_sz = 0;
+        if (blyt_cart_find_section(g_cart, ".lua_exports", &exports_sz)) {
+            g_session = blyt_session_create(g_cart, wasm_log);
+            if (!g_session) {
+                blyt_js_error("hybrid session failed");
+                lua_close(g_lua);
+                g_lua = NULL;
+                return 1;
+            }
+#ifdef BLYT_GDB
+            {
+                int p = blyt_js_gdb_port();
+                if (p > 0)
+                    blyt_session_gdb_listen(g_session, &p);
+            }
+#endif
+            wasm_register_lua_trampolines(g_lua, g_session);
+        }
+    }
+
     /* Load and execute the bytecode chunk (defines init/update/draw globals). */
     if (luaL_loadbuffer(g_lua, (const char *)bytecode, bytecode_size, "@cart") != LUA_OK) {
         blyt_js_error(lua_tostring(g_lua, -1));
@@ -643,29 +678,6 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     if (fc_master_hook_cfg.dap_enabled && !g_lua_needs_start)
         fc_consolelua_master_hook_install(g_lua_co);
 #endif
-
-    /* Hybrid cart: if the cart has a .lua_exports section, create an rv32emu
-     * session so native C functions can be called via trampolines from Lua. */
-    {
-        size_t exports_sz = 0;
-        if (blyt_cart_find_section(g_cart, ".lua_exports", &exports_sz)) {
-            g_session = blyt_session_create(g_cart, wasm_log);
-            if (!g_session) {
-                blyt_js_error("hybrid session failed");
-                lua_close(g_lua);
-                g_lua = NULL;
-                return 1;
-            }
-#ifdef BLYT_GDB
-            {
-                int p = blyt_js_gdb_port();
-                if (p > 0)
-                    blyt_session_gdb_listen(g_session, &p);
-            }
-#endif
-            wasm_register_lua_trampolines(g_lua, g_session);
-        }
-    }
 
     /* Render one static test card frame into g_xrgb before starting the loop.
      * This gives the display a non-black image during the configurationDone
