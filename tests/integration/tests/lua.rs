@@ -32,7 +32,6 @@ fn build_lua_no_source_fails_with_error() {
 fn lua_cart_debug_output() {
     require_sdk();
     require_lua_sdk();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_hello");
@@ -58,7 +57,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -80,7 +78,6 @@ function draw() end
 fn lua_cart_calls_c_lib() {
     require_sdk();
     require_lua_sdk();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_c_lib");
@@ -151,7 +148,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -175,7 +171,6 @@ fn lua_cart_calls_rust_lib() {
     require_sdk();
     require_lua_sdk();
     require_rust_riscv_target();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_rust_lib");
@@ -274,7 +269,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -298,7 +292,6 @@ fn lua_cart_calls_cpp_lib() {
     require_sdk();
     require_cpp_sdk();
     require_lua_sdk();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_cpp_lib");
@@ -372,7 +365,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -398,7 +390,6 @@ function draw() end
 fn c_lib_drives_lua_vm() {
     require_sdk();
     require_lua_sdk();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("c_drives_lua");
@@ -470,7 +461,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -501,7 +491,6 @@ function draw() end
 fn lua_cart_with_c_game_code() {
     require_sdk();
     require_lua_sdk();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_c_game");
@@ -558,7 +547,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -578,7 +566,6 @@ fn lua_cart_with_cpp_game_code() {
     require_sdk();
     require_cpp_sdk();
     require_lua_sdk();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_cpp_game");
@@ -646,7 +633,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -670,7 +656,6 @@ fn lua_cart_with_rust_game_code() {
     require_sdk();
     require_lua_sdk();
     require_rust_riscv_target();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_rust_game");
@@ -753,7 +738,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -777,7 +761,6 @@ fn lua_rust_c_call_chain() {
     require_sdk();
     require_lua_sdk();
     require_rust_riscv_target();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_rust_c_chain");
@@ -862,7 +845,6 @@ function draw() end
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()

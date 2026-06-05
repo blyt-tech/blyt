@@ -1,7 +1,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{CartProject, blytplay, build_cart, require_cpp_sdk, sdk_dir};
+use common::{CartProject, blytplay, build_cart, require_cpp_sdk};
 use tempfile::TempDir;
 
 /// Build and run a minimal C++ cart.
@@ -14,7 +14,6 @@ use tempfile::TempDir;
 #[test]
 fn cpp_cart_debug_output() {
     require_cpp_sdk();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("cpp_hello");
@@ -44,7 +43,6 @@ extern "C" void blyt_cart_draw()   {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -68,7 +66,6 @@ extern "C" void blyt_cart_draw()   {}
 #[test]
 fn cpp_cart_std_string() {
     require_cpp_sdk();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("cpp_string");
@@ -100,7 +97,6 @@ extern "C" void blyt_cart_draw()   {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()

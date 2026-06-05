@@ -3,7 +3,6 @@ mod common;
 use assert_cmd::Command;
 use common::{
     CartProject, blytplay, build_cart, require_cpp_sdk, require_rust_riscv_target, require_sdk,
-    sdk_dir,
 };
 use tempfile::TempDir;
 
@@ -13,7 +12,6 @@ use tempfile::TempDir;
 fn rust_cart_debug_output() {
     require_sdk();
     require_rust_riscv_target();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("rust_hello");
@@ -43,7 +41,6 @@ pub extern "C" fn blyt_cart_draw() {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -65,7 +62,6 @@ pub extern "C" fn blyt_cart_draw() {}
 fn rust_cart_calls_c_lib_function() {
     require_sdk();
     require_rust_riscv_target();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("rust_c_lib");
@@ -110,7 +106,6 @@ pub extern "C" fn blyt_cart_draw() {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -134,7 +129,6 @@ fn rust_cart_calls_cpp_lib_over_c_abi() {
     require_sdk();
     require_cpp_sdk();
     require_rust_riscv_target();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("rust_cpp_lib");
@@ -190,7 +184,6 @@ pub extern "C" fn blyt_cart_draw() {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -213,7 +206,6 @@ pub extern "C" fn blyt_cart_draw() {}
 fn rust_cart_calls_rust_lib() {
     require_sdk();
     require_rust_riscv_target();
-    let sdk = sdk_dir();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("rust_lib_test");
@@ -253,7 +245,6 @@ pub extern "C" fn blyt_cart_draw() {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()

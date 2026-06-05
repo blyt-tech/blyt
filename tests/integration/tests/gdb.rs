@@ -2,9 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytdebug, build_cart, build_debug_cart, build_debug_lua_cart, debug_lib_dir,
-    find_symbol_addr, find_wasm_debug_dir, repo_root, require_gdb, require_lua_sdk, require_sdk,
-    require_wasm_debug,
+    CartProject, blytdebug, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
+    find_wasm_debug_dir, repo_root, require_gdb, require_lua_sdk, require_sdk, require_wasm_debug,
 };
 use tempfile::TempDir;
 
@@ -39,7 +38,6 @@ fn sdl_gdb_handshake() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .assert()
         .success();
 }
@@ -77,7 +75,6 @@ fn sdl_gdb_breakpoint_step() {
                 blytdebug().to_str().unwrap(),
                 cart.to_str().unwrap(),
             ])
-            .env("BLYT_LIB_DIR", debug_lib_dir())
             .assert()
             .success();
         return;
@@ -91,7 +88,6 @@ fn sdl_gdb_breakpoint_step() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"))
         .assert()
         .success();
@@ -140,7 +136,6 @@ fn sdl_gdb_rust_cart() {
         blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
     ])
-    .env("BLYT_LIB_DIR", debug_lib_dir());
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
     }
@@ -294,7 +289,6 @@ function draw()   end\n";
         blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
     ])
-    .env("BLYT_LIB_DIR", debug_lib_dir());
 
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
@@ -357,7 +351,6 @@ fn sdl_c_cart_gdb_memory_read() {
                 blytdebug().to_str().unwrap(),
                 cart.to_str().unwrap(),
             ])
-            .env("BLYT_LIB_DIR", debug_lib_dir())
             .assert()
             .success();
         return;
@@ -370,7 +363,6 @@ fn sdl_c_cart_gdb_memory_read() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_BREAK_ADDR", format!("{:x}", bp_addr.unwrap()))
         .env("BLYT_GDB_MEM_ADDR", format!("{:x}", mem_addr.unwrap()))
         .assert()
@@ -408,7 +400,6 @@ fn sdl_c_cart_gdb_multi_breakpoints() {
                     blytdebug().to_str().unwrap(),
                     cart.to_str().unwrap(),
                 ])
-                .env("BLYT_LIB_DIR", debug_lib_dir())
                 .env("BLYT_GDB_BP_ADDRS", format!("{a1:x},{a2:x},{a3:x}"))
                 .assert()
                 .success();
@@ -422,7 +413,6 @@ fn sdl_c_cart_gdb_multi_breakpoints() {
                     blytdebug().to_str().unwrap(),
                     cart.to_str().unwrap(),
                 ])
-                .env("BLYT_LIB_DIR", debug_lib_dir())
                 .assert()
                 .success();
         }
@@ -455,7 +445,6 @@ fn sdl_c_cart_gdb_detach() {
         blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
     ])
-    .env("BLYT_LIB_DIR", debug_lib_dir())
     .env("BLYT_GDB_DETACH", "1");
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
@@ -497,7 +486,6 @@ fn sdl_c_cart_gdb_interrupt() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .assert()
         .success();
 }
@@ -527,7 +515,6 @@ fn sdl_c_cart_gdb_exec_file_query() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_EXEC_FILE_CHECK", "1")
         .assert()
         .success();
@@ -559,7 +546,6 @@ fn sdl_c_cart_gdb_library_list() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_LIBRARY_CHECK", "1")
         .assert()
         .success();
@@ -631,7 +617,6 @@ fn sdl_c_cart_gdb_features_query() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_FEATURES_CHECK", "1")
         .assert()
         .success();
@@ -661,7 +646,6 @@ fn sdl_c_cart_gdb_process_info() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_PROCESS_INFO", "1")
         .assert()
         .success();
@@ -698,7 +682,6 @@ fn sdl_c_cart_gdb_register_write() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_BREAK_ADDR", &break_addr)
         .env("BLYT_GDB_REGISTER_WRITE_CHECK", "1")
         .assert()
@@ -736,7 +719,6 @@ fn sdl_c_cart_gdb_thread_stop_info() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_GDB_BREAK_ADDR", &break_addr)
         .env("BLYT_GDB_THREAD_STOP_INFO", "1")
         .assert()

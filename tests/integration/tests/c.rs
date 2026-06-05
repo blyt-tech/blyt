@@ -106,7 +106,6 @@ void blyt_cart_draw(void)   {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success()
         .get_output()
@@ -240,7 +239,6 @@ void blyt_cart_draw(void)   {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success()
         .get_output()
@@ -466,7 +464,6 @@ void blyt_cart_draw(void)   {}
             frame_path.to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success();
 
@@ -526,7 +523,6 @@ void blyt_cart_draw(void)   {}
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success()
         .get_output()
@@ -571,7 +567,6 @@ void blyt_cart_draw(void)   {}
     let cart = build_cart(&project);
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success()
         .get_output()
@@ -623,7 +618,6 @@ void blyt_cart_draw(void)   {}
     let cart = build_cart(&project);
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success()
         .get_output()

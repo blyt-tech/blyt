@@ -60,7 +60,6 @@ void blyt_cart_draw(void)   {}
     // Run the cart with the SDK's blytplay.
     let out = Command::new(&sdk_blytplay)
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk.join("lib"))
         .assert()
         .success()
         .get_output()
@@ -108,7 +107,6 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
 
     let output = Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .success()
         .get_output()
@@ -156,7 +154,6 @@ void blyt_cart_draw(void)   {}
 
     Command::new(blytplay())
         .args(["--headless", cart.to_str().unwrap()])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .failure() // non-zero exit — abort is not a clean exit
         .stderr(predicate::str::contains("aborted"));
@@ -167,7 +164,6 @@ void blyt_cart_draw(void)   {}
 fn run_missing_cart_fails() {
     Command::new(blytplay())
         .args(["--headless", "/nonexistent/path/cart.blyt"])
-        .env("BLYT_LIB_DIR", sdk_dir().join("lib"))
         .assert()
         .failure();
 }

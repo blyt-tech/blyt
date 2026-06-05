@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytdebug, build_debug_lua_cart, build_lua_cart, debug_lib_dir,
-    find_wasm_debug_dir, repo_root, require_gdb, require_lua_sdk, require_sdk, require_wasm_debug,
+    CartProject, blytdebug, build_debug_lua_cart, build_lua_cart, find_wasm_debug_dir, repo_root,
+    require_gdb, require_lua_sdk, require_sdk, require_wasm_debug,
 };
 use tempfile::TempDir;
 
@@ -223,7 +223,6 @@ fn sdl_dap_breakpoint_step_inspect() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .assert()
         .success();
@@ -263,7 +262,6 @@ fn sdl_dap_loaded_sources() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .env("BLYT_DAP_LOADED_SOURCES", "1")
         .assert()
@@ -306,7 +304,6 @@ fn sdl_dap_conditional_breakpoint() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .env("BLYT_DAP_CONDITIONAL_COND", "x > 10")
         .assert()
@@ -348,7 +345,6 @@ fn sdl_dap_restart() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .env("BLYT_DAP_TEST_RESTART", "1")
         .assert()
@@ -388,7 +384,6 @@ fn sdl_dap_exception_breakpoint() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
         .assert()
         .success();
@@ -430,7 +425,6 @@ fn sdl_dap_evaluate_expr() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .env("BLYT_DAP_EVALUATE_EXPR", "x + 1")
         .env("BLYT_DAP_EVALUATE_EXPECT", "43")
@@ -516,7 +510,6 @@ fn sdl_dap_evaluate_upvalue() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "4")
         .env("BLYT_DAP_EVALUATE_EXPR", "counter")
         .env("BLYT_DAP_EVALUATE_EXPECT", "7")
@@ -672,7 +665,6 @@ fn sdl_hybrid_lua_c_dap_no_gdb() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .assert()
         .success();
@@ -723,7 +715,6 @@ fn sdl_hybrid_lua_c_dap_with_gdb() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_LIB_DIR", debug_lib_dir())
         .env("BLYT_DAP_BP_LINE", "3")
         .assert()
         .success();

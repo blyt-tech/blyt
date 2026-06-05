@@ -30,24 +30,17 @@ pub fn sdk_dir() -> PathBuf {
     build_dir().join("sdk")
 }
 
+/// The release player — uses the SDK bin/ copy so BLYT_LIB_DIR auto-inference
+/// from the binary path resolves to sdk/lib/ (the release guest libs).
 pub fn blytplay() -> PathBuf {
-    build_dir().join("blytplay")
+    sdk_dir().join("bin/blytplay")
 }
 
 /// The debug player (ADR-0129): GDB/DAP on, loads the debug guest libs.
+/// Uses the SDK bin/ copy so BLYT_LIB_DIR auto-inference resolves to
+/// sdk/lib/debug/ when --debug or --gdb flags are present.
 pub fn blytdebug() -> PathBuf {
-    build_dir().join("blytdebug")
-}
-
-/// SDK release guest-lib dir (stripped, -O2).
-pub fn lib_dir() -> PathBuf {
-    sdk_dir().join("lib")
-}
-
-/// SDK debug guest-lib dir (DWARF, with the DAP/GDB master hook) — what
-/// blytdebug and the debug WASM load (ADR-0129).
-pub fn debug_lib_dir() -> PathBuf {
-    sdk_dir().join("lib").join("debug")
+    sdk_dir().join("bin/blytdebug")
 }
 
 /// Path to the `blyt` devtool binary.
