@@ -184,9 +184,10 @@ set(LIBBLYT32LUA "${BLYT_GUEST_LIB_DIR}/libblyt32lua.so")
 
 add_custom_command(
   OUTPUT "${EMBEDDED_LIBS_C}"
-  COMMAND python3 "${BLYT_ROOT}/cmake/bin2c.py" blytcommon_so "${LIBBLYTCOMMON}"
-          blytc_so "${LIBBLYTC}" blyt32_so "${LIBBLYT32}"
-          blyt32lua_so "${LIBBLYT32LUA}" "${EMBEDDED_LIBS_C}"
+  COMMAND
+    python3 "${BLYT_ROOT}/cmake/bin2c.py" blytcommon_so "${LIBBLYTCOMMON}"
+    blytc_so "${LIBBLYTC}" blyt32_so "${LIBBLYT32}" blyt32lua_so
+    "${LIBBLYT32LUA}" "${EMBEDDED_LIBS_C}"
   DEPENDS "${LIBBLYTCOMMON}" "${LIBBLYTC}" "${LIBBLYT32}" "${LIBBLYT32LUA}"
   COMMENT "Embedding guest libs for blytplay (WASM)"
   VERBATIM)
