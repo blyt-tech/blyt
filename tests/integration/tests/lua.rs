@@ -742,11 +742,9 @@ fn lua_rust_hybrid_wasm() {
 fn build_lua_c_hybrid_cart(tmp: &std::path::Path) -> std::path::PathBuf {
     let project = tmp.join("lua_c_hybrid");
     CartProject::new()
-        .c(
-            "#include \"lua.h\"\n\
+        .c("#include \"lua.h\"\n\
              #include \"blyt.h\"\n\
-             BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n",
-        )
+             BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n")
         .lua(
             r#"
 function init()
@@ -784,11 +782,9 @@ fn lua_c_hybrid_wasm() {
 fn build_lua_c_rust_exports_cart(tmp: &std::path::Path) -> std::path::PathBuf {
     let project = tmp.join("lua_c_rust_exports");
     CartProject::new()
-        .c(
-            "#include \"lua.h\"\n\
+        .c("#include \"lua.h\"\n\
              #include \"blyt.h\"\n\
-             BLYT_LUA_EXPORT_I32(c_triple, int32_t x) { return x * 3; }\n",
-        )
+             BLYT_LUA_EXPORT_I32(c_triple, int32_t x) { return x * 3; }\n")
         .rust(
             r#"#![no_std]
 extern crate blyt;

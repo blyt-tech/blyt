@@ -477,7 +477,8 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     // via .lua_regtab section iteration.  Weak so user-defined cart_lua_modules wins.
     // Skipped whenever Rust is present: Rust defines cart_lua_modules in a static archive;
     // a weak direct-object definition would prevent the archive from being searched.
-    let has_c_native = languages.contains(&CartLanguage::C) || languages.contains(&CartLanguage::Cpp);
+    let has_c_native =
+        languages.contains(&CartLanguage::C) || languages.contains(&CartLanguage::Cpp);
     let has_rust = languages.contains(&CartLanguage::Rust);
     if is_lua && has_c_native && !has_rust {
         let glue_src = build_dir.join("__blyt_lua_glue.c");

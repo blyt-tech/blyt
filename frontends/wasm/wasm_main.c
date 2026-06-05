@@ -102,9 +102,9 @@ static bool g_trampoline_active = false;
 static uint32_t g_trampoline_ret = 0;
 /* BLYT_LUA_TYPE_* constants — must match blyt.h guest SDK definition. */
 #define WASM_LUA_TYPE_VOID 0
-#define WASM_LUA_TYPE_I32  1
-#define WASM_LUA_TYPE_U32  2
-#define WASM_LUA_TYPE_F32  3
+#define WASM_LUA_TYPE_I32 1
+#define WASM_LUA_TYPE_U32 2
+#define WASM_LUA_TYPE_F32 3
 #define WASM_LUA_TYPE_BOOL 4
 #endif
 
@@ -227,32 +227,43 @@ static int lua_wasm_quit(lua_State *L) {
 /* Convert a Lua stack value at index idx to a uint32_t for rv32 register. */
 static uint32_t wasm_lua_to_rv32(lua_State *L, int idx, int type) {
     switch (type) {
-    case WASM_LUA_TYPE_I32:  return (uint32_t)(int32_t)lua_tointeger(L, idx);
-    case WASM_LUA_TYPE_U32:  return (uint32_t)lua_tointeger(L, idx);
+    case WASM_LUA_TYPE_I32:
+        return (uint32_t)(int32_t)lua_tointeger(L, idx);
+    case WASM_LUA_TYPE_U32:
+        return (uint32_t)lua_tointeger(L, idx);
     case WASM_LUA_TYPE_F32: {
         float f = (float)lua_tonumber(L, idx);
         uint32_t bits;
         memcpy(&bits, &f, 4);
         return bits;
     }
-    case WASM_LUA_TYPE_BOOL: return lua_toboolean(L, idx) ? 1u : 0u;
-    default:                 return 0u;
+    case WASM_LUA_TYPE_BOOL:
+        return lua_toboolean(L, idx) ? 1u : 0u;
+    default:
+        return 0u;
     }
 }
 
 /* Push a uint32_t rv32 return value onto the Lua stack. */
 static void wasm_rv32_to_lua(lua_State *L, uint32_t val, int type) {
     switch (type) {
-    case WASM_LUA_TYPE_I32:  lua_pushinteger(L, (lua_Integer)(int32_t)val); break;
-    case WASM_LUA_TYPE_U32:  lua_pushinteger(L, (lua_Integer)(uint32_t)val); break;
+    case WASM_LUA_TYPE_I32:
+        lua_pushinteger(L, (lua_Integer)(int32_t)val);
+        break;
+    case WASM_LUA_TYPE_U32:
+        lua_pushinteger(L, (lua_Integer)(uint32_t)val);
+        break;
     case WASM_LUA_TYPE_F32: {
         float f;
         memcpy(&f, &val, 4);
         lua_pushnumber(L, (lua_Number)f);
         break;
     }
-    case WASM_LUA_TYPE_BOOL: lua_pushboolean(L, val ? 1 : 0); break;
-    default: break; /* VOID: push nothing */
+    case WASM_LUA_TYPE_BOOL:
+        lua_pushboolean(L, val ? 1 : 0);
+        break;
+    default:
+        break; /* VOID: push nothing */
     }
 }
 
@@ -272,16 +283,14 @@ static int wasm_make_trampoline(lua_State *L) {
     int nargs = (int)lua_tointeger(L, lua_upvalueindex(2));
     uint32_t args[4] = {0};
     for (int i = 0; i < nargs && i < 4; i++)
-        args[i] = wasm_lua_to_rv32(L, i + 1,
-                                   (int)lua_tointeger(L, lua_upvalueindex(3 + i)));
+        args[i] = wasm_lua_to_rv32(L, i + 1, (int)lua_tointeger(L, lua_upvalueindex(3 + i)));
     blyt_session_begin_fn_call(g_session, fn_addr, nargs, args);
     g_trampoline_active = true;
     return lua_yieldk(L, 0, (lua_KContext)(uintptr_t)fn_addr, wasm_trampoline_cont);
 }
 
-static void wasm_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr,
-                                 uint8_t nargs, const uint8_t arg_types[4],
-                                 uint8_t ret_type, void *userdata) {
+static void wasm_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr, uint8_t nargs,
+                                 const uint8_t arg_types[4], uint8_t ret_type, void *userdata) {
     lua_State *L = (lua_State *)userdata;
     lua_pushlightuserdata(L, (void *)(uintptr_t)fn_guest_addr);
     lua_pushinteger(L, nargs);

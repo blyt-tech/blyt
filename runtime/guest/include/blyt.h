@@ -61,21 +61,21 @@ void blyt_console_debug(const char *s);
 
 /* Type codes for BLYT_LUA_EXPORT primitive types. */
 #define BLYT_LUA_TYPE_VOID 0
-#define BLYT_LUA_TYPE_I32  1
-#define BLYT_LUA_TYPE_U32  2
-#define BLYT_LUA_TYPE_F32  3
+#define BLYT_LUA_TYPE_I32 1
+#define BLYT_LUA_TYPE_U32 2
+#define BLYT_LUA_TYPE_F32 3
 #define BLYT_LUA_TYPE_BOOL 4
 
 /* One entry per exported function, placed in .lua_exports by the macros below.
  * The host reads this section to resolve guest addresses without raw pointers
  * (which would require relocation processing). */
 typedef struct {
-    char    lua_name[32];  /* Lua global name */
-    char    fn_sym[64];    /* underlying C function symbol name */
-    char    wrap_sym[64];  /* Lua C wrapper symbol: __lua_export_<fn_sym> */
+    char lua_name[32]; /* Lua global name */
+    char fn_sym[64]; /* underlying C function symbol name */
+    char wrap_sym[64]; /* Lua C wrapper symbol: __lua_export_<fn_sym> */
     uint8_t nargs;
     uint8_t arg_types[4]; /* BLYT_LUA_TYPE_* for each arg */
-    uint8_t ret_type;     /* BLYT_LUA_TYPE_* */
+    uint8_t ret_type; /* BLYT_LUA_TYPE_* */
     uint8_t _pad[2];
 } blyt_lua_export_entry_t; /* 168 bytes */
 

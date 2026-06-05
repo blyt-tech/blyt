@@ -419,7 +419,7 @@ fn wasm_c_cart_gdb_memory_read() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let bp_addr  = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let bp_addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
     let mem_addr = find_symbol_addr(&cart, "g_counter");
     let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
     let mut cmd = Command::new("node");
@@ -430,7 +430,7 @@ fn wasm_c_cart_gdb_memory_read() {
     ]);
     if let (Some(bp), Some(mem)) = (bp_addr, mem_addr) {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{bp:x}"));
-        cmd.env("BLYT_GDB_MEM_ADDR",   format!("{mem:x}"));
+        cmd.env("BLYT_GDB_MEM_ADDR", format!("{mem:x}"));
     }
     cmd.assert().success();
 }

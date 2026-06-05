@@ -108,9 +108,9 @@ void blyt_clear_libs(void) {
 
 #ifdef BLYT_LUA
 typedef struct {
-    char    lua_name[32];
-    char    fn_sym[64];
-    char    wrap_sym[64];
+    char lua_name[32];
+    char fn_sym[64];
+    char wrap_sym[64];
     uint8_t nargs;
     uint8_t arg_types[4];
     uint8_t ret_type;
@@ -179,11 +179,11 @@ struct blyt_session {
     /* Resolved export table for WASM hybrid trampolines.  Populated by dynlink
      * when the cart has a .lua_exports section (hybrid Lua+C carts only). */
     struct {
-        char     lua_name[32];
+        char lua_name[32];
         uint32_t fn_guest_addr;
-        uint8_t  nargs;
-        uint8_t  arg_types[4];
-        uint8_t  ret_type;
+        uint8_t nargs;
+        uint8_t arg_types[4];
+        uint8_t ret_type;
     } lua_exports[32];
     int lua_nexports;
 #endif
@@ -1555,8 +1555,8 @@ void blyt_session_destroy(blyt_session_t *session) {
  * Host→guest function call API (WASM hybrid Lua+C carts)
  * ------------------------------------------------------------------------- */
 
-int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr,
-                               int nargs, const uint32_t args[]) {
+int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr, int nargs,
+                               const uint32_t args[]) {
     if (nargs > 4)
         nargs = 4;
     s->rv->PC = fn_addr;
@@ -1572,16 +1572,16 @@ uint32_t blyt_session_fn_return_value(const blyt_session_t *s) {
     return rv_get_reg(s->rv, rv_reg_a0);
 }
 
-void blyt_session_visit_lua_exports(blyt_session_t *s,
-                                    blyt_lua_export_visitor_t cb,
+void blyt_session_visit_lua_exports(blyt_session_t *s, blyt_lua_export_visitor_t cb,
                                     void *userdata) {
 #ifdef BLYT_LUA
     for (int i = 0; i < s->lua_nexports; i++)
-        cb(s->lua_exports[i].lua_name, s->lua_exports[i].fn_guest_addr,
-           s->lua_exports[i].nargs, s->lua_exports[i].arg_types,
-           s->lua_exports[i].ret_type, userdata);
+        cb(s->lua_exports[i].lua_name, s->lua_exports[i].fn_guest_addr, s->lua_exports[i].nargs,
+           s->lua_exports[i].arg_types, s->lua_exports[i].ret_type, userdata);
 #else
-    (void)s; (void)cb; (void)userdata;
+    (void)s;
+    (void)cb;
+    (void)userdata;
 #endif
 }
 

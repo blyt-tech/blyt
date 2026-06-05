@@ -213,8 +213,8 @@ void blyt_session_gdb_shutdown(blyt_session_t *s);
  * and a0..a3 to args[0..nargs-1] (nargs capped at 4).
  * Drive with blyt_session_run_frame() until it returns BLYT_RUN_FN_DONE.
  */
-int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr,
-                               int nargs, const uint32_t args[]);
+int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr, int nargs,
+                               const uint32_t args[]);
 
 /* After BLYT_RUN_FN_DONE: read the function's return value from rv register a0. */
 uint32_t blyt_session_fn_return_value(const blyt_session_t *s);
@@ -224,18 +224,16 @@ uint32_t blyt_session_fn_return_value(const blyt_session_t *s);
  * Called once per exported function with its Lua name, guest function address,
  * argument count, argument types (BLYT_LUA_TYPE_* constants), and return type.
  */
-typedef void (*blyt_lua_export_visitor_t)(
-    const char *lua_name, uint32_t fn_guest_addr,
-    uint8_t nargs, const uint8_t arg_types[4], uint8_t ret_type,
-    void *userdata);
+typedef void (*blyt_lua_export_visitor_t)(const char *lua_name, uint32_t fn_guest_addr,
+                                          uint8_t nargs, const uint8_t arg_types[4],
+                                          uint8_t ret_type, void *userdata);
 
 /*
  * Iterate all Lua exports parsed from the cart's .lua_exports section.
  * Calls cb once per export.  No-op when BLYT_LUA is not compiled in or
  * the cart has no .lua_exports section.
  */
-void blyt_session_visit_lua_exports(blyt_session_t *s,
-                                    blyt_lua_export_visitor_t cb,
+void blyt_session_visit_lua_exports(blyt_session_t *s, blyt_lua_export_visitor_t cb,
                                     void *userdata);
 
 /*
