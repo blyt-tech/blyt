@@ -70,6 +70,51 @@ function draw() end
     );
 }
 
+#[test]
+fn lua_cart_debug_output_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_hello_wasm");
+
+    CartProject::new()
+        .lua(
+            r#"
+function init()
+    blyt32.debug.print("hello from lua")
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    run_cart_wasm(&cart, "hello from lua");
+}
+
+// -------------------------------------------------------------------------
+// cart_lua_modules tests — native only, no WASM equivalent
+//
+// The tests below exercise the `cart_lua_modules`/`luaL_requiref` mechanism,
+// which requires the cart (guest) C code to call Lua API functions via a
+// `lua_State *` pointer supplied by the runtime.  On WASM the Lua VM lives
+// in host WASM memory (not in rv32emu), so there is no valid Lua state
+// pointer to hand to the guest; the mechanism is architecturally
+// incompatible.
+//
+// The WASM-compatible alternative — exporting individual functions via
+// `BLYT_LUA_EXPORT_*` (C) or `#[lua_export]` (Rust), which uses the
+// `.lua_exports` metadata section instead of a Lua state pointer — is
+// already covered by the `lua_*_hybrid_wasm` tests.
+// -------------------------------------------------------------------------
+
 /// A Lua cart calls a C library function via the cart_lua_modules mechanism.
 ///
 /// The C library defines `cart_lua_modules` which registers a "mathlib" Lua

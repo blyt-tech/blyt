@@ -670,6 +670,52 @@ fn sdl_hybrid_lua_c_dap_no_gdb() {
         .success();
 }
 
+/// WASM DAP: Lua breakpoint in a hybrid (Lua+C) cart — DAP only, no GDB.
+///
+/// WASM equivalent of sdl_hybrid_lua_c_dap_no_gdb.  The WASM debug runtime has
+/// both DAP and GDB compiled in, but when no GDB client connects the runtime
+/// simply runs without GDB; Lua breakpoints must still fire correctly.
+///
+/// The DAP+GDB WASM combination (blyt_native_work both paused by DAP and
+/// stepped under GDB) is covered by wasm_hybrid_gdb_and_dap in gdb.rs.
+#[test]
+fn wasm_hybrid_lua_c_dap_no_gdb() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_hybrid_lua_c_no_gdb");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .c("#include \"blyt.h\"\n\
+             void c_helper(void) { (void)0; }\n")
+        .write(&project);
+
+    let cart = build_debug_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .assert()
+        .success();
+}
+
 /// SDL2 DAP: Lua breakpoint in a hybrid (Lua+C) cart — full hybrid mode.
 ///
 /// Builds a Lua+C hybrid debug cart and runs blytdebug with both DAP and GDB

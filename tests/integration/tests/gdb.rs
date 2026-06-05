@@ -3,7 +3,8 @@ mod common;
 use assert_cmd::Command;
 use common::{
     CartProject, blytdebug, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
-    find_wasm_debug_dir, repo_root, require_gdb, require_lua_sdk, require_sdk, require_wasm_debug,
+    find_wasm_debug_dir, repo_root, require_gdb, require_lua_sdk, require_rust_riscv_target,
+    require_sdk, require_wasm_debug,
 };
 use tempfile::TempDir;
 
@@ -134,6 +135,51 @@ fn sdl_gdb_rust_cart() {
     cmd.args([
         orchestrator.to_str().unwrap(),
         blytdebug().to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ]);
+    if let Some(a) = addr {
+        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
+    }
+    cmd.assert().success();
+}
+
+/// WASM GDB: Rust cart — same breakpoint+step flow as sdl_gdb_rust_cart on the
+/// WASM path.
+#[test]
+fn wasm_gdb_rust_cart() {
+    require_sdk();
+    require_wasm_debug();
+    require_rust_riscv_target();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_rust");
+    CartProject::new()
+        .rust(
+            "#![no_std]\n\
+             static mut G_FRAME: u32 = 0;\n\
+             #[no_mangle]\n\
+             pub extern \"C\" fn blyt_cart_init() {}\n\
+             #[no_mangle]\n\
+             pub extern \"C\" fn blyt_cart_update() {\n\
+             \x20   unsafe {\n\
+             \x20       G_FRAME += 1;\n\
+             \x20       if G_FRAME >= 3 { blyt::quit(); }\n\
+             \x20   }\n\
+             }\n\
+             #[no_mangle]\n\
+             pub extern \"C\" fn blyt_cart_draw() {}\n",
+        )
+        .write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr = find_symbol_addr(&cart, "blyt_cart_init");
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    let mut cmd = Command::new("node");
+    cmd.args([
+        orchestrator.to_str().unwrap(),
+        find_wasm_debug_dir().to_str().unwrap(),
         cart.to_str().unwrap(),
     ]);
     if let Some(a) = addr {
@@ -356,6 +402,302 @@ function draw()   end\n";
     }
 
     cmd.assert().success();
+}
+
+/* ── WASM equivalents of the extended SDL GDB protocol tests ─────────────── */
+
+/// WASM GDB: read a known global variable address with the 'm' packet.
+#[test]
+fn wasm_c_cart_gdb_memory_read() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_mem");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let bp_addr  = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let mem_addr = find_symbol_addr(&cart, "g_counter");
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    let mut cmd = Command::new("node");
+    cmd.args([
+        orchestrator.to_str().unwrap(),
+        find_wasm_debug_dir().to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ]);
+    if let (Some(bp), Some(mem)) = (bp_addr, mem_addr) {
+        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{bp:x}"));
+        cmd.env("BLYT_GDB_MEM_ADDR",   format!("{mem:x}"));
+    }
+    cmd.assert().success();
+}
+
+/// WASM GDB: set three breakpoints and hit them in sequence.
+#[test]
+fn wasm_c_cart_gdb_multi_breakpoints() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_multi_bp");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr1 = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let addr2 = find_symbol_addr(&cart, "blyt_debug_bp2");
+    let addr3 = find_symbol_addr(&cart, "blyt_debug_bp3");
+
+    match (addr1, addr2, addr3) {
+        (Some(a1), Some(a2), Some(a3)) => {
+            let orchestrator = repo_root().join("tests/gdb/run_wasm_multi_bp_test.mjs");
+            Command::new("node")
+                .args([
+                    orchestrator.to_str().unwrap(),
+                    find_wasm_debug_dir().to_str().unwrap(),
+                    cart.to_str().unwrap(),
+                ])
+                .env("BLYT_GDB_BP_ADDRS", format!("{a1:x},{a2:x},{a3:x}"))
+                .assert()
+                .success();
+        }
+        _ => {
+            // readelf not available — fall back to basic handshake.
+            let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+            Command::new("node")
+                .args([
+                    orchestrator.to_str().unwrap(),
+                    find_wasm_debug_dir().to_str().unwrap(),
+                    cart.to_str().unwrap(),
+                ])
+                .assert()
+                .success();
+        }
+    }
+}
+
+/// WASM GDB: detach after a breakpoint stop — cart continues to completion.
+#[test]
+fn wasm_c_cart_gdb_detach() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_detach");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    let mut cmd = Command::new("node");
+    cmd.args([
+        orchestrator.to_str().unwrap(),
+        find_wasm_debug_dir().to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ])
+    .env("BLYT_GDB_DETACH", "1");
+    if let Some(a) = addr {
+        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
+    }
+    cmd.assert().success();
+}
+
+/// WASM GDB: out-of-band interrupt (\x03) halts the cart and returns T02.
+#[test]
+fn wasm_c_cart_gdb_interrupt() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_interrupt");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+             static int g_frame = 0;\n\
+             void blyt_cart_init(void)   {}\n\
+             void blyt_cart_update(void) { if (++g_frame >= 30000000) blyt_quit(); }\n\
+             void blyt_cart_draw(void)   {}\n")
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_wasm_interrupt_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+/// WASM GDB: qXfer:exec-file:read returns the cart path.
+#[test]
+fn wasm_c_cart_gdb_exec_file_query() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_exec_file");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_EXEC_FILE_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// WASM GDB: qXfer:libraries-svr4:read contains libblyt32.so.
+#[test]
+fn wasm_c_cart_gdb_library_list() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_lib_list");
+    CartProject::new().c(DEBUG_C).write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_LIBRARY_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// WASM GDB: qXfer:features:read returns a target.xml with the RISC-V architecture.
+#[test]
+fn wasm_c_cart_gdb_features_query() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_features");
+    CartProject::new().c(DEBUG_C).write(&project);
+    let cart = build_cart(&project);
+    assert!(cart.exists());
+
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_FEATURES_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// WASM GDB: qProcessInfo returns the correct RISC-V 32-bit process triple.
+#[test]
+fn wasm_c_cart_gdb_process_info() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_procinfo");
+    CartProject::new().c(DEBUG_C).write(&project);
+    let cart = build_cart(&project);
+    assert!(cart.exists());
+
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_PROCESS_INFO", "1")
+        .assert()
+        .success();
+}
+
+/// WASM GDB: P (single register write) correctly updates a register.
+#[test]
+fn wasm_c_cart_gdb_register_write() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_reg_write");
+    CartProject::new().c(DEBUG_C).write(&project);
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists());
+
+    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    if addr.is_none() {
+        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
+        return;
+    }
+    let break_addr = format!("{:x}", addr.unwrap());
+
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_BREAK_ADDR", &break_addr)
+        .env("BLYT_GDB_REGISTER_WRITE_CHECK", "1")
+        .assert()
+        .success();
+}
+
+/// WASM GDB: qThreadStopInfo returns T05 after a breakpoint stop.
+#[test]
+fn wasm_c_cart_gdb_thread_stop_info() {
+    require_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_gdb_tsi");
+    CartProject::new().c(DEBUG_C).write(&project);
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists());
+
+    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    if addr.is_none() {
+        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
+        return;
+    }
+    let break_addr = format!("{:x}", addr.unwrap());
+
+    let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_BREAK_ADDR", &break_addr)
+        .env("BLYT_GDB_THREAD_STOP_INFO", "1")
+        .assert()
+        .success();
 }
 
 /* ── Debug test cart source — shared by the extended protocol tests ───────── */
