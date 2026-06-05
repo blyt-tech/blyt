@@ -882,3 +882,99 @@ fn lua_rust_c_chain_wasm() {
     let cart = build_lua_rust_c_chain_cart(tmp.path());
     run_cart_wasm(&cart, "lua->rust->c ok");
 }
+
+fn build_lua_cpp_hybrid_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_cpp_hybrid");
+    CartProject::new()
+        .cpp(
+            r#"
+extern "C" {
+#include "lua.h"
+}
+#include "blyt.h"
+
+static int cpp_cube(int x) { return x * x * x; }
+
+extern "C" {
+BLYT_LUA_EXPORT_I32(cube, int32_t x) { return (int32_t)cpp_cube((int)x); }
+}
+"#,
+        )
+        .lua(
+            r#"
+function init()
+    local r = cube(3)
+    if r ~= 27 then error("expected 27, got " .. tostring(r)) end
+    blyt32.debug.print("lua+cpp ok")
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_cpp_hybrid_native() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_cpp_hybrid_cart(tmp.path());
+    run_cart_native(&cart, "lua+cpp ok");
+}
+
+#[test]
+fn lua_cpp_hybrid_wasm() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_cpp_hybrid_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+cpp ok");
+}
+
+fn build_lua_c_lib_export_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_lib_export");
+    CartProject::new()
+        .lib_file(
+            "triplelib",
+            "triplelib.c",
+            "#include \"lua.h\"\n#include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(lib_triple, int32_t x) { return x * 3; }\n",
+        )
+        .lua(
+            r#"
+function init()
+    local r = lib_triple(14)
+    if r ~= 42 then error("expected 42, got " .. tostring(r)) end
+    blyt32.debug.print("lua+c-lib ok")
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_c_lib_export_native() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_lib_export_cart(tmp.path());
+    run_cart_native(&cart, "lua+c-lib ok");
+}
+
+#[test]
+fn lua_c_lib_export_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_lib_export_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+c-lib ok");
+}

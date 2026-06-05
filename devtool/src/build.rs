@@ -1559,18 +1559,19 @@ fn link_cart(
             .arg("-Wl,-u,blyt_cart_draw");
     }
 
-    // C+Lua carts: force lld to pull in the archive member that defines
-    // cart_lua_modules from the C lib archives.  For Rust+Lua this is already
-    // handled above (--whole-archive on the Rust archive).
-    if lua_cart && rust_archive.is_none() && !lib_archives.is_empty() {
-        cmd.arg("-Wl,-u,cart_lua_modules");
-    }
-
     // Library archives (src/lib/*/lib.a): linked before -lblyt32 so game code
-    // symbols resolve against them first.  No --whole-archive: game code calls
-    // library functions explicitly, so the linker pulls in only used members.
+    // symbols resolve against them first.
+    // Lua hybrid carts: --whole-archive so BLYT_LUA_EXPORT_* entries in
+    // .lua_regtab/.lua_exports are preserved even when no C game code calls
+    // the exported function by name.  Same rationale as the Rust archive above.
     for archive in lib_archives {
-        cmd.arg(archive);
+        if lua_cart {
+            cmd.arg("-Wl,--whole-archive")
+                .arg(archive)
+                .arg("-Wl,--no-whole-archive");
+        } else {
+            cmd.arg(archive);
+        }
     }
 
     // Lua carts: libblyt32lua.so provides blyt_cart_init/update/draw.
