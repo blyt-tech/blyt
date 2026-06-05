@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_lua_sdk,
-    require_rust_riscv_target, require_sdk, sdk_dir,
+    CartProject, blyt_bin, blytplay, build_lua_cart, find_wasm_dir, repo_root, require_cpp_sdk,
+    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, sdk_dir,
 };
 use tempfile::TempDir;
 
@@ -749,6 +749,57 @@ function draw() end
         "expected 'lua+rust-game ok' in output, got: {}",
         String::from_utf8_lossy(&output)
     );
+}
+
+/// WASM: a hybrid Lua+C cart calls a C function via the BLYT_LUA_EXPORT_I32
+/// trampoline mechanism and gets the correct return value.
+///
+/// The C lib uses BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }.
+/// The Lua cart calls add_one(41) in init() and asserts the result is 42, then
+/// exits cleanly via blyt_quit() in update().
+///
+/// Requires the WASM runtime to have been built:
+///   emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm
+/// Silently skipped when blytplay.js is not found.
+#[test]
+fn wasm_lua_c_hybrid() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_hybrid_basic");
+
+    CartProject::new()
+        .c(
+            "#include \"lua.h\"\n\
+             #include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n",
+        )
+        .lua(
+            "function init()\n\
+             \x20   local r = add_one(41)\n\
+             \x20   if r ~= 42 then\n\
+             \x20       error(\"expected 42, got \" .. tostring(r))\n\
+             \x20   end\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+    Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            find_wasm_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
 }
 
 /// Lua → Rust → C three-language call chain.

@@ -28,6 +28,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "blyt_runtime.h"
 
@@ -72,6 +73,8 @@ extern const unsigned char blytc_so[];
 extern const unsigned int blytc_so_len;
 extern const unsigned char blyt32_so[];
 extern const unsigned int blyt32_so_len;
+extern const unsigned char blyt32lua_so[];
+extern const unsigned int blyt32lua_so_len;
 #endif
 
 /* -------------------------------------------------------------------------
@@ -93,6 +96,15 @@ static bool g_lua_active = false;
 static bool g_lua_dap_paused = false; /* hook yielded, waiting for DAP */
 static bool g_lua_needs_start = false; /* waiting for configurationDone */
 #endif
+/* Hybrid cart trampoline state: set while a native C call is in flight. */
+static bool g_trampoline_active = false;
+static uint32_t g_trampoline_ret = 0;
+/* BLYT_LUA_TYPE_* constants — must match blyt.h guest SDK definition. */
+#define WASM_LUA_TYPE_VOID 0
+#define WASM_LUA_TYPE_I32  1
+#define WASM_LUA_TYPE_U32  2
+#define WASM_LUA_TYPE_F32  3
+#define WASM_LUA_TYPE_BOOL 4
 #endif
 
 /* -------------------------------------------------------------------------
@@ -205,6 +217,83 @@ static int lua_wasm_quit(lua_State *L) {
     (void)L;
     g_lua_quit = true;
     return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * WASM hybrid trampoline — calls rv32 native functions from host-side Lua
+ * ------------------------------------------------------------------------- */
+
+/* Convert a Lua stack value at index idx to a uint32_t for rv32 register. */
+static uint32_t wasm_lua_to_rv32(lua_State *L, int idx, int type) {
+    switch (type) {
+    case WASM_LUA_TYPE_I32:  return (uint32_t)(int32_t)lua_tointeger(L, idx);
+    case WASM_LUA_TYPE_U32:  return (uint32_t)lua_tointeger(L, idx);
+    case WASM_LUA_TYPE_F32: {
+        float f = (float)lua_tonumber(L, idx);
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        return bits;
+    }
+    case WASM_LUA_TYPE_BOOL: return lua_toboolean(L, idx) ? 1u : 0u;
+    default:                 return 0u;
+    }
+}
+
+/* Push a uint32_t rv32 return value onto the Lua stack. */
+static void wasm_rv32_to_lua(lua_State *L, uint32_t val, int type) {
+    switch (type) {
+    case WASM_LUA_TYPE_I32:  lua_pushinteger(L, (lua_Integer)(int32_t)val); break;
+    case WASM_LUA_TYPE_U32:  lua_pushinteger(L, (lua_Integer)(uint32_t)val); break;
+    case WASM_LUA_TYPE_F32: {
+        float f;
+        memcpy(&f, &val, 4);
+        lua_pushnumber(L, (lua_Number)f);
+        break;
+    }
+    case WASM_LUA_TYPE_BOOL: lua_pushboolean(L, val ? 1 : 0); break;
+    default: break; /* VOID: push nothing */
+    }
+}
+
+/* Lua yieldk continuation: called when the trampoline's rv32emu run completes. */
+static int wasm_trampoline_cont(lua_State *L, int status, lua_KContext ctx) {
+    (void)status;
+    (void)ctx;
+    int ret_type = (int)lua_tointeger(L, lua_upvalueindex(7));
+    wasm_rv32_to_lua(L, g_trampoline_ret, ret_type);
+    return (ret_type == WASM_LUA_TYPE_VOID) ? 0 : 1;
+}
+
+/* Lua C closure: one per exported function, installed as a Lua global.
+ * Upvalues: [1]=fn_guest_addr [2]=nargs [3..6]=arg_types [7]=ret_type */
+static int wasm_make_trampoline(lua_State *L) {
+    uint32_t fn_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
+    int nargs = (int)lua_tointeger(L, lua_upvalueindex(2));
+    uint32_t args[4] = {0};
+    for (int i = 0; i < nargs && i < 4; i++)
+        args[i] = wasm_lua_to_rv32(L, i + 1,
+                                   (int)lua_tointeger(L, lua_upvalueindex(3 + i)));
+    blyt_session_begin_fn_call(g_session, fn_addr, nargs, args);
+    g_trampoline_active = true;
+    return lua_yieldk(L, 0, (lua_KContext)(uintptr_t)fn_addr, wasm_trampoline_cont);
+}
+
+static void wasm_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr,
+                                 uint8_t nargs, const uint8_t arg_types[4],
+                                 uint8_t ret_type, void *userdata) {
+    lua_State *L = (lua_State *)userdata;
+    lua_pushlightuserdata(L, (void *)(uintptr_t)fn_guest_addr);
+    lua_pushinteger(L, nargs);
+    for (int j = 0; j < 4; j++)
+        lua_pushinteger(L, arg_types[j]);
+    lua_pushinteger(L, ret_type);
+    lua_pushcclosure(L, wasm_make_trampoline, 7);
+    lua_setglobal(L, lua_name);
+}
+
+/* Register one Lua global closure per entry in the cart's .lua_exports section. */
+static void wasm_register_lua_trampolines(lua_State *L, blyt_session_t *s) {
+    blyt_session_visit_lua_exports(s, wasm_visit_export_cb, L);
 }
 
 /* Set by host-provided blyt32 drawing functions; cleared each frame before draw(). */
@@ -330,6 +419,25 @@ static void wasm_lua_loop(void) {
             return;
         }
 #endif
+        /* Hybrid trampoline: Lua yielded while waiting for a native C call. */
+        if (g_trampoline_active) {
+            blyt_cart_run_err_t ferr = blyt_session_run_frame(g_session);
+            if (ferr == BLYT_RUN_FN_DONE) {
+                g_trampoline_active = false;
+                g_trampoline_ret = blyt_session_fn_return_value(g_session);
+                int nres = 0;
+                lua_resume(g_lua_co, g_lua, 0, &nres); /* fires wasm_trampoline_cont */
+            }
+#ifdef BLYT_GDB
+            else if (ferr == BLYT_RUN_GDB_PAUSED) {
+                /* Hold Lua coroutine; GDB client drives next steps. */
+                blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+                return;
+            }
+#endif
+            blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+            return;
+        }
         lua_settop(g_lua_co, 0); /* discard yielded values — normal frame yield */
         /* Normal frame-end yield — fall through to render. */
     } else {
@@ -460,6 +568,29 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         fc_consolelua_master_hook_install(g_lua_co);
 #endif
 
+    /* Hybrid cart: if the cart has a .lua_exports section, create an rv32emu
+     * session so native C functions can be called via trampolines from Lua. */
+    {
+        size_t exports_sz = 0;
+        if (blyt_cart_find_section(g_cart, ".lua_exports", &exports_sz)) {
+            g_session = blyt_session_create(g_cart, wasm_log);
+            if (!g_session) {
+                blyt_js_error("hybrid session failed");
+                lua_close(g_lua);
+                g_lua = NULL;
+                return 1;
+            }
+#ifdef BLYT_GDB
+            {
+                int p = blyt_js_gdb_port();
+                if (p > 0)
+                    blyt_session_gdb_listen(g_session, &p);
+            }
+#endif
+            wasm_register_lua_trampolines(g_lua, g_session);
+        }
+    }
+
     /* Render one static test card frame into g_xrgb before starting the loop.
      * This gives the display a non-black image during the configurationDone
      * wait (DAP) and as the fallback frozen frame for any DAP pause. */
@@ -542,6 +673,7 @@ int main(void) {
     blyt_register_lib("libblytcommon.so", blytcommon_so, blytcommon_so_len);
     blyt_register_lib("libblytc.so", blytc_so, blytc_so_len);
     blyt_register_lib("libblyt32.so", blyt32_so, blyt32_so_len);
+    blyt_register_lib("libblyt32lua.so", blyt32lua_so, blyt32lua_so_len);
 #endif
 
     blyt_cart_err_t cerr = blyt_cart_open("/cart.blyt", &g_cart);

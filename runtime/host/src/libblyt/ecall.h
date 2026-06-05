@@ -27,6 +27,15 @@
  * writes JSON to guest buf; returns length in a0 (0 = continue/disconnect) */
 #define BLYT_ECALL_DAP_RECV 5
 
+/* ECALLs 6–8 are reserved for DAP extension operations (handled as literal
+ * case labels in the ecall dispatch; see cart_run.c for details). */
+
+/* Host-function return: fired by BLYT_TRAMPOLINE_FN_RETURN_ADDR when a
+ * guest function invoked via blyt_session_begin_fn_call() returns.
+ * The return value is already in a0 from the C function's ret instruction;
+ * this ecall signals the host to stop driving rv32emu and read a0. */
+#define BLYT_ECALL_HOST_FN_RETURN 9
+
 /*
  * EXIT trampoline — injected into rv32emu guest memory by the runtime.
  *
@@ -47,8 +56,11 @@
  */
 #define BLYT_TRAMPOLINE_BASE 0x00003000u
 #define BLYT_TRAMPOLINE_EXIT_ADDR BLYT_TRAMPOLINE_BASE
+/* FN_RETURN stub at +64 from exit (16 bytes each, 48 bytes gap for growth). */
+#define BLYT_TRAMPOLINE_FN_RETURN_ADDR (BLYT_TRAMPOLINE_EXIT_ADDR + 64u)
 
 #define RV32_LI_A0_0 UINT32_C(0x00000513) /* addi x10, x0, 0 */
 #define RV32_LI_A7_0 UINT32_C(0x00000893) /* addi x17, x0, 0 */
+#define RV32_LI_A7_9 UINT32_C(0x00900893) /* addi x17, x0, 9 (BLYT_ECALL_HOST_FN_RETURN) */
 #define RV32_ECALL UINT32_C(0x00000073)
 #define RV32_UNIMP UINT32_C(0x00000000)

@@ -102,6 +102,23 @@ void blyt_clear_libs(void) {
 }
 
 /* -------------------------------------------------------------------------
+ * Lua export entry — mirrors blyt_lua_export_entry_t from blyt.h (guest SDK).
+ * Must have the same binary layout; used to parse .lua_exports ELF sections.
+ * ------------------------------------------------------------------------- */
+
+#ifdef BLYT_LUA
+typedef struct {
+    char    lua_name[32];
+    char    fn_sym[64];
+    char    wrap_sym[64];
+    uint8_t nargs;
+    uint8_t arg_types[4];
+    uint8_t ret_type;
+    uint8_t _pad[2];
+} blyt_lua_export_entry_t; /* 168 bytes — must match guest SDK definition */
+#endif
+
+/* -------------------------------------------------------------------------
  * ECALL handler context
  * ------------------------------------------------------------------------- */
 
@@ -116,6 +133,7 @@ typedef struct {
     bool ecall_trapped; /* cart issued a non-permitted ecall */
     bool ecall_aborted; /* cart called abort() — ECALL_EXIT with a0 != 0 */
     bool frame_done; /* set by BLYT_ECALL_FRAME_DONE; cleared by run_frame */
+    bool fn_return_done; /* set by BLYT_ECALL_HOST_FN_RETURN; cleared by run_frame */
     bool dap_enabled; /* set by blyt_session_dap_listen(); enables ECALL_DAP_HOOK */
     blyt_debug_state_t debug_state;
     bool gdb_enabled; /* set by blyt_session_gdb_listen() */
@@ -156,6 +174,19 @@ struct blyt_session {
     uint32_t palette[256]; /* XRGB8888 — set at session create, updated by cart */
     uint32_t frame_count;
     bool cart_has_drawn;
+
+#ifdef BLYT_LUA
+    /* Resolved export table for WASM hybrid trampolines.  Populated by dynlink
+     * when the cart has a .lua_exports section (hybrid Lua+C carts only). */
+    struct {
+        char     lua_name[32];
+        uint32_t fn_guest_addr;
+        uint8_t  nargs;
+        uint8_t  arg_types[4];
+        uint8_t  ret_type;
+    } lua_exports[32];
+    int lua_nexports;
+#endif
 
 #ifdef BLYT_GDB
     /* Library layout for GDB qXfer:libraries-svr4:read. */
@@ -316,7 +347,16 @@ static bool inject_exit_trampoline(memory_t *mem) {
     write_u32_le(stub + 4, RV32_LI_A7_0); /* a7 = BLYT_ECALL_EXIT */
     write_u32_le(stub + 8, RV32_ECALL);
     write_u32_le(stub + 12, RV32_UNIMP);
-    return memory_write(mem, BLYT_TRAMPOLINE_EXIT_ADDR, stub, sizeof(stub));
+    if (!memory_write(mem, BLYT_TRAMPOLINE_EXIT_ADDR, stub, sizeof(stub)))
+        return false;
+
+    /* FN_RETURN stub: a0 already holds the C function's return value;
+     * set a7 = BLYT_ECALL_HOST_FN_RETURN and fire.  Do NOT clobber a0. */
+    write_u32_le(stub + 0, RV32_LI_A7_9); /* a7 = BLYT_ECALL_HOST_FN_RETURN */
+    write_u32_le(stub + 4, RV32_ECALL);
+    write_u32_le(stub + 8, RV32_UNIMP);
+    write_u32_le(stub + 12, RV32_UNIMP);
+    return memory_write(mem, BLYT_TRAMPOLINE_FN_RETURN_ADDR, stub, sizeof(stub));
 }
 
 /* -------------------------------------------------------------------------
@@ -568,6 +608,17 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 #endif /* BLYT_DAP */
+
+    case BLYT_ECALL_HOST_FN_RETURN: {
+        /* Guest function called via blyt_session_begin_fn_call() returned.
+         * a0 holds the return value (set by the C function's ret instruction).
+         * Signal the host; blyt_session_fn_return_value() will read a0. */
+        rv->PC += 4;
+        if (g_run_ctx)
+            g_run_ctx->fn_return_done = true;
+        rv_halt(rv);
+        return;
+    }
 
     case 93: /* SYS_exit (Linux NR 93) — blyt_exit on emulated path */
     case 94: /* SYS_exit_group (Linux NR 94) — blyt_exit on emulated path */
@@ -1155,6 +1206,32 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
             munmap((void *)libs[i].map, libs[i].size);
     }
 
+#if defined(BLYT_LUA) && defined(__EMSCRIPTEN__)
+    /* Resolve .lua_exports for WASM hybrid trampolines.  The section contains
+     * one blyt_lua_export_entry_t per BLYT_LUA_EXPORT_* macro invocation;
+     * we cache the resolved guest addresses so run_lua_cart() can register
+     * host-side trampolines without re-parsing the ELF section at runtime. */
+    if (ok) {
+        size_t esz = 0;
+        const blyt_lua_export_entry_t *ent =
+            (const blyt_lua_export_entry_t *)blyt_cart_find_section(cart, ".lua_exports", &esz);
+        if (ent) {
+            int n = (int)(esz / sizeof(*ent));
+            for (int i = 0; i < n && s->lua_nexports < 32; i++) {
+                uint32_t addr = symtab_lookup(all_syms, ent[i].fn_sym);
+                if (!addr)
+                    continue;
+                s->lua_exports[s->lua_nexports].fn_guest_addr = addr;
+                memcpy(s->lua_exports[s->lua_nexports].lua_name, ent[i].lua_name, 32);
+                s->lua_exports[s->lua_nexports].nargs = ent[i].nargs;
+                memcpy(s->lua_exports[s->lua_nexports].arg_types, ent[i].arg_types, 4);
+                s->lua_exports[s->lua_nexports].ret_type = ent[i].ret_type;
+                s->lua_nexports++;
+            }
+        }
+    }
+#endif
+
     free(all_syms);
     return ok ? BLYT_RUN_OK : BLYT_RUN_ERR_EMU;
 }
@@ -1223,6 +1300,7 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
 blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     g_run_ctx = &session->ctx;
     session->ctx.frame_done = false;
+    session->ctx.fn_return_done = false;
     /* Clear any halt set by the previous BLYT_ECALL_FRAME_DONE so the while
      * loop below can execute the new frame.  A halt from blyt_exit/abort would
      * have caused the caller to stop resubmitting frames entirely. */
@@ -1441,6 +1519,15 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             g_run_ctx = NULL;
             return BLYT_RUN_FRAME_DONE;
         }
+        if (session->ctx.fn_return_done) {
+            g_run_ctx = NULL;
+            return BLYT_RUN_FN_DONE;
+        }
+    }
+
+    if (session->ctx.fn_return_done) {
+        g_run_ctx = NULL;
+        return BLYT_RUN_FN_DONE;
     }
 
     bool trapped = session->ctx.ecall_trapped;
@@ -1462,6 +1549,40 @@ void blyt_session_destroy(blyt_session_t *session) {
 #endif
     rv_delete(session->rv);
     free(session);
+}
+
+/* -------------------------------------------------------------------------
+ * Host→guest function call API (WASM hybrid Lua+C carts)
+ * ------------------------------------------------------------------------- */
+
+int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr,
+                               int nargs, const uint32_t args[]) {
+    if (nargs > 4)
+        nargs = 4;
+    s->rv->PC = fn_addr;
+    rv_set_reg(s->rv, rv_reg_ra, BLYT_TRAMPOLINE_FN_RETURN_ADDR);
+    for (int i = 0; i < nargs; i++)
+        rv_set_reg(s->rv, (uint32_t)(rv_reg_a0 + (uint32_t)i), args[i]);
+    s->rv->halt = false;
+    s->ctx.fn_return_done = false;
+    return 0;
+}
+
+uint32_t blyt_session_fn_return_value(const blyt_session_t *s) {
+    return rv_get_reg(s->rv, rv_reg_a0);
+}
+
+void blyt_session_visit_lua_exports(blyt_session_t *s,
+                                    blyt_lua_export_visitor_t cb,
+                                    void *userdata) {
+#ifdef BLYT_LUA
+    for (int i = 0; i < s->lua_nexports; i++)
+        cb(s->lua_exports[i].lua_name, s->lua_exports[i].fn_guest_addr,
+           s->lua_exports[i].nargs, s->lua_exports[i].arg_types,
+           s->lua_exports[i].ret_type, userdata);
+#else
+    (void)s; (void)cb; (void)userdata;
+#endif
 }
 
 const uint8_t *blyt_session_get_pixels(const blyt_session_t *session) {

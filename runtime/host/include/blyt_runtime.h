@@ -100,6 +100,7 @@ typedef enum blyt_cart_run_err {
     BLYT_RUN_FRAME_DONE = 4, /* one frame complete; call run_frame again */
     BLYT_RUN_GDB_PAUSED = 5, /* WASM: CPU is paused at a GDB breakpoint; poll GDB */
     BLYT_RUN_RESTART = 6, /* DAP client sent restart; call blyt_session_dap_reattach then wait */
+    BLYT_RUN_FN_DONE = 7, /* host→guest fn call completed; call blyt_session_fn_return_value */
 } blyt_cart_run_err_t;
 
 /*
@@ -204,6 +205,38 @@ int blyt_session_gdb_listen(blyt_session_t *s, int *port_out);
 
 /* Stop the GDB server. Idempotent. */
 void blyt_session_gdb_shutdown(blyt_session_t *s);
+
+/* --- Host→guest function calls (WASM hybrid Lua+C carts) ------------------- */
+
+/*
+ * Begin a host→guest function call.  Sets rv PC=fn_addr, RA=FN_RETURN trampoline,
+ * and a0..a3 to args[0..nargs-1] (nargs capped at 4).
+ * Drive with blyt_session_run_frame() until it returns BLYT_RUN_FN_DONE.
+ */
+int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr,
+                               int nargs, const uint32_t args[]);
+
+/* After BLYT_RUN_FN_DONE: read the function's return value from rv register a0. */
+uint32_t blyt_session_fn_return_value(const blyt_session_t *s);
+
+/*
+ * Visitor callback for blyt_session_visit_lua_exports.
+ * Called once per exported function with its Lua name, guest function address,
+ * argument count, argument types (BLYT_LUA_TYPE_* constants), and return type.
+ */
+typedef void (*blyt_lua_export_visitor_t)(
+    const char *lua_name, uint32_t fn_guest_addr,
+    uint8_t nargs, const uint8_t arg_types[4], uint8_t ret_type,
+    void *userdata);
+
+/*
+ * Iterate all Lua exports parsed from the cart's .lua_exports section.
+ * Calls cb once per export.  No-op when BLYT_LUA is not compiled in or
+ * the cart has no .lua_exports section.
+ */
+void blyt_session_visit_lua_exports(blyt_session_t *s,
+                                    blyt_lua_export_visitor_t cb,
+                                    void *userdata);
 
 /*
  * Block until the GDB client attaches and sends vCont (ready to run).

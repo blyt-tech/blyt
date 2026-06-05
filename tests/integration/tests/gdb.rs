@@ -221,11 +221,8 @@ fn wasm_gdb_breakpoint_step() {
 ///   - GDB single-steps × 2, then continues
 ///   - DAP receives stopped at line 4 (step-over complete)
 ///
-/// WASM hybrid is architecturally unsupported: Lua carts on WASM bypass
-/// rv32emu (host-side Lua interpreter), so GDB (which operates on the
-/// rv32emu PC) cannot intercept native C calls made from Lua.  The SDL2 /
-/// libretro paths run the Lua interpreter inside rv32emu, so both debuggers
-/// operate on the same execution stream.
+/// For the equivalent test on the WASM path (host-side Lua + rv32emu session
+/// for native calls), see wasm_hybrid_gdb_and_dap.
 ///
 /// Requires: blytplay built with BLYT_DAP=ON and BLYT_GDB=ON, Lua SDK,
 /// `readelf` on PATH (for symbol address; falls back to DAP-only if absent).
@@ -238,22 +235,21 @@ fn sdl_hybrid_gdb_and_dap() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hybrid_gdb_dap");
 
-    // C library: blyt_native_work is a Lua C function with a couple of
-    // volatile assignments so that two single-steps land on distinct PCs.
+    // C game code: blyt_native_work exported via BLYT_LUA_EXPORT_VOID so the macro
+    // emits both the .lua_regtab registration (SDL2/libretro) and the .lua_exports
+    // metadata (WASM trampoline).  Uses .c() so the code ends up in src/game/c/,
+    // which (a) is always linked as a direct object and (b) triggers glue-file
+    // generation (native_count > 0) so cart_lua_modules iterates .lua_regtab.
+    // Volatile assignments give GDB two distinct PCs.
     const C_SOURCE: &str = r#"
 #include "lua.h"
 #include "lauxlib.h"
+#include "blyt.h"
 
-int blyt_native_work(lua_State *L) {
+BLYT_LUA_EXPORT_VOID(blyt_native_work) {
     volatile int x = 42;
     volatile int y = x + 1;
     (void)y;
-    return 0;
-}
-
-void cart_lua_modules(lua_State *L) {
-    lua_pushcfunction(L, blyt_native_work);
-    lua_setglobal(L, "blyt_native_work");
 }
 "#;
 
@@ -271,7 +267,7 @@ function update() end\n\
 function draw()   end\n";
 
     CartProject::new()
-        .lib_file("nativework", "nativework.c", C_SOURCE)
+        .c(C_SOURCE)
         .lua(LUA_SOURCE)
         .write(&project);
 
@@ -287,6 +283,71 @@ function draw()   end\n";
     cmd.args([
         orchestrator.to_str().unwrap(),
         blytdebug().to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ]);
+
+    if let Some(a) = addr {
+        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
+    }
+
+    cmd.assert().success();
+}
+
+/// WASM hybrid: Lua cart that calls a native C function debuggable via both
+/// DAP (Lua) and GDB (C).  Mirrors sdl_hybrid_gdb_and_dap on the WASM path.
+///
+/// Requires the WASM debug runtime (blytdebug.* built with BLYT_DAP+BLYT_GDB).
+/// Silently skipped when blytdebug.js or the Lua SDK is not found.
+///
+/// For the equivalent test on the SDL2 path, see sdl_hybrid_gdb_and_dap.
+#[test]
+fn wasm_hybrid_gdb_and_dap() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm_debug();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_hybrid_gdb_dap");
+
+    const C_SOURCE: &str = r#"
+#include "lua.h"
+#include "lauxlib.h"
+#include "blyt.h"
+
+BLYT_LUA_EXPORT_VOID(blyt_native_work) {
+    volatile int x = 42;
+    volatile int y = x + 1;
+    (void)y;
+}
+"#;
+
+    const LUA_SOURCE: &str = "\
+function init()\n\
+    local _ = 0\n\
+    blyt_native_work()\n\
+    local done = true\n\
+    blyt_quit()\n\
+end\n\
+\n\
+function update() end\n\
+function draw()   end\n";
+
+    CartProject::new()
+        .c(C_SOURCE)
+        .lua(LUA_SOURCE)
+        .write(&project);
+
+    let cart = build_debug_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr = find_symbol_addr(&cart, "blyt_native_work");
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/gdb/run_wasm_hybrid_test.mjs");
+
+    let mut cmd = Command::new("node");
+    cmd.args([
+        orchestrator.to_str().unwrap(),
+        wasm_dir.to_str().unwrap(),
         cart.to_str().unwrap(),
     ]);
 
