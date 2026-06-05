@@ -135,7 +135,7 @@ fn sdl_gdb_rust_cart() {
         orchestrator.to_str().unwrap(),
         blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
-    ])
+    ]);
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
     }
@@ -288,7 +288,7 @@ function draw()   end\n";
         orchestrator.to_str().unwrap(),
         blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
-    ])
+    ]);
 
     if let Some(a) = addr {
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
