@@ -518,6 +518,47 @@ pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     ))
 }
 
+/// Run a cart with blytplay --headless; assert `expected` appears in stdout.
+pub fn run_cart_native(cart: &std::path::Path, expected: &str) {
+    use assert_cmd::Command;
+    let output = Command::new(blytplay())
+        .args(["--headless", cart.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in native output, got: {}",
+        expected,
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// Run a cart with the WASM runner; assert `expected` appears in stdout.
+pub fn run_cart_wasm(cart: &std::path::Path, expected: &str) {
+    use assert_cmd::Command;
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+    let output = Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            find_wasm_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in wasm output, got: {}",
+        expected,
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// Path to the test_session_api binary produced by the CMake build.
 pub fn test_session_api() -> PathBuf {
     build_dir().join("test_session_api")

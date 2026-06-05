@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blyt_bin, blytplay, build_lua_cart, find_wasm_dir, repo_root, require_cpp_sdk,
-    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, sdk_dir,
+    CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_lua_sdk,
+    require_rust_riscv_target, require_sdk, require_wasm, run_cart_native, run_cart_wasm, sdk_dir,
 };
 use tempfile::TempDir;
 
@@ -646,87 +646,56 @@ function draw() end
     );
 }
 
-/// A Lua cart with Rust game code under src/game/rust/ that registers a Lua module.
-///
-/// The Rust game crate defines cart_lua_modules using raw Lua C FFI.  The blyt
-/// SDK crate (auto-injected as a dependency) provides the #[panic_handler] and
-/// #[global_allocator] so the Rust game code integrates cleanly with the cart.
-#[test]
-fn lua_cart_with_rust_game_code() {
-    require_sdk();
-    require_lua_sdk();
-    require_rust_riscv_target();
-
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_rust_game");
-
-    let rust_game_src = r#"#![no_std]
+fn build_lua_rust_hybrid_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_rust_hybrid");
+    CartProject::new()
+        .rust(
+            r#"#![no_std]
 extern crate blyt;
 use blyt::lua_export;
 
 #[lua_export]
 fn double(x: i32) -> i32 { x * 2 }
-"#;
-
-    CartProject::new()
-        .rust(rust_game_src)
+"#,
+        )
         .lua(
             r#"
 function init()
-    local result = double(21)
-    if result == 42 then
-        blyt32.debug.print("lua+rust-game ok")
-    else
-        blyt32.debug.print("lua+rust-game wrong")
-    end
+    local r = double(21)
+    if r ~= 42 then error("expected 42, got " .. tostring(r)) end
+    blyt32.debug.print("lua+rust ok")
 end
-
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("lua+rust-game ok"),
-        "expected 'lua+rust-game ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+    build_lua_cart(&project)
 }
 
-/// WASM: a hybrid Lua+C cart calls a C function via the BLYT_LUA_EXPORT_I32
-/// trampoline mechanism and gets the correct return value.
-///
-/// The C lib uses BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }.
-/// The Lua cart calls add_one(41) in init() and asserts the result is 42, then
-/// exits cleanly via blyt_quit() in update().
-///
-/// Requires the WASM runtime to have been built:
-///   emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm
-/// Silently skipped when blytplay.js is not found.
 #[test]
-fn wasm_lua_c_hybrid() {
+fn lua_rust_hybrid_native() {
     require_sdk();
     require_lua_sdk();
-    require_wasm();
-
+    require_rust_riscv_target();
     let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("wasm_hybrid_basic");
+    let cart = build_lua_rust_hybrid_cart(tmp.path());
+    run_cart_native(&cart, "lua+rust ok");
+}
 
+#[test]
+fn lua_rust_hybrid_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_hybrid_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+rust ok");
+}
+
+fn build_lua_c_hybrid_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_hybrid");
     CartProject::new()
         .c(
             "#include \"lua.h\"\n\
@@ -734,168 +703,141 @@ fn wasm_lua_c_hybrid() {
              BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n",
         )
         .lua(
-            "function init()\n\
-             \x20   local r = add_one(41)\n\
-             \x20   if r ~= 42 then\n\
-             \x20       error(\"expected 42, got \" .. tostring(r))\n\
-             \x20   end\n\
-             end\n\
-             function update() blyt_quit() end\n\
-             function draw() end\n",
+            r#"
+function init()
+    local r = add_one(41)
+    if r ~= 42 then error("expected 42, got " .. tostring(r)) end
+    blyt32.debug.print("lua+c ok")
+end
+function update() blyt.quit() end
+function draw() end
+"#,
         )
         .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    let driver = repo_root().join("tests/wasm/run_cart.js");
-    Command::new("node")
-        .args([
-            driver.to_str().unwrap(),
-            find_wasm_dir().to_str().unwrap(),
-            cart.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    build_lua_cart(&project)
 }
 
-/// C and Rust each export independent Lua globals in the same cart.
-///
-/// C uses BLYT_LUA_EXPORT_I32 to register `c_triple`; Rust uses #[lua_export]
-/// to register `rust_double`.  Both generate .lua_regtab entries; the Rust
-/// cart_lua_modules iterates the whole section and registers both.
 #[test]
-fn lua_c_and_rust_both_export() {
+fn lua_c_hybrid_native() {
     require_sdk();
     require_lua_sdk();
-    require_rust_riscv_target();
-
     let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_c_rust_exports");
+    let cart = build_lua_c_hybrid_cart(tmp.path());
+    run_cart_native(&cart, "lua+c ok");
+}
 
-    let c_src = r#"
-#include "lua.h"
-#include "blyt.h"
-BLYT_LUA_EXPORT_I32(c_triple, int32_t x) { return x * 3; }
-"#;
+#[test]
+fn lua_c_hybrid_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_hybrid_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+c ok");
+}
 
-    let rust_src = r#"#![no_std]
+fn build_lua_c_rust_exports_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_rust_exports");
+    CartProject::new()
+        .c(
+            "#include \"lua.h\"\n\
+             #include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(c_triple, int32_t x) { return x * 3; }\n",
+        )
+        .rust(
+            r#"#![no_std]
 extern crate blyt;
 use blyt::lua_export;
 
 #[lua_export]
 fn rust_double(x: i32) -> i32 { x * 2 }
-"#;
-
-    CartProject::new()
-        .c(c_src)
-        .rust(rust_src)
+"#,
+        )
         .lua(
             r#"
 function init()
     local r1 = c_triple(7)
     local r2 = rust_double(21)
-    if r1 == 21 and r2 == 42 then
-        blyt32.debug.print("lua+c+rust exports ok")
-    else
-        blyt32.debug.print("wrong: c_triple=" .. tostring(r1) .. " rust_double=" .. tostring(r2))
-    end
+    if r1 ~= 21 then error("c_triple wrong: " .. tostring(r1)) end
+    if r2 ~= 42 then error("rust_double wrong: " .. tostring(r2)) end
+    blyt32.debug.print("lua+c+rust exports ok")
 end
-
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("lua+c+rust exports ok"),
-        "expected 'lua+c+rust exports ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+    build_lua_cart(&project)
 }
 
-/// Lua → Rust → C three-language call chain.
-///
-/// C provides `c_double(x)`; Rust calls it and exposes the result via a Lua module;
-/// Lua calls the module and verifies the answer.  This test exercises the
-/// `languages: { lua:, c:, rust: }` multi-language declaration path end-to-end.
 #[test]
-fn lua_rust_c_call_chain() {
+fn lua_c_rust_exports_native() {
     require_sdk();
     require_lua_sdk();
     require_rust_riscv_target();
-
     let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_rust_c_chain");
+    let cart = build_lua_c_rust_exports_cart(tmp.path());
+    run_cart_native(&cart, "lua+c+rust exports ok");
+}
 
-    let c_src = r#"
-int c_double(int x) { return x * 2; }
-"#;
+#[test]
+fn lua_c_rust_exports_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_rust_exports_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+c+rust exports ok");
+}
 
-    let rust_game_src = r#"#![no_std]
+fn build_lua_rust_c_chain_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_rust_c_chain");
+    CartProject::new()
+        .c("int c_double(int x) { return x * 2; }\n")
+        .rust(
+            r#"#![no_std]
 extern crate blyt;
 use blyt::lua_export;
 
 extern "C" { fn c_double(x: i32) -> i32; }
 
 #[lua_export(name = "compute")]
-fn bridge_compute(x: i32) -> i32 {
-    unsafe { c_double(x) }
-}
-"#;
-
-    CartProject::new()
-        .c(c_src)
-        .rust(rust_game_src)
+fn bridge_compute(x: i32) -> i32 { unsafe { c_double(x) } }
+"#,
+        )
         .lua(
             r#"
 function init()
-    local result = compute(21)
-    if result == 42 then
-        blyt32.debug.print("lua->rust->c ok")
-    else
-        blyt32.debug.print("lua->rust->c wrong: " .. tostring(result))
-    end
+    local r = compute(21)
+    if r ~= 42 then error("expected 42, got " .. tostring(r)) end
+    blyt32.debug.print("lua->rust->c ok")
 end
-
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
+    build_lua_cart(&project)
+}
 
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
+#[test]
+fn lua_rust_c_chain_native() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_c_chain_cart(tmp.path());
+    run_cart_native(&cart, "lua->rust->c ok");
+}
 
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("lua->rust->c ok"),
-        "expected 'lua->rust->c ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+#[test]
+fn lua_rust_c_chain_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_c_chain_cart(tmp.path());
+    run_cart_wasm(&cart, "lua->rust->c ok");
 }

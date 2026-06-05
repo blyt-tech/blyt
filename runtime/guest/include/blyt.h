@@ -82,7 +82,7 @@ typedef struct {
 /* 0 args, void return */
 /* clang-format off */
 #define BLYT_LUA_EXPORT_VOID(name) \
-    static void name(void); \
+    void name(void); \
     static int __lua_export_##name(lua_State *L) { \
         (void)L; name(); return 0; \
     } \
@@ -97,12 +97,12 @@ typedef struct {
         #name, #name, "__lua_export_" #name, \
         0, {0, 0, 0, 0}, BLYT_LUA_TYPE_VOID, {0, 0} \
     }; \
-    static void name(void)
+    void name(void)
 
 /* 1 I32 arg (...), I32 return.  The variadic arg is the C parameter declaration
  * (e.g. "int32_t x"); the wrapper reads one integer from the Lua stack. */
 #define BLYT_LUA_EXPORT_I32(name, ...) \
-    static int32_t name(__VA_ARGS__); \
+    int32_t name(__VA_ARGS__); \
     static int __lua_export_##name(lua_State *L) { \
         int32_t _a0 = (int32_t)lua_tointeger(L, 1); \
         int32_t _r = name(_a0); \
@@ -120,7 +120,7 @@ typedef struct {
         #name, #name, "__lua_export_" #name, \
         1, {BLYT_LUA_TYPE_I32, 0, 0, 0}, BLYT_LUA_TYPE_I32, {0, 0} \
     }; \
-    static int32_t name(__VA_ARGS__)
+    int32_t name(__VA_ARGS__)
 /* clang-format on */
 
 #ifdef __cplusplus

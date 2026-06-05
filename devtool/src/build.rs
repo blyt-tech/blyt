@@ -1516,6 +1516,15 @@ fn link_cart(
     .arg("-o")
     .arg(output);
 
+    // Hybrid Lua+native carts: export all global defined symbols to .dynsym so
+    // the WASM host's symtab_lookup can find guest function addresses for
+    // trampolines (e.g. add_one, __blyt_fnsym_double).  Pure Lua-only carts
+    // have no guest C functions to look up so this flag is unnecessary there.
+    let has_native = !objs.is_empty() || rust_archive.is_some() || !lib_archives.is_empty();
+    if lua_cart && has_native {
+        cmd.arg("-Wl,--export-dynamic");
+    }
+
     for obj in objs {
         cmd.arg(obj);
     }

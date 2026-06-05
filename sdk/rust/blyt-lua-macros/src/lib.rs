@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
+use proc_macro2::{Literal, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::{
     parse::{Parse, ParseStream},
@@ -85,6 +85,16 @@ fn c_void() -> TokenStream2 {
 
 fn c_int() -> TokenStream2 {
     quote! { ::core::ffi::c_int }
+}
+
+fn lua_type_to_rust(lt: LuaType) -> TokenStream2 {
+    match lt {
+        LuaType::I32  => quote! { i32 },
+        LuaType::U32  => quote! { u32 },
+        LuaType::F32  => quote! { f32 },
+        LuaType::Bool => quote! { bool },
+        LuaType::Void => quote! { () },
+    }
 }
 
 /// Extern "C" declarations + expression to read argument `stack_idx` from L.
@@ -218,7 +228,9 @@ fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
     let regptr_sym = format_ident!("__LUA_REGPTR_{}", fn_name_s.to_uppercase());
     let export_sym = format_ident!("__LUA_EXPORT_{}", fn_name_s.to_uppercase());
 
-    let wrap_sym_s = format!("__lua_export_{}", fn_name);
+    let wrap_sym_s  = format!("__lua_export_{}", fn_name);
+    let fnsym_fn    = format_ident!("__blyt_fnsym_{}", fn_name);
+    let fnsym_s     = format!("__blyt_fnsym_{}", fn_name);
     let lua_name_null = format!("{lua_name}\0");
 
     /* ------------------------------------------------------------------
@@ -267,8 +279,20 @@ fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
     let at2 = Literal::u8_unsuffixed(arg_type_codes[2]);
     let at3 = Literal::u8_unsuffixed(arg_type_codes[3]);
 
+    /* Shim: #[no_mangle] pub extern "C" fn __blyt_fnsym_NAME(args) -> ret { NAME(args) }
+     * Gives the WASM host a stable, dynsym-visible symbol to look up for trampolines. */
+    let shim_arg_decls: Vec<TokenStream2> = arg_names.iter().zip(arg_lua_types.iter())
+        .map(|(aname, lt)| { let ty = lua_type_to_rust(*lt); quote! { #aname: #ty } })
+        .collect();
+    let shim_ret_ty = if ret_lua != LuaType::Void {
+        let ty = lua_type_to_rust(ret_lua);
+        quote! { -> #ty }
+    } else {
+        quote! {}
+    };
+
     let lua_name_bytes  = fixed_bytes(&lua_name,     32);
-    let fn_sym_bytes    = fixed_bytes(&fn_name_s,    64);
+    let fn_sym_bytes    = fixed_bytes(&fnsym_s,      64);
     let wrap_sym_bytes  = fixed_bytes(&wrap_sym_s,   64);
 
     let null_name: &[u8] = lua_name_null.as_bytes();
@@ -279,6 +303,11 @@ fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
      * ------------------------------------------------------------------ */
     Ok(quote! {
         #func
+
+        #[no_mangle]
+        pub extern "C" fn #fnsym_fn(#(#shim_arg_decls),*) #shim_ret_ty {
+            #fn_name(#(#arg_names),*)
+        }
 
         #[no_mangle]
         unsafe extern "C" fn #export_fn(#l: #cv) -> #ci {

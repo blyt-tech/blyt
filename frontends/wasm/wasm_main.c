@@ -91,6 +91,7 @@ static lua_State *g_lua = NULL;
 static lua_State *g_lua_co = NULL; /* game-loop coroutine */
 static int g_lua_co_ref = LUA_NOREF;
 static bool g_lua_quit = false;
+static bool g_lua_error = false;
 static bool g_lua_active = false;
 #ifdef BLYT_DAP
 static bool g_lua_dap_paused = false; /* hook yielded, waiting for DAP */
@@ -396,11 +397,37 @@ static void wasm_lua_loop(void) {
     if (g_lua_quit) {
         emscripten_cancel_main_loop();
         lua_cleanup();
+        if (g_lua_error)
+            emscripten_force_exit(1);
         return;
     }
 
     if (!g_lua_co)
         return;
+
+    /* If a trampoline call is pending from a previous inner lua_resume (i.e.
+     * the Lua script made a second native call while we were processing the
+     * first), execute the guest function NOW and feed its return value to the
+     * waiting coroutine before advancing to the next Lua frame.  Without this
+     * early-exit path the outer lua_resume below would resume wasm_trampoline_cont
+     * with the stale g_trampoline_ret from the previous call. */
+    if (g_trampoline_active) {
+        blyt_cart_run_err_t ferr = blyt_session_run_frame(g_session);
+        if (ferr == BLYT_RUN_FN_DONE) {
+            g_trampoline_active = false;
+            g_trampoline_ret = blyt_session_fn_return_value(g_session);
+            int nres = 0;
+            lua_resume(g_lua_co, g_lua, 0, &nres); /* fires wasm_trampoline_cont */
+        }
+#ifdef BLYT_GDB
+        else if (ferr == BLYT_RUN_GDB_PAUSED) {
+            blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+            return;
+        }
+#endif
+        blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+        return;
+    }
 
     /* Advance the game-loop coroutine by one frame. */
     g_lua_drawn = false;
@@ -455,6 +482,7 @@ static void wasm_lua_loop(void) {
             }
 #endif
             blyt_js_error(msg ? msg : "Lua runtime error");
+            g_lua_error = true;
         }
         g_lua_quit = true;
         return;
