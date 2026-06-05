@@ -660,54 +660,12 @@ fn lua_cart_with_rust_game_code() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_rust_game");
 
-    // The blyt SDK crate (injected via --config at build time) provides
-    // #[panic_handler] and #[global_allocator].  `extern crate blyt` forces the
-    // crate into the compilation graph even though no blyt items are directly
-    // called — without this the panic handler from blyt is not discovered.
     let rust_game_src = r#"#![no_std]
 extern crate blyt;
+use blyt::lua_export;
 
-use core::ffi::{c_int, c_void};
-
-type LuaState = c_void;
-
-extern "C" {
-    fn lua_createtable(L: *mut LuaState, narr: c_int, nrec: c_int);
-    fn lua_pushcclosure(
-        L: *mut LuaState,
-        f: unsafe extern "C" fn(*mut LuaState) -> c_int,
-        n: c_int,
-    );
-    fn lua_setfield(L: *mut LuaState, idx: c_int, k: *const u8);
-    fn lua_pushinteger(L: *mut LuaState, n: c_int);
-    fn luaL_checkinteger(L: *mut LuaState, arg: c_int) -> c_int;
-    fn luaL_requiref(
-        L: *mut LuaState,
-        modname: *const u8,
-        openf: unsafe extern "C" fn(*mut LuaState) -> c_int,
-        glb: c_int,
-    );
-    fn lua_settop(L: *mut LuaState, idx: c_int);
-}
-
-unsafe extern "C" fn l_double(L: *mut LuaState) -> c_int {
-    let x = luaL_checkinteger(L, 1);
-    lua_pushinteger(L, x * 2);
-    1
-}
-
-unsafe extern "C" fn luaopen_rustgamelib(L: *mut LuaState) -> c_int {
-    lua_createtable(L, 0, 1);
-    lua_pushcclosure(L, l_double, 0);
-    lua_setfield(L, -2, b"double\0".as_ptr());
-    1
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
-    luaL_requiref(L, b"rustgamelib\0".as_ptr(), luaopen_rustgamelib, 1);
-    lua_settop(L, -2); // lua_pop(L, 1)
-}
+#[lua_export]
+fn double(x: i32) -> i32 { x * 2 }
 "#;
 
     CartProject::new()
@@ -715,8 +673,7 @@ pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
         .lua(
             r#"
 function init()
-    local m = require("rustgamelib")
-    local result = m.double(21)
+    local result = double(21)
     if result == 42 then
         blyt32.debug.print("lua+rust-game ok")
     else
@@ -822,48 +779,13 @@ int c_double(int x) { return x * 2; }
 
     let rust_game_src = r#"#![no_std]
 extern crate blyt;
+use blyt::lua_export;
 
-use core::ffi::{c_int, c_void};
+extern "C" { fn c_double(x: i32) -> i32; }
 
-type LuaState = c_void;
-
-extern "C" {
-    fn c_double(x: c_int) -> c_int;
-    fn lua_createtable(L: *mut LuaState, narr: c_int, nrec: c_int);
-    fn lua_pushcclosure(
-        L: *mut LuaState,
-        f: unsafe extern "C" fn(*mut LuaState) -> c_int,
-        n: c_int,
-    );
-    fn lua_setfield(L: *mut LuaState, idx: c_int, k: *const u8);
-    fn lua_pushinteger(L: *mut LuaState, n: c_int);
-    fn luaL_checkinteger(L: *mut LuaState, arg: c_int) -> c_int;
-    fn luaL_requiref(
-        L: *mut LuaState,
-        modname: *const u8,
-        openf: unsafe extern "C" fn(*mut LuaState) -> c_int,
-        glb: c_int,
-    );
-    fn lua_settop(L: *mut LuaState, idx: c_int);
-}
-
-unsafe extern "C" fn l_compute(L: *mut LuaState) -> c_int {
-    let x = luaL_checkinteger(L, 1);
-    lua_pushinteger(L, c_double(x));
-    1
-}
-
-unsafe extern "C" fn luaopen_bridge(L: *mut LuaState) -> c_int {
-    lua_createtable(L, 0, 1);
-    lua_pushcclosure(L, l_compute, 0);
-    lua_setfield(L, -2, b"compute\0".as_ptr());
-    1
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
-    luaL_requiref(L, b"bridge\0".as_ptr(), luaopen_bridge, 1);
-    lua_settop(L, -2);
+#[lua_export(name = "compute")]
+fn bridge_compute(x: i32) -> i32 {
+    unsafe { c_double(x) }
 }
 "#;
 
@@ -873,8 +795,7 @@ pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
         .lua(
             r#"
 function init()
-    local bridge = require("bridge")
-    local result = bridge.compute(21)
+    local result = compute(21)
     if result == 42 then
         blyt32.debug.print("lua->rust->c ok")
     else

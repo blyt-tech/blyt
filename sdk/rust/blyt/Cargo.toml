@@ -7,6 +7,12 @@ publish = false
 [lib]
 crate-type = ["rlib"]
 
+[features]
+lua = ["dep:blyt-lua-macros"]
+
+[dependencies]
+blyt-lua-macros = { path = "../blyt-lua-macros", optional = true }
+
 # abort on panic in all profiles — there is no unwinding runtime in a cart,
 # and catching panics is not part of the cart API contract.
 [profile.dev]

@@ -492,7 +492,8 @@ pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     let mut cmd = Command::new(blyt_bin());
     cmd.args(["build", project_dir.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)
-        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_RUST_SDK", repo_root().join("sdk/rust/blyt"));
     let sdk_clang = sdk.join("bin/blyt-clang");
     if sdk_clang.exists() {
         cmd.env("BLYT_CLANG", &sdk_clang);

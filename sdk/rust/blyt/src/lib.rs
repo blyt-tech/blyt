@@ -96,3 +96,70 @@ static ALLOC: BlytAlloc = BlytAlloc;
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe { abort() }
 }
+
+// -------------------------------------------------------------------------
+// Lua export support (feature "lua") — enabled for Lua+Rust hybrid carts.
+//
+// Provides cart_lua_modules (iterates .lua_regtab populated by #[lua_export])
+// and re-exports the lua_export attribute macro from blyt-lua-macros.
+// -------------------------------------------------------------------------
+
+#[cfg(feature = "lua")]
+pub mod lua {
+    pub use blyt_lua_macros::lua_export;
+
+    // Matches blyt_lua_export_entry_t in runtime/guest/include/blyt.h.
+    #[repr(C)]
+    pub struct BlytLuaExportEntry {
+        pub lua_name:  [u8; 32],
+        pub fn_sym:    [u8; 64],
+        pub wrap_sym:  [u8; 64],
+        pub nargs:     u8,
+        pub arg_types: [u8; 4],
+        pub ret_type:  u8,
+        pub pad:       [u8; 2],
+    }
+
+    pub const LUA_TYPE_VOID: u8 = 0;
+    pub const LUA_TYPE_I32:  u8 = 1;
+    pub const LUA_TYPE_U32:  u8 = 2;
+    pub const LUA_TYPE_F32:  u8 = 3;
+    pub const LUA_TYPE_BOOL: u8 = 4;
+
+    // Used by proc-macro generated statics to build BlytLuaExportEntry at
+    // compile time without requiring heap allocation.
+    pub const fn str_to_fixed<const N: usize>(s: &str) -> [u8; N] {
+        let src = s.as_bytes();
+        let mut arr = [0u8; N];
+        let mut i = 0;
+        while i < src.len() && i + 1 < N {
+            arr[i] = src[i];
+            i += 1;
+        }
+        arr
+    }
+
+    type RegFn = unsafe extern "C" fn(*mut ::core::ffi::c_void);
+
+    // __start_lua_regtab / __stop_lua_regtab are defined via PROVIDE in
+    // HYBRID_LUA_LINKER_SCRIPT.  PROVIDE-defined symbols can be accessed
+    // through the GOT in PIE mode (unlike synthesized start/stop symbols).
+    extern "C" {
+        static __start_lua_regtab: RegFn;
+        static __stop_lua_regtab:  RegFn;
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn cart_lua_modules(l: *mut ::core::ffi::c_void) {
+        let start = ::core::ptr::addr_of!(__start_lua_regtab) as *const RegFn;
+        let end   = ::core::ptr::addr_of!(__stop_lua_regtab)  as *const RegFn;
+        let mut p = start;
+        while p < end {
+            unsafe { (*p)(l) };
+            p = unsafe { p.add(1) };
+        }
+    }
+}
+
+#[cfg(feature = "lua")]
+pub use lua::lua_export;

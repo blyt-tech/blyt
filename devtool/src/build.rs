@@ -574,13 +574,9 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             &rust_sdk,
             &rust_libs,
             &debug_rust_flags,
+            is_lua,
         )?;
-        if is_lua {
-            lib_archives.push(archive);
-            None
-        } else {
-            Some(archive)
-        }
+        Some(archive)
     } else {
         None
     };
@@ -1048,6 +1044,7 @@ fn build_rust_archive(
     rust_sdk_path: &Path,
     rust_lib_patches: &[(String, PathBuf)],
     extra_rustflags: &str,
+    is_lua: bool,
 ) -> Result<PathBuf, BuildError> {
     // Inject the SDK crate and any src/lib/ Rust crates via --config patches so
     // the game's Cargo.toml needs only version constraints and cargo resolves to
@@ -1064,6 +1061,11 @@ fn build_rust_archive(
             r#"patch."crates-io".{name}.path = "{}""#,
             path.display()
         ));
+    }
+
+    // Enable the lua feature so cart_lua_modules and #[lua_export] are available.
+    if is_lua {
+        cmd.arg("--features").arg("blyt/lua");
     }
 
     let status = cmd
@@ -1523,10 +1525,20 @@ fn link_cart(
     // -u <sym> marks each symbol as "needed" so lld retains the archive member
     // that defines it (ADR-0073 / spike-o-results: -Wl,-u,<cart_sym>).
     if let Some(archive) = rust_archive {
-        cmd.arg("-Wl,-u,blyt_cart_init")
-            .arg("-Wl,-u,blyt_cart_update")
-            .arg("-Wl,-u,blyt_cart_draw")
-            .arg(archive);
+        if lua_cart {
+            // Lua+Rust: each #[lua_export] fn lands in its own CGU; --whole-archive
+            // ensures all .lua_regtab entries are extracted even though nothing
+            // outside the archive references them by name.
+            cmd.arg("-Wl,-u,cart_lua_modules")
+                .arg("-Wl,--whole-archive")
+                .arg(archive)
+                .arg("-Wl,--no-whole-archive");
+        } else {
+            cmd.arg("-Wl,-u,blyt_cart_init")
+                .arg("-Wl,-u,blyt_cart_update")
+                .arg("-Wl,-u,blyt_cart_draw")
+                .arg(archive);
+        }
     } else if !lua_cart {
         // C/C++ carts: under --gc-sections the lifecycle entry points must be
         // retained as GC roots. They are exported in .dynsym (default
@@ -1537,12 +1549,10 @@ fn link_cart(
             .arg("-Wl,-u,blyt_cart_draw");
     }
 
-    // Lua carts with src/lib/ C libraries: force lld to pull in the archive
-    // member that defines cart_lua_modules and export it in .dynsym so the
-    // host dynlink can patch libblyt32lua.so's GOT slot for this weak symbol.
-    // Without -u, lld sees only the weak reference in libblyt32lua.so and
-    // never queries the archives for a strong definition.
-    if lua_cart && !lib_archives.is_empty() {
+    // C+Lua carts: force lld to pull in the archive member that defines
+    // cart_lua_modules from the C lib archives.  For Rust+Lua this is already
+    // handled above (--whole-archive on the Rust archive).
+    if lua_cart && rust_archive.is_none() && !lib_archives.is_empty() {
         cmd.arg("-Wl,-u,cart_lua_modules");
     }
 
