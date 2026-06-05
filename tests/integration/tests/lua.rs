@@ -759,6 +759,76 @@ fn wasm_lua_c_hybrid() {
         .success();
 }
 
+/// C and Rust each export independent Lua globals in the same cart.
+///
+/// C uses BLYT_LUA_EXPORT_I32 to register `c_triple`; Rust uses #[lua_export]
+/// to register `rust_double`.  Both generate .lua_regtab entries; the Rust
+/// cart_lua_modules iterates the whole section and registers both.
+#[test]
+fn lua_c_and_rust_both_export() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_c_rust_exports");
+
+    let c_src = r#"
+#include "lua.h"
+#include "blyt.h"
+BLYT_LUA_EXPORT_I32(c_triple, int32_t x) { return x * 3; }
+"#;
+
+    let rust_src = r#"#![no_std]
+extern crate blyt;
+use blyt::lua_export;
+
+#[lua_export]
+fn rust_double(x: i32) -> i32 { x * 2 }
+"#;
+
+    CartProject::new()
+        .c(c_src)
+        .rust(rust_src)
+        .lua(
+            r#"
+function init()
+    local r1 = c_triple(7)
+    local r2 = rust_double(21)
+    if r1 == 21 and r2 == 42 then
+        blyt32.debug.print("lua+c+rust exports ok")
+    else
+        blyt32.debug.print("wrong: c_triple=" .. tostring(r1) .. " rust_double=" .. tostring(r2))
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let output = Command::new(blytplay())
+        .args(["--headless", cart.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("lua+c+rust exports ok"),
+        "expected 'lua+c+rust exports ok' in output, got: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// Lua → Rust → C three-language call chain.
 ///
 /// C provides `c_double(x)`; Rust calls it and exposes the result via a Lua module;
