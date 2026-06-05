@@ -48,16 +48,30 @@ void blyt_console_debug(const char *s);
  * Usage:
  *   BLYT_LUA_EXPORT_VOID(my_fn) { ... }
  *   BLYT_LUA_EXPORT_I32(my_fn, int32_t x) { return x + 1; }
+ *   BLYT_LUA_MODULE_EXPORT_VOID(mylib, my_fn) { ... }
+ *   BLYT_LUA_MODULE_EXPORT_I32(mylib, my_fn, int32_t x) { return x + 1; }
  *
- * Requires <lua.h> to be included before these macros are used.
+ * No pre-requisite includes needed: blyt.h pulls in the minimal Lua API
+ * declarations automatically.  Cart code must NOT include lua.h directly.
+ *
  * Each macro:
- *   1. Emits a Lua C wrapper (__lua_export_NAME) for SDL2/libretro.
- *   2. Emits a registration helper (__lua_reg_NAME) in .lua_regtab, iterated
- *      by the generated cart_lua_modules glue on SDL2/libretro.
+ *   1. Emits a Lua C wrapper (__lua_export_NAME) callable by the Lua VM.
+ *   2. Emits a blyt_lua_regtab_entry_t in .lua_regtab, iterated by the
+ *      SDK-generated cart_lua_modules on SDL2/libretro/WASM-native.
  *   3. Emits a blyt_lua_export_entry_t in .lua_exports, parsed by the WASM
  *      host to build trampolines that call the function via rv32emu.
  *   4. Defines the underlying C function (user writes the body).
+ *
+ * BLYT_LUA_MODULE_EXPORT_* registers the function in a Lua module table so
+ * Lua code can call it via require("mylib").my_fn(x).  The underlying C
+ * symbol is named mylib_my_fn; the Lua name is "mylib.my_fn".  Use this
+ * instead of cart_lua_modules / luaopen_* which are not portable to WASM.
  * ------------------------------------------------------------------------- */
+
+/* Pull in minimal Lua type and API declarations if lua.h not already loaded. */
+#ifndef LUA_VERSION_NUM
+#include "blyt_lua_internal.h"
+#endif
 
 /* Type codes for BLYT_LUA_EXPORT primitive types. */
 #define BLYT_LUA_TYPE_VOID 0
@@ -68,9 +82,10 @@ void blyt_console_debug(const char *s);
 
 /* One entry per exported function, placed in .lua_exports by the macros below.
  * The host reads this section to resolve guest addresses without raw pointers
- * (which would require relocation processing). */
+ * (which would require relocation processing).
+ * For module exports lua_name uses dotted notation: "module.fn". */
 typedef struct {
-    char lua_name[32]; /* Lua global name */
+    char lua_name[32]; /* Lua name: "fn" for globals, "mod.fn" for modules */
     char fn_sym[64]; /* underlying C function symbol name */
     char wrap_sym[64]; /* Lua C wrapper symbol: __lua_export_<fn_sym> */
     uint8_t nargs;
@@ -79,19 +94,28 @@ typedef struct {
     uint8_t _pad[2];
 } blyt_lua_export_entry_t; /* 168 bytes */
 
-/* 0 args, void return */
+/* One entry per exported function, placed in .lua_regtab by the macros below.
+ * Iterated by the SDK-generated cart_lua_modules to register exports with the
+ * Lua VM.  module_name == NULL means a global export; non-NULL registers the
+ * function into a module table accessible via require(module_name). */
+typedef struct {
+    const char *module_name; /* NULL = global export */
+    const char *lua_fn_name; /* fn name within module, or global name */
+    lua_CFunction wrapper; /* the __lua_export_* CFunction */
+} blyt_lua_regtab_entry_t;
+
 /* clang-format off */
+
+/* 0 args, void return, global export */
 #define BLYT_LUA_EXPORT_VOID(name) \
     void name(void); \
     static int __lua_export_##name(lua_State *L) { \
         (void)L; name(); return 0; \
     } \
-    static void __lua_reg_##name(lua_State *L) { \
-        lua_pushcfunction(L, __lua_export_##name); \
-        lua_setglobal(L, #name); \
-    } \
-    static void (*__lua_regptr_##name)(lua_State *) \
-        __attribute__((used, retain, section(".lua_regtab"))) = __lua_reg_##name; \
+    static const blyt_lua_regtab_entry_t __lua_regtab_##name \
+        __attribute__((used, retain, section(".lua_regtab"))) = { \
+        0, #name, __lua_export_##name \
+    }; \
     static const blyt_lua_export_entry_t __export_##name \
         __attribute__((used, retain, section(".lua_exports"))) = { \
         #name, #name, "__lua_export_" #name, \
@@ -99,8 +123,8 @@ typedef struct {
     }; \
     void name(void)
 
-/* 1 I32 arg (...), I32 return.  The variadic arg is the C parameter declaration
- * (e.g. "int32_t x"); the wrapper reads one integer from the Lua stack. */
+/* 1 I32 arg, I32 return, global export.
+ * The variadic arg is the C parameter declaration (e.g. "int32_t x"). */
 #define BLYT_LUA_EXPORT_I32(name, ...) \
     int32_t name(__VA_ARGS__); \
     static int __lua_export_##name(lua_State *L) { \
@@ -109,18 +133,58 @@ typedef struct {
         lua_pushinteger(L, (lua_Integer)_r); \
         return 1; \
     } \
-    static void __lua_reg_##name(lua_State *L) { \
-        lua_pushcfunction(L, __lua_export_##name); \
-        lua_setglobal(L, #name); \
-    } \
-    static void (*__lua_regptr_##name)(lua_State *) \
-        __attribute__((used, retain, section(".lua_regtab"))) = __lua_reg_##name; \
+    static const blyt_lua_regtab_entry_t __lua_regtab_##name \
+        __attribute__((used, retain, section(".lua_regtab"))) = { \
+        0, #name, __lua_export_##name \
+    }; \
     static const blyt_lua_export_entry_t __export_##name \
         __attribute__((used, retain, section(".lua_exports"))) = { \
         #name, #name, "__lua_export_" #name, \
         1, {BLYT_LUA_TYPE_I32, 0, 0, 0}, BLYT_LUA_TYPE_I32, {0, 0} \
     }; \
     int32_t name(__VA_ARGS__)
+
+/* 0 args, void return, module export.
+ * The underlying C function is named module##_##fn_name; the Lua name is
+ * "module.fn_name" accessible via require("module").fn_name(). */
+#define BLYT_LUA_MODULE_EXPORT_VOID(module, fn_name) \
+    void module##_##fn_name(void); \
+    static int __lua_export_##module##_##fn_name(lua_State *L) { \
+        (void)L; module##_##fn_name(); return 0; \
+    } \
+    static const blyt_lua_regtab_entry_t __lua_regtab_##module##_##fn_name \
+        __attribute__((used, retain, section(".lua_regtab"))) = { \
+        #module, #fn_name, __lua_export_##module##_##fn_name \
+    }; \
+    static const blyt_lua_export_entry_t __export_##module##_##fn_name \
+        __attribute__((used, retain, section(".lua_exports"))) = { \
+        #module "." #fn_name, #module "_" #fn_name, \
+        "__lua_export_" #module "_" #fn_name, \
+        0, {0, 0, 0, 0}, BLYT_LUA_TYPE_VOID, {0, 0} \
+    }; \
+    void module##_##fn_name(void)
+
+/* 1 I32 arg, I32 return, module export. */
+#define BLYT_LUA_MODULE_EXPORT_I32(module, fn_name, ...) \
+    int32_t module##_##fn_name(__VA_ARGS__); \
+    static int __lua_export_##module##_##fn_name(lua_State *L) { \
+        int32_t _a0 = (int32_t)lua_tointeger(L, 1); \
+        int32_t _r = module##_##fn_name(_a0); \
+        lua_pushinteger(L, (lua_Integer)_r); \
+        return 1; \
+    } \
+    static const blyt_lua_regtab_entry_t __lua_regtab_##module##_##fn_name \
+        __attribute__((used, retain, section(".lua_regtab"))) = { \
+        #module, #fn_name, __lua_export_##module##_##fn_name \
+    }; \
+    static const blyt_lua_export_entry_t __export_##module##_##fn_name \
+        __attribute__((used, retain, section(".lua_exports"))) = { \
+        #module "." #fn_name, #module "_" #fn_name, \
+        "__lua_export_" #module "_" #fn_name, \
+        1, {BLYT_LUA_TYPE_I32, 0, 0, 0}, BLYT_LUA_TYPE_I32, {0, 0} \
+    }; \
+    int32_t module##_##fn_name(__VA_ARGS__)
+
 /* clang-format on */
 
 #ifdef __cplusplus

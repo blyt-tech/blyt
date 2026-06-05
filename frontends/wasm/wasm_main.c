@@ -298,7 +298,46 @@ static void wasm_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr, u
         lua_pushinteger(L, arg_types[j]);
     lua_pushinteger(L, ret_type);
     lua_pushcclosure(L, wasm_make_trampoline, 7);
-    lua_setglobal(L, lua_name);
+
+    /* Dotted lua_name (e.g. "mylib.add") → module export; plain name → global. */
+    const char *dot = strchr(lua_name, '.');
+    if (!dot) {
+        lua_setglobal(L, lua_name);
+    } else {
+        /* Extract module name (before dot) and fn name (after dot). */
+        char mod[32];
+        int mod_len = (int)(dot - lua_name);
+        if (mod_len >= (int)sizeof(mod))
+            mod_len = (int)sizeof(mod) - 1;
+        for (int i = 0; i < mod_len; i++)
+            mod[i] = lua_name[i];
+        mod[mod_len] = '\0';
+        const char *fn = dot + 1;
+
+        /* Get or create the module table. */
+        lua_getglobal(L, mod);
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            lua_newtable(L);
+            lua_pushvalue(L, -1);
+            lua_setglobal(L, mod);
+            /* Register in package.loaded so require() works. */
+            lua_getglobal(L, "package");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "loaded");
+                if (lua_istable(L, -1)) {
+                    lua_pushvalue(L, -3);
+                    lua_setfield(L, -2, mod);
+                }
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+        }
+        /* The trampoline closure is at stack index -2 (module table is -1). */
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, fn);
+        lua_pop(L, 2); /* pop module table + original closure */
+    }
 }
 
 /* Register one Lua global closure per entry in the cart's .lua_exports section. */

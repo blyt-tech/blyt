@@ -607,8 +607,9 @@ else()
       ${LIBBLYTC_CFLAGS} ${_VOPT} -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1
       ${_VLUA_DAP_FLAGS} -I "${LUA_DIR}" -I "${SF_INC}" -I "${SF_SRC}/RISCV" -I
       "${SF_PLATFORM_DIR}" -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_ROUND_ODD=1
-      -Wl,-soname,libblyt32lua.so -Wl,--as-needed "${_VDIR}/libblyt32.so" -o
-      "${_VDIR}/libblyt32lua.so"
+      -Wl,-soname,libblyt32lua.so
+      -Wl,--version-script,${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.sym
+      -Wl,--as-needed "${_VDIR}/libblyt32.so" -o "${_VDIR}/libblyt32lua.so"
       # Lua VM sources embedded directly (exports lua_*/luaL_* in .dynsym)
       ${LUA_ALL_SRCS}
       # musl riscv32 setjmp/longjmp (not in libblytc)
@@ -879,6 +880,7 @@ file(REMOVE_RECURSE "${SDK_INC}")
 file(MAKE_DIRECTORY "${SDK_INC}")
 file(COPY "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt.h"
           "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt32.h"
+          "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt_lua_internal.h"
      DESTINATION "${SDK_INC}")
 
 # Copy the curated subset of musl public headers that correspond to functions
@@ -947,30 +949,11 @@ if(EXISTS "${SDK_LIB}/libc++.a")
   endif()
 endif()
 
-# Install Lua public headers into SDK_INC so C/C++ libs can #include lua.h,
-# lauxlib.h, and lualib.h via the standard SDK include path. Patch the installed
-# luaconf.h to enable LUA_32BITS=1 and LUA_USE_LONGJMP=1 so that C/C++ libraries
-# calling the Lua C API compile with the same numeric types as the blyt Lua VM
-# (lua_Integer=int, lua_Number=float).
-if(EXISTS "${LUA_DIR}/lua.h")
-  foreach(_LUA_H lua.h luaconf.h lualib.h lauxlib.h lua.hpp)
-    if(EXISTS "${LUA_DIR}/${_LUA_H}")
-      file(COPY "${LUA_DIR}/${_LUA_H}" DESTINATION "${SDK_INC}")
-    endif()
-  endforeach()
-  # Activate LUA_32BITS and LUA_USE_LONGJMP in the installed luaconf.h so that
-  # src/lib/ C code using the Lua C API compiles with the same numeric types as
-  # the blyt Lua VM (lua_Integer=int, lua_Number=float). LUA_32BITS must be
-  # defined BEFORE the type-selection conditionals, so we replace the
-  # commented-out placeholder line in place rather than appending.
-  file(READ "${SDK_INC}/luaconf.h" _LUACONF_CONTENT)
-  if(NOT _LUACONF_CONTENT MATCHES "blyt-sdk-patch")
-    string(REPLACE "/* #define LUA_32BITS */"
-                   "#define LUA_32BITS 1 /* blyt-sdk-patch */" _LUACONF_CONTENT
-                   "${_LUACONF_CONTENT}")
-    file(WRITE "${SDK_INC}/luaconf.h" "${_LUACONF_CONTENT}")
-  endif()
-endif()
+# Lua headers (lua.h, lauxlib.h, lualib.h, luaconf.h) are NOT installed in the
+# public SDK include path.  Cart code must not include them directly; use
+# BLYT_LUA_EXPORT_* macros which pull in blyt_lua_internal.h automatically.
+# The raw Lua C API headers are SDK-internal and only used by devtool-generated
+# cart_lua_modules glue code that the cart developer never writes by hand.
 
 # -------------------------------------------------------------------------
 # Step 4: blyt devtool

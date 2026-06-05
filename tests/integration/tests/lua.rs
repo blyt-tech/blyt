@@ -100,288 +100,126 @@ function draw() end
 }
 
 // -------------------------------------------------------------------------
-// cart_lua_modules tests — native only, no WASM equivalent
+// Portable module exports — C, Rust, C++ — native and WASM
 //
-// The tests below exercise the `cart_lua_modules`/`luaL_requiref` mechanism,
-// which requires the cart (guest) C code to call Lua API functions via a
-// `lua_State *` pointer supplied by the runtime.  On WASM the Lua VM lives
-// in host WASM memory (not in rv32emu), so there is no valid Lua state
-// pointer to hand to the guest; the mechanism is architecturally
-// incompatible.
-//
-// The WASM-compatible alternative — exporting individual functions via
-// `BLYT_LUA_EXPORT_*` (C) or `#[lua_export]` (Rust), which uses the
-// `.lua_exports` metadata section instead of a Lua state pointer — is
-// already covered by the `lua_*_hybrid_wasm` tests.
+// All tests use BLYT_LUA_MODULE_EXPORT_* or #[lua_export(module = ...)]
+// which route through the .lua_regtab and .lua_exports metadata sections.
+// This is cross-runtime compatible: rv32emu-native and WASM both supported.
+// cart_lua_modules and raw lua_State * access are forbidden from cart code.
 // -------------------------------------------------------------------------
 
-/// A Lua cart calls a C library function via the cart_lua_modules mechanism.
-///
-/// The C library defines `cart_lua_modules` which registers a "mathlib" Lua
-/// module.  The Lua cart requires("mathlib") and calls mathlib.add().
-#[test]
-fn lua_cart_calls_c_lib() {
-    require_sdk();
-    require_lua_sdk();
-
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_c_lib");
-
+fn build_lua_c_lib_module_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_lib_module");
     CartProject::new()
-        // C library with cart_lua_modules registration
-        .lib_file(
-            "mathlib",
-            "include/mathlib.h",
-            "#ifndef MATHLIB_H\n#define MATHLIB_H\n\
-             #ifdef __cplusplus\nextern \"C\" {\n#endif\n\
-             void mathlib_lua_register(void *L);\n\
-             #ifdef __cplusplus\n}\n#endif\n#endif\n",
-        )
         .lib_file(
             "mathlib",
             "mathlib.c",
-            r#"
-#include "lua.h"
-#include "lauxlib.h"
-
-static int l_add(lua_State *L) {
-    int a = (int)luaL_checkinteger(L, 1);
-    int b = (int)luaL_checkinteger(L, 2);
-    lua_pushinteger(L, a + b);
-    return 1;
-}
-
-static const luaL_Reg mathlib_funcs[] = {
-    {"add", l_add},
-    {NULL, NULL}
-};
-
-int luaopen_mathlib(lua_State *L) {
-    luaL_newlib(L, mathlib_funcs);
-    return 1;
-}
-
-void cart_lua_modules(lua_State *L) {
-    luaL_requiref(L, "mathlib", luaopen_mathlib, 1);
-    lua_pop(L, 1);
-}
-"#,
+            "#include \"blyt.h\"\n\
+             BLYT_LUA_MODULE_EXPORT_I32(mathlib, double, int32_t x) { return x * 2; }\n",
         )
         .lua(
             r#"
 function init()
     local m = require("mathlib")
-    local result = m.add(3, 4)
-    if result == 7 then
+    local result = m.double(5)
+    if result == 10 then
         blyt32.debug.print("lua+c ok")
     else
         blyt32.debug.print("lua+c wrong")
     end
 end
 
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("lua+c ok"),
-        "expected 'lua+c ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+    build_lua_cart(&project)
 }
 
-/// A Lua cart calls a Rust library function via the cart_lua_modules mechanism.
-///
-/// The Rust library defines `cart_lua_modules` using raw Lua C FFI, registering
-/// a "rustlib" module.  The Lua cart requires("rustlib") and calls
-/// rustlib.multiply().
 #[test]
-fn lua_cart_calls_rust_lib() {
+fn lua_cart_calls_c_lib() {
     require_sdk();
     require_lua_sdk();
-    require_rust_riscv_target();
-
     let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_rust_lib");
-
-    // The Rust lib defines cart_lua_modules using raw Lua C FFI.  It registers
-    // a "rustlib" Lua module with a single multiply() function implemented in Rust.
-    // No blyt SDK dependency: the lib only calls lua_* symbols exported by
-    // libblyt32lua.so and resolved by the cart dynlinker at runtime.
-    let rust_lib_src = r#"#![no_std]
-
-// staticlib requires a panic handler even with panic=abort (the symbol must
-// exist; it is never called because -C panic=abort generates abort instead).
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
+    let cart = build_lua_c_lib_module_cart(tmp.path());
+    run_cart_native(&cart, "lua+c ok");
 }
 
-use core::ffi::{c_int, c_void};
-
-type LuaState = c_void;
-
-extern "C" {
-    fn lua_createtable(L: *mut LuaState, narr: c_int, nrec: c_int);
-    fn lua_pushcclosure(
-        L: *mut LuaState,
-        f: unsafe extern "C" fn(*mut LuaState) -> c_int,
-        n: c_int,
-    );
-    fn lua_setfield(L: *mut LuaState, idx: c_int, k: *const u8);
-    fn lua_pushinteger(L: *mut LuaState, n: c_int);
-    fn luaL_checkinteger(L: *mut LuaState, arg: c_int) -> c_int;
-    fn luaL_requiref(
-        L: *mut LuaState,
-        modname: *const u8,
-        openf: unsafe extern "C" fn(*mut LuaState) -> c_int,
-        glb: c_int,
-    );
-    fn lua_settop(L: *mut LuaState, idx: c_int);
+#[test]
+fn lua_cart_calls_c_lib_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_lib_module_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+c ok");
 }
 
-unsafe extern "C" fn l_multiply(L: *mut LuaState) -> c_int {
-    let a = luaL_checkinteger(L, 1);
-    let b = luaL_checkinteger(L, 2);
-    lua_pushinteger(L, a * b);
-    1
-}
-
-unsafe extern "C" fn luaopen_rustlib(L: *mut LuaState) -> c_int {
-    lua_createtable(L, 0, 1);
-    lua_pushcclosure(L, l_multiply, 0);
-    lua_setfield(L, -2, b"multiply\0".as_ptr());
-    1
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn cart_lua_modules(L: *mut LuaState) {
-    luaL_requiref(L, b"rustlib\0".as_ptr(), luaopen_rustlib, 1);
-    lua_settop(L, -2); // lua_pop(L, 1)
-}
-"#;
-
-    // Use lib_file to write the Cargo.toml with crate-type = ["staticlib"] so
-    // blyt build can compile the Rust lib to a .a and link it into the cart.
-    // (rust_lib() generates crate-type-less Cargo.toml suitable only for
-    // --config injection into a parent Rust game crate.)
+fn build_lua_rust_lib_module_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_rust_lib_module");
     CartProject::new()
-        .lib_file(
-            "rustlib",
-            "Cargo.toml",
-            "[package]\nname = \"rustlib\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\ncrate-type = [\"staticlib\"]\n",
+        .rust(
+            r#"#![no_std]
+extern crate blyt;
+use blyt::lua_export;
+
+#[lua_export(module = "rustlib")]
+fn square(x: i32) -> i32 { x * x }
+"#,
         )
-        .lib_file("rustlib", "src/lib.rs", rust_lib_src)
         .lua(
             r#"
 function init()
     local m = require("rustlib")
-    local result = m.multiply(6, 7)
-    if result == 42 then
+    local result = m.square(7)
+    if result == 49 then
         blyt32.debug.print("lua+rust ok")
     else
         blyt32.debug.print("lua+rust wrong")
     end
 end
 
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("lua+rust ok"),
-        "expected 'lua+rust ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+    build_lua_cart(&project)
 }
 
-/// A Lua cart calls a C++ library function via the cart_lua_modules mechanism.
-///
-/// The C++ library defines `extern "C" void cart_lua_modules(lua_State *L)`
-/// which registers a "cpplib" Lua module backed by a C++ function.  The Lua
-/// cart requires("cpplib") and calls cpplib.square().
 #[test]
-fn lua_cart_calls_cpp_lib() {
+fn lua_cart_calls_rust_lib() {
     require_sdk();
-    require_cpp_sdk();
     require_lua_sdk();
-
+    require_rust_riscv_target();
     let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_cpp_lib");
+    let cart = build_lua_rust_lib_module_cart(tmp.path());
+    run_cart_native(&cart, "lua+rust ok");
+}
 
+#[test]
+fn lua_cart_calls_rust_lib_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_lib_module_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+rust ok");
+}
+
+fn build_lua_cpp_lib_module_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_cpp_lib_module");
     CartProject::new()
-        // C++ library: defines cart_lua_modules with extern "C" so the cart
-        // dynlinker finds it as a plain C symbol; uses a C++ function internally.
         .lib_file(
             "cpplib",
             "cpplib.cpp",
-            // Lua headers have no extern "C" guards, so wrap them explicitly to
-            // prevent C++ name mangling of lua_* / luaL_* symbols.
-            r#"
-extern "C" {
-#include "lua.h"
-#include "lauxlib.h"
-}
-
-// C++ implementation (unguarded — purely internal, no Lua API exposure).
-static int cpp_square(int x) { return x * x; }
+            r#"#include "blyt.h"
 
 extern "C" {
-
-static int l_square(lua_State *L) {
-    int x = (int)luaL_checkinteger(L, 1);
-    lua_pushinteger(L, cpp_square(x));
-    return 1;
+BLYT_LUA_MODULE_EXPORT_I32(cpplib, square, int32_t x) { return x * x; }
 }
-
-static const luaL_Reg cpplib_funcs[] = {
-    {"square", l_square},
-    {NULL, NULL}
-};
-
-int luaopen_cpplib(lua_State *L) {
-    luaL_newlib(L, cpplib_funcs);
-    return 1;
-}
-
-void cart_lua_modules(lua_State *L) {
-    luaL_requiref(L, "cpplib", luaopen_cpplib, 1);
-    lua_pop(L, 1);
-}
-
-} // extern "C"
 "#,
         )
         .lua(
@@ -396,95 +234,50 @@ function init()
     end
 end
 
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("lua+cpp ok"),
-        "expected 'lua+cpp ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+    build_lua_cart(&project)
 }
 
-/// Cart C library code drives the Lua VM: calls back into Lua from within a
-/// C function registered as a Lua module entry point.
-///
-/// This distinguishes cart-native code using the Lua API from the runtime
-/// (libblyt32lua.so) doing so.  The C lib registers a Lua module; that module's
-/// function retrieves a Lua global (set by the Lua cart) and returns it
-/// incremented, exercising lua_getglobal / lua_tointegerx / lua_pushinteger
-/// from within cart C code.
 #[test]
-fn c_lib_drives_lua_vm() {
+fn lua_cart_calls_cpp_lib() {
     require_sdk();
+    require_cpp_sdk();
     require_lua_sdk();
-
     let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("c_drives_lua");
+    let cart = build_lua_cpp_lib_module_cart(tmp.path());
+    run_cart_native(&cart, "lua+cpp ok");
+}
 
+#[test]
+fn lua_cart_calls_cpp_lib_wasm() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_cpp_lib_module_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+cpp ok");
+}
+
+/// The portable cross-runtime pattern: C code receives a value as an argument
+/// rather than reading Lua globals via lua_getglobal (which is WASM-incompatible).
+fn build_c_increment_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("c_increment");
     CartProject::new()
         .lib_file(
-            "cdrivelib",
-            "cdrivelib.c",
-            r#"
-#include "lua.h"
-#include "lauxlib.h"
-
-/* l_get_base: reads the Lua global "base_value" set by the cart and returns
- * it incremented by 1.  Exercises lua_getglobal and lua_tointegerx from
- * cart C code rather than from the runtime. */
-static int l_get_base(lua_State *L) {
-    lua_getglobal(L, "base_value");
-    int ok = 0;
-    int val = (int)lua_tointegerx(L, -1, &ok);
-    lua_pop(L, 1);
-    if (!ok) {
-        return luaL_error(L, "base_value is not an integer");
-    }
-    lua_pushinteger(L, val + 1);
-    return 1;
-}
-
-static const luaL_Reg cdrivelib_funcs[] = {
-    {"get_base", l_get_base},
-    {NULL, NULL}
-};
-
-int luaopen_cdrivelib(lua_State *L) {
-    luaL_newlib(L, cdrivelib_funcs);
-    return 1;
-}
-
-void cart_lua_modules(lua_State *L) {
-    luaL_requiref(L, "cdrivelib", luaopen_cdrivelib, 1);
-    lua_pop(L, 1);
-}
-"#,
+            "inclib",
+            "inclib.c",
+            "#include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(increment, int32_t x) { return x + 1; }\n",
         )
         .lua(
             r#"
-base_value = 41
-
 function init()
-    local m = require("cdrivelib")
-    local result = m.get_base()
+    local result = increment(41)
     if result == 42 then
         blyt32.debug.print("c-drives-lua ok")
     else
@@ -492,80 +285,42 @@ function init()
     end
 end
 
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
+    build_lua_cart(&project)
+}
 
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
+#[test]
+fn c_lib_drives_lua_vm() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_c_increment_cart(tmp.path());
+    run_cart_native(&cart, "c-drives-lua ok");
+}
 
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("c-drives-lua ok"),
-        "expected 'c-drives-lua ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+#[test]
+fn c_lib_drives_lua_vm_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_c_increment_cart(tmp.path());
+    run_cart_wasm(&cart, "c-drives-lua ok");
 }
 
 // -------------------------------------------------------------------------
 // Lua + src/game/ native code tests
-//
-// These verify that a Lua cart can ship C, C++, or Rust game code under
-// src/game/ (not src/lib/).  The native code defines cart_lua_modules and
-// is compiled/linked alongside the Lua bytecode.
 // -------------------------------------------------------------------------
 
-/// A Lua cart with C game code under src/game/c/ that registers a Lua module.
-///
-/// This is distinct from lua_cart_calls_c_lib (which uses src/lib/): game-level
-/// C code is compiled as plain object files and linked directly, so no archive
-/// step is involved.
-#[test]
-fn lua_cart_with_c_game_code() {
-    require_sdk();
-    require_lua_sdk();
-
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_c_game");
-
+fn build_lua_c_game_module_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_game_module");
     CartProject::new()
-        .c(r#"
-#include "lua.h"
-#include "lauxlib.h"
-
-static int l_negate(lua_State *L) {
-    int x = (int)luaL_checkinteger(L, 1);
-    lua_pushinteger(L, -x);
-    return 1;
-}
-
-static const luaL_Reg gamelib_funcs[] = {
-    {"negate", l_negate},
-    {NULL, NULL}
-};
-
-int luaopen_gamelib(lua_State *L) {
-    luaL_newlib(L, gamelib_funcs);
-    return 1;
-}
-
-void cart_lua_modules(lua_State *L) {
-    luaL_requiref(L, "gamelib", luaopen_gamelib, 1);
-    lua_pop(L, 1);
-}
-"#)
+        .c("#include \"blyt.h\"\n\
+             BLYT_LUA_MODULE_EXPORT_I32(gamelib, negate, int32_t x) { return -x; }\n")
         .lua(
             r#"
 function init()
@@ -578,78 +333,42 @@ function init()
     end
 end
 
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("lua+c-game ok"),
-        "expected 'lua+c-game ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+    build_lua_cart(&project)
 }
 
-/// A Lua cart with C++ game code under src/game/c++/ that registers a Lua module.
 #[test]
-fn lua_cart_with_cpp_game_code() {
+fn lua_cart_with_c_game_code() {
     require_sdk();
-    require_cpp_sdk();
     require_lua_sdk();
-
     let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_cpp_game");
+    let cart = build_lua_c_game_module_cart(tmp.path());
+    run_cart_native(&cart, "lua+c-game ok");
+}
 
+#[test]
+fn lua_cart_with_c_game_code_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_game_module_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+c-game ok");
+}
+
+fn build_lua_cpp_game_module_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_cpp_game_module");
     CartProject::new()
-        // Lua headers have no extern "C" guards — wrap includes explicitly.
         .cpp(
-            r#"
-extern "C" {
-#include "lua.h"
-#include "lauxlib.h"
-}
-
-static int cpp_square(int x) { return x * x; }
+            r#"#include "blyt.h"
 
 extern "C" {
-
-static int l_square(lua_State *L) {
-    int x = (int)luaL_checkinteger(L, 1);
-    lua_pushinteger(L, cpp_square(x));
-    return 1;
+BLYT_LUA_MODULE_EXPORT_I32(cppgamelib, square, int32_t x) { return x * x; }
 }
-
-static const luaL_Reg gamelib_funcs[] = {
-    {"square", l_square},
-    {NULL, NULL}
-};
-
-int luaopen_cppgamelib(lua_State *L) {
-    luaL_newlib(L, gamelib_funcs);
-    return 1;
-}
-
-void cart_lua_modules(lua_State *L) {
-    luaL_requiref(L, "cppgamelib", luaopen_cppgamelib, 1);
-    lua_pop(L, 1);
-}
-
-} // extern "C"
 "#,
         )
         .lua(
@@ -664,31 +383,33 @@ function init()
     end
 end
 
-function update()
-    blyt.quit()
-end
-
+function update() blyt.quit() end
 function draw() end
 "#,
         )
         .write(&project);
+    build_lua_cart(&project)
+}
 
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
+#[test]
+fn lua_cart_with_cpp_game_code() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_cpp_game_module_cart(tmp.path());
+    run_cart_native(&cart, "lua+cpp-game ok");
+}
 
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-
-    assert!(
-        String::from_utf8_lossy(&output).contains("lua+cpp-game ok"),
-        "expected 'lua+cpp-game ok' in output, got: {}",
-        String::from_utf8_lossy(&output)
-    );
+#[test]
+fn lua_cart_with_cpp_game_code_wasm() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_cpp_game_module_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+cpp-game ok");
 }
 
 fn build_lua_rust_hybrid_cart(tmp: &std::path::Path) -> std::path::PathBuf {
@@ -742,8 +463,7 @@ fn lua_rust_hybrid_wasm() {
 fn build_lua_c_hybrid_cart(tmp: &std::path::Path) -> std::path::PathBuf {
     let project = tmp.join("lua_c_hybrid");
     CartProject::new()
-        .c("#include \"lua.h\"\n\
-             #include \"blyt.h\"\n\
+        .c("#include \"blyt.h\"\n\
              BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n")
         .lua(
             r#"
@@ -782,8 +502,7 @@ fn lua_c_hybrid_wasm() {
 fn build_lua_c_rust_exports_cart(tmp: &std::path::Path) -> std::path::PathBuf {
     let project = tmp.join("lua_c_rust_exports");
     CartProject::new()
-        .c("#include \"lua.h\"\n\
-             #include \"blyt.h\"\n\
+        .c("#include \"blyt.h\"\n\
              BLYT_LUA_EXPORT_I32(c_triple, int32_t x) { return x * 3; }\n")
         .rust(
             r#"#![no_std]
@@ -887,11 +606,7 @@ fn build_lua_cpp_hybrid_cart(tmp: &std::path::Path) -> std::path::PathBuf {
     let project = tmp.join("lua_cpp_hybrid");
     CartProject::new()
         .cpp(
-            r#"
-extern "C" {
-#include "lua.h"
-}
-#include "blyt.h"
+            r#"#include "blyt.h"
 
 static int cpp_cube(int x) { return x * x * x; }
 
@@ -942,7 +657,7 @@ fn build_lua_c_lib_export_cart(tmp: &std::path::Path) -> std::path::PathBuf {
         .lib_file(
             "triplelib",
             "triplelib.c",
-            "#include \"lua.h\"\n#include \"blyt.h\"\n\
+            "#include \"blyt.h\"\n\
              BLYT_LUA_EXPORT_I32(lib_triple, int32_t x) { return x * 3; }\n",
         )
         .lua(
@@ -977,4 +692,106 @@ fn lua_c_lib_export_wasm() {
     let tmp = TempDir::new().unwrap();
     let cart = build_lua_c_lib_export_cart(tmp.path());
     run_cart_wasm(&cart, "lua+c-lib ok");
+}
+
+// -------------------------------------------------------------------------
+// New module export tests — dedicated coverage for BLYT_LUA_MODULE_EXPORT_*
+// and #[lua_export(module = ...)] on both native and WASM runtimes.
+// -------------------------------------------------------------------------
+
+fn build_lua_module_export_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_module_export");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+             BLYT_LUA_MODULE_EXPORT_I32(ops, triple, int32_t x) { return x * 3; }\n")
+        .lua(
+            r#"
+function init()
+    local m = require("ops")
+    local result = m.triple(14)
+    if result == 42 then
+        blyt32.debug.print("module export ok")
+    else
+        blyt32.debug.print("module export wrong")
+    end
+end
+
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_module_export_native() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_module_export_cart(tmp.path());
+    run_cart_native(&cart, "module export ok");
+}
+
+#[test]
+fn lua_module_export_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_module_export_cart(tmp.path());
+    run_cart_wasm(&cart, "module export ok");
+}
+
+fn build_lua_rust_module_export_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_rust_module_export");
+    CartProject::new()
+        .rust(
+            r#"#![no_std]
+extern crate blyt;
+use blyt::lua_export;
+
+#[lua_export(module = "ops")]
+fn negate(x: i32) -> i32 { -x }
+"#,
+        )
+        .lua(
+            r#"
+function init()
+    local m = require("ops")
+    local result = m.negate(42)
+    if result == -42 then
+        blyt32.debug.print("rust module export ok")
+    else
+        blyt32.debug.print("rust module export wrong")
+    end
+end
+
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_rust_module_export_native() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_module_export_cart(tmp.path());
+    run_cart_native(&cart, "rust module export ok");
+}
+
+#[test]
+fn lua_rust_module_export_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_module_export_cart(tmp.path());
+    run_cart_wasm(&cart, "rust module export ok");
 }

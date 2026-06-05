@@ -7,25 +7,30 @@ use syn::{
 };
 
 /* -------------------------------------------------------------------------
- * Attribute arguments: #[lua_export] or #[lua_export(name = "foo")]
+ * Attribute arguments: #[lua_export], #[lua_export(name = "foo")],
+ *                      or #[lua_export(module = "mylib")]
  * ------------------------------------------------------------------------- */
 
 struct MacroArgs {
     lua_name: Option<String>,
+    module:   Option<String>,
 }
 
 impl Parse for MacroArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         if input.is_empty() {
-            return Ok(MacroArgs { lua_name: None });
+            return Ok(MacroArgs { lua_name: None, module: None });
         }
         let key: syn::Ident = input.parse()?;
-        if key != "name" {
-            return Err(syn::Error::new(key.span(), "expected `name = \"...\"`"));
-        }
         let _: Token![=] = input.parse()?;
         let lit: LitStr = input.parse()?;
-        Ok(MacroArgs { lua_name: Some(lit.value()) })
+        if key == "name" {
+            Ok(MacroArgs { lua_name: Some(lit.value()), module: None })
+        } else if key == "module" {
+            Ok(MacroArgs { lua_name: None, module: Some(lit.value()) })
+        } else {
+            Err(syn::Error::new(key.span(), "expected `name = \"...\"` or `module = \"...\"`"))
+        }
     }
 }
 
@@ -185,7 +190,15 @@ pub fn lua_export(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
     let fn_name   = &func.sig.ident;
     let fn_name_s = fn_name.to_string();
-    let lua_name  = args.lua_name.unwrap_or_else(|| fn_name_s.clone());
+    let module_s  = args.module;
+    // For module exports: C symbol = "module_fn", Lua name = "module.fn"
+    // For global exports: C symbol = fn_name (or explicit name), Lua name = same
+    let (sym_name_s, lua_name) = if let Some(ref m) = module_s {
+        (format!("{}_{}", m, fn_name_s), format!("{}.{}", m, fn_name_s))
+    } else {
+        let n = args.lua_name.unwrap_or_else(|| fn_name_s.clone());
+        (n.clone(), n)
+    };
 
     /* ------------------------------------------------------------------
      * Parse return type
@@ -221,17 +234,26 @@ fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
 
     /* ------------------------------------------------------------------
      * Identifiers for generated symbols
+     * sym_name_s = fn_name for globals, "module_fn" for module exports
      * ------------------------------------------------------------------ */
+    let sym_upper = sym_name_s.to_uppercase();
     let l = format_ident!("_l");
-    let export_fn  = format_ident!("__lua_export_{}", fn_name);
-    let reg_fn     = format_ident!("__lua_reg_{}", fn_name);
-    let regptr_sym = format_ident!("__LUA_REGPTR_{}", fn_name_s.to_uppercase());
-    let export_sym = format_ident!("__LUA_EXPORT_{}", fn_name_s.to_uppercase());
+    let export_fn  = format_ident!("__lua_export_{}", sym_name_s);
+    let regtab_sym = format_ident!("__LUA_REGTAB_{}", sym_upper);
+    let export_sym = format_ident!("__LUA_EXPORT_{}", sym_upper);
+    let regtab_fn_name_sym = format_ident!("__LUA_REGTAB_FN_{}", sym_upper);
 
-    let wrap_sym_s  = format!("__lua_export_{}", fn_name);
-    let fnsym_fn    = format_ident!("__blyt_fnsym_{}", fn_name);
-    let fnsym_s     = format!("__blyt_fnsym_{}", fn_name);
-    let lua_name_null = format!("{lua_name}\0");
+    let wrap_sym_s = format!("__lua_export_{}", sym_name_s);
+    // Shim function: for module exports, the C symbol is "module_fn" (distinct
+    // from the Rust fn name).  For globals, we keep "__blyt_fnsym_fn" so the
+    // shim has a different symbol than the user's Rust function and the call
+    // inside the shim body resolves to the Rust function, not itself.
+    let (fnsym_fn, fnsym_s) = if module_s.is_some() {
+        (format_ident!("{}", sym_name_s), sym_name_s.clone())
+    } else {
+        let s = format!("__blyt_fnsym_{}", sym_name_s);
+        (format_ident!("{}", s), s)
+    };
 
     /* ------------------------------------------------------------------
      * Generate argument extraction (extern decls + let bindings)
@@ -291,12 +313,44 @@ fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
         quote! {}
     };
 
-    let lua_name_bytes  = fixed_bytes(&lua_name,     32);
-    let fn_sym_bytes    = fixed_bytes(&fnsym_s,      64);
-    let wrap_sym_bytes  = fixed_bytes(&wrap_sym_s,   64);
+    let lua_name_bytes = fixed_bytes(&lua_name,   32);
+    let fn_sym_bytes   = fixed_bytes(&fnsym_s,    64);
+    let wrap_sym_bytes = fixed_bytes(&wrap_sym_s, 64);
 
-    let null_name: &[u8] = lua_name_null.as_bytes();
-    let null_name_lit: Vec<_> = null_name.iter().map(|&b| Literal::u8_unsuffixed(b)).collect();
+    /* Null-terminated lua_fn_name string for the .lua_regtab struct.
+     * For globals this is just fn_name; for modules it is the bare fn name
+     * (without the "module." prefix, which is stored in module_name). */
+    let regtab_fn_name_s: &str = if module_s.is_some() {
+        &fn_name_s
+    } else {
+        &lua_name
+    };
+    let fn_name_null_bytes: Vec<_> = {
+        let mut v: Vec<u8> = regtab_fn_name_s.bytes().collect();
+        v.push(0);
+        v.iter().map(|&b| Literal::u8_unsuffixed(b)).collect()
+    };
+    let fn_name_null_len = regtab_fn_name_s.len() + 1;
+
+    /* module_name static + pointer expression for the .lua_regtab entry. */
+    let (module_name_static, module_name_ptr_expr) = if let Some(ref m) = module_s {
+        let mod_sym = format_ident!("__LUA_REGTAB_MOD_{}", sym_upper);
+        let mod_null_bytes: Vec<_> = {
+            let mut v: Vec<u8> = m.bytes().collect();
+            v.push(0);
+            v.iter().map(|&b| Literal::u8_unsuffixed(b)).collect()
+        };
+        let mod_null_len = m.len() + 1;
+        let stat = quote! {
+            static #mod_sym: [u8; #mod_null_len] = [#(#mod_null_bytes),*];
+        };
+        let ptr = quote! {
+            &#mod_sym as *const [u8; #mod_null_len] as *const u8
+        };
+        (stat, ptr)
+    } else {
+        (quote! {}, quote! { ::core::ptr::null::<u8>() })
+    };
 
     /* ------------------------------------------------------------------
      * Emit everything
@@ -318,23 +372,16 @@ fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
             #nresults_lit as #ci
         }
 
-        #[no_mangle]
-        unsafe extern "C" fn #reg_fn(#l: #cv) {
-            extern "C" {
-                fn lua_pushcclosure(#l: #cv,
-                    f: unsafe extern "C" fn(#cv) -> #ci,
-                    n: ::core::ffi::c_int);
-                fn lua_setglobal(#l: #cv, k: *const u8);
-            }
-            unsafe {
-                lua_pushcclosure(#l, #export_fn, 0);
-                lua_setglobal(#l, [#(#null_name_lit),*].as_ptr());
-            }
-        }
+        #module_name_static
+        static #regtab_fn_name_sym: [u8; #fn_name_null_len] = [#(#fn_name_null_bytes),*];
 
         #[link_section = ".lua_regtab"]
         #[used]
-        static #regptr_sym: unsafe extern "C" fn(#cv) = #reg_fn;
+        static #regtab_sym: ::blyt::lua::BlytLuaRegtabEntry = ::blyt::lua::BlytLuaRegtabEntry {
+            module_name: #module_name_ptr_expr,
+            lua_fn_name: &#regtab_fn_name_sym as *const [u8; #fn_name_null_len] as *const u8,
+            wrapper: #export_fn,
+        };
 
         #[link_section = ".lua_exports"]
         #[used]
