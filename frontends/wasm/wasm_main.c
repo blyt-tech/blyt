@@ -382,6 +382,10 @@ static void lua_cleanup(void) {
         lua_close(g_lua);
         g_lua = NULL;
     }
+    if (g_session) {
+        blyt_session_destroy(g_session);
+        g_session = NULL;
+    }
     if (g_cart) {
         blyt_cart_close(g_cart);
         g_cart = NULL;
