@@ -196,13 +196,12 @@ endif()
 # -------------------------------------------------------------------------
 # Debug/release library variants (ADR-0129)
 #
-# Each guest .so is built twice:
-#   release → ${SDK_LIB}        (-O2, stripped: no DWARF, no .symtab)
-#   debug   → ${SDK_LIB}/debug  (-O0 -g, unstripped — full source debugging)
-# Determinism flags (ADR-0007) live in LIBBLYTC_CFLAGS / RV32_BASE and apply to
-# both variants; only -O/-g differ.  Release dynamic libs are what the runtime
-# embeds/ships; debug libs are SDK-only and loaded via BLYT_LIB_DIR by the
-# debug frontends.
+# Each guest .so is built twice: release → ${SDK_LIB}        (-O2, stripped: no
+# DWARF, no .symtab) debug   → ${SDK_LIB}/debug  (-O0 -g, unstripped — full
+# source debugging) Determinism flags (ADR-0007) live in LIBBLYTC_CFLAGS /
+# RV32_BASE and apply to both variants; only -O/-g differ.  Release dynamic libs
+# are what the runtime embeds/ships; debug libs are SDK-only and loaded via
+# BLYT_LIB_DIR by the debug frontends.
 # -------------------------------------------------------------------------
 set(SDK_LIB_DEBUG "${SDK_LIB}/debug")
 file(MAKE_DIRECTORY "${SDK_LIB_DEBUG}")
@@ -225,14 +224,14 @@ endmacro()
 # variants, strip DWARF + the symbol table.  --strip-unneeded keeps .dynsym so
 # the library's exports (which carts link against) survive.
 function(blyt_link_guest_so out_so strip)
-  execute_process(COMMAND "${FOUND_CLANG}" ${RV32_BASE} ${ARGN} RESULT_VARIABLE _r)
+  execute_process(COMMAND "${FOUND_CLANG}" ${RV32_BASE} ${ARGN}
+                  RESULT_VARIABLE _r)
   if(NOT _r EQUAL 0)
     message(FATAL_ERROR "Failed to build ${out_so}")
   endif()
   if(strip AND FOUND_OBJCOPY)
-    execute_process(
-      COMMAND "${FOUND_OBJCOPY}" --strip-debug --strip-unneeded "${out_so}"
-      RESULT_VARIABLE _sr)
+    execute_process(COMMAND "${FOUND_OBJCOPY}" --strip-debug --strip-unneeded
+                            "${out_so}" RESULT_VARIABLE _sr)
     if(NOT _sr EQUAL 0)
       message(FATAL_ERROR "Failed to strip ${out_so}")
     endif()
@@ -243,8 +242,12 @@ message(STATUS "Building libblytcommon.so (release + debug)…")
 foreach(_var release debug)
   blyt_set_variant(${_var})
   blyt_link_guest_so(
-    "${_VDIR}/libblytcommon.so" ${_VSTRIP} ${_VOPT}
-    -Wl,-soname,libblytcommon.so -o "${_VDIR}/libblytcommon.so"
+    "${_VDIR}/libblytcommon.so"
+    ${_VSTRIP}
+    ${_VOPT}
+    -Wl,-soname,libblytcommon.so
+    -o
+    "${_VDIR}/libblytcommon.so"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c")
 endforeach()
 
@@ -356,8 +359,14 @@ foreach(_var release debug)
   if(NOT EXISTS "${_VDIR}/libblytc.so")
     message(STATUS "Building libblytc.so (${_var})…")
     blyt_link_guest_so(
-      "${_VDIR}/libblytc.so" ${_VSTRIP} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-      ${_VOPT} -Wl,-soname,libblytc.so -o "${_VDIR}/libblytc.so"
+      "${_VDIR}/libblytc.so"
+      ${_VSTRIP}
+      ${LIBBLYTC_INCLUDES}
+      ${LIBBLYTC_CFLAGS}
+      ${_VOPT}
+      -Wl,-soname,libblytc.so
+      -o
+      "${_VDIR}/libblytc.so"
       ${LIBBLYTC_SRCS})
   else()
     message(STATUS "libblytc.so (${_var}) already built — skipping")
@@ -380,9 +389,8 @@ endforeach()
 set(SF_SRC "${BLYT_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
 if(NOT EXISTS "${SF_SRC}/f64_add.c")
   message(
-    FATAL_ERROR
-      "third_party/rv32emu SoftFloat sources not found at ${SF_SRC}. "
-      "Run: git submodule update --init third_party/rv32emu")
+    FATAL_ERROR "third_party/rv32emu SoftFloat sources not found at ${SF_SRC}. "
+                "Run: git submodule update --init third_party/rv32emu")
 endif()
 set(SF_INC "${SF_SRC}/include")
 set(SF_PLATFORM_DIR "${BLYT_BINARY_DIR}/softfloat-rv32")
@@ -453,16 +461,28 @@ foreach(_var release debug)
   blyt_set_variant(${_var})
   message(STATUS "Building libblyt32.so (${_var})…")
   blyt_link_guest_so(
-    "${_VDIR}/libblyt32.so" ${_VSTRIP} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-    ${SF_INCLUDES} ${SF_DEFINES} ${_VOPT}
-    -Wl,-soname,libblyt32.so -Wl,--no-as-needed "${_VDIR}/libblytc.so"
-    -Wl,--as-needed -o "${_VDIR}/libblyt32.so"
+    "${_VDIR}/libblyt32.so"
+    ${_VSTRIP}
+    ${LIBBLYTC_INCLUDES}
+    ${LIBBLYTC_CFLAGS}
+    ${SF_INCLUDES}
+    ${SF_DEFINES}
+    ${_VOPT}
+    -Wl,-soname,libblyt32.so
+    -Wl,--no-as-needed
+    "${_VDIR}/libblytc.so"
+    -Wl,--as-needed
+    -o
+    "${_VDIR}/libblyt32.so"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
     "${BLYT_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     ${LIBBLYTC_SRCS}
     # Soft-float / 64-bit-int compiler-rt builtins (__*df3, __udivdi3, …) so
     # C/C++ carts that do double / 64-bit math resolve them from libblyt32.so.
-    ${SF_ALL} ${SF_RISCV} ${SF_MWORD} ${SF_BUILTINS})
+    ${SF_ALL}
+    ${SF_RISCV}
+    ${SF_MWORD}
+    ${SF_BUILTINS})
 endforeach()
 
 # libblyt32.so (native path) — real API implementations for trusted native exec.
@@ -489,8 +509,9 @@ if(NOT DEFINED BLYT_BUILD_NATIVE OR BLYT_BUILD_NATIVE)
       "${BLYT_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c"
     RESULT_VARIABLE R)
   # Note: libblytc.so is intentionally NOT linked here.  On native execution the
-  # cart process already has musl from the ld.so interpreter; loading libblytc.so
-  # (our musl subset) would create two conflicting musl instances → SIGSEGV.
+  # cart process already has musl from the ld.so interpreter; loading
+  # libblytc.so (our musl subset) would create two conflicting musl instances →
+  # SIGSEGV.
   if(NOT R EQUAL 0)
     message(FATAL_ERROR "Failed to build libblyt32.so (native build)")
   endif()
@@ -584,11 +605,11 @@ else()
   # symbols (lua_*, luaL_*).  Carts with src/lib/ C code that call Lua APIs
   # resolve them through libblyt32lua.so; no DT_NEEDED: libblytcommonlua.so is
   # added to the cart.  libblytcommonlua.so is still built above for standalone
-  # / tooling use.
-  # ADR-0129: the guest-side DAP master hook (per-instruction stepping support)
-  # is debug-only.  The debug variant defines BLYT_DAP=1 and links the master
-  # hook sources; the release variant drops both — blyt32lua.c's hook install is
-  # `#ifdef BLYT_DAP`, so the master_hook sources are unreferenced in release.
+  # / tooling use. ADR-0129: the guest-side DAP master hook (per-instruction
+  # stepping support) is debug-only.  The debug variant defines BLYT_DAP=1 and
+  # links the master hook sources; the release variant drops both —
+  # blyt32lua.c's hook install is `#ifdef BLYT_DAP`, so the master_hook sources
+  # are unreferenced in release.
   foreach(_var release debug)
     blyt_set_variant(${_var})
     if("${_var}" STREQUAL "debug")
@@ -596,27 +617,47 @@ else()
                           "${BLYT_SOURCE_DIR}/runtime/host/src/dap")
       set(_VLUA_DAP_SRCS
           "${BLYT_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"
-          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/master_hook_ecall.c")
+          "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/master_hook_ecall.c"
+      )
     else()
       set(_VLUA_DAP_FLAGS "")
       set(_VLUA_DAP_SRCS "")
     endif()
     message(STATUS "Building libblyt32lua.so (${_var})…")
     blyt_link_guest_so(
-      "${_VDIR}/libblyt32lua.so" ${_VSTRIP} ${LUA_MUSL_INCLUDES}
-      ${LIBBLYTC_CFLAGS} ${_VOPT} -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1
-      ${_VLUA_DAP_FLAGS} -I "${LUA_DIR}" -I "${SF_INC}" -I "${SF_SRC}/RISCV" -I
-      "${SF_PLATFORM_DIR}" -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_ROUND_ODD=1
+      "${_VDIR}/libblyt32lua.so"
+      ${_VSTRIP}
+      ${LUA_MUSL_INCLUDES}
+      ${LIBBLYTC_CFLAGS}
+      ${_VOPT}
+      -DLUA_32BITS=1
+      -DLUA_USE_LONGJMP=1
+      ${_VLUA_DAP_FLAGS}
+      -I
+      "${LUA_DIR}"
+      -I
+      "${SF_INC}"
+      -I
+      "${SF_SRC}/RISCV"
+      -I
+      "${SF_PLATFORM_DIR}"
+      -DSOFTFLOAT_FAST_INT64=1
+      -DSOFTFLOAT_ROUND_ODD=1
       -Wl,-soname,libblyt32lua.so
       -Wl,--version-script,${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.sym
-      -Wl,--as-needed "${_VDIR}/libblyt32.so" -o "${_VDIR}/libblyt32lua.so"
+      -Wl,--as-needed
+      "${_VDIR}/libblyt32.so"
+      -o
+      "${_VDIR}/libblyt32lua.so"
       # Lua VM sources embedded directly (exports lua_*/luaL_* in .dynsym)
       ${LUA_ALL_SRCS}
       # musl riscv32 setjmp/longjmp (not in libblytc)
       "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
       "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S"
       # SoftFloat for RV32: provides f64/f128 arithmetic
-      ${SF_ALL} ${SF_RISCV} ${SF_MWORD}
+      ${SF_ALL}
+      ${SF_RISCV}
+      ${SF_MWORD}
       # compiler-rt ABI wrappers + fenv/stdio/stdlib stubs
       "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/softfloat_builtins.c"
       "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/lua_runtime_stubs.c"
@@ -703,12 +744,12 @@ else()
       "-isystem ${MUSL_DIR}/include -isystem ${MUSL_DIR}/arch/riscv32 -isystem ${MUSL_DIR}/arch/generic -isystem ${MUSL_DIR}/src/internal -isystem ${LIBBLYTC_BITS_DIR}/.."
   )
 
-  # -ffunction-sections/-fdata-sections put each libc++ function/datum in its own
-  # section so the cart link's --gc-sections can drop unused std-lib code (e.g.
-  # the wide-char std::to_wstring/wcsto* path and aligned operator new pulled in
-  # transitively by std::string but never used). Required for debug cart builds,
-  # which don't use LTO. (ADR-0121 mandates LTO for release; gc-sections covers
-  # both modes.)
+  # -ffunction-sections/-fdata-sections put each libc++ function/datum in its
+  # own section so the cart link's --gc-sections can drop unused std-lib code
+  # (e.g. the wide-char std::to_wstring/wcsto* path and aligned operator new
+  # pulled in transitively by std::string but never used). Required for debug
+  # cart builds, which don't use LTO. (ADR-0121 mandates LTO for release;
+  # gc-sections covers both modes.)
   set(_LXX_SECTION_FLAGS "-ffunction-sections -fdata-sections")
   set(_LXX_C_FLAGS
       "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib ${_LXX_SECTION_FLAGS} ${_LXX_MUSL_FLAGS}"
@@ -794,14 +835,14 @@ endif()
 # Step 2b-debug: debug libc++ / libc++abi (ADR-0129)
 #
 # A second, unoptimised (-O0 -g) build of the static libc++ for source-level
-# debugging of cart C++ code.  Same musl/cross flags as the release build
-# (LTO is a separate ADR-0127 follow-up); only the archives land in
-# ${SDK_LIB}/debug — headers are shared with the release build above.
+# debugging of cart C++ code.  Same musl/cross flags as the release build (LTO
+# is a separate ADR-0127 follow-up); only the archives land in ${SDK_LIB}/debug
+# — headers are shared with the release build above.
 # -------------------------------------------------------------------------
 set(LIBCXX_DEBUG_BUILD_DIR "${BLYT_BINARY_DIR}/build-libcxx-rv32-debug")
 
-if(NOT EXISTS "${LIBCXX_SOURCE_DIR}/runtimes/CMakeLists.txt"
-   OR NOT FOUND_CLANGPP)
+if(NOT EXISTS "${LIBCXX_SOURCE_DIR}/runtimes/CMakeLists.txt" OR NOT
+                                                                FOUND_CLANGPP)
   # Skipped: same conditions as the release build warn above.
 elseif(EXISTS "${SDK_LIB_DEBUG}/libc++.a")
   message(
@@ -847,7 +888,8 @@ else()
     RESULT_VARIABLE _LXXD_CFG_R
     OUTPUT_QUIET)
   if(NOT _LXXD_CFG_R EQUAL 0)
-    message(FATAL_ERROR "debug libc++ cmake configure failed (exit ${_LXXD_CFG_R})")
+    message(
+      FATAL_ERROR "debug libc++ cmake configure failed (exit ${_LXXD_CFG_R})")
   endif()
 
   execute_process(COMMAND ${CMAKE_COMMAND} --build "${LIBCXX_DEBUG_BUILD_DIR}"
@@ -878,10 +920,11 @@ endif()
 # Start with a clean include/ so removed headers don't linger across rebuilds.
 file(REMOVE_RECURSE "${SDK_INC}")
 file(MAKE_DIRECTORY "${SDK_INC}")
-file(COPY "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt.h"
-          "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt32.h"
-          "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt_lua_internal.h"
-     DESTINATION "${SDK_INC}")
+file(
+  COPY "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt.h"
+       "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt32.h"
+       "${BLYT_SOURCE_DIR}/runtime/guest/include/blyt_lua_internal.h"
+  DESTINATION "${SDK_INC}")
 
 # Copy the curated subset of musl public headers that correspond to functions
 # libblytc.so actually provides (ADR-0120).  Excluded: filesystem I/O (fopen,
@@ -951,8 +994,8 @@ endif()
 
 # Lua headers (lua.h, lauxlib.h, lualib.h, luaconf.h) are NOT installed in the
 # public SDK include path.  Cart code must not include them directly; use
-# BLYT_LUA_EXPORT_* macros which pull in blyt_lua_internal.h automatically.
-# The raw Lua C API headers are SDK-internal and only used by devtool-generated
+# BLYT_LUA_EXPORT_* macros which pull in blyt_lua_internal.h automatically. The
+# raw Lua C API headers are SDK-internal and only used by devtool-generated
 # cart_lua_modules glue code that the cart developer never writes by hand.
 
 # -------------------------------------------------------------------------
@@ -1141,10 +1184,10 @@ if(EMCC)
   file(MAKE_DIRECTORY "${SDK_SHARE_WASM}")
   file(MAKE_DIRECTORY "${SDK_SHARE_WASM_DEBUG}")
 
-  # ADR-0129: build the WASM player twice.
-  #   release → blytplay.*  (DAP/GDB OFF, release libs) → share/wasm
-  #   debug   → blytdebug.* (DAP/GDB ON,  debug libs)   → share/wasm-debug
-  # `blyt run` serves the release set; `blyt debug` serves the debug set.
+  # ADR-0129: build the WASM player twice. release → blytplay.*  (DAP/GDB OFF,
+  # release libs) → share/wasm debug   → blytdebug.* (DAP/GDB ON,  debug libs) →
+  # share/wasm-debug `blyt run` serves the release set; `blyt debug` serves the
+  # debug set.
   foreach(_w release debug)
     if("${_w}" STREQUAL "debug")
       set(_WDIR "${BLYT_BINARY_DIR}/build-wasm-debug")
