@@ -11,9 +11,7 @@
 /// Silently skipped if images or qemu-system-riscv64 are not present.
 mod common;
 
-use common::{
-    CartProject, build_dir, build_lua_cart, has_luac, repo_root, sdk_dir, write_c_cart_project,
-};
+use common::{CartProject, build_dir, has_luac, repo_root, sdk_dir, write_c_cart_project};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -327,7 +325,7 @@ function draw() end
 "#,
             )
             .write(&project);
-        Some(build_lua_cart(&project))
+        Some(build_cart(&project))
     } else {
         None
     };
@@ -356,7 +354,7 @@ function draw() end
 "#,
             )
             .write(&project);
-        Some(build_lua_cart(&project))
+        Some(build_cart(&project))
     } else {
         None
     };
