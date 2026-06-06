@@ -164,6 +164,7 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Rust tests (unit + integration)
+        timeout-minutes: 20
         env:
           BLYT_BUILD_DIR: ${{ github.workspace }}/build
         run: |
