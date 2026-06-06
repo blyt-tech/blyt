@@ -253,8 +253,12 @@ async function main() {
                 console.log(`[gdb_test] register reply: ${regs}`);
             }
 
-            /* Optional: single register write + read roundtrip (validates P packet). */
+            /* Optional: single register write + read roundtrip (validates P packet).
+             * Save and restore x1 (ra) so the breakpointed function can still
+             * return correctly after the test — corrupting ra without restoring it
+             * would send execution to an invalid address and hang the emulator. */
             if (process.env.BLYT_GDB_REGISTER_WRITE_CHECK) {
+                const savedRa = await t.exchange('p1');
                 const pResp = await t.exchange('P1:cdab3412');
                 if (pResp !== 'OK') {
                     process.stderr.write(`[gdb_test] FAIL: P1 response: ${pResp}\n`);
@@ -265,6 +269,7 @@ async function main() {
                     process.stderr.write(`[gdb_test] FAIL: p1 after P1: ${pRead}\n`);
                     process.exit(1);
                 }
+                await t.exchange(`P1:${savedRa}`);
                 console.log('PASS: P/p register write roundtrip');
             }
 
