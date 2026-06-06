@@ -84,13 +84,18 @@ const LINKER_SCRIPT: &str = "ENTRY(_blyt_entry)
  *
  * C/C++/Rust carts are never this small and use the minimal LINKER_SCRIPT.
  *
- * The second ALIGN(0x1000) separates the RELRO region (.got/.got.plt/.dynamic)
- * from .data/.bss.  Without it, lld's RELRO padding extends the mprotect range
- * to the next page boundary, which would cover .data and make it read-only.
- *
  * PROVIDE'd start/stop symbols for .lua_regtab let cart_lua_modules iterate
  * registrars without GOT-via-hidden-visibility tricks; KEEP prevents
- * --gc-sections from discarding them before the symbols are resolved. */
+ * --gc-sections from discarding them before the symbols are resolved.
+ *
+ * .lua_regtab entries contain pointer fields that need RELATIVE relocations.
+ * They are merged into the .data.rel.ro output section (placed between
+ * .got.plt and .dynamic) so that lld's -z,relro algorithm includes them in
+ * the single RELRO PT_LOAD on page 2.  If they were in a separate custom
+ * output section, lld would create a second RW PT_LOAD on the same page.
+ * The rv64ilp32 compat kernel cannot handle two RW PT_LOAD segments sharing
+ * a page and one of the mappings ends up unmapped, causing SIGSEGV during
+ * reloc_all in musl ld.so. */
 const HYBRID_LUA_LINKER_SCRIPT: &str = "ENTRY(_blyt_entry)
 
 SECTIONS {
@@ -112,27 +117,31 @@ SECTIONS {
     .dynstr : { *(.dynstr) }
     .rela.dyn : { *(.rela.dyn) }
     .rela.plt : { *(.rela.plt) }
-    .lua_regtab : {
-        PROVIDE(__start_lua_regtab = .);
-        KEEP(*(.lua_regtab))
-        PROVIDE(__stop_lua_regtab = .);
-    }
-    .lua_exports : { KEEP(*(.lua_exports)) }
     .rodata : { *(.rodata .rodata.*) }
+    /* .lua_exports contains only strings and byte fields (no pointer fields);
+     * it needs no RELATIVE relocation and is safe in the read-only LOAD0. */
+    .lua_exports : { KEEP(*(.lua_exports)) }
     /* Page 1+: executable code.  Page base != addr_min so musl remaps this
      * segment with PROT_READ|PROT_EXEC via mmap_fixed. */
     . = ALIGN(0x1000);
     .plt : { *(.plt) }
     .text : { *(.text .text.*) }
-    /* Page 2+: RELRO region (.got/.got.plt/.dynamic).  Page base != addr_min
-     * so musl remaps with PROT_READ|PROT_WRITE; RELRO then mprotects it. */
+    /* Page 2+: RELRO region (.got/.got.plt/.data.rel.ro/.dynamic) plus
+     * non-RELRO data.  Page base != addr_min so musl remaps with
+     * PROT_READ|PROT_WRITE; RELRO then mprotects it read-only.
+     *
+     * .lua_regtab input sections are placed inside the .data.rel.ro output
+     * section so that lld treats them as RELRO and does NOT create a second
+     * RW PT_LOAD for them on this same page. */
     . = ALIGN(0x1000);
     .got : { *(.got) }
     .got.plt : { *(.got.plt) }
+    .data.rel.ro : {
+        PROVIDE(__start_lua_regtab = .);
+        KEEP(*(.lua_regtab))
+        PROVIDE(__stop_lua_regtab = .);
+    }
     .dynamic : { *(.dynamic) }
-    /* Page 3+: non-RELRO writable data.  Separate page so RELRO mprotect
-     * (which lld pads to the next page boundary) cannot cover .data/.bss. */
-    . = ALIGN(0x1000);
     .data : { *(.data .data.*) }
     .sdata : { *(.sdata .sdata.*) }
     .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }
