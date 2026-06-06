@@ -669,6 +669,81 @@ else()
 
   message(STATUS "Lua libraries built: libblytcommonlua.so + libblyt32lua.so")
 
+  # libblyt32lua.so (native path) — Lua VM + blyt bindings for trusted native exec.
+  #
+  # Built for the RISC-V QEMU gate alongside the native libblyt32.so.  The key
+  # difference from the emulated build:
+  #   • lua_native_stubs.c replaces lua_runtime_stubs.c — native musl (from the
+  #     cart process's ld.so interpreter) provides errno, stdio, etc.; the stubs
+  #     only supply the excluded Lua library openers.
+  #   • Links against sdk/lib/native/libblyt32.so (real Linux syscall impls)
+  #     instead of the ecall-based release variant.
+  #   • No BLYT_DAP flag: blyt32lua.c's DAP paths are #ifdef-guarded and
+  #     compiled out; no master_hook sources are needed.
+  #
+  if(NOT DEFINED BLYT_BUILD_NATIVE OR BLYT_BUILD_NATIVE)
+    # To make malloc/strlen/fopen/etc visible to libblyt32lua.so at runtime, we
+    # need ld-blyt.so.1 (the full musl libc) in the dynlink symbol-search chain.
+    # musl's load_library() only adds ldso to that chain when it encounters a
+    # DT_NEEDED matching a reserved libc name (libc., libm., libpthread., …) or
+    # the exact interpreter path.  We inject DT_NEEDED: libc.so by linking
+    # against a zero-symbol stub whose SONAME is "libc.so"; musl hits the
+    # reserved-name is_self path for this entry and adds ldso to syms_next,
+    # making all libc symbols available without shipping a second musl instance.
+    set(_LIBC_STUB "${BLYT_BINARY_DIR}/libc-stub.so")
+    execute_process(
+      COMMAND "${FOUND_CLANG}" ${RV32_BASE}
+              -Wl,-soname,libc.so
+              -x c /dev/null
+              -o "${_LIBC_STUB}"
+      RESULT_VARIABLE _libc_stub_r)
+    if(NOT _libc_stub_r EQUAL 0)
+      message(FATAL_ERROR "Failed to build libc-stub.so for native libblyt32lua.so")
+    endif()
+    message(STATUS "Building libblyt32lua.so (native build)…")
+    blyt_link_guest_so(
+      "${SDK_LIB}/native/libblyt32lua.so"
+      TRUE
+      ${LUA_MUSL_INCLUDES}
+      ${LIBBLYTC_CFLAGS}
+      -O2
+      -DLUA_32BITS=1
+      -DLUA_USE_LONGJMP=1
+      -I "${LUA_DIR}"
+      -I "${SF_INC}"
+      -I "${SF_SRC}/RISCV"
+      -I "${SF_PLATFORM_DIR}"
+      -DSOFTFLOAT_FAST_INT64=1
+      -DSOFTFLOAT_ROUND_ODD=1
+      -Wl,-soname,libblyt32lua.so
+      -Wl,--version-script,${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.sym
+      -Wl,-z,now
+      # --no-as-needed forces DT_NEEDED: libc.so even though the stub has no
+      # symbols; musl's reserved-name is_self path then adds ldso to syms_next.
+      -Wl,--no-as-needed
+      "${_LIBC_STUB}"
+      -Wl,--as-needed
+      "${SDK_LIB}/native/libblyt32.so"
+      -o
+      "${SDK_LIB}/native/libblyt32lua.so"
+      # Lua VM sources embedded directly
+      ${LUA_ALL_SRCS}
+      # musl riscv32 setjmp/longjmp (not in the cart's musl interpreter)
+      "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
+      "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S"
+      # SoftFloat for RV32: f64/f128 arithmetic
+      ${SF_ALL}
+      ${SF_RISCV}
+      ${SF_MWORD}
+      # compiler-rt ABI wrappers + fenv stubs
+      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/softfloat_builtins.c"
+      # Native Lua opener stubs (luaopen_io/os/debug/package/utf8 → no-ops)
+      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/lua_native_stubs.c"
+      # blyt32 API Lua bindings + cart lifecycle
+      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.c")
+    message(STATUS "libblyt32lua.so (native build) built")
+  endif()
+
   file(MAKE_DIRECTORY "${SDK_BIN}")
 
   # Build host-native blyt-luac with -DLUA_32BITS=1.

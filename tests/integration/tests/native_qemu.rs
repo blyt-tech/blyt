@@ -11,7 +11,9 @@
 /// Silently skipped if images or qemu-system-riscv64 are not present.
 mod common;
 
-use common::{build_dir, repo_root, sdk_dir, write_c_cart_project};
+use common::{
+    CartProject, build_dir, build_lua_cart, has_luac, repo_root, sdk_dir, write_c_cart_project,
+};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -308,6 +310,57 @@ void blyt_cart_draw(void)   { }
         dirty_cart.display()
     );
 
+    // ── Build Lua and hybrid carts (gates 7 & 8) ──────────────────────
+    let lua_sdk_native = sdk_dir().join("lib/native/libblyt32lua.so");
+    let have_lua_gate = lua_sdk_native.exists() && has_luac();
+
+    let lua_cart = if have_lua_gate {
+        let project = tmp.path().join("lua_metal");
+        CartProject::new()
+            .lua(
+                r#"
+function init()
+    blyt32.debug.print("lua-metal-ok")
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+            )
+            .write(&project);
+        Some(build_lua_cart(&project))
+    } else {
+        None
+    };
+
+    let hybrid_cart = if have_lua_gate {
+        let project = tmp.path().join("hybrid_metal");
+        CartProject::new()
+            .lib_file(
+                "mathlib",
+                "mathlib.c",
+                "#include \"blyt.h\"\n\
+                 BLYT_LUA_MODULE_EXPORT_I32(mathlib, double, int32_t x) { return x * 2; }\n",
+            )
+            .lua(
+                r#"
+function init()
+    local m = require("mathlib")
+    if m.double(21) == 42 then
+        blyt32.debug.print("lua+c metal ok")
+    else
+        blyt32.debug.print("lua+c metal wrong")
+    end
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+            )
+            .write(&project);
+        Some(build_lua_cart(&project))
+    } else {
+        None
+    };
+
     // ── Start QEMU ────────────────────────────────────────────────────
     let ssh_port = free_port();
     println!("Starting QEMU (SSH port {ssh_port})...");
@@ -353,7 +406,17 @@ void blyt_cart_draw(void)   { }
         }
     }
 
-    // Cart.
+    // Lua runtime library (optional; gates 7 & 8 are skipped when absent).
+    // libblyt32lua.so embeds the Lua VM and has DT_NEEDED: libblyt32.so only;
+    // no separate libblytcommonlua.so is needed at runtime.
+    if have_lua_gate {
+        assert!(
+            qemu.scp_to(&lua_sdk_native, "/tmp/blyt_gate/native/"),
+            "scp libblyt32lua.so failed"
+        );
+    }
+
+    // Carts.
     assert!(
         qemu.scp_to(&hello_cart, "/tmp/blyt_gate/"),
         "scp hello.blyt failed"
@@ -362,6 +425,18 @@ void blyt_cart_draw(void)   { }
         qemu.scp_to(&dirty_cart, "/tmp/blyt_gate/"),
         "scp dirty_frm.blyt failed"
     );
+    if let Some(ref cart) = lua_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp lua_metal.blyt failed"
+        );
+    }
+    if let Some(ref cart) = hybrid_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp hybrid_metal.blyt failed"
+        );
+    }
 
     // fcsr_frame_test.c — staged for FCSR gates 5 & 6.
     qemu.scp_to(
@@ -582,6 +657,52 @@ void blyt_cart_draw(void)   { }
         println!("  PASS: abort message present, exit 1");
     } else {
         println!("Gates 5 & 6: SKIP (riscv32-linux-musl-gcc not available in QEMU VM)");
+    }
+
+    // ── Gate 7: pure Lua cart ─────────────────────────────────────────
+    if have_lua_gate {
+        println!("Gate 7: pure Lua cart on metal...");
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/lua_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "lua_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("lua-metal-ok"),
+            "expected 'lua-metal-ok' in output\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    } else {
+        println!("Gate 7: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 8: hybrid Lua + C lib cart ──────────────────────────────
+    if have_lua_gate {
+        println!("Gate 8: hybrid Lua+C cart on metal...");
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/hybrid_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "hybrid_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("lua+c metal ok"),
+            "expected 'lua+c metal ok' in output\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    } else {
+        println!("Gate 8: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     println!("Gate tests passed.");
