@@ -70,39 +70,27 @@ fn cart_info_bytes(debug: bool) -> Vec<u8> {
  *   - No ecall in cart code: cart calls blyt API via PLT only
  *   - Entry point in PF_X PT_LOAD segment: _blyt_entry in cart .text
  * ------------------------------------------------------------------------- */
-/* Force .got and writable sections onto a separate 4KB page from .text/rodata.
- * Without this, small carts (< one page of code) pack all PT_LOAD segments into
- * the same page; musl's map_library initial-mmap is PROT_READ only (from the
- * first PT_LOAD flags) and never calls mmap_fixed for segments whose page base
- * equals addr_min=0, so do_relocs cannot write GOT entries → SIGSEGV. */
 const LINKER_SCRIPT: &str = "ENTRY(_blyt_entry)
-
-SECTIONS {
-    .interp : { *(.interp) }
-    .hash : { *(.hash) }
-    .gnu.hash : { *(.gnu.hash) }
-    .dynsym : { *(.dynsym) }
-    .dynstr : { *(.dynstr) }
-    .rela.dyn : { *(.rela.dyn) }
-    .rela.plt : { *(.rela.plt) }
-    .plt : { *(.plt) }
-    .text : { *(.text .text.*) }
-    .rodata : { *(.rodata .rodata.*) }
-    . = ALIGN(0x1000);
-    .got : { *(.got) }
-    .got.plt : { *(.got.plt) }
-    .dynamic : { *(.dynamic) }
-    .data : { *(.data .data.*) }
-    .sdata : { *(.sdata .sdata.*) }
-    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }
-    .sbss (NOLOAD) : { *(.sbss .sbss.*) }
-}
 ";
 
-/* Hybrid Lua+C linker script: same page-alignment fix as LINKER_SCRIPT, plus
- * PROVIDE'd start/stop symbols for .lua_regtab so cart_lua_modules can iterate
- * registrars without GOT-via-hidden-visibility tricks. KEEP prevents --gc-sections
- * from discarding the sections before the PROVIDE symbols are resolved. */
+/* Lua cart linker script (pure-Lua and hybrid Lua+C).
+ *
+ * Small Lua carts (< 4KB of code) pack all PT_LOAD segments into the same page.
+ * musl's map_library initial-mmap is PROT_READ only (from the first PT_LOAD
+ * flags) and only calls mmap_fixed for segments whose page base differs from
+ * addr_min=0.  With everything on page 0 the RW GOT is never remapped, so
+ * do_relocs cannot write PLT/GOT entries → SIGSEGV.  The first ALIGN(0x1000)
+ * forces .got onto a separate page regardless of cart code size.
+ *
+ * C/C++/Rust carts are never this small and use the minimal LINKER_SCRIPT.
+ *
+ * The second ALIGN(0x1000) separates the RELRO region (.got/.got.plt/.dynamic)
+ * from .data/.bss.  Without it, lld's RELRO padding extends the mprotect range
+ * to the next page boundary, which would cover .data and make it read-only.
+ *
+ * PROVIDE'd start/stop symbols for .lua_regtab let cart_lua_modules iterate
+ * registrars without GOT-via-hidden-visibility tricks; KEEP prevents
+ * --gc-sections from discarding them before the symbols are resolved. */
 const HYBRID_LUA_LINKER_SCRIPT: &str = "ENTRY(_blyt_entry)
 
 SECTIONS {
@@ -126,6 +114,7 @@ SECTIONS {
     .got : { *(.got) }
     .got.plt : { *(.got.plt) }
     .dynamic : { *(.dynamic) }
+    . = ALIGN(0x1000);
     .data : { *(.data .data.*) }
     .sdata : { *(.sdata .sdata.*) }
     .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }
