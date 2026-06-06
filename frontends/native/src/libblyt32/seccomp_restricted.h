@@ -64,6 +64,8 @@ static const unsigned int blyt_restricted_nrs[] = {
     64u, /* write      */
     93u, /* exit       */
     94u, /* exit_group */
+    215u, /* munmap     — Lua VM heap (lua_native_malloc.c) */
+    222u, /* mmap       — Lua VM heap (lua_native_malloc.c) */
 };
 #define BLYT_RESTRICTED_N ((int)(sizeof(blyt_restricted_nrs) / sizeof(blyt_restricted_nrs[0])))
 

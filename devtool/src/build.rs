@@ -94,6 +94,17 @@ const LINKER_SCRIPT: &str = "ENTRY(_blyt_entry)
 const HYBRID_LUA_LINKER_SCRIPT: &str = "ENTRY(_blyt_entry)
 
 SECTIONS {
+    /* Page 0 (addr_min): R-only metadata + read-only data.
+     * musl's map_library skips mmap_fixed for segments whose page base equals
+     * addr_min; the initial PROT_READ mmap covers them correctly.
+     *
+     * SIZEOF_HEADERS reserves space for the ELF file header and program
+     * headers at vaddr 0, so lld produces p_offset=0 for the first PT_LOAD.
+     * Without this, lld places sections at vaddr=0 but file-offset=0x1000
+     * (p_offset=0x1000), which causes the kernel to set AT_PHDR pointing to
+     * file[0x1034] instead of the real program headers at file[0x34], and
+     * ld.so crashes reading garbage as PHDRs before any constructor runs. */
+    . = SIZEOF_HEADERS;
     .interp : { *(.interp) }
     .hash : { *(.hash) }
     .gnu.hash : { *(.gnu.hash) }
@@ -101,19 +112,26 @@ SECTIONS {
     .dynstr : { *(.dynstr) }
     .rela.dyn : { *(.rela.dyn) }
     .rela.plt : { *(.rela.plt) }
-    .plt : { *(.plt) }
     .lua_regtab : {
         PROVIDE(__start_lua_regtab = .);
         KEEP(*(.lua_regtab))
         PROVIDE(__stop_lua_regtab = .);
     }
     .lua_exports : { KEEP(*(.lua_exports)) }
-    .text : { *(.text .text.*) }
     .rodata : { *(.rodata .rodata.*) }
+    /* Page 1+: executable code.  Page base != addr_min so musl remaps this
+     * segment with PROT_READ|PROT_EXEC via mmap_fixed. */
+    . = ALIGN(0x1000);
+    .plt : { *(.plt) }
+    .text : { *(.text .text.*) }
+    /* Page 2+: RELRO region (.got/.got.plt/.dynamic).  Page base != addr_min
+     * so musl remaps with PROT_READ|PROT_WRITE; RELRO then mprotects it. */
     . = ALIGN(0x1000);
     .got : { *(.got) }
     .got.plt : { *(.got.plt) }
     .dynamic : { *(.dynamic) }
+    /* Page 3+: non-RELRO writable data.  Separate page so RELRO mprotect
+     * (which lld pads to the next page boundary) cannot cover .data/.bss. */
     . = ALIGN(0x1000);
     .data : { *(.data .data.*) }
     .sdata : { *(.sdata .sdata.*) }
