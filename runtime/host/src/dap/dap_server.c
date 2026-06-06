@@ -444,6 +444,11 @@ static void handle_threads(int seq, const char *args) {
 
 static void handle_continue(int seq, const char *args) {
     (void)args;
+    /* Send response before signalling the condvar so the client receives it
+     * before the cart resumes and potentially closes the connection (mirrors
+     * the ordering in handle_step). */
+    send_response(seq, "continue", 1, "{\"allThreadsContinued\":true}");
+    send_event("continued", "{\"threadId\":1,\"allThreadsContinued\":true}");
     pthread_mutex_lock(&g_dap.mu);
     g_dap.pending_step_mode = 0;
     g_dap.pending_pause = 0;
@@ -452,8 +457,6 @@ static void handle_continue(int seq, const char *args) {
         pthread_cond_signal(&g_dap.msg_cond);
     }
     pthread_mutex_unlock(&g_dap.mu);
-    send_response(seq, "continue", 1, "{\"allThreadsContinued\":true}");
-    send_event("continued", "{\"threadId\":1,\"allThreadsContinued\":true}");
 }
 
 static void handle_step(int seq, const char *args, int mode) {
