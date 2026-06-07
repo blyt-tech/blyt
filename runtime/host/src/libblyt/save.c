@@ -29,19 +29,23 @@
 /* type_tag field sizes */
 static size_t field_sizeof_tag(uint8_t tag) {
     switch (tag) {
-    case 0: case 1: case 7: return 1; /* i8, u8, bool */
-    case 2: case 3:         return 2; /* i16, u16 */
-    default:                return 4; /* i32, u32, f32 */
+    case 0:
+    case 1:
+    case 7:
+        return 1; /* i8, u8, bool */
+    case 2:
+    case 3:
+        return 2; /* i16, u16 */
+    default:
+        return 4; /* i32, u32, f32 */
     }
 }
 
 /* Build the save file path into buf (buf_len bytes).
  * Returns 0 on success, -1 on truncation. */
-static int build_path(char *buf, size_t buf_len,
-                      const char *save_dir, const char *cart_name,
+static int build_path(char *buf, size_t buf_len, const char *save_dir, const char *cart_name,
                       uint32_t slot) {
-    int n = snprintf(buf, buf_len, "%s/%s/slot_%u.blys",
-                     save_dir, cart_name, slot);
+    int n = snprintf(buf, buf_len, "%s/%s/slot_%u.blys", save_dir, cart_name, slot);
     return (n > 0 && (size_t)n < buf_len) ? 0 : -1;
 }
 
@@ -62,27 +66,34 @@ static int ensure_dir(const char *save_dir, const char *cart_name) {
 
 /* Write little-endian integers to a buffer. */
 static void write_u16le(uint8_t *p, uint16_t v) {
-    p[0] = v & 0xff; p[1] = (v >> 8) & 0xff;
+    p[0] = v & 0xff;
+    p[1] = (v >> 8) & 0xff;
 }
 static void write_u32le(uint8_t *p, uint32_t v) {
-    p[0] = v & 0xff; p[1] = (v >> 8) & 0xff;
-    p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff;
+    p[0] = v & 0xff;
+    p[1] = (v >> 8) & 0xff;
+    p[2] = (v >> 16) & 0xff;
+    p[3] = (v >> 24) & 0xff;
 }
 static void write_u64le(uint8_t *p, uint64_t v) {
-    for (int i = 0; i < 8; i++) { p[i] = v & 0xff; v >>= 8; }
+    for (int i = 0; i < 8; i++) {
+        p[i] = v & 0xff;
+        v >>= 8;
+    }
 }
 static uint32_t read_u32le(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 static uint64_t read_u64le(const uint8_t *p) {
     uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) { v = (v << 8) | p[i]; }
+    for (int i = 7; i >= 0; i--) {
+        v = (v << 8) | p[i];
+    }
     return v;
 }
 
-int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir,
-                    const char *cart_name, uint32_t slot) {
+int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir, const char *cart_name,
+                    uint32_t slot) {
     if (!save_dir || !cart_name)
         return -1;
 
@@ -135,7 +146,10 @@ int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir,
         /* name_len + name */
         uint8_t nl[4];
         write_u32le(nl, name_len);
-        if (fwrite(nl, 1, 4, f) != 4) { fclose(f); return -1; }
+        if (fwrite(nl, 1, 4, f) != 4) {
+            fclose(f);
+            return -1;
+        }
         if (name_len && fwrite(name, 1, name_len, f) != name_len) {
             fclose(f);
             return -1;
@@ -163,8 +177,8 @@ int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir,
     return 0;
 }
 
-int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir,
-                   const char *cart_name, uint32_t slot) {
+int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir, const char *cart_name,
+                   uint32_t slot) {
     if (!save_dir || !cart_name)
         return -1;
 
@@ -217,13 +231,22 @@ int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir,
 
         /* Read name_len + name */
         uint8_t nl[4];
-        if (fread(nl, 1, 4, f) < 4) { fclose(f); return -1; }
+        if (fread(nl, 1, 4, f) < 4) {
+            fclose(f);
+            return -1;
+        }
         uint32_t name_len = read_u32le(nl);
 
         char name_buf[256];
         if (name_len > 0) {
-            if (name_len >= sizeof(name_buf)) { fclose(f); return -1; }
-            if (fread(name_buf, 1, name_len, f) != name_len) { fclose(f); return -1; }
+            if (name_len >= sizeof(name_buf)) {
+                fclose(f);
+                return -1;
+            }
+            if (fread(name_buf, 1, name_len, f) != name_len) {
+                fclose(f);
+                return -1;
+            }
         }
         name_buf[name_len] = '\0';
 

@@ -26,11 +26,11 @@ typedef struct blyt_session blyt_session_t;
  * save_dir: path to the save directory for this cart (may be NULL → default).
  * cart_name: used as the subdirectory under save_dir.
  * Returns BLYT_RUN_OK on success, BLYT_RUN_ERR_IO on failure. */
-int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir,
-                    const char *cart_name, uint32_t slot);
+int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir, const char *cart_name,
+                    uint32_t slot);
 
 /* Read save slot N back into state buffers.
  * Returns BLYT_RUN_OK on success, BLYT_RUN_ERR_IO on read failure,
  * BLYT_RUN_ERR_SAVE_SCHEMA on unrecoverable schema mismatch. */
-int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir,
-                   const char *cart_name, uint32_t slot);
+int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir, const char *cart_name,
+                   uint32_t slot);

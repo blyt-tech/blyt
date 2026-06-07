@@ -67,14 +67,10 @@ void blyt_state_ctx_destroy(blyt_state_ctx_t *ctx);
  * f32 SET canonicalises NaN (ADR-0010).
  * ------------------------------------------------------------------------- */
 
-int blyt_state_get(const blyt_state_ctx_t *ctx,
-                   uint32_t buf_id, int32_t slot, uint32_t field,
+int blyt_state_get(const blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
                    uint32_t *out_bits);
-int blyt_state_set(blyt_state_ctx_t *ctx,
-                   uint32_t buf_id, int32_t slot, uint32_t field,
+int blyt_state_set(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
                    uint32_t value_bits, uint8_t type_tag);
 
-int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id,
-                          int32_t *out_slot);
-int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id,
-                         int32_t slot);
+int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t *out_slot);
+int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot);

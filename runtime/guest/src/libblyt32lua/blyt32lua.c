@@ -111,77 +111,101 @@ static int lua_blyt_save_read(lua_State *L) {
  * ------------------------------------------------------------------------- */
 
 static int lua_buf_get_f32(lua_State *L) {
-    lua_pushinteger(L, (int)blyt_buffer_get_f32((uint32_t)luaL_checkinteger(L,1), (int32_t)luaL_checkinteger(L,2), (uint32_t)luaL_checkinteger(L,3)));
+    lua_pushinteger(L, (int)blyt_buffer_get_f32((uint32_t)luaL_checkinteger(L, 1),
+                                                (int32_t)luaL_checkinteger(L, 2),
+                                                (uint32_t)luaL_checkinteger(L, 3)));
     return 1;
 }
 static int lua_buf_set_f32(lua_State *L) {
-    blyt_buffer_set_f32((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3),(float)luaL_checknumber(L,4));
+    blyt_buffer_set_f32((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                        (uint32_t)luaL_checkinteger(L, 3), (float)luaL_checknumber(L, 4));
     return 0;
 }
 static int lua_buf_get_i32(lua_State *L) {
-    lua_pushinteger(L, blyt_buffer_get_i32((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3)));
+    lua_pushinteger(L, blyt_buffer_get_i32((uint32_t)luaL_checkinteger(L, 1),
+                                           (int32_t)luaL_checkinteger(L, 2),
+                                           (uint32_t)luaL_checkinteger(L, 3)));
     return 1;
 }
 static int lua_buf_set_i32(lua_State *L) {
-    blyt_buffer_set_i32((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3),(int32_t)luaL_checkinteger(L,4));
+    blyt_buffer_set_i32((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                        (uint32_t)luaL_checkinteger(L, 3), (int32_t)luaL_checkinteger(L, 4));
     return 0;
 }
 static int lua_buf_get_u32(lua_State *L) {
-    lua_pushinteger(L, (int32_t)blyt_buffer_get_u32((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3)));
+    lua_pushinteger(L, (int32_t)blyt_buffer_get_u32((uint32_t)luaL_checkinteger(L, 1),
+                                                    (int32_t)luaL_checkinteger(L, 2),
+                                                    (uint32_t)luaL_checkinteger(L, 3)));
     return 1;
 }
 static int lua_buf_set_u32(lua_State *L) {
-    blyt_buffer_set_u32((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3),(uint32_t)luaL_checkinteger(L,4));
+    blyt_buffer_set_u32((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                        (uint32_t)luaL_checkinteger(L, 3), (uint32_t)luaL_checkinteger(L, 4));
     return 0;
 }
 static int lua_buf_get_i16(lua_State *L) {
-    lua_pushinteger(L, blyt_buffer_get_i16((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3)));
+    lua_pushinteger(L, blyt_buffer_get_i16((uint32_t)luaL_checkinteger(L, 1),
+                                           (int32_t)luaL_checkinteger(L, 2),
+                                           (uint32_t)luaL_checkinteger(L, 3)));
     return 1;
 }
 static int lua_buf_set_i16(lua_State *L) {
-    blyt_buffer_set_i16((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3),(int16_t)luaL_checkinteger(L,4));
+    blyt_buffer_set_i16((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                        (uint32_t)luaL_checkinteger(L, 3), (int16_t)luaL_checkinteger(L, 4));
     return 0;
 }
 static int lua_buf_get_u16(lua_State *L) {
-    lua_pushinteger(L, blyt_buffer_get_u16((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3)));
+    lua_pushinteger(L, blyt_buffer_get_u16((uint32_t)luaL_checkinteger(L, 1),
+                                           (int32_t)luaL_checkinteger(L, 2),
+                                           (uint32_t)luaL_checkinteger(L, 3)));
     return 1;
 }
 static int lua_buf_set_u16(lua_State *L) {
-    blyt_buffer_set_u16((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3),(uint16_t)luaL_checkinteger(L,4));
+    blyt_buffer_set_u16((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                        (uint32_t)luaL_checkinteger(L, 3), (uint16_t)luaL_checkinteger(L, 4));
     return 0;
 }
 static int lua_buf_get_i8(lua_State *L) {
-    lua_pushinteger(L, blyt_buffer_get_i8((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3)));
+    lua_pushinteger(L, blyt_buffer_get_i8((uint32_t)luaL_checkinteger(L, 1),
+                                          (int32_t)luaL_checkinteger(L, 2),
+                                          (uint32_t)luaL_checkinteger(L, 3)));
     return 1;
 }
 static int lua_buf_set_i8(lua_State *L) {
-    blyt_buffer_set_i8((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3),(int8_t)luaL_checkinteger(L,4));
+    blyt_buffer_set_i8((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                       (uint32_t)luaL_checkinteger(L, 3), (int8_t)luaL_checkinteger(L, 4));
     return 0;
 }
 static int lua_buf_get_u8(lua_State *L) {
-    lua_pushinteger(L, blyt_buffer_get_u8((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3)));
+    lua_pushinteger(L, blyt_buffer_get_u8((uint32_t)luaL_checkinteger(L, 1),
+                                          (int32_t)luaL_checkinteger(L, 2),
+                                          (uint32_t)luaL_checkinteger(L, 3)));
     return 1;
 }
 static int lua_buf_set_u8(lua_State *L) {
-    blyt_buffer_set_u8((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3),(uint8_t)luaL_checkinteger(L,4));
+    blyt_buffer_set_u8((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                       (uint32_t)luaL_checkinteger(L, 3), (uint8_t)luaL_checkinteger(L, 4));
     return 0;
 }
 static int lua_buf_get_bool(lua_State *L) {
-    lua_pushboolean(L, blyt_buffer_get_bool((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3)));
+    lua_pushboolean(L, blyt_buffer_get_bool((uint32_t)luaL_checkinteger(L, 1),
+                                            (int32_t)luaL_checkinteger(L, 2),
+                                            (uint32_t)luaL_checkinteger(L, 3)));
     return 1;
 }
 static int lua_buf_set_bool(lua_State *L) {
-    blyt_buffer_set_bool((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2),(uint32_t)luaL_checkinteger(L,3),(bool)lua_toboolean(L,4));
+    blyt_buffer_set_bool((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                         (uint32_t)luaL_checkinteger(L, 3), (bool)lua_toboolean(L, 4));
     return 0;
 }
 static int lua_buf_alloc_slot(lua_State *L) {
     int32_t slot = -1;
-    blyt_buffer_alloc_slot((uint32_t)luaL_checkinteger(L,1), &slot);
+    blyt_buffer_alloc_slot((uint32_t)luaL_checkinteger(L, 1), &slot);
     lua_pushinteger(L, slot);
     return 1;
 }
 static int lua_buf_free_slot(lua_State *L) {
-    blyt_buffer_free_slot((uint32_t)luaL_checkinteger(L,1),(int32_t)luaL_checkinteger(L,2));
+    blyt_buffer_free_slot((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2));
     return 0;
 }
 
@@ -205,17 +229,28 @@ static void register_blyt32(lua_State *L) {
 
     /* --- shared: blyt.buf subtable (state buffer API, ADR-0009) --- */
     lua_newtable(L); /* idx B: blyt.buf */
-    static const struct { const char *name; lua_CFunction fn; } buf_fns[] = {
-        {"get_f32", lua_buf_get_f32}, {"set_f32", lua_buf_set_f32},
-        {"get_i32", lua_buf_get_i32}, {"set_i32", lua_buf_set_i32},
-        {"get_u32", lua_buf_get_u32}, {"set_u32", lua_buf_set_u32},
-        {"get_i16", lua_buf_get_i16}, {"set_i16", lua_buf_set_i16},
-        {"get_u16", lua_buf_get_u16}, {"set_u16", lua_buf_set_u16},
-        {"get_i8",  lua_buf_get_i8},  {"set_i8",  lua_buf_set_i8},
-        {"get_u8",  lua_buf_get_u8},  {"set_u8",  lua_buf_set_u8},
-        {"get_bool",lua_buf_get_bool},{"set_bool", lua_buf_set_bool},
+    static const struct {
+        const char *name;
+        lua_CFunction fn;
+    } buf_fns[] = {
+        {"get_f32", lua_buf_get_f32},
+        {"set_f32", lua_buf_set_f32},
+        {"get_i32", lua_buf_get_i32},
+        {"set_i32", lua_buf_set_i32},
+        {"get_u32", lua_buf_get_u32},
+        {"set_u32", lua_buf_set_u32},
+        {"get_i16", lua_buf_get_i16},
+        {"set_i16", lua_buf_set_i16},
+        {"get_u16", lua_buf_get_u16},
+        {"set_u16", lua_buf_set_u16},
+        {"get_i8", lua_buf_get_i8},
+        {"set_i8", lua_buf_set_i8},
+        {"get_u8", lua_buf_get_u8},
+        {"set_u8", lua_buf_set_u8},
+        {"get_bool", lua_buf_get_bool},
+        {"set_bool", lua_buf_set_bool},
         {"alloc_slot", lua_buf_alloc_slot},
-        {"free_slot",  lua_buf_free_slot},
+        {"free_slot", lua_buf_free_slot},
         {NULL, NULL},
     };
     for (int i = 0; buf_fns[i].name; i++) {

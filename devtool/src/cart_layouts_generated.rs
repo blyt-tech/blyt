@@ -12,567 +12,711 @@
 // @generated
 extern crate alloc;
 
-
 #[allow(unused_imports, dead_code)]
 pub mod blyt {
 
+    pub enum FieldDeclOffset {}
+    #[derive(Copy, Clone, PartialEq)]
 
-pub enum FieldDeclOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct FieldDecl<'a> {
-  pub _tab: ::flatbuffers::Table<'a>,
-}
-
-impl<'a> ::flatbuffers::Follow<'a> for FieldDecl<'a> {
-  type Inner = FieldDecl<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
-  }
-}
-
-impl<'a> FieldDecl<'a> {
-  pub const VT_NAME: ::flatbuffers::VOffsetT = 4;
-  pub const VT_TYPE_TAG: ::flatbuffers::VOffsetT = 6;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
-    FieldDecl { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
-    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args FieldDeclArgs<'args>
-  ) -> ::flatbuffers::WIPOffset<FieldDecl<'bldr>> {
-    let mut builder = FieldDeclBuilder::new(_fbb);
-    if let Some(x) = args.name { builder.add_name(x); }
-    builder.add_type_tag(args.type_tag);
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn name(&self) -> Option<&'a str> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(FieldDecl::VT_NAME, None)}
-  }
-  #[inline]
-  pub fn type_tag(&self) -> u8 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u8>(FieldDecl::VT_TYPE_TAG, Some(0)).unwrap()}
-  }
-}
-
-impl ::flatbuffers::Verifiable for FieldDecl<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut ::flatbuffers::Verifier, pos: usize
-  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    v.visit_table(pos)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
-     .visit_field::<u8>("type_tag", Self::VT_TYPE_TAG, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct FieldDeclArgs<'a> {
-    pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
-    pub type_tag: u8,
-}
-impl<'a> Default for FieldDeclArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    FieldDeclArgs {
-      name: None,
-      type_tag: 0,
+    pub struct FieldDecl<'a> {
+        pub _tab: ::flatbuffers::Table<'a>,
     }
-  }
-}
 
-pub struct FieldDeclBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
-  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
-  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> FieldDeclBuilder<'a, 'b, A> {
-  #[inline]
-  pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(FieldDecl::VT_NAME, name);
-  }
-  #[inline]
-  pub fn add_type_tag(&mut self, type_tag: u8) {
-    self.fbb_.push_slot::<u8>(FieldDecl::VT_TYPE_TAG, type_tag, 0);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> FieldDeclBuilder<'a, 'b, A> {
-    let start = _fbb.start_table();
-    FieldDeclBuilder {
-      fbb_: _fbb,
-      start_: start,
+    impl<'a> ::flatbuffers::Follow<'a> for FieldDecl<'a> {
+        type Inner = FieldDecl<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: unsafe { ::flatbuffers::Table::new(buf, loc) },
+            }
+        }
     }
-  }
-  #[inline]
-  pub fn finish(self) -> ::flatbuffers::WIPOffset<FieldDecl<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    ::flatbuffers::WIPOffset::new(o.value())
-  }
-}
 
-impl ::core::fmt::Debug for FieldDecl<'_> {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-    let mut ds = f.debug_struct("FieldDecl");
-      ds.field("name", &self.name());
-      ds.field("type_tag", &self.type_tag());
-      ds.finish()
-  }
-}
-pub enum RecordDeclOffset {}
-#[derive(Copy, Clone, PartialEq)]
+    impl<'a> FieldDecl<'a> {
+        pub const VT_NAME: ::flatbuffers::VOffsetT = 4;
+        pub const VT_TYPE_TAG: ::flatbuffers::VOffsetT = 6;
 
-pub struct RecordDecl<'a> {
-  pub _tab: ::flatbuffers::Table<'a>,
-}
+        #[inline]
+        pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+            FieldDecl { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<
+            'bldr: 'args,
+            'args: 'mut_bldr,
+            'mut_bldr,
+            A: ::flatbuffers::Allocator + 'bldr,
+        >(
+            _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+            args: &'args FieldDeclArgs<'args>,
+        ) -> ::flatbuffers::WIPOffset<FieldDecl<'bldr>> {
+            let mut builder = FieldDeclBuilder::new(_fbb);
+            if let Some(x) = args.name {
+                builder.add_name(x);
+            }
+            builder.add_type_tag(args.type_tag);
+            builder.finish()
+        }
 
-impl<'a> ::flatbuffers::Follow<'a> for RecordDecl<'a> {
-  type Inner = RecordDecl<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
-  }
-}
-
-impl<'a> RecordDecl<'a> {
-  pub const VT_NAME: ::flatbuffers::VOffsetT = 4;
-  pub const VT_FIELDS: ::flatbuffers::VOffsetT = 6;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
-    RecordDecl { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
-    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args RecordDeclArgs<'args>
-  ) -> ::flatbuffers::WIPOffset<RecordDecl<'bldr>> {
-    let mut builder = RecordDeclBuilder::new(_fbb);
-    if let Some(x) = args.fields { builder.add_fields(x); }
-    if let Some(x) = args.name { builder.add_name(x); }
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn name(&self) -> Option<&'a str> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(RecordDecl::VT_NAME, None)}
-  }
-  #[inline]
-  pub fn fields(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FieldDecl<'a>>>> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FieldDecl>>>>(RecordDecl::VT_FIELDS, None)}
-  }
-}
-
-impl ::flatbuffers::Verifiable for RecordDecl<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut ::flatbuffers::Verifier, pos: usize
-  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    v.visit_table(pos)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<FieldDecl>>>>("fields", Self::VT_FIELDS, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct RecordDeclArgs<'a> {
-    pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
-    pub fields: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FieldDecl<'a>>>>>,
-}
-impl<'a> Default for RecordDeclArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    RecordDeclArgs {
-      name: None,
-      fields: None,
+        #[inline]
+        pub fn name(&self) -> Option<&'a str> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<::flatbuffers::ForwardsUOffset<&str>>(FieldDecl::VT_NAME, None)
+            }
+        }
+        #[inline]
+        pub fn type_tag(&self) -> u8 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u8>(FieldDecl::VT_TYPE_TAG, Some(0))
+                    .unwrap()
+            }
+        }
     }
-  }
-}
 
-pub struct RecordDeclBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
-  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
-  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> RecordDeclBuilder<'a, 'b, A> {
-  #[inline]
-  pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(RecordDecl::VT_NAME, name);
-  }
-  #[inline]
-  pub fn add_fields(&mut self, fields: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<FieldDecl<'b >>>>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(RecordDecl::VT_FIELDS, fields);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> RecordDeclBuilder<'a, 'b, A> {
-    let start = _fbb.start_table();
-    RecordDeclBuilder {
-      fbb_: _fbb,
-      start_: start,
+    impl ::flatbuffers::Verifiable for FieldDecl<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut ::flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+            v.visit_table(pos)?
+                .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
+                .visit_field::<u8>("type_tag", Self::VT_TYPE_TAG, false)?
+                .finish();
+            Ok(())
+        }
     }
-  }
-  #[inline]
-  pub fn finish(self) -> ::flatbuffers::WIPOffset<RecordDecl<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    ::flatbuffers::WIPOffset::new(o.value())
-  }
-}
-
-impl ::core::fmt::Debug for RecordDecl<'_> {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-    let mut ds = f.debug_struct("RecordDecl");
-      ds.field("name", &self.name());
-      ds.field("fields", &self.fields());
-      ds.finish()
-  }
-}
-pub enum BufferDeclOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct BufferDecl<'a> {
-  pub _tab: ::flatbuffers::Table<'a>,
-}
-
-impl<'a> ::flatbuffers::Follow<'a> for BufferDecl<'a> {
-  type Inner = BufferDecl<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
-  }
-}
-
-impl<'a> BufferDecl<'a> {
-  pub const VT_NAME: ::flatbuffers::VOffsetT = 4;
-  pub const VT_RECORD_NAME: ::flatbuffers::VOffsetT = 6;
-  pub const VT_COUNT: ::flatbuffers::VOffsetT = 8;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
-    BufferDecl { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
-    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args BufferDeclArgs<'args>
-  ) -> ::flatbuffers::WIPOffset<BufferDecl<'bldr>> {
-    let mut builder = BufferDeclBuilder::new(_fbb);
-    builder.add_count(args.count);
-    if let Some(x) = args.record_name { builder.add_record_name(x); }
-    if let Some(x) = args.name { builder.add_name(x); }
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn name(&self) -> Option<&'a str> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(BufferDecl::VT_NAME, None)}
-  }
-  #[inline]
-  pub fn record_name(&self) -> Option<&'a str> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(BufferDecl::VT_RECORD_NAME, None)}
-  }
-  #[inline]
-  pub fn count(&self) -> u32 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u32>(BufferDecl::VT_COUNT, Some(0)).unwrap()}
-  }
-}
-
-impl ::flatbuffers::Verifiable for BufferDecl<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut ::flatbuffers::Verifier, pos: usize
-  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    v.visit_table(pos)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("record_name", Self::VT_RECORD_NAME, false)?
-     .visit_field::<u32>("count", Self::VT_COUNT, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct BufferDeclArgs<'a> {
-    pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
-    pub record_name: Option<::flatbuffers::WIPOffset<&'a str>>,
-    pub count: u32,
-}
-impl<'a> Default for BufferDeclArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    BufferDeclArgs {
-      name: None,
-      record_name: None,
-      count: 0,
+    pub struct FieldDeclArgs<'a> {
+        pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
+        pub type_tag: u8,
     }
-  }
-}
-
-pub struct BufferDeclBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
-  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
-  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> BufferDeclBuilder<'a, 'b, A> {
-  #[inline]
-  pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(BufferDecl::VT_NAME, name);
-  }
-  #[inline]
-  pub fn add_record_name(&mut self, record_name: ::flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(BufferDecl::VT_RECORD_NAME, record_name);
-  }
-  #[inline]
-  pub fn add_count(&mut self, count: u32) {
-    self.fbb_.push_slot::<u32>(BufferDecl::VT_COUNT, count, 0);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> BufferDeclBuilder<'a, 'b, A> {
-    let start = _fbb.start_table();
-    BufferDeclBuilder {
-      fbb_: _fbb,
-      start_: start,
+    impl<'a> Default for FieldDeclArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            FieldDeclArgs {
+                name: None,
+                type_tag: 0,
+            }
+        }
     }
-  }
-  #[inline]
-  pub fn finish(self) -> ::flatbuffers::WIPOffset<BufferDecl<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    ::flatbuffers::WIPOffset::new(o.value())
-  }
-}
 
-impl ::core::fmt::Debug for BufferDecl<'_> {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-    let mut ds = f.debug_struct("BufferDecl");
-      ds.field("name", &self.name());
-      ds.field("record_name", &self.record_name());
-      ds.field("count", &self.count());
-      ds.finish()
-  }
-}
-pub enum CartLayoutsOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct CartLayouts<'a> {
-  pub _tab: ::flatbuffers::Table<'a>,
-}
-
-impl<'a> ::flatbuffers::Follow<'a> for CartLayouts<'a> {
-  type Inner = CartLayouts<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
-  }
-}
-
-impl<'a> CartLayouts<'a> {
-  pub const VT_RECORDS: ::flatbuffers::VOffsetT = 4;
-  pub const VT_BUFFERS: ::flatbuffers::VOffsetT = 6;
-  pub const VT_SCHEMA_HASH: ::flatbuffers::VOffsetT = 8;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
-    CartLayouts { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
-    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args CartLayoutsArgs<'args>
-  ) -> ::flatbuffers::WIPOffset<CartLayouts<'bldr>> {
-    let mut builder = CartLayoutsBuilder::new(_fbb);
-    builder.add_schema_hash(args.schema_hash);
-    if let Some(x) = args.buffers { builder.add_buffers(x); }
-    if let Some(x) = args.records { builder.add_records(x); }
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn records(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<RecordDecl<'a>>>> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<RecordDecl>>>>(CartLayouts::VT_RECORDS, None)}
-  }
-  #[inline]
-  pub fn buffers(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BufferDecl<'a>>>> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BufferDecl>>>>(CartLayouts::VT_BUFFERS, None)}
-  }
-  #[inline]
-  pub fn schema_hash(&self) -> u64 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u64>(CartLayouts::VT_SCHEMA_HASH, Some(0)).unwrap()}
-  }
-}
-
-impl ::flatbuffers::Verifiable for CartLayouts<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut ::flatbuffers::Verifier, pos: usize
-  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    v.visit_table(pos)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<RecordDecl>>>>("records", Self::VT_RECORDS, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<BufferDecl>>>>("buffers", Self::VT_BUFFERS, false)?
-     .visit_field::<u64>("schema_hash", Self::VT_SCHEMA_HASH, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct CartLayoutsArgs<'a> {
-    pub records: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<RecordDecl<'a>>>>>,
-    pub buffers: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BufferDecl<'a>>>>>,
-    pub schema_hash: u64,
-}
-impl<'a> Default for CartLayoutsArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    CartLayoutsArgs {
-      records: None,
-      buffers: None,
-      schema_hash: 0,
+    pub struct FieldDeclBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+        fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
     }
-  }
-}
-
-pub struct CartLayoutsBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
-  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
-  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> CartLayoutsBuilder<'a, 'b, A> {
-  #[inline]
-  pub fn add_records(&mut self, records: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<RecordDecl<'b >>>>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(CartLayouts::VT_RECORDS, records);
-  }
-  #[inline]
-  pub fn add_buffers(&mut self, buffers: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<BufferDecl<'b >>>>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(CartLayouts::VT_BUFFERS, buffers);
-  }
-  #[inline]
-  pub fn add_schema_hash(&mut self, schema_hash: u64) {
-    self.fbb_.push_slot::<u64>(CartLayouts::VT_SCHEMA_HASH, schema_hash, 0);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> CartLayoutsBuilder<'a, 'b, A> {
-    let start = _fbb.start_table();
-    CartLayoutsBuilder {
-      fbb_: _fbb,
-      start_: start,
+    impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> FieldDeclBuilder<'a, 'b, A> {
+        #[inline]
+        pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<::flatbuffers::WIPOffset<_>>(FieldDecl::VT_NAME, name);
+        }
+        #[inline]
+        pub fn add_type_tag(&mut self, type_tag: u8) {
+            self.fbb_
+                .push_slot::<u8>(FieldDecl::VT_TYPE_TAG, type_tag, 0);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        ) -> FieldDeclBuilder<'a, 'b, A> {
+            let start = _fbb.start_table();
+            FieldDeclBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> ::flatbuffers::WIPOffset<FieldDecl<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            ::flatbuffers::WIPOffset::new(o.value())
+        }
     }
-  }
-  #[inline]
-  pub fn finish(self) -> ::flatbuffers::WIPOffset<CartLayouts<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    ::flatbuffers::WIPOffset::new(o.value())
-  }
-}
 
-impl ::core::fmt::Debug for CartLayouts<'_> {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-    let mut ds = f.debug_struct("CartLayouts");
-      ds.field("records", &self.records());
-      ds.field("buffers", &self.buffers());
-      ds.field("schema_hash", &self.schema_hash());
-      ds.finish()
-  }
-}
-#[inline]
-/// Verifies that a buffer of bytes contains a `CartLayouts`
-/// and returns it.
-/// Note that verification is still experimental and may not
-/// catch every error, or be maximally performant. For the
-/// previous, unchecked, behavior use
-/// `root_as_cart_layouts_unchecked`.
-pub fn root_as_cart_layouts(buf: &[u8]) -> Result<CartLayouts<'_>, ::flatbuffers::InvalidFlatbuffer> {
-  ::flatbuffers::root::<CartLayouts>(buf)
-}
-#[inline]
-/// Verifies that a buffer of bytes contains a size prefixed
-/// `CartLayouts` and returns it.
-/// Note that verification is still experimental and may not
-/// catch every error, or be maximally performant. For the
-/// previous, unchecked, behavior use
-/// `size_prefixed_root_as_cart_layouts_unchecked`.
-pub fn size_prefixed_root_as_cart_layouts(buf: &[u8]) -> Result<CartLayouts<'_>, ::flatbuffers::InvalidFlatbuffer> {
-  ::flatbuffers::size_prefixed_root::<CartLayouts>(buf)
-}
-#[inline]
-/// Verifies, with the given options, that a buffer of bytes
-/// contains a `CartLayouts` and returns it.
-/// Note that verification is still experimental and may not
-/// catch every error, or be maximally performant. For the
-/// previous, unchecked, behavior use
-/// `root_as_cart_layouts_unchecked`.
-pub fn root_as_cart_layouts_with_opts<'b, 'o>(
-  opts: &'o ::flatbuffers::VerifierOptions,
-  buf: &'b [u8],
-) -> Result<CartLayouts<'b>, ::flatbuffers::InvalidFlatbuffer> {
-  ::flatbuffers::root_with_opts::<CartLayouts<'b>>(opts, buf)
-}
-#[inline]
-/// Verifies, with the given verifier options, that a buffer of
-/// bytes contains a size prefixed `CartLayouts` and returns
-/// it. Note that verification is still experimental and may not
-/// catch every error, or be maximally performant. For the
-/// previous, unchecked, behavior use
-/// `root_as_cart_layouts_unchecked`.
-pub fn size_prefixed_root_as_cart_layouts_with_opts<'b, 'o>(
-  opts: &'o ::flatbuffers::VerifierOptions,
-  buf: &'b [u8],
-) -> Result<CartLayouts<'b>, ::flatbuffers::InvalidFlatbuffer> {
-  ::flatbuffers::size_prefixed_root_with_opts::<CartLayouts<'b>>(opts, buf)
-}
-#[inline]
-/// Assumes, without verification, that a buffer of bytes contains a CartLayouts and returns it.
-/// # Safety
-/// Callers must trust the given bytes do indeed contain a valid `CartLayouts`.
-pub unsafe fn root_as_cart_layouts_unchecked(buf: &[u8]) -> CartLayouts<'_> {
-  unsafe { ::flatbuffers::root_unchecked::<CartLayouts>(buf) }
-}
-#[inline]
-/// Assumes, without verification, that a buffer of bytes contains a size prefixed CartLayouts and returns it.
-/// # Safety
-/// Callers must trust the given bytes do indeed contain a valid size prefixed `CartLayouts`.
-pub unsafe fn size_prefixed_root_as_cart_layouts_unchecked(buf: &[u8]) -> CartLayouts<'_> {
-  unsafe { ::flatbuffers::size_prefixed_root_unchecked::<CartLayouts>(buf) }
-}
-#[inline]
-pub fn finish_cart_layouts_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(
-    fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
-    root: ::flatbuffers::WIPOffset<CartLayouts<'a>>) {
-  fbb.finish(root, None);
-}
+    impl ::core::fmt::Debug for FieldDecl<'_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            let mut ds = f.debug_struct("FieldDecl");
+            ds.field("name", &self.name());
+            ds.field("type_tag", &self.type_tag());
+            ds.finish()
+        }
+    }
+    pub enum RecordDeclOffset {}
+    #[derive(Copy, Clone, PartialEq)]
 
-#[inline]
-pub fn finish_size_prefixed_cart_layouts_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>, root: ::flatbuffers::WIPOffset<CartLayouts<'a>>) {
-  fbb.finish_size_prefixed(root, None);
-}
-}  // pub mod blyt
+    pub struct RecordDecl<'a> {
+        pub _tab: ::flatbuffers::Table<'a>,
+    }
 
+    impl<'a> ::flatbuffers::Follow<'a> for RecordDecl<'a> {
+        type Inner = RecordDecl<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: unsafe { ::flatbuffers::Table::new(buf, loc) },
+            }
+        }
+    }
+
+    impl<'a> RecordDecl<'a> {
+        pub const VT_NAME: ::flatbuffers::VOffsetT = 4;
+        pub const VT_FIELDS: ::flatbuffers::VOffsetT = 6;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+            RecordDecl { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<
+            'bldr: 'args,
+            'args: 'mut_bldr,
+            'mut_bldr,
+            A: ::flatbuffers::Allocator + 'bldr,
+        >(
+            _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+            args: &'args RecordDeclArgs<'args>,
+        ) -> ::flatbuffers::WIPOffset<RecordDecl<'bldr>> {
+            let mut builder = RecordDeclBuilder::new(_fbb);
+            if let Some(x) = args.fields {
+                builder.add_fields(x);
+            }
+            if let Some(x) = args.name {
+                builder.add_name(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn name(&self) -> Option<&'a str> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<::flatbuffers::ForwardsUOffset<&str>>(RecordDecl::VT_NAME, None)
+            }
+        }
+        #[inline]
+        pub fn fields(
+            &self,
+        ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FieldDecl<'a>>>>
+        {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab.get::<::flatbuffers::ForwardsUOffset<
+                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FieldDecl>>,
+                >>(RecordDecl::VT_FIELDS, None)
+            }
+        }
+    }
+
+    impl ::flatbuffers::Verifiable for RecordDecl<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut ::flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+            v.visit_table(pos)?
+                .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
+                .visit_field::<::flatbuffers::ForwardsUOffset<
+                    ::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<FieldDecl>>,
+                >>("fields", Self::VT_FIELDS, false)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct RecordDeclArgs<'a> {
+        pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
+        pub fields: Option<
+            ::flatbuffers::WIPOffset<
+                ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FieldDecl<'a>>>,
+            >,
+        >,
+    }
+    impl<'a> Default for RecordDeclArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            RecordDeclArgs {
+                name: None,
+                fields: None,
+            }
+        }
+    }
+
+    pub struct RecordDeclBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+        fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> RecordDeclBuilder<'a, 'b, A> {
+        #[inline]
+        pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<::flatbuffers::WIPOffset<_>>(RecordDecl::VT_NAME, name);
+        }
+        #[inline]
+        pub fn add_fields(
+            &mut self,
+            fields: ::flatbuffers::WIPOffset<
+                ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<FieldDecl<'b>>>,
+            >,
+        ) {
+            self.fbb_
+                .push_slot_always::<::flatbuffers::WIPOffset<_>>(RecordDecl::VT_FIELDS, fields);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        ) -> RecordDeclBuilder<'a, 'b, A> {
+            let start = _fbb.start_table();
+            RecordDeclBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> ::flatbuffers::WIPOffset<RecordDecl<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            ::flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl ::core::fmt::Debug for RecordDecl<'_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            let mut ds = f.debug_struct("RecordDecl");
+            ds.field("name", &self.name());
+            ds.field("fields", &self.fields());
+            ds.finish()
+        }
+    }
+    pub enum BufferDeclOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct BufferDecl<'a> {
+        pub _tab: ::flatbuffers::Table<'a>,
+    }
+
+    impl<'a> ::flatbuffers::Follow<'a> for BufferDecl<'a> {
+        type Inner = BufferDecl<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: unsafe { ::flatbuffers::Table::new(buf, loc) },
+            }
+        }
+    }
+
+    impl<'a> BufferDecl<'a> {
+        pub const VT_NAME: ::flatbuffers::VOffsetT = 4;
+        pub const VT_RECORD_NAME: ::flatbuffers::VOffsetT = 6;
+        pub const VT_COUNT: ::flatbuffers::VOffsetT = 8;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+            BufferDecl { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<
+            'bldr: 'args,
+            'args: 'mut_bldr,
+            'mut_bldr,
+            A: ::flatbuffers::Allocator + 'bldr,
+        >(
+            _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+            args: &'args BufferDeclArgs<'args>,
+        ) -> ::flatbuffers::WIPOffset<BufferDecl<'bldr>> {
+            let mut builder = BufferDeclBuilder::new(_fbb);
+            builder.add_count(args.count);
+            if let Some(x) = args.record_name {
+                builder.add_record_name(x);
+            }
+            if let Some(x) = args.name {
+                builder.add_name(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn name(&self) -> Option<&'a str> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<::flatbuffers::ForwardsUOffset<&str>>(BufferDecl::VT_NAME, None)
+            }
+        }
+        #[inline]
+        pub fn record_name(&self) -> Option<&'a str> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<::flatbuffers::ForwardsUOffset<&str>>(BufferDecl::VT_RECORD_NAME, None)
+            }
+        }
+        #[inline]
+        pub fn count(&self) -> u32 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe { self._tab.get::<u32>(BufferDecl::VT_COUNT, Some(0)).unwrap() }
+        }
+    }
+
+    impl ::flatbuffers::Verifiable for BufferDecl<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut ::flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+            v.visit_table(pos)?
+                .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
+                .visit_field::<::flatbuffers::ForwardsUOffset<&str>>(
+                    "record_name",
+                    Self::VT_RECORD_NAME,
+                    false,
+                )?
+                .visit_field::<u32>("count", Self::VT_COUNT, false)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct BufferDeclArgs<'a> {
+        pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
+        pub record_name: Option<::flatbuffers::WIPOffset<&'a str>>,
+        pub count: u32,
+    }
+    impl<'a> Default for BufferDeclArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            BufferDeclArgs {
+                name: None,
+                record_name: None,
+                count: 0,
+            }
+        }
+    }
+
+    pub struct BufferDeclBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+        fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> BufferDeclBuilder<'a, 'b, A> {
+        #[inline]
+        pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<::flatbuffers::WIPOffset<_>>(BufferDecl::VT_NAME, name);
+        }
+        #[inline]
+        pub fn add_record_name(&mut self, record_name: ::flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                BufferDecl::VT_RECORD_NAME,
+                record_name,
+            );
+        }
+        #[inline]
+        pub fn add_count(&mut self, count: u32) {
+            self.fbb_.push_slot::<u32>(BufferDecl::VT_COUNT, count, 0);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        ) -> BufferDeclBuilder<'a, 'b, A> {
+            let start = _fbb.start_table();
+            BufferDeclBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> ::flatbuffers::WIPOffset<BufferDecl<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            ::flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl ::core::fmt::Debug for BufferDecl<'_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            let mut ds = f.debug_struct("BufferDecl");
+            ds.field("name", &self.name());
+            ds.field("record_name", &self.record_name());
+            ds.field("count", &self.count());
+            ds.finish()
+        }
+    }
+    pub enum CartLayoutsOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct CartLayouts<'a> {
+        pub _tab: ::flatbuffers::Table<'a>,
+    }
+
+    impl<'a> ::flatbuffers::Follow<'a> for CartLayouts<'a> {
+        type Inner = CartLayouts<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: unsafe { ::flatbuffers::Table::new(buf, loc) },
+            }
+        }
+    }
+
+    impl<'a> CartLayouts<'a> {
+        pub const VT_RECORDS: ::flatbuffers::VOffsetT = 4;
+        pub const VT_BUFFERS: ::flatbuffers::VOffsetT = 6;
+        pub const VT_SCHEMA_HASH: ::flatbuffers::VOffsetT = 8;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+            CartLayouts { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<
+            'bldr: 'args,
+            'args: 'mut_bldr,
+            'mut_bldr,
+            A: ::flatbuffers::Allocator + 'bldr,
+        >(
+            _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+            args: &'args CartLayoutsArgs<'args>,
+        ) -> ::flatbuffers::WIPOffset<CartLayouts<'bldr>> {
+            let mut builder = CartLayoutsBuilder::new(_fbb);
+            builder.add_schema_hash(args.schema_hash);
+            if let Some(x) = args.buffers {
+                builder.add_buffers(x);
+            }
+            if let Some(x) = args.records {
+                builder.add_records(x);
+            }
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn records(
+            &self,
+        ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<RecordDecl<'a>>>>
+        {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab.get::<::flatbuffers::ForwardsUOffset<
+                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<RecordDecl>>,
+                >>(CartLayouts::VT_RECORDS, None)
+            }
+        }
+        #[inline]
+        pub fn buffers(
+            &self,
+        ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BufferDecl<'a>>>>
+        {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab.get::<::flatbuffers::ForwardsUOffset<
+                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BufferDecl>>,
+                >>(CartLayouts::VT_BUFFERS, None)
+            }
+        }
+        #[inline]
+        pub fn schema_hash(&self) -> u64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u64>(CartLayouts::VT_SCHEMA_HASH, Some(0))
+                    .unwrap()
+            }
+        }
+    }
+
+    impl ::flatbuffers::Verifiable for CartLayouts<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut ::flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+            v.visit_table(pos)?
+                .visit_field::<::flatbuffers::ForwardsUOffset<
+                    ::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<RecordDecl>>,
+                >>("records", Self::VT_RECORDS, false)?
+                .visit_field::<::flatbuffers::ForwardsUOffset<
+                    ::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<BufferDecl>>,
+                >>("buffers", Self::VT_BUFFERS, false)?
+                .visit_field::<u64>("schema_hash", Self::VT_SCHEMA_HASH, false)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct CartLayoutsArgs<'a> {
+        pub records: Option<
+            ::flatbuffers::WIPOffset<
+                ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<RecordDecl<'a>>>,
+            >,
+        >,
+        pub buffers: Option<
+            ::flatbuffers::WIPOffset<
+                ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BufferDecl<'a>>>,
+            >,
+        >,
+        pub schema_hash: u64,
+    }
+    impl<'a> Default for CartLayoutsArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            CartLayoutsArgs {
+                records: None,
+                buffers: None,
+                schema_hash: 0,
+            }
+        }
+    }
+
+    pub struct CartLayoutsBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+        fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> CartLayoutsBuilder<'a, 'b, A> {
+        #[inline]
+        pub fn add_records(
+            &mut self,
+            records: ::flatbuffers::WIPOffset<
+                ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<RecordDecl<'b>>>,
+            >,
+        ) {
+            self.fbb_
+                .push_slot_always::<::flatbuffers::WIPOffset<_>>(CartLayouts::VT_RECORDS, records);
+        }
+        #[inline]
+        pub fn add_buffers(
+            &mut self,
+            buffers: ::flatbuffers::WIPOffset<
+                ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<BufferDecl<'b>>>,
+            >,
+        ) {
+            self.fbb_
+                .push_slot_always::<::flatbuffers::WIPOffset<_>>(CartLayouts::VT_BUFFERS, buffers);
+        }
+        #[inline]
+        pub fn add_schema_hash(&mut self, schema_hash: u64) {
+            self.fbb_
+                .push_slot::<u64>(CartLayouts::VT_SCHEMA_HASH, schema_hash, 0);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        ) -> CartLayoutsBuilder<'a, 'b, A> {
+            let start = _fbb.start_table();
+            CartLayoutsBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> ::flatbuffers::WIPOffset<CartLayouts<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            ::flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl ::core::fmt::Debug for CartLayouts<'_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            let mut ds = f.debug_struct("CartLayouts");
+            ds.field("records", &self.records());
+            ds.field("buffers", &self.buffers());
+            ds.field("schema_hash", &self.schema_hash());
+            ds.finish()
+        }
+    }
+    #[inline]
+    /// Verifies that a buffer of bytes contains a `CartLayouts`
+    /// and returns it.
+    /// Note that verification is still experimental and may not
+    /// catch every error, or be maximally performant. For the
+    /// previous, unchecked, behavior use
+    /// `root_as_cart_layouts_unchecked`.
+    pub fn root_as_cart_layouts(
+        buf: &[u8],
+    ) -> Result<CartLayouts<'_>, ::flatbuffers::InvalidFlatbuffer> {
+        ::flatbuffers::root::<CartLayouts>(buf)
+    }
+    #[inline]
+    /// Verifies that a buffer of bytes contains a size prefixed
+    /// `CartLayouts` and returns it.
+    /// Note that verification is still experimental and may not
+    /// catch every error, or be maximally performant. For the
+    /// previous, unchecked, behavior use
+    /// `size_prefixed_root_as_cart_layouts_unchecked`.
+    pub fn size_prefixed_root_as_cart_layouts(
+        buf: &[u8],
+    ) -> Result<CartLayouts<'_>, ::flatbuffers::InvalidFlatbuffer> {
+        ::flatbuffers::size_prefixed_root::<CartLayouts>(buf)
+    }
+    #[inline]
+    /// Verifies, with the given options, that a buffer of bytes
+    /// contains a `CartLayouts` and returns it.
+    /// Note that verification is still experimental and may not
+    /// catch every error, or be maximally performant. For the
+    /// previous, unchecked, behavior use
+    /// `root_as_cart_layouts_unchecked`.
+    pub fn root_as_cart_layouts_with_opts<'b, 'o>(
+        opts: &'o ::flatbuffers::VerifierOptions,
+        buf: &'b [u8],
+    ) -> Result<CartLayouts<'b>, ::flatbuffers::InvalidFlatbuffer> {
+        ::flatbuffers::root_with_opts::<CartLayouts<'b>>(opts, buf)
+    }
+    #[inline]
+    /// Verifies, with the given verifier options, that a buffer of
+    /// bytes contains a size prefixed `CartLayouts` and returns
+    /// it. Note that verification is still experimental and may not
+    /// catch every error, or be maximally performant. For the
+    /// previous, unchecked, behavior use
+    /// `root_as_cart_layouts_unchecked`.
+    pub fn size_prefixed_root_as_cart_layouts_with_opts<'b, 'o>(
+        opts: &'o ::flatbuffers::VerifierOptions,
+        buf: &'b [u8],
+    ) -> Result<CartLayouts<'b>, ::flatbuffers::InvalidFlatbuffer> {
+        ::flatbuffers::size_prefixed_root_with_opts::<CartLayouts<'b>>(opts, buf)
+    }
+    #[inline]
+    /// Assumes, without verification, that a buffer of bytes contains a CartLayouts and returns it.
+    /// # Safety
+    /// Callers must trust the given bytes do indeed contain a valid `CartLayouts`.
+    pub unsafe fn root_as_cart_layouts_unchecked(buf: &[u8]) -> CartLayouts<'_> {
+        unsafe { ::flatbuffers::root_unchecked::<CartLayouts>(buf) }
+    }
+    #[inline]
+    /// Assumes, without verification, that a buffer of bytes contains a size prefixed CartLayouts and returns it.
+    /// # Safety
+    /// Callers must trust the given bytes do indeed contain a valid size prefixed `CartLayouts`.
+    pub unsafe fn size_prefixed_root_as_cart_layouts_unchecked(buf: &[u8]) -> CartLayouts<'_> {
+        unsafe { ::flatbuffers::size_prefixed_root_unchecked::<CartLayouts>(buf) }
+    }
+    #[inline]
+    pub fn finish_cart_layouts_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(
+        fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        root: ::flatbuffers::WIPOffset<CartLayouts<'a>>,
+    ) {
+        fbb.finish(root, None);
+    }
+
+    #[inline]
+    pub fn finish_size_prefixed_cart_layouts_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(
+        fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        root: ::flatbuffers::WIPOffset<CartLayouts<'a>>,
+    ) {
+        fbb.finish_size_prefixed(root, None);
+    }
+} // pub mod blyt

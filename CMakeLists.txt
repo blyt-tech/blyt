@@ -68,11 +68,9 @@ else()
     COMMAND
       "$<TARGET_FILE:flatcc_cli>" --common_reader --reader --verifier -o
       "${GENERATED_DIR}" "${SCHEMAS_DIR}/cart_info.fbs"
-      "${SCHEMAS_DIR}/cart_config.fbs"
-      "${SCHEMAS_DIR}/cart_layouts.fbs"
+      "${SCHEMAS_DIR}/cart_config.fbs" "${SCHEMAS_DIR}/cart_layouts.fbs"
     DEPENDS flatcc_cli "${SCHEMAS_DIR}/cart_info.fbs"
-            "${SCHEMAS_DIR}/cart_config.fbs"
-            "${SCHEMAS_DIR}/cart_layouts.fbs"
+            "${SCHEMAS_DIR}/cart_config.fbs" "${SCHEMAS_DIR}/cart_layouts.fbs"
     COMMENT "Generating FlatBuffers C headers"
     VERBATIM)
   add_custom_target(
@@ -1072,11 +1070,9 @@ if(NOT DEFINED BLYT_PREGENERATED_DIR)
     COMMAND
       "$<TARGET_FILE:flatcc_cli>" --common --reader --builder -o
       "${TEST_GENERATED_DIR}" "${SCHEMAS_DIR}/cart_info.fbs"
-      "${SCHEMAS_DIR}/cart_config.fbs"
-      "${SCHEMAS_DIR}/cart_layouts.fbs"
+      "${SCHEMAS_DIR}/cart_config.fbs" "${SCHEMAS_DIR}/cart_layouts.fbs"
     DEPENDS flatcc_cli "${SCHEMAS_DIR}/cart_info.fbs"
-            "${SCHEMAS_DIR}/cart_config.fbs"
-            "${SCHEMAS_DIR}/cart_layouts.fbs"
+            "${SCHEMAS_DIR}/cart_config.fbs" "${SCHEMAS_DIR}/cart_layouts.fbs"
     COMMENT "Generating FlatBuffers test builder headers"
     VERBATIM)
 

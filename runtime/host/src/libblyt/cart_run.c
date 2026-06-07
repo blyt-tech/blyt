@@ -1198,17 +1198,27 @@ static void blyt_ecall_handler(riscv_t *rv) {
         uint32_t value_bits = rv_get_reg(rv, rv_reg_a4);
 
         switch (op) {
-        case BUF_OP_GET_F32: case BUF_OP_GET_I32: case BUF_OP_GET_U32:
-        case BUF_OP_GET_I16: case BUF_OP_GET_U16: case BUF_OP_GET_I8:
-        case BUF_OP_GET_U8:  case BUF_OP_GET_BOOL: {
+        case BUF_OP_GET_F32:
+        case BUF_OP_GET_I32:
+        case BUF_OP_GET_U32:
+        case BUF_OP_GET_I16:
+        case BUF_OP_GET_U16:
+        case BUF_OP_GET_I8:
+        case BUF_OP_GET_U8:
+        case BUF_OP_GET_BOOL: {
             uint32_t bits = 0;
             blyt_state_get(sc, buf_id, slot, field, &bits);
             rv_set_reg(rv, rv_reg_a0, bits);
             break;
         }
-        case BUF_OP_SET_F32: case BUF_OP_SET_I32: case BUF_OP_SET_U32:
-        case BUF_OP_SET_I16: case BUF_OP_SET_U16: case BUF_OP_SET_I8:
-        case BUF_OP_SET_U8:  case BUF_OP_SET_BOOL: {
+        case BUF_OP_SET_F32:
+        case BUF_OP_SET_I32:
+        case BUF_OP_SET_U32:
+        case BUF_OP_SET_I16:
+        case BUF_OP_SET_U16:
+        case BUF_OP_SET_I8:
+        case BUF_OP_SET_U8:
+        case BUF_OP_SET_BOOL: {
             /* type_tag = (op / 2) - 1: SET_F32=2→0 (f32=6), etc.
              * We rely on the field declaration's type_tag in blyt_state_set. */
             blyt_state_set(sc, buf_id, slot, field, value_bits, 0);
@@ -1248,8 +1258,8 @@ static void blyt_ecall_handler(riscv_t *rv) {
         uint32_t slot_n = rv_get_reg(rv, rv_reg_a0);
         int r = -1;
         if (g_run_ctx && g_run_ctx->state_ctx && g_run_ctx->save_dir) {
-            r = blyt_save_write(g_run_ctx->state_ctx, g_run_ctx->save_dir,
-                                g_run_ctx->cart_name, slot_n);
+            r = blyt_save_write(g_run_ctx->state_ctx, g_run_ctx->save_dir, g_run_ctx->cart_name,
+                                slot_n);
         }
         rv_set_reg(rv, rv_reg_a0, r == 0 ? 0u : 3u); /* BLYT_ERR_IO=3 */
         rv->PC += 4;
@@ -1261,8 +1271,8 @@ static void blyt_ecall_handler(riscv_t *rv) {
         uint32_t slot_n = rv_get_reg(rv, rv_reg_a0);
         int r = -1;
         if (g_run_ctx && g_run_ctx->state_ctx && g_run_ctx->save_dir) {
-            r = blyt_save_read(g_run_ctx->state_ctx, g_run_ctx->save_dir,
-                               g_run_ctx->cart_name, slot_n);
+            r = blyt_save_read(g_run_ctx->state_ctx, g_run_ctx->save_dir, g_run_ctx->cart_name,
+                               slot_n);
         }
         /* r==0 → BLYT_OK=0, r==-1 → BLYT_ERR_IO=3, r==-2 → BLYT_ERR_SCHEMA_MISMATCH=5 */
         uint32_t result = (r == 0) ? 0u : (r == -2) ? 5u : 3u;
@@ -1947,7 +1957,8 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     {
         const char *base = cart->path ? cart->path : "cart";
         const char *slash = strrchr(base, '/');
-        if (slash) base = slash + 1;
+        if (slash)
+            base = slash + 1;
         size_t n = strlen(base);
         /* Strip .blyt or .dbg.blyt suffix */
         if (n > 10 && strcmp(base + n - 10, ".dbg.blyt") == 0)
@@ -1967,7 +1978,8 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
             s->ctx.save_dir = strdup(env_dir);
         } else {
             const char *home = getenv("HOME");
-            if (!home) home = "/tmp";
+            if (!home)
+                home = "/tmp";
             char buf[512];
             snprintf(buf, sizeof(buf), "%s/.local/share/blyt", home);
             s->ctx.save_dir = strdup(buf);

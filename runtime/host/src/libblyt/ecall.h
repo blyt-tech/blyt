@@ -40,7 +40,7 @@
  * SAVE_WRITE: a0=slot; returns blyt_result_t in a0.
  * SAVE_READ:  a0=slot; returns blyt_result_t in a0; fires on_load_state. */
 #define BLYT_ECALL_SAVE_WRITE 11
-#define BLYT_ECALL_SAVE_READ  12
+#define BLYT_ECALL_SAVE_READ 12
 
 /* State buffer op (ADR-0009, ADR-0057, ADR-0058).
  * a0 = sub-opcode (BUF_OP_*), remaining args per sub-opcode below.
@@ -51,24 +51,24 @@
 
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool */
-#define BUF_OP_GET_F32   1
-#define BUF_OP_SET_F32   2
-#define BUF_OP_GET_I32   3
-#define BUF_OP_SET_I32   4
-#define BUF_OP_GET_U32   5
-#define BUF_OP_SET_U32   6
-#define BUF_OP_GET_I16   7
-#define BUF_OP_SET_I16   8
-#define BUF_OP_GET_U16   9
-#define BUF_OP_SET_U16  10
-#define BUF_OP_GET_I8   11
-#define BUF_OP_SET_I8   12
-#define BUF_OP_GET_U8   13
-#define BUF_OP_SET_U8   14
+#define BUF_OP_GET_F32 1
+#define BUF_OP_SET_F32 2
+#define BUF_OP_GET_I32 3
+#define BUF_OP_SET_I32 4
+#define BUF_OP_GET_U32 5
+#define BUF_OP_SET_U32 6
+#define BUF_OP_GET_I16 7
+#define BUF_OP_SET_I16 8
+#define BUF_OP_GET_U16 9
+#define BUF_OP_SET_U16 10
+#define BUF_OP_GET_I8 11
+#define BUF_OP_SET_I8 12
+#define BUF_OP_GET_U8 13
+#define BUF_OP_SET_U8 14
 #define BUF_OP_GET_BOOL 15
 #define BUF_OP_SET_BOOL 16
 #define BUF_OP_ALLOC_SLOT 17
-#define BUF_OP_FREE_SLOT  18
+#define BUF_OP_FREE_SLOT 18
 
 /* Lua C API bridge op (ADR-0130, WASM hybrid carts only).
  * Issued by the bridge-stub variant of libblyt32lua.so while a bridged

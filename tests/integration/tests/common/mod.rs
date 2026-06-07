@@ -549,12 +549,7 @@ pub fn run_cart_native_with_env(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let output = cmd
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+    let output = cmd.assert().success().get_output().stdout.clone();
     assert!(
         String::from_utf8_lossy(&output).contains(expected),
         "expected {:?} in native output, got: {}",

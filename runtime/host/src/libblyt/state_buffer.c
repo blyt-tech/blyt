@@ -14,13 +14,13 @@
 #include "cart_layouts_reader.h"
 
 /* type_tag encoding (must match ecall.h and config.rs) */
-#define TYPE_I8   0
-#define TYPE_U8   1
-#define TYPE_I16  2
-#define TYPE_U16  3
-#define TYPE_I32  4
-#define TYPE_U32  5
-#define TYPE_F32  6
+#define TYPE_I8 0
+#define TYPE_U8 1
+#define TYPE_I16 2
+#define TYPE_U16 3
+#define TYPE_I32 4
+#define TYPE_U32 5
+#define TYPE_F32 6
 #define TYPE_BOOL 7
 
 /* Canonical NaN bit pattern for f32 writes (ADR-0010). */
@@ -159,8 +159,7 @@ static int slot_is_allocated(const blyt_buffer_ctx_t *bc, int32_t slot) {
  * Get/set
  * ------------------------------------------------------------------------- */
 
-int blyt_state_get(const blyt_state_ctx_t *ctx,
-                   uint32_t buf_id, int32_t slot, uint32_t field,
+int blyt_state_get(const blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
                    uint32_t *out_bits) {
     blyt_buffer_ctx_t *bc = find_buffer((blyt_state_ctx_t *)ctx, buf_id);
     if (!bc)
@@ -181,8 +180,7 @@ int blyt_state_get(const blyt_state_ctx_t *ctx,
     return 0;
 }
 
-int blyt_state_set(blyt_state_ctx_t *ctx,
-                   uint32_t buf_id, int32_t slot, uint32_t field,
+int blyt_state_set(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
                    uint32_t value_bits, uint8_t type_tag) {
     blyt_buffer_ctx_t *bc = find_buffer(ctx, buf_id);
     if (!bc)
@@ -214,8 +212,7 @@ int blyt_state_set(blyt_state_ctx_t *ctx,
  * Slot management
  * ------------------------------------------------------------------------- */
 
-int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id,
-                          int32_t *out_slot) {
+int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t *out_slot) {
     blyt_buffer_ctx_t *bc = find_buffer(ctx, buf_id);
     if (!bc)
         return -1;
@@ -231,8 +228,7 @@ int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id,
     return -1;
 }
 
-int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id,
-                         int32_t slot) {
+int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot) {
     blyt_buffer_ctx_t *bc = find_buffer(ctx, buf_id);
     if (!bc)
         return -1;

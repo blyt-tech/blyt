@@ -9,7 +9,7 @@ use crate::cart_layouts_generated::blyt::{
     BufferDecl, BufferDeclArgs, CartLayouts, CartLayoutsArgs, FieldDecl, FieldDeclArgs, RecordDecl,
     RecordDeclArgs,
 };
-use crate::config::{flatten_record, CartConfig, FlatField};
+use crate::config::{CartConfig, FlatField, flatten_record};
 use flatbuffers::FlatBufferBuilder;
 
 /* -------------------------------------------------------------------------
@@ -142,10 +142,10 @@ fn cart_layouts_bytes(cfg: &CartConfig) -> Vec<u8> {
  * ------------------------------------------------------------------------- */
 
 struct CartStateFiles {
-    c_header: PathBuf,       /* build/blyt/c/cart_state.h */
-    rust_module: PathBuf,    /* build/blyt/rust/cart_state.rs */
-    layouts_bin: PathBuf,    /* build/cart.layouts.bin */
-    c_include_dir: PathBuf,  /* build/blyt/c/ */
+    c_header: PathBuf,      /* build/blyt/c/cart_state.h */
+    rust_module: PathBuf,   /* build/blyt/rust/cart_state.rs */
+    layouts_bin: PathBuf,   /* build/cart.layouts.bin */
+    c_include_dir: PathBuf, /* build/blyt/c/ */
     /// C function body for register_cart_state_S(); empty when no buffers.
     lua_c_snippet: String,
     buffers_present: bool,
@@ -156,9 +156,7 @@ fn generate_cart_state(
     build_dir: &Path,
     cfg: &CartConfig,
 ) -> Result<CartStateFiles, BuildError> {
-    use crate::config::{
-        type_tag_buf_get_suffix, type_tag_c_type, type_tag_rust_type,
-    };
+    use crate::config::{type_tag_buf_get_suffix, type_tag_c_type, type_tag_rust_type};
 
     let blyt_dir = build_dir.join("blyt");
     let c_dir = blyt_dir.join("c");
@@ -212,8 +210,7 @@ fn generate_cart_state(
         /* Resolve flat fields for this buffer's record */
         let mut visiting = Vec::new();
         let fields: Vec<FlatField> =
-            flatten_record(&buf_decl.record, &cfg.records, &mut visiting)
-                .map_err(|e| err(e))?;
+            flatten_record(&buf_decl.record, &cfg.records, &mut visiting).map_err(|e| err(e))?;
 
         for f in &fields {
             /* C/Rust name: S_BUFNAME_FIELDNAME; Lua key: BUFNAME_FIELDNAME */
@@ -267,7 +264,11 @@ fn generate_cart_state(
         rust_module: rs_path,
         layouts_bin,
         c_include_dir: c_dir,
-        lua_c_snippet: if buffers_present { lua_c } else { String::new() },
+        lua_c_snippet: if buffers_present {
+            lua_c
+        } else {
+            String::new()
+        },
         buffers_present,
     })
 }
@@ -674,8 +675,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     fs::write(&cart_info_file, cart_info_bytes(debug))?;
 
     /* Parse blyt.config.yaml and generate state buffer codegen artifacts. */
-    let cart_config =
-        crate::config::read_cart_config(project_dir).map_err(|e| err(e))?;
+    let cart_config = crate::config::read_cart_config(project_dir).map_err(|e| err(e))?;
     let cart_state = generate_cart_state(project_dir, &build_dir, &cart_config)?;
 
     /* Generate the cart entry point stub.  _blyt_entry is the ELF e_entry:
@@ -782,7 +782,9 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         if cart_state.buffers_present {
             glue.push_str(&cart_state.lua_c_snippet);
         }
-        glue.push_str("/* Defined by the linker script via PROVIDE; not synthesised at link time. */\n");
+        glue.push_str(
+            "/* Defined by the linker script via PROVIDE; not synthesised at link time. */\n",
+        );
         glue.push_str("extern blyt_lua_regtab_entry_t __start_lua_regtab[];\n");
         glue.push_str("extern blyt_lua_regtab_entry_t __stop_lua_regtab[];\n");
         glue.push_str("void cart_lua_modules(lua_State *L) {\n");

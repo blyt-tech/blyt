@@ -77,7 +77,8 @@ fn rust_cart_state_buffer_round_trips() {
 
     CartProject::new()
         .config(CART_CONFIG)
-        .rust(r#"#![no_std]
+        .rust(
+            r#"#![no_std]
 include!(env!("BLYT_CART_STATE_RS"));
 
 use blyt::buffer::{alloc_slot, get_i32, set_i32};
@@ -105,7 +106,8 @@ pub extern "C" fn blyt_cart_update() {
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_draw() {}
-"#)
+"#,
+        )
         .write(&project);
 
     let cart = build_cart(&project);
@@ -130,7 +132,8 @@ fn lua_cart_state_buffer_round_trips() {
 
     CartProject::new()
         .config(CART_CONFIG)
-        .lua(r#"
+        .lua(
+            r#"
 -- S is the generated constants module (require("S") or global S).
 local slot = -1
 
@@ -149,7 +152,8 @@ function update()
 end
 
 function draw() end
-"#)
+"#,
+        )
         .write(&project);
 
     let cart = build_lua_cart(&project);
@@ -174,7 +178,8 @@ fn cpp_cart_state_buffer_round_trips() {
 
     CartProject::new()
         .config(CART_CONFIG)
-        .cpp(r#"
+        .cpp(
+            r#"
 #include "blyt.h"
 #include "cart_state.h"
 #include <cstdio>
@@ -197,7 +202,8 @@ extern "C" void blyt_cart_update() {
 }
 
 extern "C" void blyt_cart_draw() {}
-"#)
+"#,
+        )
         .write(&project);
 
     let cart = build_cart(&project);

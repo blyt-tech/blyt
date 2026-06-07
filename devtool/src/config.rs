@@ -228,10 +228,9 @@ pub fn read_cart_config(project_dir: &Path) -> Result<CartConfig, String> {
     if !path.exists() {
         return Ok(CartConfig::default());
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("blyt.config.yaml: {e}"))?;
-    let cfg: CartConfig = serde_yaml::from_str(&text)
-        .map_err(|e| format!("blyt.config.yaml: {e}"))?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("blyt.config.yaml: {e}"))?;
+    let cfg: CartConfig =
+        serde_yaml::from_str(&text).map_err(|e| format!("blyt.config.yaml: {e}"))?;
 
     // Validate all state_buffer record references
     for (buf_name, buf) in &cfg.state_buffers {
@@ -246,8 +245,7 @@ pub fn read_cart_config(project_dir: &Path) -> Result<CartConfig, String> {
     // Validate all field type names (detect cycles + unknown types)
     for (rec_name, _) in &cfg.records {
         let mut visiting = Vec::new();
-        flatten_record(rec_name, &cfg.records, &mut visiting)
-            .map_err(|e| e)?;
+        flatten_record(rec_name, &cfg.records, &mut visiting).map_err(|e| e)?;
     }
 
     Ok(cfg)

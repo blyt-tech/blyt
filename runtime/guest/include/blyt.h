@@ -32,9 +32,9 @@ typedef enum {
  * ------------------------------------------------------------------------- */
 typedef uint32_t blyt_buffer_h;
 typedef uint32_t blyt_field_h;
-#define BLYT_FIELD_NONE    ((blyt_field_h)0)
+#define BLYT_FIELD_NONE ((blyt_field_h)0)
 #define BLYT_FIELD_INDEX(fh) ((uint32_t)((fh) & 0xFFFFu))
-#define BLYT_INVALID_SLOT  ((int32_t)-1)
+#define BLYT_INVALID_SLOT ((int32_t)-1)
 
 /* -------------------------------------------------------------------------
  * State buffer API (ADR-0009, ADR-0010, ADR-0057, ADR-0058)
@@ -46,51 +46,51 @@ typedef uint32_t blyt_field_h;
  * f32 writes NaN-canonicalize to 0x7FC00000 (ADR-0010).
  * All functions are no-ops on invalid buf/slot/field; debug builds assert.
  * ------------------------------------------------------------------------- */
-float    blyt_buffer_get_f32 (blyt_buffer_h buf, int32_t slot, blyt_field_h field);
-void     blyt_buffer_set_f32 (blyt_buffer_h buf, int32_t slot, blyt_field_h field, float v);
-int32_t  blyt_buffer_get_i32 (blyt_buffer_h buf, int32_t slot, blyt_field_h field);
-void     blyt_buffer_set_i32 (blyt_buffer_h buf, int32_t slot, blyt_field_h field, int32_t v);
-uint32_t blyt_buffer_get_u32 (blyt_buffer_h buf, int32_t slot, blyt_field_h field);
-void     blyt_buffer_set_u32 (blyt_buffer_h buf, int32_t slot, blyt_field_h field, uint32_t v);
-int16_t  blyt_buffer_get_i16 (blyt_buffer_h buf, int32_t slot, blyt_field_h field);
-void     blyt_buffer_set_i16 (blyt_buffer_h buf, int32_t slot, blyt_field_h field, int16_t v);
-uint16_t blyt_buffer_get_u16 (blyt_buffer_h buf, int32_t slot, blyt_field_h field);
-void     blyt_buffer_set_u16 (blyt_buffer_h buf, int32_t slot, blyt_field_h field, uint16_t v);
-int8_t   blyt_buffer_get_i8  (blyt_buffer_h buf, int32_t slot, blyt_field_h field);
-void     blyt_buffer_set_i8  (blyt_buffer_h buf, int32_t slot, blyt_field_h field, int8_t v);
-uint8_t  blyt_buffer_get_u8  (blyt_buffer_h buf, int32_t slot, blyt_field_h field);
-void     blyt_buffer_set_u8  (blyt_buffer_h buf, int32_t slot, blyt_field_h field, uint8_t v);
-bool     blyt_buffer_get_bool(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
-void     blyt_buffer_set_bool(blyt_buffer_h buf, int32_t slot, blyt_field_h field, bool v);
+float blyt_buffer_get_f32(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_f32(blyt_buffer_h buf, int32_t slot, blyt_field_h field, float v);
+int32_t blyt_buffer_get_i32(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_i32(blyt_buffer_h buf, int32_t slot, blyt_field_h field, int32_t v);
+uint32_t blyt_buffer_get_u32(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_u32(blyt_buffer_h buf, int32_t slot, blyt_field_h field, uint32_t v);
+int16_t blyt_buffer_get_i16(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_i16(blyt_buffer_h buf, int32_t slot, blyt_field_h field, int16_t v);
+uint16_t blyt_buffer_get_u16(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_u16(blyt_buffer_h buf, int32_t slot, blyt_field_h field, uint16_t v);
+int8_t blyt_buffer_get_i8(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_i8(blyt_buffer_h buf, int32_t slot, blyt_field_h field, int8_t v);
+uint8_t blyt_buffer_get_u8(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_u8(blyt_buffer_h buf, int32_t slot, blyt_field_h field, uint8_t v);
+bool blyt_buffer_get_bool(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_bool(blyt_buffer_h buf, int32_t slot, blyt_field_h field, bool v);
 
 /* Slot lifecycle (ADR-0058) */
 blyt_result_t blyt_buffer_alloc_slot(blyt_buffer_h buf, int32_t *out_slot);
-blyt_result_t blyt_buffer_free_slot (blyt_buffer_h buf, int32_t slot);
+blyt_result_t blyt_buffer_free_slot(blyt_buffer_h buf, int32_t slot);
 
 /* -------------------------------------------------------------------------
  * Save/load (ADR-0087, ADR-0125)
  * ------------------------------------------------------------------------- */
 blyt_result_t blyt_save_write(uint32_t slot);
-blyt_result_t blyt_save_read (uint32_t slot);
+blyt_result_t blyt_save_read(uint32_t slot);
 
 /* -------------------------------------------------------------------------
  * Cart lifecycle types for save/load callbacks (ADR-0087 amendment)
  * ------------------------------------------------------------------------- */
 typedef enum {
-    BLYT_LOAD_SAVE_GAME  = 0,
+    BLYT_LOAD_SAVE_GAME = 0,
     BLYT_LOAD_SAVE_STATE = 1,
-    BLYT_LOAD_REWIND     = 2,
+    BLYT_LOAD_REWIND = 2,
     BLYT_LOAD_HOT_RELOAD = 3,
 } blyt_load_reason_t;
 
 typedef struct {
-    bool        was_restored;    /* false if buffer was entirely absent from save */
+    bool was_restored; /* false if buffer was entirely absent from save */
     const bool *fields_restored; /* [BLYT_FIELD_INDEX(field_h)] — NULL if !was_restored */
 } blyt_buffer_load_info_t;
 
 typedef struct {
-    blyt_load_reason_t             reason;
-    uint32_t                       saved_cart_version;
+    blyt_load_reason_t reason;
+    uint32_t saved_cart_version;
     const blyt_buffer_load_info_t *buffers; /* indexed by blyt_buffer_h (1-based) */
 } blyt_load_info_t;
 

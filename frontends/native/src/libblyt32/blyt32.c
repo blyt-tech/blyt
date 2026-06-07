@@ -112,6 +112,126 @@ __attribute__((noreturn)) void blyt_exit(int code) {
     blyt_rs_exit_group(code);
 }
 
+/* State buffer and save/load stubs — not implemented on the native path.
+ * The native trusted-exec cart runs without a host runtime, so there is no
+ * SOA backing store or save-file infrastructure.  These stubs satisfy the
+ * dynamic linker (libblyt32lua.so needs them) and return BLYT_ERR_INVALID_ARG
+ * so Lua cart code that calls them gets a defined error result. */
+float blyt_buffer_get_f32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    (void)b;
+    (void)s;
+    (void)f;
+    return 0.0f;
+}
+void blyt_buffer_set_f32(blyt_buffer_h b, int32_t s, blyt_field_h f, float v) {
+    (void)b;
+    (void)s;
+    (void)f;
+    (void)v;
+}
+int32_t blyt_buffer_get_i32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    (void)b;
+    (void)s;
+    (void)f;
+    return 0;
+}
+void blyt_buffer_set_i32(blyt_buffer_h b, int32_t s, blyt_field_h f, int32_t v) {
+    (void)b;
+    (void)s;
+    (void)f;
+    (void)v;
+}
+uint32_t blyt_buffer_get_u32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    (void)b;
+    (void)s;
+    (void)f;
+    return 0;
+}
+void blyt_buffer_set_u32(blyt_buffer_h b, int32_t s, blyt_field_h f, uint32_t v) {
+    (void)b;
+    (void)s;
+    (void)f;
+    (void)v;
+}
+int16_t blyt_buffer_get_i16(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    (void)b;
+    (void)s;
+    (void)f;
+    return 0;
+}
+void blyt_buffer_set_i16(blyt_buffer_h b, int32_t s, blyt_field_h f, int16_t v) {
+    (void)b;
+    (void)s;
+    (void)f;
+    (void)v;
+}
+uint16_t blyt_buffer_get_u16(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    (void)b;
+    (void)s;
+    (void)f;
+    return 0;
+}
+void blyt_buffer_set_u16(blyt_buffer_h b, int32_t s, blyt_field_h f, uint16_t v) {
+    (void)b;
+    (void)s;
+    (void)f;
+    (void)v;
+}
+int8_t blyt_buffer_get_i8(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    (void)b;
+    (void)s;
+    (void)f;
+    return 0;
+}
+void blyt_buffer_set_i8(blyt_buffer_h b, int32_t s, blyt_field_h f, int8_t v) {
+    (void)b;
+    (void)s;
+    (void)f;
+    (void)v;
+}
+uint8_t blyt_buffer_get_u8(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    (void)b;
+    (void)s;
+    (void)f;
+    return 0;
+}
+void blyt_buffer_set_u8(blyt_buffer_h b, int32_t s, blyt_field_h f, uint8_t v) {
+    (void)b;
+    (void)s;
+    (void)f;
+    (void)v;
+}
+bool blyt_buffer_get_bool(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    (void)b;
+    (void)s;
+    (void)f;
+    return false;
+}
+void blyt_buffer_set_bool(blyt_buffer_h b, int32_t s, blyt_field_h f, bool v) {
+    (void)b;
+    (void)s;
+    (void)f;
+    (void)v;
+}
+blyt_result_t blyt_buffer_alloc_slot(blyt_buffer_h b, int32_t *out_slot) {
+    (void)b;
+    (void)out_slot;
+    return BLYT_ERR_INVALID_ARG;
+}
+blyt_result_t blyt_buffer_free_slot(blyt_buffer_h b, int32_t s) {
+    (void)b;
+    (void)s;
+    return BLYT_ERR_INVALID_ARG;
+}
+blyt_result_t blyt_save_write(uint32_t slot) {
+    (void)slot;
+    return BLYT_ERR_INVALID_ARG;
+}
+blyt_result_t blyt_save_read(uint32_t slot) {
+    (void)slot;
+    return BLYT_ERR_INVALID_ARG;
+}
+
 /* blyt_console_debug — SYS_write(fd=2, s, len).
  * write(2) is NR 64, in the restricted allowlist. */
 void blyt_console_debug(const char *s) {
