@@ -263,6 +263,149 @@ fn lua_cart_calls_cpp_lib_wasm() {
     run_cart_wasm(&cart, "lua+cpp ok");
 }
 
+// -------------------------------------------------------------------------
+// Raw (bridged) exports — ADR-0130
+//
+// BLYT_LUA_MODULE_EXPORT_RAW / #[lua_export(module = ..., raw)]: the author
+// writes the lua_CFunction-shaped wrapper directly against the restricted
+// Lua C API — strings, multiple returns.  Real Lua C API on rv32; the same
+// wrapper runs ECALL-bridged on WASM (BLYT_LUA_EXPORT_FLAG_BRIDGED).
+// -------------------------------------------------------------------------
+
+fn build_lua_c_raw_string_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_raw_string");
+    CartProject::new()
+        .lib_file(
+            "strlib",
+            "strlib.c",
+            r#"#include "blyt.h"
+
+BLYT_LUA_MODULE_EXPORT_RAW(strlib, echo) {
+    size_t_blyt len = 0;
+    const char *s = luaL_checklstring(L, 1, &len);
+    blyt_console_debug(s);
+    lua_pushlstring(L, s, len);
+    lua_pushinteger(L, (lua_Integer)len);
+    return 2;
+}
+"#,
+        )
+        .lua(
+            r#"
+function init()
+    local m = require("strlib")
+    local s, n = m.echo("frame " .. 42)
+    if s == "frame 42" and n == 8 then
+        blyt32.debug.print("lua+c raw ok")
+    else
+        blyt32.debug.print("lua+c raw wrong: " .. tostring(s) .. " " .. tostring(n))
+    end
+end
+
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_cart_calls_c_raw_string() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_raw_string_cart(tmp.path());
+    run_cart_native(&cart, "lua+c raw ok");
+}
+
+#[test]
+fn lua_cart_calls_c_raw_string_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_raw_string_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+c raw ok");
+}
+
+fn build_lua_rust_raw_string_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_rust_raw_string");
+    CartProject::new()
+        .rust(
+            r#"#![no_std]
+extern crate blyt;
+use blyt::lua::{capi, lua_export, LuaState};
+use core::ffi::c_char;
+
+extern "C" {
+    fn blyt_console_debug(s: *const c_char);
+}
+
+// () return: no results pushed.
+#[lua_export(module = "strlib", raw)]
+fn log(l: LuaState) {
+    unsafe {
+        let s = capi::luaL_checklstring(l, 1, core::ptr::null_mut());
+        blyt_console_debug(s);
+    }
+}
+
+// i32 return: the Lua result count.
+#[lua_export(module = "strlib", raw)]
+fn echo(l: LuaState) -> i32 {
+    unsafe {
+        let mut len: usize = 0;
+        let s = capi::luaL_checklstring(l, 1, &mut len);
+        capi::lua_pushlstring(l, s, len);
+        capi::lua_pushinteger(l, len as i32);
+    }
+    2
+}
+"#,
+        )
+        .lua(
+            r#"
+function init()
+    local m = require("strlib")
+    m.log("hello via raw log")
+    local s, n = m.echo("frame " .. 42)
+    if s == "frame 42" and n == 8 then
+        blyt32.debug.print("lua+rust raw ok")
+    else
+        blyt32.debug.print("lua+rust raw wrong: " .. tostring(s) .. " " .. tostring(n))
+    end
+end
+
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_cart_calls_rust_raw_string() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_raw_string_cart(tmp.path());
+    run_cart_native(&cart, "lua+rust raw ok");
+}
+
+#[test]
+fn lua_cart_calls_rust_raw_string_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_raw_string_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+rust raw ok");
+}
+
 /// The portable cross-runtime pattern: C code receives a value as an argument
 /// rather than reading Lua globals via lua_getglobal (which is WASM-incompatible).
 fn build_c_increment_cart(tmp: &std::path::Path) -> std::path::PathBuf {

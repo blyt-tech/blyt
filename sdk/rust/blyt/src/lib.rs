@@ -118,7 +118,8 @@ pub mod lua {
         pub nargs:     u8,
         pub arg_types: [u8; 4],
         pub ret_type:  u8,
-        pub pad:       [u8; 2],
+        pub flags:     u8,
+        pub pad:       u8,
     }
 
     pub const LUA_TYPE_VOID: u8 = 0;
@@ -126,6 +127,74 @@ pub mod lua {
     pub const LUA_TYPE_U32:  u8 = 2;
     pub const LUA_TYPE_F32:  u8 = 3;
     pub const LUA_TYPE_BOOL: u8 = 4;
+
+    // BLYT_LUA_EXPORT_FLAG_BRIDGED (ADR-0130): the WASM host invokes the
+    // wrapper through the ECALL-bridged Lua C API instead of typed register
+    // conversion — enables strings, tables, >4 args, and multiple returns.
+    pub const LUA_EXPORT_FLAG_BRIDGED: u8 = 0x01;
+
+    /// Opaque Lua state token passed to raw `#[lua_export(..., raw)]` bodies.
+    /// On rv32 it is a real `lua_State *`; on WASM it is an opaque per-call
+    /// token understood by the ECALL bridge (libblyt32lua-bridge.so).
+    pub type LuaState = *mut ::core::ffi::c_void;
+
+    /// Restricted Lua C API for raw `#[lua_export(..., raw)]` wrapper bodies.
+    /// Mirrors runtime/guest/include/blyt_lua_internal.h (the blyt32lua.sym
+    /// surface): Lua 5.4 with LUA_32BITS=1, so lua_Integer = i32 and
+    /// lua_Number = f32.  Deliberately omits code-loading and call entry
+    /// points — cart code communicates with Lua exclusively through the
+    /// export boundary.
+    pub mod capi {
+        use super::LuaState;
+        use core::ffi::{c_char, c_int};
+
+        pub const LUA_TNONE: c_int = -1;
+        pub const LUA_TNIL: c_int = 0;
+        pub const LUA_TBOOLEAN: c_int = 1;
+        pub const LUA_TLIGHTUSERDATA: c_int = 2;
+        pub const LUA_TNUMBER: c_int = 3;
+        pub const LUA_TSTRING: c_int = 4;
+        pub const LUA_TTABLE: c_int = 5;
+        pub const LUA_TFUNCTION: c_int = 6;
+        pub const LUA_TUSERDATA: c_int = 7;
+        pub const LUA_TTHREAD: c_int = 8;
+
+        extern "C" {
+            // Stack inspection / manipulation.
+            pub fn lua_gettop(l: LuaState) -> c_int;
+            pub fn lua_settop(l: LuaState, idx: c_int);
+            pub fn lua_type(l: LuaState, idx: c_int) -> c_int;
+            pub fn lua_typename(l: LuaState, tp: c_int) -> *const c_char;
+
+            // Argument extraction.
+            pub fn lua_tointegerx(l: LuaState, idx: c_int, isnum: *mut c_int) -> i32;
+            pub fn lua_tonumberx(l: LuaState, idx: c_int, isnum: *mut c_int) -> f32;
+            pub fn lua_toboolean(l: LuaState, idx: c_int) -> c_int;
+            pub fn lua_tolstring(l: LuaState, idx: c_int, len: *mut usize) -> *const c_char;
+            pub fn luaL_checkinteger(l: LuaState, arg: c_int) -> i32;
+            pub fn luaL_checknumber(l: LuaState, arg: c_int) -> f32;
+            pub fn luaL_checklstring(l: LuaState, arg: c_int, len: *mut usize) -> *const c_char;
+
+            // Result push.
+            pub fn lua_pushinteger(l: LuaState, n: i32);
+            pub fn lua_pushnumber(l: LuaState, n: f32);
+            pub fn lua_pushboolean(l: LuaState, b: c_int);
+            pub fn lua_pushnil(l: LuaState);
+            pub fn lua_pushstring(l: LuaState, s: *const c_char) -> *const c_char;
+            pub fn lua_pushlstring(l: LuaState, s: *const c_char, len: usize) -> *const c_char;
+
+            // Tables.
+            pub fn lua_createtable(l: LuaState, narr: c_int, nrec: c_int);
+            pub fn lua_geti(l: LuaState, idx: c_int, i: i32) -> c_int;
+            pub fn lua_seti(l: LuaState, idx: c_int, i: i32);
+            pub fn lua_rawlen(l: LuaState, idx: c_int) -> u32;
+            pub fn lua_next(l: LuaState, idx: c_int) -> c_int;
+
+            // Errors.  lua_error never returns; luaL_error is variadic.
+            pub fn lua_error(l: LuaState) -> c_int;
+            pub fn luaL_error(l: LuaState, fmt: *const c_char, ...) -> c_int;
+        }
+    }
 
     // Used by proc-macro generated statics to build BlytLuaExportEntry at
     // compile time without requiring heap allocation.

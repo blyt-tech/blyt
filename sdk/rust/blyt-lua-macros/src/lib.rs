@@ -8,29 +8,41 @@ use syn::{
 
 /* -------------------------------------------------------------------------
  * Attribute arguments: #[lua_export], #[lua_export(name = "foo")],
- *                      or #[lua_export(module = "mylib")]
+ *                      #[lua_export(module = "mylib")], optionally with a
+ *                      trailing `raw` flag: #[lua_export(module = "m", raw)]
  * ------------------------------------------------------------------------- */
 
 struct MacroArgs {
     lua_name: Option<String>,
     module:   Option<String>,
+    raw:      bool,
 }
 
 impl Parse for MacroArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        if input.is_empty() {
-            return Ok(MacroArgs { lua_name: None, module: None });
+        let mut args = MacroArgs { lua_name: None, module: None, raw: false };
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            if key == "raw" {
+                args.raw = true;
+            } else if key == "name" || key == "module" {
+                let _: Token![=] = input.parse()?;
+                let lit: LitStr = input.parse()?;
+                if key == "name" {
+                    args.lua_name = Some(lit.value());
+                } else {
+                    args.module = Some(lit.value());
+                }
+            } else {
+                return Err(syn::Error::new(key.span(),
+                    "expected `name = \"...\"`, `module = \"...\"`, or `raw`"));
+            }
+            if input.is_empty() {
+                break;
+            }
+            let _: Token![,] = input.parse()?;
         }
-        let key: syn::Ident = input.parse()?;
-        let _: Token![=] = input.parse()?;
-        let lit: LitStr = input.parse()?;
-        if key == "name" {
-            Ok(MacroArgs { lua_name: Some(lit.value()), module: None })
-        } else if key == "module" {
-            Ok(MacroArgs { lua_name: None, module: Some(lit.value()) })
-        } else {
-            Err(syn::Error::new(key.span(), "expected `name = \"...\"` or `module = \"...\"`"))
-        }
+        Ok(args)
     }
 }
 
@@ -199,6 +211,11 @@ fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
         let n = args.lua_name.unwrap_or_else(|| fn_name_s.clone());
         (n.clone(), n)
     };
+
+    /* Raw exports (ADR-0130) take an entirely different shape; see below. */
+    if args.raw {
+        return lua_export_raw_impl(func, &sym_name_s, &lua_name, module_s.as_deref());
+    }
 
     /* ------------------------------------------------------------------
      * Parse return type
@@ -392,7 +409,140 @@ fn lua_export_impl(args: MacroArgs, func: ItemFn) -> syn::Result<TokenStream2> {
             nargs:     #nargs_lit,
             arg_types: [#at0, #at1, #at2, #at3],
             ret_type:  #ret_type_lit,
-            pad:       [0, 0],
+            flags:     0,
+            pad:       0,
+        };
+    })
+}
+
+/* -------------------------------------------------------------------------
+ * Raw exports (ADR-0130) — Rust counterpart of BLYT_LUA_MODULE_EXPORT_RAW.
+ *
+ * The user writes the lua_CFunction-shaped wrapper body directly against the
+ * restricted Lua C API (blyt::lua::capi) — strings, tables, any number of
+ * arguments, multiple returns:
+ *
+ *   #[lua_export(module = "greeting", raw)]
+ *   fn log(l: LuaState) {                       // or: -> i32 (result count)
+ *       unsafe { ... luaL_checklstring(l, 1, ...) ... }
+ *   }
+ *
+ * The same body runs on every target: real Lua C API on rv32; ECALL-bridged
+ * on WASM (flags = LUA_EXPORT_FLAG_BRIDGED).  A `()` return means "no
+ * results pushed" (the generated wrapper returns 0); an `i32` return is the
+ * Lua result count, passed through.
+ * ------------------------------------------------------------------------- */
+
+fn lua_export_raw_impl(
+    func: ItemFn,
+    sym_name_s: &str,
+    lua_name: &str,
+    module_s: Option<&str>,
+) -> syn::Result<TokenStream2> {
+    let fn_name   = &func.sig.ident;
+    let fn_name_s = fn_name.to_string();
+
+    /* Signature: exactly one argument (the Lua state) and () or i32 return. */
+    let inputs = &func.sig.inputs;
+    if inputs.len() != 1 || matches!(inputs.first(), Some(FnArg::Receiver(_))) {
+        return Err(syn::Error::new_spanned(inputs,
+            "raw lua_export functions take exactly one argument: \
+             the Lua state (blyt::lua::LuaState)"));
+    }
+    let returns_count = match &func.sig.output {
+        ReturnType::Default => false,
+        ReturnType::Type(_, box_ty) => match &**box_ty {
+            Type::Tuple(t) if t.elems.is_empty() => false,
+            Type::Path(TypePath { path, .. })
+                if path.segments.last().is_some_and(|s| s.ident == "i32") => true,
+            other => {
+                return Err(syn::Error::new_spanned(other,
+                    "raw lua_export functions return () or i32 \
+                     (the Lua result count)"));
+            }
+        },
+    };
+
+    let cv = c_void();
+    let ci = c_int();
+    let l  = format_ident!("_l");
+
+    let sym_upper  = sym_name_s.to_uppercase();
+    let raw_sym_s  = format!("__blyt_lua_raw_{}", sym_name_s);
+    let raw_fn     = format_ident!("{}", raw_sym_s);
+    let regtab_sym = format_ident!("__LUA_REGTAB_{}", sym_upper);
+    let export_sym = format_ident!("__LUA_EXPORT_{}", sym_upper);
+    let regtab_fn_name_sym = format_ident!("__LUA_REGTAB_FN_{}", sym_upper);
+
+    let call = if returns_count {
+        quote! { #fn_name(#l) as #ci }
+    } else {
+        quote! { #fn_name(#l); 0 as #ci }
+    };
+
+    /* .lua_exports: fn_sym == wrap_sym == the raw wrapper; arg/ret metadata
+     * is unused on the bridged path (the wrapper reads the stack itself). */
+    let lua_name_bytes = fixed_bytes(lua_name,   32);
+    let raw_sym_bytes  = fixed_bytes(&raw_sym_s, 64);
+
+    /* .lua_regtab fn name: bare name within the module, or the global name. */
+    let regtab_fn_name_s: &str = if module_s.is_some() { &fn_name_s } else { lua_name };
+    let fn_name_null_bytes: Vec<_> = {
+        let mut v: Vec<u8> = regtab_fn_name_s.bytes().collect();
+        v.push(0);
+        v.iter().map(|&b| Literal::u8_unsuffixed(b)).collect()
+    };
+    let fn_name_null_len = regtab_fn_name_s.len() + 1;
+
+    let (module_name_static, module_name_ptr_expr) = if let Some(m) = module_s {
+        let mod_sym = format_ident!("__LUA_REGTAB_MOD_{}", sym_upper);
+        let mod_null_bytes: Vec<_> = {
+            let mut v: Vec<u8> = m.bytes().collect();
+            v.push(0);
+            v.iter().map(|&b| Literal::u8_unsuffixed(b)).collect()
+        };
+        let mod_null_len = m.len() + 1;
+        let stat = quote! {
+            static #mod_sym: [u8; #mod_null_len] = [#(#mod_null_bytes),*];
+        };
+        let ptr = quote! {
+            &#mod_sym as *const [u8; #mod_null_len] as *const u8
+        };
+        (stat, ptr)
+    } else {
+        (quote! {}, quote! { ::core::ptr::null::<u8>() })
+    };
+
+    Ok(quote! {
+        #func
+
+        #[no_mangle]
+        unsafe extern "C" fn #raw_fn(#l: #cv) -> #ci {
+            #call
+        }
+
+        #module_name_static
+        static #regtab_fn_name_sym: [u8; #fn_name_null_len] = [#(#fn_name_null_bytes),*];
+
+        #[link_section = ".lua_regtab"]
+        #[used]
+        static #regtab_sym: ::blyt::lua::BlytLuaRegtabEntry = ::blyt::lua::BlytLuaRegtabEntry {
+            module_name: #module_name_ptr_expr,
+            lua_fn_name: &#regtab_fn_name_sym as *const [u8; #fn_name_null_len] as *const u8,
+            wrapper: #raw_fn,
+        };
+
+        #[link_section = ".lua_exports"]
+        #[used]
+        static #export_sym: ::blyt::lua::BlytLuaExportEntry = ::blyt::lua::BlytLuaExportEntry {
+            lua_name:  #lua_name_bytes,
+            fn_sym:    #raw_sym_bytes,
+            wrap_sym:  #raw_sym_bytes,
+            nargs:     0,
+            arg_types: [0, 0, 0, 0],
+            ret_type:  0,
+            flags:     ::blyt::lua::LUA_EXPORT_FLAG_BRIDGED,
+            pad:       0,
         };
     })
 }
