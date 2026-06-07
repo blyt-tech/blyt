@@ -131,19 +131,19 @@ fn lua_cart_state_buffer_round_trips() {
     CartProject::new()
         .config(CART_CONFIG)
         .lua(r#"
--- S_GAME and S_GAME_SCORE are globals from cart_state.lua (prepended at build time).
+-- S is the generated constants module (require("S") or global S).
 local slot = -1
 
 function init()
-    slot = blyt.buf.alloc_slot(S_GAME)
-    blyt.buf.set_i32(S_GAME, slot, S_GAME_SCORE, 42)
+    slot = blyt.buf.alloc_slot(S.GAME)
+    blyt.buf.set_i32(S.GAME, slot, S.GAME_SCORE, 42)
     blyt.save_write(0)
-    blyt.buf.set_i32(S_GAME, slot, S_GAME_SCORE, 99)
+    blyt.buf.set_i32(S.GAME, slot, S.GAME_SCORE, 99)
 end
 
 function update()
     blyt.save_read(0)
-    local score = blyt.buf.get_i32(S_GAME, slot, S_GAME_SCORE)
+    local score = blyt.buf.get_i32(S.GAME, slot, S.GAME_SCORE)
     blyt.debug.print("score=" .. tostring(score))
     blyt.quit()
 end
