@@ -560,19 +560,41 @@ pub fn run_cart_native_with_env(
 
 /// Run a cart with the WASM runner; assert `expected` appears in stdout.
 pub fn run_cart_wasm(cart: &std::path::Path, expected: &str) {
+    run_cart_wasm_with_env(cart, &[], expected)
+}
+
+/// Run a cart with the WASM runner plus extra C environment variables; assert
+/// `expected` appears in stdout.
+///
+/// Variables are injected via the 5th argument to `run_cart.js` as a JSON
+/// object, read by `module_pre.js` into Emscripten's `ENV` table before C
+/// startup.  This is needed because Emscripten does not inherit Node.js
+/// `process.env` for the multi-environment (web+node) build.
+pub fn run_cart_wasm_with_env(
+    cart: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    expected: &str,
+) {
     use assert_cmd::Command;
     let driver = repo_root().join("tests/wasm/run_cart.js");
-    let output = Command::new("node")
-        .args([
-            driver.to_str().unwrap(),
-            find_wasm_dir().to_str().unwrap(),
-            cart.to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+    let wasm_dir = find_wasm_dir();
+    let mut cmd = Command::new("node");
+    cmd.args([
+        driver.to_str().unwrap(),
+        wasm_dir.to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ]);
+    if !extra_env.is_empty() {
+        // Build a minimal JSON object {"KEY":"VALUE",...} without serde_json.
+        let pairs: Vec<String> = extra_env
+            .iter()
+            .map(|(k, v)| format!("\"{}\":\"{}\"", k, v.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect();
+        let env_json = format!("{{{}}}", pairs.join(","));
+        // 4th arg = frame0OutPath (empty); 5th arg = env JSON
+        cmd.args(["", &env_json]);
+    }
+    let output = cmd.assert().success().get_output().stdout.clone();
     assert!(
         String::from_utf8_lossy(&output).contains(expected),
         "expected {:?} in wasm output, got: {}",
