@@ -43,6 +43,15 @@ pub fn console_debug(s: &str) {
     unsafe { blyt_console_debug(buf.as_ptr().cast()) }
 }
 
+/// Write a null-terminated C string to the host console.
+///
+/// Callers are responsible for ensuring `s` is a valid null-terminated pointer.
+/// Provided as a convenience for raw Lua export bodies that receive strings
+/// directly from the Lua C API.
+pub fn console_debug_ptr(s: *const c_char) {
+    unsafe { blyt_console_debug(s) }
+}
+
 /// Signal the runtime that the cart is ready to exit.
 ///
 /// Call from `blyt_cart_update` when the cart decides it has finished.
@@ -193,6 +202,86 @@ pub mod lua {
             // Errors.  lua_error never returns; luaL_error is variadic.
             pub fn lua_error(l: LuaState) -> c_int;
             pub fn luaL_error(l: LuaState, fmt: *const c_char, ...) -> c_int;
+        }
+    }
+
+    /// Safe wrappers around the raw Lua C API (`capi`).
+    ///
+    /// All functions forward directly to `capi` with the `unsafe` hidden
+    /// inside the SDK.  Cart code running inside the rv32 emulator can call
+    /// these without writing `unsafe {}` blocks.
+    pub mod api {
+        use super::{capi, LuaState};
+        use core::ffi::{c_char, c_int};
+
+        // Stack inspection / manipulation.
+        pub fn gettop(l: LuaState) -> i32 { unsafe { capi::lua_gettop(l) } }
+        pub fn settop(l: LuaState, idx: i32) { unsafe { capi::lua_settop(l, idx) } }
+        pub fn get_type(l: LuaState, idx: i32) -> i32 { unsafe { capi::lua_type(l, idx) } }
+        pub fn typename(l: LuaState, tp: i32) -> *const c_char { unsafe { capi::lua_typename(l, tp) } }
+
+        // Argument extraction.
+        pub fn tointeger(l: LuaState, idx: i32) -> (i32, bool) {
+            let mut isnum: c_int = 0;
+            let v = unsafe { capi::lua_tointegerx(l, idx, &mut isnum) };
+            (v, isnum != 0)
+        }
+        pub fn tonumber(l: LuaState, idx: i32) -> (f32, bool) {
+            let mut isnum: c_int = 0;
+            let v = unsafe { capi::lua_tonumberx(l, idx, &mut isnum) };
+            (v, isnum != 0)
+        }
+        pub fn toboolean(l: LuaState, idx: i32) -> bool {
+            unsafe { capi::lua_toboolean(l, idx) != 0 }
+        }
+        /// Returns (pointer, byte-length).  The pointer is valid until the
+        /// value is popped from the stack.
+        pub fn tolstring(l: LuaState, idx: i32) -> (*const c_char, usize) {
+            let mut len = 0usize;
+            let p = unsafe { capi::lua_tolstring(l, idx, &mut len) };
+            (p, len)
+        }
+        pub fn check_integer(l: LuaState, arg: i32) -> i32 {
+            unsafe { capi::luaL_checkinteger(l, arg) }
+        }
+        pub fn check_number(l: LuaState, arg: i32) -> f32 {
+            unsafe { capi::luaL_checknumber(l, arg) }
+        }
+        /// Returns (pointer, byte-length).
+        pub fn check_lstring(l: LuaState, arg: i32) -> (*const c_char, usize) {
+            let mut len = 0usize;
+            let p = unsafe { capi::luaL_checklstring(l, arg, &mut len) };
+            (p, len)
+        }
+
+        // Result push.
+        pub fn push_integer(l: LuaState, n: i32) { unsafe { capi::lua_pushinteger(l, n) } }
+        pub fn push_number(l: LuaState, n: f32)  { unsafe { capi::lua_pushnumber(l, n) } }
+        pub fn push_boolean(l: LuaState, b: bool) { unsafe { capi::lua_pushboolean(l, if b { 1 } else { 0 }) } }
+        pub fn push_nil(l: LuaState) { unsafe { capi::lua_pushnil(l) } }
+        /// Push a null-terminated C string.  The pointer must be valid and
+        /// null-terminated for the duration of the call.
+        pub fn push_string(l: LuaState, s: *const c_char) -> *const c_char {
+            unsafe { capi::lua_pushstring(l, s) }
+        }
+        /// Push a string given as a pointer + byte length (need not be null-terminated).
+        pub fn push_lstring(l: LuaState, s: *const c_char, len: usize) -> *const c_char {
+            unsafe { capi::lua_pushlstring(l, s, len) }
+        }
+
+        // Tables.
+        pub fn create_table(l: LuaState, narr: i32, nrec: i32) {
+            unsafe { capi::lua_createtable(l, narr, nrec) }
+        }
+        pub fn geti(l: LuaState, idx: i32, i: i32) -> i32 { unsafe { capi::lua_geti(l, idx, i) } }
+        pub fn seti(l: LuaState, idx: i32, i: i32) { unsafe { capi::lua_seti(l, idx, i) } }
+        pub fn rawlen(l: LuaState, idx: i32) -> u32 { unsafe { capi::lua_rawlen(l, idx) } }
+        pub fn next(l: LuaState, idx: i32) -> bool { unsafe { capi::lua_next(l, idx) != 0 } }
+
+        // Errors.
+        pub fn error(l: LuaState) -> ! {
+            unsafe { capi::lua_error(l) };
+            loop {} // lua_error is declared -> c_int but performs a longjmp; unreachable
         }
     }
 

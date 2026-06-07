@@ -1,8 +1,9 @@
 #![no_std]
 extern crate alloc;
 use alloc::format;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-static mut S_FRAME: u32 = 0;
+static S_FRAME: AtomicU32 = AtomicU32::new(0);
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_init() {
@@ -11,19 +12,16 @@ pub extern "C" fn blyt_cart_init() {
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_update() {
-    unsafe {
-        S_FRAME += 1;
-        if S_FRAME % 60 == 0 {
-            blyt::console_debug(&format!("update {}", S_FRAME));
-        }
+    let frame = S_FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+    if frame % 60 == 0 {
+        blyt::console_debug(&format!("update {}", frame));
     }
 }
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_draw() {
-    unsafe {
-        if S_FRAME % 60 == 0 {
-            blyt::console_debug(&format!("draw {}", S_FRAME));
-        }
+    let frame = S_FRAME.load(Ordering::Relaxed);
+    if frame % 60 == 0 {
+        blyt::console_debug(&format!("draw {}", frame));
     }
 }
