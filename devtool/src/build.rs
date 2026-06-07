@@ -261,14 +261,12 @@ fn generate_cart_state(
         let fn_buf_idx = format!("_blyt_proxy_{buf_name}_idx");
 
         /* row __index: S.game[slot].field -> blyt_buffer_get_*(buf_h, slot, fh) */
-        lua_c_proxy_fns
-            .push_str(&format!("static int {fn_row_idx}(lua_State *L) {{\n"));
-        lua_c_proxy_fns
-            .push_str("    lua_rawgeti(L, 1, 1); /* slot stored at raw key 1 */\n");
-        lua_c_proxy_fns
-            .push_str("    lua_Integer _s = lua_tointeger(L, -1); lua_pop(L, 1);\n");
-        lua_c_proxy_fns
-            .push_str("    blyt_buffer_h _bh = (blyt_buffer_h)lua_tointeger(L, lua_upvalueindex(1));\n");
+        lua_c_proxy_fns.push_str(&format!("static int {fn_row_idx}(lua_State *L) {{\n"));
+        lua_c_proxy_fns.push_str("    lua_rawgeti(L, 1, 1); /* slot stored at raw key 1 */\n");
+        lua_c_proxy_fns.push_str("    lua_Integer _s = lua_tointeger(L, -1); lua_pop(L, 1);\n");
+        lua_c_proxy_fns.push_str(
+            "    blyt_buffer_h _bh = (blyt_buffer_h)lua_tointeger(L, lua_upvalueindex(1));\n",
+        );
         lua_c_proxy_fns.push_str("    const char *_k = lua_tostring(L, 2);\n");
         lua_c_proxy_fns.push_str("    if (_k) {\n");
         for (fi, f) in fields.iter().enumerate() {
@@ -295,14 +293,12 @@ fn generate_cart_state(
         lua_c_proxy_fns.push_str("}\n");
 
         /* row __newindex: S.game[slot].field = v -> blyt_buffer_set_*(buf_h, slot, fh, v) */
-        lua_c_proxy_fns
-            .push_str(&format!("static int {fn_row_newidx}(lua_State *L) {{\n"));
-        lua_c_proxy_fns
-            .push_str("    lua_rawgeti(L, 1, 1);\n");
-        lua_c_proxy_fns
-            .push_str("    lua_Integer _s = lua_tointeger(L, -1); lua_pop(L, 1);\n");
-        lua_c_proxy_fns
-            .push_str("    blyt_buffer_h _bh = (blyt_buffer_h)lua_tointeger(L, lua_upvalueindex(1));\n");
+        lua_c_proxy_fns.push_str(&format!("static int {fn_row_newidx}(lua_State *L) {{\n"));
+        lua_c_proxy_fns.push_str("    lua_rawgeti(L, 1, 1);\n");
+        lua_c_proxy_fns.push_str("    lua_Integer _s = lua_tointeger(L, -1); lua_pop(L, 1);\n");
+        lua_c_proxy_fns.push_str(
+            "    blyt_buffer_h _bh = (blyt_buffer_h)lua_tointeger(L, lua_upvalueindex(1));\n",
+        );
         lua_c_proxy_fns.push_str("    const char *_k = lua_tostring(L, 2);\n");
         lua_c_proxy_fns.push_str("    if (_k) {\n");
         for (fi, f) in fields.iter().enumerate() {
@@ -344,12 +340,10 @@ fn generate_cart_state(
         lua_c_proxy_fns.push_str("}\n");
 
         /* buffer proxy __index: S.game[slot]->row proxy, S.game.count->n */
-        lua_c_proxy_fns
-            .push_str(&format!("static int {fn_buf_idx}(lua_State *L) {{\n"));
+        lua_c_proxy_fns.push_str(&format!("static int {fn_buf_idx}(lua_State *L) {{\n"));
         lua_c_proxy_fns.push_str("    if (lua_type(L, 2) == LUA_TSTRING) {\n");
         lua_c_proxy_fns.push_str("        const char *_k = lua_tostring(L, 2);\n");
-        lua_c_proxy_fns
-            .push_str("        if (_k && strcmp(_k, \"count\") == 0) {\n");
+        lua_c_proxy_fns.push_str("        if (_k && strcmp(_k, \"count\") == 0) {\n");
         lua_c_proxy_fns.push_str(&format!(
             "            lua_pushinteger(L, {}); return 1;\n",
             buf_decl.count
@@ -358,8 +352,7 @@ fn generate_cart_state(
         lua_c_proxy_fns.push_str("        lua_pushnil(L); return 1;\n");
         lua_c_proxy_fns.push_str("    }\n");
         /* Integer key: return pre-allocated row proxy from upvalue 1 (_rows). */
-        lua_c_proxy_fns
-            .push_str("    lua_rawgeti(L, lua_upvalueindex(1), lua_tointeger(L, 2));\n");
+        lua_c_proxy_fns.push_str("    lua_rawgeti(L, lua_upvalueindex(1), lua_tointeger(L, 2));\n");
         lua_c_proxy_fns.push_str("    return 1;\n");
         lua_c_proxy_fns.push_str("}\n");
 
@@ -372,47 +365,40 @@ fn generate_cart_state(
         lua_c_proxy_setup.push_str("        lua_newtable(L);\n");
         lua_c_proxy_setup.push_str("        int _row_mt = lua_gettop(L);\n");
         /* row __index closure: upvalue 1=buf_h, 2..=field_h per field */
-        lua_c_proxy_setup
-            .push_str(&format!("        lua_pushinteger(L, {buf_index}u);\n"));
+        lua_c_proxy_setup.push_str(&format!("        lua_pushinteger(L, {buf_index}u);\n"));
         for f in &fields {
             let field_h: u32 = (buf_index << 16) | (f.index & 0xFFFF);
-            lua_c_proxy_setup
-                .push_str(&format!("        lua_pushinteger(L, 0x{field_h:08X}u);\n"));
+            lua_c_proxy_setup.push_str(&format!("        lua_pushinteger(L, 0x{field_h:08X}u);\n"));
         }
         lua_c_proxy_setup.push_str(&format!(
             "        lua_pushcclosure(L, {fn_row_idx}, {n_upvals});\n"
         ));
-        lua_c_proxy_setup
-            .push_str("        lua_setfield(L, _row_mt, \"__index\");\n");
+        lua_c_proxy_setup.push_str("        lua_setfield(L, _row_mt, \"__index\");\n");
         /* row __newindex closure */
-        lua_c_proxy_setup
-            .push_str(&format!("        lua_pushinteger(L, {buf_index}u);\n"));
+        lua_c_proxy_setup.push_str(&format!("        lua_pushinteger(L, {buf_index}u);\n"));
         for f in &fields {
             let field_h: u32 = (buf_index << 16) | (f.index & 0xFFFF);
-            lua_c_proxy_setup
-                .push_str(&format!("        lua_pushinteger(L, 0x{field_h:08X}u);\n"));
+            lua_c_proxy_setup.push_str(&format!("        lua_pushinteger(L, 0x{field_h:08X}u);\n"));
         }
         lua_c_proxy_setup.push_str(&format!(
             "        lua_pushcclosure(L, {fn_row_newidx}, {n_upvals});\n"
         ));
-        lua_c_proxy_setup
-            .push_str("        lua_setfield(L, _row_mt, \"__newindex\");\n");
+        lua_c_proxy_setup.push_str("        lua_setfield(L, _row_mt, \"__newindex\");\n");
         /* Create _rows table */
         lua_c_proxy_setup.push_str("        lua_newtable(L);\n");
         lua_c_proxy_setup.push_str("        int _rows = lua_gettop(L);\n");
         /* Pre-allocate row proxies */
-        lua_c_proxy_setup
-            .push_str(&format!("        for (lua_Integer _i = 0; _i < {}; _i++) {{\n", buf_decl.count));
+        lua_c_proxy_setup.push_str(&format!(
+            "        for (lua_Integer _i = 0; _i < {}; _i++) {{\n",
+            buf_decl.count
+        ));
         lua_c_proxy_setup.push_str("            lua_newtable(L);\n");
         lua_c_proxy_setup.push_str("            int _row = lua_gettop(L);\n");
         lua_c_proxy_setup.push_str("            lua_pushinteger(L, _i);\n");
-        lua_c_proxy_setup
-            .push_str("            lua_rawseti(L, _row, 1); /* row[1] = slot */\n");
+        lua_c_proxy_setup.push_str("            lua_rawseti(L, _row, 1); /* row[1] = slot */\n");
         lua_c_proxy_setup.push_str("            lua_pushvalue(L, _row_mt);\n");
-        lua_c_proxy_setup
-            .push_str("            lua_setmetatable(L, _row);\n");
-        lua_c_proxy_setup
-            .push_str("            lua_rawseti(L, _rows, _i); /* _rows[i] = row */\n");
+        lua_c_proxy_setup.push_str("            lua_setmetatable(L, _row);\n");
+        lua_c_proxy_setup.push_str("            lua_rawseti(L, _rows, _i); /* _rows[i] = row */\n");
         lua_c_proxy_setup.push_str("        }\n");
         /* Create buffer proxy + its metatable with __index closure */
         lua_c_proxy_setup.push_str("        lua_newtable(L);\n");
@@ -420,23 +406,19 @@ fn generate_cart_state(
         lua_c_proxy_setup.push_str("        lua_newtable(L);\n");
         lua_c_proxy_setup.push_str("        int _proxy_mt = lua_gettop(L);\n");
         lua_c_proxy_setup.push_str("        lua_pushvalue(L, _rows);\n");
-        lua_c_proxy_setup
-            .push_str(&format!("        lua_pushinteger(L, {});\n", buf_decl.count));
         lua_c_proxy_setup.push_str(&format!(
-            "        lua_pushcclosure(L, {fn_buf_idx}, 2);\n"
+            "        lua_pushinteger(L, {});\n",
+            buf_decl.count
         ));
-        lua_c_proxy_setup
-            .push_str("        lua_setfield(L, _proxy_mt, \"__index\");\n");
+        lua_c_proxy_setup.push_str(&format!("        lua_pushcclosure(L, {fn_buf_idx}, 2);\n"));
+        lua_c_proxy_setup.push_str("        lua_setfield(L, _proxy_mt, \"__index\");\n");
         lua_c_proxy_setup.push_str("        lua_pushvalue(L, _proxy_mt);\n");
-        lua_c_proxy_setup
-            .push_str("        lua_setmetatable(L, _proxy);\n");
+        lua_c_proxy_setup.push_str("        lua_setmetatable(L, _proxy);\n");
         /* S.game = proxy */
         lua_c_proxy_setup.push_str("        lua_getglobal(L, \"S\");\n");
-        lua_c_proxy_setup
-            .push_str("        int _S = lua_gettop(L);\n");
+        lua_c_proxy_setup.push_str("        int _S = lua_gettop(L);\n");
         lua_c_proxy_setup.push_str("        lua_pushvalue(L, _proxy);\n");
-        lua_c_proxy_setup
-            .push_str(&format!("        lua_setfield(L, _S, \"{buf_name}\");\n"));
+        lua_c_proxy_setup.push_str(&format!("        lua_setfield(L, _S, \"{buf_name}\");\n"));
         lua_c_proxy_setup.push_str("        lua_settop(L, _init);\n");
         lua_c_proxy_setup.push_str("    }\n");
 
