@@ -11,6 +11,8 @@
 #include "cart_config_verifier.h"
 #include "cart_info_reader.h"
 #include "cart_info_verifier.h"
+#include "cart_layouts_reader.h"
+#include "cart_layouts_verifier.h"
 
 /* -------------------------------------------------------------------------
  * Section name allowlist (ADR-0112: reject unknown ELF sections)
@@ -106,6 +108,30 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_console_debug",
     "blyt_quit",
     "blyt_frame_done",
+
+    /* blyt state buffer API (ADR-0009, ADR-0010, ADR-0057, ADR-0058) */
+    "blyt_buffer_get_f32",
+    "blyt_buffer_set_f32",
+    "blyt_buffer_get_i32",
+    "blyt_buffer_set_i32",
+    "blyt_buffer_get_u32",
+    "blyt_buffer_set_u32",
+    "blyt_buffer_get_i16",
+    "blyt_buffer_set_i16",
+    "blyt_buffer_get_u16",
+    "blyt_buffer_set_u16",
+    "blyt_buffer_get_i8",
+    "blyt_buffer_set_i8",
+    "blyt_buffer_get_u8",
+    "blyt_buffer_set_u8",
+    "blyt_buffer_get_bool",
+    "blyt_buffer_set_bool",
+    "blyt_buffer_alloc_slot",
+    "blyt_buffer_free_slot",
+
+    /* blyt save/load API (ADR-0087, ADR-0125) */
+    "blyt_save_write",
+    "blyt_save_read",
 
     /* libblytc.so — allocator (ADR-0120) */
     "malloc",
@@ -655,6 +681,7 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
 
     const Elf32_Shdr *sect_cart_info = NULL;
     const Elf32_Shdr *sect_cart_config = NULL;
+    const Elf32_Shdr *sect_cart_layouts = NULL;
     const Elf32_Shdr *sect_cart_lua = NULL;
     const Elf32_Shdr *sect_dynamic = NULL;
     const Elf32_Shdr *sect_dynsym = NULL;
@@ -690,6 +717,8 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
             sect_cart_info = sh;
         if (strcmp(name, ".cart.config") == 0)
             sect_cart_config = sh;
+        if (strcmp(name, ".cart.layouts") == 0)
+            sect_cart_layouts = sh;
         if (strcmp(name, ".cart.lua") == 0)
             sect_cart_lua = sh;
         if (strcmp(name, ".dynamic") == 0)
@@ -880,6 +909,35 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
 
         if (verify_result != flatcc_verify_ok) {
             err = BLYT_CART_ERR_BAD_CART_CONFIG;
+            goto fail;
+        }
+    }
+
+    /* -----------------------------------------------------------------------
+     * .cart.layouts: optional, verify if present (ADR-0009)
+     * --------------------------------------------------------------------- */
+
+    if (sect_cart_layouts) {
+        const void *sect_data = (const uint8_t *)map + sect_cart_layouts->sh_offset;
+        size_t fb_size;
+        const void *fb =
+            check_preamble(sect_data, sect_cart_layouts->sh_size, CART_LAYOUTS_TAG, &fb_size);
+        if (!fb) {
+            err = BLYT_CART_ERR_BAD_PREAMBLE;
+            goto fail;
+        }
+
+        void *fb_aligned = malloc(fb_size);
+        if (!fb_aligned) {
+            err = BLYT_CART_ERR_IO;
+            goto fail;
+        }
+        memcpy(fb_aligned, fb, fb_size);
+        int verify_result = blyt_CartLayouts_verify_as_root(fb_aligned, fb_size);
+        free(fb_aligned);
+
+        if (verify_result != flatcc_verify_ok) {
+            err = BLYT_CART_ERR_BAD_LAYOUTS;
             goto fail;
         }
     }

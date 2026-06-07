@@ -124,6 +124,8 @@ pub struct CartProject {
     lib_files: Vec<(String, String, String)>,
     /// Names of Rust libs declared via rust_lib(); used to generate the game Cargo.toml.
     rust_lib_names: Vec<String>,
+    /// Contents of blyt.config.yaml (state buffers, fps, etc.)
+    config_yaml: Option<String>,
 }
 
 impl CartProject {
@@ -132,6 +134,7 @@ impl CartProject {
             c_files: Vec::new(),
             cpp_files: Vec::new(),
             rust_lib_rs: None,
+            config_yaml: None,
             lua_files: Vec::new(),
             lib_files: Vec::new(),
             rust_lib_names: Vec::new(),
@@ -202,6 +205,12 @@ impl CartProject {
     pub fn lib_file(mut self, name: &str, rel_path: &str, content: &str) -> Self {
         self.lib_files
             .push((name.into(), rel_path.into(), content.into()));
+        self
+    }
+
+    /// Set the contents of `blyt.config.yaml` (state buffers, fps, etc.).
+    pub fn config(mut self, yaml: &str) -> Self {
+        self.config_yaml = Some(yaml.into());
         self
     }
 
@@ -299,6 +308,10 @@ impl CartProject {
             let dest = dir.join("src/lib").join(lib_name).join(rel_path);
             fs::create_dir_all(dest.parent().unwrap()).unwrap();
             fs::write(dest, content).unwrap();
+        }
+
+        if let Some(ref yaml) = self.config_yaml {
+            fs::write(dir.join("blyt.config.yaml"), yaml).unwrap();
         }
     }
 }
@@ -520,9 +533,23 @@ pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
 
 /// Run a cart with blytplay --headless; assert `expected` appears in stdout.
 pub fn run_cart_native(cart: &std::path::Path, expected: &str) {
+    run_cart_native_with_env(cart, &[], expected)
+}
+
+/// Run a cart with blytplay --headless plus extra environment variables; assert
+/// `expected` appears in stdout.
+pub fn run_cart_native_with_env(
+    cart: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    expected: &str,
+) {
     use assert_cmd::Command;
-    let output = Command::new(blytplay())
-        .args(["--headless", cart.to_str().unwrap()])
+    let mut cmd = Command::new(blytplay());
+    cmd.args(["--headless", cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd
         .assert()
         .success()
         .get_output()

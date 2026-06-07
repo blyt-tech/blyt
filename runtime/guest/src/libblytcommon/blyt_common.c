@@ -59,6 +59,9 @@ __attribute__((weak)) void blyt_cart_on_new_state(void) {
 }
 __attribute__((weak)) void blyt_cart_on_save_state(void) {
 }
+__attribute__((weak)) void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
+}
 __attribute__((weak)) void blyt_cart_on_quit(void) {
     blyt_quit();
 }

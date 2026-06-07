@@ -13,6 +13,8 @@
 #include "blyt_runtime.h"
 #include "cart_load.h"
 #include "ecall.h"
+#include "save.h"
+#include "state_buffer.h"
 #ifdef BLYT_DAP
 #include "dap_server.h"
 #endif
@@ -155,6 +157,12 @@ typedef struct {
     uint32_t lua_bridge_token; /* nonce passed to the wrapper as its lua_State* */
     bool lua_bridge_error; /* a bridge op raised; run_frame returns FN_ERROR */
 #endif
+    /* State buffer context — pointer into the owning blyt_session_t. */
+    blyt_state_ctx_t *state_ctx;
+    /* Save directory (from BLYT_SAVE_DIR or default).  Heap-allocated. */
+    char *save_dir;
+    /* Cart name derived from the cart path (used as save subdirectory). */
+    char cart_name[64];
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -183,6 +191,7 @@ struct blyt_session {
      * so it must not be stack-allocated in blyt_session_create. */
     vm_attr_t attr;
     blyt_run_ctx_t ctx;
+    blyt_state_ctx_t state_ctx;
     /* Palette-indexed framebuffer: filled by the runtime until the cart draws.
      * Frontends call blyt_session_expand_frame() to convert to XRGB8888. */
     uint8_t pixels[BLYT_FRAME_W * BLYT_FRAME_H];
@@ -1173,6 +1182,95 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 
+    case BLYT_ECALL_BUF_OP: {
+        /* State buffer typed get/set + slot management (ADR-0009, ADR-0057, ADR-0058).
+         * a0=sub-opcode, a1=buf_h (1-based), a2=slot, a3=field_h, a4=value_bits */
+        if (!g_run_ctx || !g_run_ctx->state_ctx) {
+            rv_set_reg(rv, rv_reg_a0, (uint32_t)-1);
+            rv->PC += 4;
+            return;
+        }
+        blyt_state_ctx_t *sc = g_run_ctx->state_ctx;
+        uint32_t op = rv_get_reg(rv, rv_reg_a0);
+        uint32_t buf_id = rv_get_reg(rv, rv_reg_a1);
+        int32_t slot = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        uint32_t field = rv_get_reg(rv, rv_reg_a3) & 0xFFFFu; /* lower 16 bits */
+        uint32_t value_bits = rv_get_reg(rv, rv_reg_a4);
+
+        switch (op) {
+        case BUF_OP_GET_F32: case BUF_OP_GET_I32: case BUF_OP_GET_U32:
+        case BUF_OP_GET_I16: case BUF_OP_GET_U16: case BUF_OP_GET_I8:
+        case BUF_OP_GET_U8:  case BUF_OP_GET_BOOL: {
+            uint32_t bits = 0;
+            blyt_state_get(sc, buf_id, slot, field, &bits);
+            rv_set_reg(rv, rv_reg_a0, bits);
+            break;
+        }
+        case BUF_OP_SET_F32: case BUF_OP_SET_I32: case BUF_OP_SET_U32:
+        case BUF_OP_SET_I16: case BUF_OP_SET_U16: case BUF_OP_SET_I8:
+        case BUF_OP_SET_U8:  case BUF_OP_SET_BOOL: {
+            /* type_tag = (op / 2) - 1: SET_F32=2→0 (f32=6), etc.
+             * We rely on the field declaration's type_tag in blyt_state_set. */
+            blyt_state_set(sc, buf_id, slot, field, value_bits, 0);
+            rv_set_reg(rv, rv_reg_a0, 0);
+            break;
+        }
+        case BUF_OP_ALLOC_SLOT: {
+            /* a2 = guest pointer to int32_t out_slot */
+            uint32_t out_vaddr = (uint32_t)slot; /* slot register holds the ptr */
+            int32_t new_slot = -1;
+            int r = blyt_state_alloc_slot(sc, buf_id, &new_slot);
+            /* Write result back to guest memory */
+            if (out_vaddr) {
+                vm_attr_t *attr = PRIV(rv);
+                memory_t *mem = attr->mem;
+                uint32_t v = (uint32_t)new_slot;
+                memory_write(mem, out_vaddr, (const uint8_t *)&v, 4);
+            }
+            rv_set_reg(rv, rv_reg_a0, r == 0 ? 0 : (uint32_t)-1);
+            break;
+        }
+        case BUF_OP_FREE_SLOT: {
+            int r = blyt_state_free_slot(sc, buf_id, slot);
+            rv_set_reg(rv, rv_reg_a0, r == 0 ? 0 : (uint32_t)-1);
+            break;
+        }
+        default:
+            rv_set_reg(rv, rv_reg_a0, (uint32_t)-1);
+            break;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SAVE_WRITE: {
+        /* a0=slot (uint32_t); blyt_save_write already called on_save_state. */
+        uint32_t slot_n = rv_get_reg(rv, rv_reg_a0);
+        int r = -1;
+        if (g_run_ctx && g_run_ctx->state_ctx && g_run_ctx->save_dir) {
+            r = blyt_save_write(g_run_ctx->state_ctx, g_run_ctx->save_dir,
+                                g_run_ctx->cart_name, slot_n);
+        }
+        rv_set_reg(rv, rv_reg_a0, r == 0 ? 0u : 3u); /* BLYT_ERR_IO=3 */
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SAVE_READ: {
+        /* a0=slot (uint32_t); guest stub calls on_load_state after we return. */
+        uint32_t slot_n = rv_get_reg(rv, rv_reg_a0);
+        int r = -1;
+        if (g_run_ctx && g_run_ctx->state_ctx && g_run_ctx->save_dir) {
+            r = blyt_save_read(g_run_ctx->state_ctx, g_run_ctx->save_dir,
+                               g_run_ctx->cart_name, slot_n);
+        }
+        /* r==0 → BLYT_OK=0, r==-1 → BLYT_ERR_IO=3, r==-2 → BLYT_ERR_SCHEMA_MISMATCH=5 */
+        uint32_t result = (r == 0) ? 0u : (r == -2) ? 5u : 3u;
+        rv_set_reg(rv, rv_reg_a0, result);
+        rv->PC += 4;
+        return;
+    }
+
     case 93: /* SYS_exit (Linux NR 93) — blyt_exit on emulated path */
     case 94: /* SYS_exit_group (Linux NR 94) — blyt_exit on emulated path */
         rv_halt(rv);
@@ -1841,6 +1939,41 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
         return NULL;
     }
 
+    /* Initialise state buffer context from .cart.layouts (if present). */
+    blyt_state_ctx_init(cart, &s->state_ctx);
+    s->ctx.state_ctx = &s->state_ctx;
+
+    /* Derive cart name from path for save file subdirectory. */
+    {
+        const char *base = cart->path ? cart->path : "cart";
+        const char *slash = strrchr(base, '/');
+        if (slash) base = slash + 1;
+        size_t n = strlen(base);
+        /* Strip .blyt or .dbg.blyt suffix */
+        if (n > 10 && strcmp(base + n - 10, ".dbg.blyt") == 0)
+            n -= 10;
+        else if (n > 5 && strcmp(base + n - 5, ".blyt") == 0)
+            n -= 5;
+        if (n >= sizeof(s->ctx.cart_name))
+            n = sizeof(s->ctx.cart_name) - 1;
+        memcpy(s->ctx.cart_name, base, n);
+        s->ctx.cart_name[n] = '\0';
+    }
+
+    /* Resolve save directory: BLYT_SAVE_DIR env var or ~/.local/share/blyt */
+    {
+        const char *env_dir = getenv("BLYT_SAVE_DIR");
+        if (env_dir) {
+            s->ctx.save_dir = strdup(env_dir);
+        } else {
+            const char *home = getenv("HOME");
+            if (!home) home = "/tmp";
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s/.local/share/blyt", home);
+            s->ctx.save_dir = strdup(buf);
+        }
+    }
+
     s->rv->io.on_ecall = blyt_ecall_handler;
 #ifdef BLYT_GDB
     s->rv->io.on_ebreak = blyt_ebreak_handler;
@@ -2147,6 +2280,8 @@ void blyt_session_destroy(blyt_session_t *session) {
 #ifdef BLYT_GDB
     blyt_session_gdb_shutdown(session);
 #endif
+    blyt_state_ctx_destroy(&session->state_ctx);
+    free(session->ctx.save_dir);
     rv_delete(session->rv);
     free(session);
 }

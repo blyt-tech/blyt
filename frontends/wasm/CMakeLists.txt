@@ -315,6 +315,8 @@ add_executable(
   ${FLATCCRT_SOURCES}
   "${BLYT_ROOT}/runtime/host/src/libblyt/cart_load.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/cart_run.c"
+  "${BLYT_ROOT}/runtime/host/src/libblyt/state_buffer.c"
+  "${BLYT_ROOT}/runtime/host/src/libblyt/save.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c"
   ${BLYT_LUA_SOURCES}
   ${BLYT_DAP_SOURCES}

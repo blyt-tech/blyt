@@ -12,6 +12,8 @@
 #define CART_INFO_TAG "CINF"
 /* .cart.config preamble type tag (ADR-0073) */
 #define CART_CONFIG_TAG "CCFG"
+/* .cart.layouts preamble type tag (ADR-0073) */
+#define CART_LAYOUTS_TAG "CLAY"
 
 /* Preamble size prepended to every FlatBuffers section (ADR-0073):
  *   offset 0: 4-byte ASCII type tag

@@ -62,13 +62,17 @@ else()
            "${GENERATED_DIR}/cart_info_verifier.h"
            "${GENERATED_DIR}/cart_config_reader.h"
            "${GENERATED_DIR}/cart_config_verifier.h"
+           "${GENERATED_DIR}/cart_layouts_reader.h"
+           "${GENERATED_DIR}/cart_layouts_verifier.h"
            "${GENERATED_DIR}/flatbuffers_common_reader.h"
     COMMAND
       "$<TARGET_FILE:flatcc_cli>" --common_reader --reader --verifier -o
       "${GENERATED_DIR}" "${SCHEMAS_DIR}/cart_info.fbs"
       "${SCHEMAS_DIR}/cart_config.fbs"
+      "${SCHEMAS_DIR}/cart_layouts.fbs"
     DEPENDS flatcc_cli "${SCHEMAS_DIR}/cart_info.fbs"
             "${SCHEMAS_DIR}/cart_config.fbs"
+            "${SCHEMAS_DIR}/cart_layouts.fbs"
     COMMENT "Generating FlatBuffers C headers"
     VERBATIM)
   add_custom_target(
@@ -77,6 +81,8 @@ else()
             "${GENERATED_DIR}/cart_info_verifier.h"
             "${GENERATED_DIR}/cart_config_reader.h"
             "${GENERATED_DIR}/cart_config_verifier.h"
+            "${GENERATED_DIR}/cart_layouts_reader.h"
+            "${GENERATED_DIR}/cart_layouts_verifier.h"
             "${GENERATED_DIR}/flatbuffers_common_reader.h")
 endif()
 
@@ -683,6 +689,7 @@ add_library(libblytc INTERFACE)
 add_library(
   libblyt STATIC
   runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
+  runtime/host/src/libblyt/state_buffer.c runtime/host/src/libblyt/save.c
   runtime/host/src/libblyt/testcard.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
@@ -774,6 +781,7 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
   add_library(
     libblyt_debug STATIC
     runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
+    runtime/host/src/libblyt/state_buffer.c runtime/host/src/libblyt/save.c
     runtime/host/src/libblyt/testcard.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
@@ -1055,23 +1063,28 @@ if(NOT DEFINED BLYT_PREGENERATED_DIR)
   add_custom_command(
     OUTPUT "${TEST_GENERATED_DIR}/cart_info_builder.h"
            "${TEST_GENERATED_DIR}/cart_config_builder.h"
+           "${TEST_GENERATED_DIR}/cart_layouts_builder.h"
            "${TEST_GENERATED_DIR}/flatbuffers_common_builder.h"
            "${TEST_GENERATED_DIR}/flatbuffers_common_reader.h"
            "${TEST_GENERATED_DIR}/cart_info_reader.h"
            "${TEST_GENERATED_DIR}/cart_config_reader.h"
+           "${TEST_GENERATED_DIR}/cart_layouts_reader.h"
     COMMAND
       "$<TARGET_FILE:flatcc_cli>" --common --reader --builder -o
       "${TEST_GENERATED_DIR}" "${SCHEMAS_DIR}/cart_info.fbs"
       "${SCHEMAS_DIR}/cart_config.fbs"
+      "${SCHEMAS_DIR}/cart_layouts.fbs"
     DEPENDS flatcc_cli "${SCHEMAS_DIR}/cart_info.fbs"
             "${SCHEMAS_DIR}/cart_config.fbs"
+            "${SCHEMAS_DIR}/cart_layouts.fbs"
     COMMENT "Generating FlatBuffers test builder headers"
     VERBATIM)
 
   add_custom_target(
     flatbuffers_test_generated
     DEPENDS "${TEST_GENERATED_DIR}/cart_info_builder.h"
-            "${TEST_GENERATED_DIR}/cart_config_builder.h")
+            "${TEST_GENERATED_DIR}/cart_config_builder.h"
+            "${TEST_GENERATED_DIR}/cart_layouts_builder.h")
 else()
   add_custom_target(flatbuffers_test_generated)
 endif()

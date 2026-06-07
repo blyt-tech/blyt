@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cart_info_generated::blyt::{CartInfo, CartInfoArgs};
+use crate::cart_layouts_generated::blyt::{
+    BufferDecl, BufferDeclArgs, CartLayouts, CartLayoutsArgs, FieldDecl, FieldDeclArgs, RecordDecl,
+    RecordDeclArgs,
+};
+use crate::config::{flatten_record, CartConfig, FlatField};
 use flatbuffers::FlatBufferBuilder;
 
 /* -------------------------------------------------------------------------
@@ -41,6 +46,223 @@ fn cart_info_bytes(debug: bool) -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes()); // format_minor
     out.extend_from_slice(body);
     out
+}
+
+/* -------------------------------------------------------------------------
+ * .cart.layouts section data (ADR-0009, ADR-0073)
+ *
+ * Serialises CartLayouts FlatBuffer with CLAY preamble.
+ * Returns empty Vec when cfg has no state_buffers (no section emitted).
+ * ------------------------------------------------------------------------- */
+fn cart_layouts_bytes(cfg: &CartConfig) -> Vec<u8> {
+    use crate::config::compute_schema_hash;
+
+    if cfg.state_buffers.is_empty() {
+        return Vec::new();
+    }
+
+    let schema_hash = compute_schema_hash(cfg);
+    let mut fbb = FlatBufferBuilder::new();
+
+    /* Build RecordDecl vector (only records referenced by a buffer). */
+    let mut record_fbs: Vec<flatbuffers::WIPOffset<RecordDecl<'_>>> = Vec::new();
+    for (rec_name, rec) in &cfg.records {
+        let name_off = fbb.create_string(rec_name);
+        /* Resolve to flat fields */
+        let mut visiting = Vec::new();
+        let flat = match flatten_record(rec_name, &cfg.records, &mut visiting) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let _ = rec; /* rec is used indirectly via flatten_record */
+        let fields_fbs: Vec<flatbuffers::WIPOffset<FieldDecl<'_>>> = flat
+            .iter()
+            .map(|f| {
+                let fn_off = fbb.create_string(&f.flat_name);
+                FieldDecl::create(
+                    &mut fbb,
+                    &FieldDeclArgs {
+                        name: Some(fn_off),
+                        type_tag: f.type_tag,
+                    },
+                )
+            })
+            .collect();
+        let fields_vec = fbb.create_vector(&fields_fbs);
+        record_fbs.push(RecordDecl::create(
+            &mut fbb,
+            &RecordDeclArgs {
+                name: Some(name_off),
+                fields: Some(fields_vec),
+            },
+        ));
+    }
+    let records_vec = fbb.create_vector(&record_fbs);
+
+    /* Build BufferDecl vector. */
+    let mut buffer_fbs: Vec<flatbuffers::WIPOffset<BufferDecl<'_>>> = Vec::new();
+    for (buf_name, buf) in &cfg.state_buffers {
+        let name_off = fbb.create_string(buf_name);
+        let rec_off = fbb.create_string(&buf.record);
+        buffer_fbs.push(BufferDecl::create(
+            &mut fbb,
+            &BufferDeclArgs {
+                name: Some(name_off),
+                record_name: Some(rec_off),
+                count: buf.count,
+            },
+        ));
+    }
+    let buffers_vec = fbb.create_vector(&buffer_fbs);
+
+    let root = CartLayouts::create(
+        &mut fbb,
+        &CartLayoutsArgs {
+            records: Some(records_vec),
+            buffers: Some(buffers_vec),
+            schema_hash,
+        },
+    );
+    fbb.finish(root, None);
+    let body = fbb.finished_data();
+
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(b"CLAY");
+    out.extend_from_slice(&0u16.to_le_bytes()); // format_major
+    out.extend_from_slice(&0u16.to_le_bytes()); // format_minor
+    out.extend_from_slice(body);
+    out
+}
+
+/* -------------------------------------------------------------------------
+ * Codegen: generate cart_state.h / cart_state.rs / cart_state.lua
+ *
+ * Returns the paths written (h, rs, lua) and the layouts binary bytes.
+ * buffers_present is false when no state_buffers are declared.
+ * ------------------------------------------------------------------------- */
+
+struct CartStateFiles {
+    c_header: PathBuf,       /* build/blyt/c/cart_state.h */
+    rust_module: PathBuf,    /* build/blyt/rust/cart_state.rs */
+    lua_module: PathBuf,     /* build/blyt/lua/cart_state.lua */
+    layouts_bin: PathBuf,    /* build/cart.layouts.bin */
+    c_include_dir: PathBuf,  /* build/blyt/c/ */
+    buffers_present: bool,
+}
+
+fn generate_cart_state(
+    project_dir: &Path,
+    build_dir: &Path,
+    cfg: &CartConfig,
+) -> Result<CartStateFiles, BuildError> {
+    use crate::config::{
+        type_tag_buf_get_suffix, type_tag_c_type, type_tag_rust_type,
+    };
+
+    let blyt_dir = build_dir.join("blyt");
+    let c_dir = blyt_dir.join("c");
+    let rust_dir = blyt_dir.join("rust");
+    let lua_dir = blyt_dir.join("lua");
+    fs::create_dir_all(&c_dir)?;
+    fs::create_dir_all(&rust_dir)?;
+    fs::create_dir_all(&lua_dir)?;
+
+    let c_path = c_dir.join("cart_state.h");
+    let rs_path = rust_dir.join("cart_state.rs");
+    let lua_path = lua_dir.join("cart_state.lua");
+    let layouts_bin = build_dir.join("cart.layouts.bin");
+
+    let _ = project_dir; /* reserved for future use */
+    let buffers_present = !cfg.state_buffers.is_empty();
+
+    /* ---- C header ---- */
+    let mut c_out = String::new();
+    c_out.push_str("/* Auto-generated by blyt build — do not edit. */\n");
+    c_out.push_str("#ifndef BLYT_CART_STATE_H\n");
+    c_out.push_str("#define BLYT_CART_STATE_H\n");
+    c_out.push_str("#include <blyt.h>\n\n");
+
+    /* ---- Rust module ---- */
+    let mut rs_out = String::new();
+    rs_out.push_str("/* Auto-generated by blyt build — do not edit. */\n");
+    rs_out.push_str("use blyt::{BlytBufferH, BlytFieldH};\n\n");
+
+    /* ---- Lua globals ---- */
+    let mut lua_out = String::new();
+    lua_out.push_str("-- Auto-generated by blyt build — do not edit.\n");
+
+    let mut buf_index: u32 = 1;
+    for (buf_name, buf_decl) in &cfg.state_buffers {
+        let buf_upper = buf_name.to_uppercase();
+        let prefix = format!("S_{buf_upper}");
+
+        /* Buffer handle constant */
+        c_out.push_str(&format!(
+            "#define {prefix} ((blyt_buffer_h){buf_index}u)\n"
+        ));
+        rs_out.push_str(&format!(
+            "#[allow(dead_code)] pub const {prefix}: BlytBufferH = {buf_index};\n"
+        ));
+        lua_out.push_str(&format!("{prefix} = {buf_index}\n"));
+
+        /* Resolve flat fields for this buffer's record */
+        let mut visiting = Vec::new();
+        let fields: Vec<FlatField> =
+            flatten_record(&buf_decl.record, &cfg.records, &mut visiting)
+                .map_err(|e| err(e))?;
+
+        let field_name_prefix = format!("S_{buf_upper}");
+
+        for f in &fields {
+            let field_name = format!(
+                "{field_name_prefix}_{}",
+                f.flat_name.to_uppercase()
+            );
+            /* blyt_field_h: upper 16 bits = buf_id, lower 16 bits = field index */
+            let field_h: u32 = (buf_index << 16) | (f.index & 0xFFFF);
+
+            let c_type = type_tag_c_type(f.type_tag);
+            let rs_type = type_tag_rust_type(f.type_tag);
+            let _suffix = type_tag_buf_get_suffix(f.type_tag);
+
+            c_out.push_str(&format!(
+                "#define {field_name} ((blyt_field_h)0x{field_h:08X}u) /* {c_type} */\n"
+            ));
+            rs_out.push_str(&format!(
+                "#[allow(dead_code)] pub const {field_name}: BlytFieldH = 0x{field_h:08X}; /* {rs_type} */\n"
+            ));
+            lua_out.push_str(&format!(
+                "{field_name} = 0x{field_h:08X}\n"
+            ));
+        }
+
+        c_out.push('\n');
+        rs_out.push('\n');
+        lua_out.push('\n');
+        buf_index += 1;
+    }
+
+    c_out.push_str("#endif /* BLYT_CART_STATE_H */\n");
+    rs_out.push_str("/* end of generated constants */\n");
+
+    fs::write(&c_path, &c_out)?;
+    fs::write(&rs_path, &rs_out)?;
+    fs::write(&lua_path, &lua_out)?;
+
+    /* ---- .cart.layouts FlatBuffer binary ---- */
+    let layouts_bytes = cart_layouts_bytes(cfg);
+    if !layouts_bytes.is_empty() {
+        fs::write(&layouts_bin, &layouts_bytes)?;
+    }
+
+    Ok(CartStateFiles {
+        c_header: c_path,
+        rust_module: rs_path,
+        lua_module: lua_path,
+        layouts_bin,
+        c_include_dir: c_dir,
+        buffers_present,
+    })
 }
 
 /* -------------------------------------------------------------------------
@@ -444,6 +666,11 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     let cart_info_file = build_dir.join("cart.info.bin");
     fs::write(&cart_info_file, cart_info_bytes(debug))?;
 
+    /* Parse blyt.config.yaml and generate state buffer codegen artifacts. */
+    let cart_config =
+        crate::config::read_cart_config(project_dir).map_err(|e| err(e))?;
+    let cart_state = generate_cart_state(project_dir, &build_dir, &cart_config)?;
+
     /* Generate the cart entry point stub.  _blyt_entry is the ELF e_entry:
      *   - On native RISC-V hardware: ld.so jumps here after loading
      *     libblyt32.so and libblytcommon.so; it calls blyt_main via PLT.
@@ -510,6 +737,10 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         let bytecode_path = build_dir.join("bytecode.luac");
         let mut luac_cmd = Command::new(&luac);
         luac_cmd.arg("-o").arg(&bytecode_path);
+        /* Prepend generated cart_state.lua so its globals are available to user code. */
+        if cart_state.buffers_present {
+            luac_cmd.arg(&cart_state.lua_module);
+        }
         for f in &lua_files {
             luac_cmd.arg(f);
         }
@@ -590,6 +821,13 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     // For Lua+Rust: the archive goes into lib_archives so the linker emits
     // -u,cart_lua_modules (not -u,blyt_cart_init — those come from libblyt32lua.so).
     // For a pure Rust cart (no Lua): rust_archive carries lifecycle symbols.
+    /* Include dirs for C/C++: lib includes + generated cart_state.h dir */
+    let mut c_include_paths: Vec<PathBuf> = lib_include_paths.clone();
+    if cart_state.buffers_present {
+        c_include_paths.push(cart_state.c_include_dir.clone());
+    }
+    let c_include_refs: Vec<&Path> = c_include_paths.iter().map(PathBuf::as_path).collect();
+
     if languages.contains(&CartLanguage::C) {
         let extra_defines: &[String] = if is_lua { &lua_lib_defines } else { &[] };
         for src in collect_c_files(&project_dir.join("src/game/c"))? {
@@ -598,7 +836,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                 &src,
                 &build_dir,
                 &sdk_include,
-                &lib_include_refs,
+                &c_include_refs,
                 extra_defines,
                 &opt_c_flags,
             )?);
@@ -634,7 +872,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                 &build_dir,
                 &sdk_include,
                 &libcxx_include,
-                &lib_include_refs,
+                &c_include_refs,
                 &opt_c_flags,
             )?);
         }
@@ -646,6 +884,11 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         let rust_build_dir = project_dir.join("build/game/rust");
         fs::create_dir_all(&rust_build_dir)?;
         let rust_libs = discover_rust_libs(project_dir)?;
+        let cart_state_rs = if cart_state.buffers_present {
+            Some(cart_state.rust_module.as_path())
+        } else {
+            None
+        };
         let archive = build_rust_archive(
             &cargo,
             &rust_manifest,
@@ -654,6 +897,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             &rust_libs,
             &debug_rust_flags,
             is_lua,
+            cart_state_rs,
         )?;
         Some(archive)
     } else {
@@ -682,25 +926,22 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         None
     };
 
+    /* Build extra_sections list: .cart.lua (Lua only) + .cart.layouts (if present). */
+    let mut extra_sections: Vec<(&str, &std::path::Path)> = Vec::new();
     if let Some(ref bytecode) = lua_bytecode_path {
-        finalise_cart(
-            &objcopy,
-            &raw_elf,
-            &cart_info_file,
-            &output_path,
-            &[(".cart.lua", bytecode.as_path())],
-            debug,
-        )?;
-    } else {
-        finalise_cart(
-            &objcopy,
-            &raw_elf,
-            &cart_info_file,
-            &output_path,
-            &[],
-            debug,
-        )?;
+        extra_sections.push((".cart.lua", bytecode.as_path()));
     }
+    if cart_state.buffers_present {
+        extra_sections.push((".cart.layouts", cart_state.layouts_bin.as_path()));
+    }
+    finalise_cart(
+        &objcopy,
+        &raw_elf,
+        &cart_info_file,
+        &output_path,
+        &extra_sections,
+        debug,
+    )?;
 
     println!("built: {}", output_path.display());
     Ok(output_path)
@@ -1124,6 +1365,7 @@ fn build_rust_archive(
     rust_lib_patches: &[(String, PathBuf)],
     extra_rustflags: &str,
     is_lua: bool,
+    cart_state_rs: Option<&Path>,
 ) -> Result<PathBuf, BuildError> {
     // Inject the SDK crate and any src/lib/ Rust crates via --config patches so
     // the game's Cargo.toml needs only version constraints and cargo resolves to
@@ -1147,7 +1389,11 @@ fn build_rust_archive(
         cmd.arg("--features").arg("blyt/lua");
     }
 
-    let status = cmd
+    let mut cargo_cmd = cmd;
+    if let Some(rs_path) = cart_state_rs {
+        cargo_cmd.env("BLYT_CART_STATE_RS", rs_path);
+    }
+    let status = cargo_cmd
         .env("RUSTFLAGS", cart_rustflags(extra_rustflags))
         .status()
         .map_err(|e| err(format!("failed to run {cargo}: {e}")))?;

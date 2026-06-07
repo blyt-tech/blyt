@@ -35,6 +35,7 @@ typedef enum blyt_cart_err {
     BLYT_CART_ERR_BAD_OPCODE = 20, /* ecall or ebreak found in executable segment */
     BLYT_CART_ERR_BAD_IMPORT = 21, /* imported symbol not on allowlist */
     BLYT_CART_ERR_MISSING_ENTRY = 22, /* required cart entry point absent */
+    BLYT_CART_ERR_BAD_LAYOUTS = 23, /* .cart.layouts FlatBuffers parse error */
 } blyt_cart_err_t;
 
 typedef struct blyt_cart blyt_cart_t;
