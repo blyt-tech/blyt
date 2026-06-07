@@ -36,6 +36,49 @@
  * this ecall signals the host to stop driving rv32emu and read a0. */
 #define BLYT_ECALL_HOST_FN_RETURN 9
 
+/* Lua C API bridge op (ADR-0130, WASM hybrid carts only).
+ * Issued by the bridge-stub variant of libblyt32lua.so while a bridged
+ * Lua→native call is in flight.  a0=opcode (BLYT_LUA_OP_*), a1=call token,
+ * a2–a5=op args.  Returns a0=status (BLYT_LUA_ST_*), a1=value, a2=aux.
+ * Outside the bridged-call window, or with a bad token/opcode, this traps. */
+#define BLYT_ECALL_LUA_OP 10
+
+/* Bridge opcodes (a0).  One per bridged Lua C API operation; the dispatch
+ * switch in lua_bridge.c is the ADR-0118 enforcement point on WASM — the
+ * loading/compiling class has no opcodes by construction. */
+enum {
+    BLYT_LUA_OP_GETTOP = 1, /* () -> top */
+    BLYT_LUA_OP_SETTOP = 2, /* (idx) */
+    BLYT_LUA_OP_PUSHVALUE = 3, /* (idx) */
+    BLYT_LUA_OP_TYPE = 4, /* (idx) -> LUA_T* */
+    BLYT_LUA_OP_PUSHNIL = 5, /* () */
+    BLYT_LUA_OP_PUSHBOOLEAN = 6, /* (b) */
+    BLYT_LUA_OP_PUSHINTEGER = 7, /* (n) */
+    BLYT_LUA_OP_PUSHNUMBER = 8, /* (f32 bits) */
+    BLYT_LUA_OP_PUSHLSTRING = 9, /* (ptr, len) */
+    BLYT_LUA_OP_TOINTEGERX = 10, /* (idx) -> n, aux=isnum */
+    BLYT_LUA_OP_TONUMBERX = 11, /* (idx) -> f32 bits, aux=isnum */
+    BLYT_LUA_OP_TOBOOLEAN = 12, /* (idx) -> 0/1 */
+    BLYT_LUA_OP_TOLSTRING = 13, /* (idx, buf, cap) -> wrote, aux=full len */
+    BLYT_LUA_OP_CREATETABLE = 14, /* (narr, nrec) */
+    BLYT_LUA_OP_GETFIELD = 15, /* (idx, k_ptr, k_len) -> type */
+    BLYT_LUA_OP_SETFIELD = 16, /* (idx, k_ptr, k_len) */
+    BLYT_LUA_OP_GETI = 17, /* (idx, i) -> type */
+    BLYT_LUA_OP_SETI = 18, /* (idx, i) */
+    BLYT_LUA_OP_RAWLEN = 19, /* (idx) -> len */
+    BLYT_LUA_OP_NEXT = 20, /* (idx) -> 0/1 */
+    BLYT_LUA_OP_GETGLOBAL = 21, /* (name_ptr, name_len) -> type */
+    BLYT_LUA_OP_SETGLOBAL = 22, /* (name_ptr, name_len) */
+    BLYT_LUA_OP_ERROR = 23, /* () — never returns to the guest */
+    BLYT_LUA_OP_ERRMSG = 24, /* (msg_ptr, msg_len) — never returns */
+};
+
+/* Bridge op status (returned in a0).  Lua errors never return: the host
+ * halts emulation and raises from the trampoline continuation instead. */
+#define BLYT_LUA_ST_OK 0
+#define BLYT_LUA_ST_RETRY 1 /* TOLSTRING: cap too small; aux has needed len */
+#define BLYT_LUA_ST_NIL 2 /* TOLSTRING: value not string/number (NULL return) */
+
 /*
  * EXIT trampoline — injected into rv32emu guest memory by the runtime.
  *

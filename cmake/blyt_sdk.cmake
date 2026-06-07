@@ -676,6 +676,31 @@ else()
 
   message(STATUS "Lua libraries built: libblytcommonlua.so + libblyt32lua.so")
 
+  # libblyt32lua-bridge.so (ADR-0130) — the WASM-target variant of
+  # libblyt32lua.so.  No Lua VM: every lua_* export is a BLYT_ECALL_LUA_OP
+  # stub serviced by the host against the host-side exchange thread.  Same
+  # soname and export surface (blyt32lua.sym), so the WASM frontend embeds
+  # it under the name "libblyt32lua.so" and carts need no rebuild.
+  foreach(_var release debug)
+    blyt_set_variant(${_var})
+    message(STATUS "Building libblyt32lua-bridge.so (${_var})…")
+    blyt_link_guest_so(
+      "${_VDIR}/libblyt32lua-bridge.so"
+      ${_VSTRIP}
+      ${LIBBLYTC_CFLAGS}
+      ${_VOPT}
+      -I
+      "${BLYT_SOURCE_DIR}/runtime/guest/include"
+      -Wl,-soname,libblyt32lua.so
+      -Wl,--version-script,${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.sym
+      -Wl,--no-as-needed
+      "${_VDIR}/libblyt32.so"
+      -Wl,--as-needed
+      -o
+      "${_VDIR}/libblyt32lua-bridge.so"
+      "${BLYT_SOURCE_DIR}/runtime/guest/src/libblyt32lua-bridge/blyt32lua_bridge.c")
+  endforeach()
+
   # libblyt32lua.so (native path) — Lua VM + blyt bindings for trusted native exec.
   #
   # Built for the RISC-V QEMU gate.  /lib/ld-blyt.so.1 is a minimal ILP32F

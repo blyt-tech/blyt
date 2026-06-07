@@ -64,6 +64,43 @@ extern int luaL_error(lua_State *L, const char *fmt, ...);
 /* Module table helper — gets or creates registry[fname]; used by cart_lua_modules. */
 extern int luaL_getsubtable(lua_State *L, int idx, const char *fname);
 
+/* --- ADR-0130 additions: string/table surface for raw wrappers ------------
+ * Same restricted-API spirit (no code loading); exported by libblyt32lua.so
+ * on rv32 and implemented as ECALL bridge stubs in the WASM-target variant. */
+
+typedef __SIZE_TYPE__ size_t_blyt; /* avoid <stddef.h> dependency here */
+
+extern int lua_gettop(lua_State *L);
+extern void lua_pushnil(lua_State *L);
+extern const char *lua_pushstring(lua_State *L, const char *s);
+extern const char *lua_pushlstring(lua_State *L, const char *s, size_t_blyt len);
+extern const char *lua_tolstring(lua_State *L, int idx, size_t_blyt *len);
+#define lua_tostring(L, i) lua_tolstring((L), (i), (size_t_blyt *)0)
+extern int lua_error(lua_State *L); /* never returns */
+extern int lua_geti(lua_State *L, int idx, lua_Integer i);
+extern void lua_seti(lua_State *L, int idx, lua_Integer i);
+extern unsigned int lua_rawlen(lua_State *L, int idx);
+extern int lua_next(lua_State *L, int idx);
+extern const char *lua_typename(lua_State *L, int tp);
+
+/* Lua type tags (match lua.h). */
+#define LUA_TNONE (-1)
+#define LUA_TNIL 0
+#define LUA_TBOOLEAN 1
+#define LUA_TLIGHTUSERDATA 2
+#define LUA_TNUMBER 3
+#define LUA_TSTRING 4
+/* LUA_TTABLE 5 defined above */
+#define LUA_TFUNCTION 6
+#define LUA_TUSERDATA 7
+#define LUA_TTHREAD 8
+
+/* Argument helpers (composed from the surface above in the bridge variant). */
+extern lua_Integer luaL_checkinteger(lua_State *L, int arg);
+extern lua_Number luaL_checknumber(lua_State *L, int arg);
+extern const char *luaL_checklstring(lua_State *L, int arg, size_t_blyt *len);
+#define luaL_checkstring(L, a) luaL_checklstring((L), (a), (size_t_blyt *)0)
+
 #ifdef __cplusplus
 }
 #endif

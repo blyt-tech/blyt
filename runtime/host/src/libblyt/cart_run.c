@@ -28,6 +28,14 @@
 #include "elf32.h"
 #include "testcard.h"
 
+#ifdef BLYT_LUA
+/* ECALL-bridged Lua C API (ADR-0130).  Only the WASM frontend builds libblyt
+ * sources with BLYT_LUA; the host-side Lua state lives in the frontend and is
+ * attached via blyt_session_lua_bridge_attach(). */
+#include <lauxlib.h>
+#include <lua.h>
+#endif
+
 /*
  * rv32emu headers — common.h must come first; ${RV32EMU_DIR} is on the
  * include path so these can be referenced by name rather than relative path.
@@ -140,6 +148,13 @@ typedef struct {
     bool gdb_single_step; /* set when vCont;s received; cleared after one step */
     bool gdb_ebreak_pending; /* ebreak fired inside rv_step; cleared by post-step handler */
     uint32_t gdb_bp_resume_addr; /* WASM: bp addr we paused at; cleared when stepping over */
+#ifdef BLYT_LUA
+    /* ECALL-bridged Lua C API (ADR-0130). */
+    struct lua_State *lua_exch; /* exchange thread; set by lua_bridge_attach */
+    bool lua_bridge_active; /* a bridged Lua→native call is in flight */
+    uint32_t lua_bridge_token; /* nonce passed to the wrapper as its lua_State* */
+    bool lua_bridge_error; /* a bridge op raised; run_frame returns FN_ERROR */
+#endif
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -181,11 +196,19 @@ struct blyt_session {
     struct {
         char lua_name[32];
         uint32_t fn_guest_addr;
+        uint32_t wrap_guest_addr; /* ADR-0130: resolved for bridged exports */
         uint8_t nargs;
         uint8_t arg_types[4];
         uint8_t ret_type;
+        uint8_t flags; /* BLYT_LUA_EXPORT_FLAG_* */
     } lua_exports[32];
     int lua_nexports;
+    /* ADR-0130 bridged-call state: register snapshot taken at
+     * begin_bridged_call, restored when a wrapper raises a Lua error so
+     * repeated errors do not leak guest stack. */
+    uint32_t bridge_saved_regs[32];
+    uint32_t bridge_saved_fcsr;
+    uint32_t lua_bridge_next_token;
 #endif
 
 #ifdef BLYT_GDB
@@ -358,6 +381,529 @@ static bool inject_exit_trampoline(memory_t *mem) {
     write_u32_le(stub + 12, RV32_UNIMP);
     return memory_write(mem, BLYT_TRAMPOLINE_FN_RETURN_ADDR, stub, sizeof(stub));
 }
+
+/* -------------------------------------------------------------------------
+ * ECALL-bridged Lua C API dispatcher (ADR-0130)
+ *
+ * Executes one Lua C API operation against the exchange thread on behalf of
+ * a guest wrapper.  The exchange thread's "outer" stack (no active frames)
+ * is the wrapper-visible Lua stack; ops that can run Lua code (metamethods)
+ * or allocate are executed inside lua_pcall so errors never reach the panic
+ * handler.  On a Lua error the error value is left on the exchange stack,
+ * lua_bridge_error is set, and emulation halts WITHOUT advancing the PC —
+ * the guest stub never resumes; the frontend raises from the trampoline
+ * continuation inside the game coroutine.
+ * ------------------------------------------------------------------------- */
+#ifdef BLYT_LUA
+
+#define BLYT_BRIDGE_STR_MAX (16u * 1024u * 1024u) /* host-OOM guard */
+
+/* Context for protected ops: filled by bridge_lua_op, read by the pcall'd
+ * helper.  A host global is fine — ops are strictly synchronous. */
+typedef struct {
+    uint32_t opcode;
+    int idx; /* absolute exchange-stack index of the op's target */
+    const char *str; /* host copy of guest string (key/name/data) */
+    size_t str_len;
+    lua_Integer i; /* GETI/SETI index */
+    int narr, nrec; /* CREATETABLE */
+    int out_type; /* GETFIELD/GETI/GETGLOBAL result type */
+    int out_more; /* NEXT: 1 = produced key/value */
+} bridge_opctx_t;
+
+static bridge_opctx_t g_bridge_opctx;
+
+/* Protected helper: runs the metamethod/allocation-capable part of one op.
+ * Arguments (copies of outer-stack values) arrive at indices 1..n; results
+ * are returned (LUA_MULTRET) and land appended to the outer stack. */
+static int bridge_protected(lua_State *L) {
+    bridge_opctx_t *c = &g_bridge_opctx;
+    switch (c->opcode) {
+    case BLYT_LUA_OP_PUSHLSTRING:
+        lua_pushlstring(L, c->str, c->str_len);
+        return 1;
+    case BLYT_LUA_OP_CREATETABLE:
+        lua_createtable(L, c->narr, c->nrec);
+        return 1;
+    case BLYT_LUA_OP_GETFIELD: /* arg1 = table */
+        c->out_type = lua_getfield(L, 1, c->str);
+        return 1;
+    case BLYT_LUA_OP_SETFIELD: /* arg1 = table, arg2 = value */
+        lua_setfield(L, 1, c->str);
+        return 0;
+    case BLYT_LUA_OP_GETI: /* arg1 = table */
+        c->out_type = lua_geti(L, 1, c->i);
+        return 1;
+    case BLYT_LUA_OP_SETI: /* arg1 = table, arg2 = value */
+        lua_seti(L, 1, c->i);
+        return 0;
+    case BLYT_LUA_OP_NEXT: /* arg1 = table, arg2 = key */
+        c->out_more = lua_next(L, 1);
+        return c->out_more ? 2 : 0;
+    case BLYT_LUA_OP_GETGLOBAL:
+        c->out_type = lua_getglobal(L, c->str);
+        return 1;
+    case BLYT_LUA_OP_SETGLOBAL: /* arg1 = value */
+        lua_pushvalue(L, 1);
+        lua_setglobal(L, c->str);
+        return 0;
+    case BLYT_LUA_OP_TOLSTRING: /* arg1 = value (string or number) */
+        /* Number→string conversion allocates; do it on the copy so the
+         * outer slot keeps its type (the real API converts in place; the
+         * difference is unobservable through the bridge). */
+        c->str = lua_tolstring(L, 1, &c->str_len);
+        return 1; /* keep the (converted) copy alive on the outer stack */
+    default:
+        return luaL_error(L, "blyt bridge: bad protected opcode %d", (int)c->opcode);
+    }
+}
+
+/* Read a guest string into a malloc'd NUL-terminated host buffer. */
+static char *bridge_read_guest_str(riscv_t *rv, uint32_t vaddr, uint32_t len, bool allow_nul,
+                                   size_t *out_len) {
+    vm_attr_t *attr = PRIV(rv);
+    memory_t *mem = attr->mem;
+    if (len > BLYT_BRIDGE_STR_MAX)
+        return NULL;
+    if (len > 0 && !GUEST_RAM_CONTAINS(mem, vaddr, len))
+        return NULL;
+    char *buf = malloc((size_t)len + 1);
+    if (!buf)
+        return NULL;
+    if (len > 0)
+        memory_read(mem, (uint8_t *)buf, vaddr, len);
+    buf[len] = '\0';
+    if (!allow_nul && memchr(buf, '\0', len) != NULL) {
+        free(buf);
+        return NULL;
+    }
+    *out_len = len;
+    return buf;
+}
+
+/* Convert a wrapper-supplied stack index to an absolute outer-stack index.
+ * Pseudo-indices (registry, upvalues) are rejected (ADR-0130 v1). */
+static bool bridge_abs_index(lua_State *EX, int32_t idx, int *out) {
+    int top = lua_gettop(EX);
+    if (idx >= 1 && idx <= top) {
+        *out = (int)idx;
+        return true;
+    }
+    if (idx <= -1 && idx >= -top) {
+        *out = top + (int)idx + 1;
+        return true;
+    }
+    return false;
+}
+
+/* Raise: leave `err` (already on top of EX) as the pending error, halt. */
+static void bridge_fail(riscv_t *rv) {
+    g_run_ctx->lua_bridge_error = true;
+    rv_halt(rv); /* PC NOT advanced: the guest stub never resumes */
+}
+
+/* Push a formatted error message on EX and fail.  Never raises (pushfstring
+ * can OOM-panic in theory; acceptable for the spike, noted in ADR-0130). */
+static void bridge_fail_msg(riscv_t *rv, lua_State *EX, const char *msg) {
+    lua_checkstack(EX, 2);
+    lua_pushstring(EX, msg);
+    bridge_fail(rv);
+}
+
+/* Run bridge_protected via lua_pcall with `nargs` copies of outer-stack
+ * values (absolute indices in `argidx`).  On success results are appended
+ * to the outer stack (MULTRET).  Returns true on success; on failure the
+ * error value is on top of EX and the call is failed. */
+static bool bridge_pcall(riscv_t *rv, lua_State *EX, const int *argidx, int nargs) {
+    if (!lua_checkstack(EX, nargs + 2)) {
+        bridge_fail_msg(rv, EX, "blyt bridge: exchange stack overflow");
+        return false;
+    }
+    lua_pushcfunction(EX, bridge_protected);
+    for (int i = 0; i < nargs; i++)
+        lua_pushvalue(EX, argidx[i]);
+    if (lua_pcall(EX, nargs, LUA_MULTRET, 0) != LUA_OK) {
+        bridge_fail(rv); /* error value already on top */
+        return false;
+    }
+    return true;
+}
+
+/* Dispatch one BLYT_ECALL_LUA_OP.  Register conventions per ecall.h. */
+static void bridge_lua_op(riscv_t *rv) {
+    /* Validity window and token check: anything wrong here is a protocol
+     * violation (fatal trap), not a recoverable Lua error. */
+    if (!g_run_ctx || !g_run_ctx->lua_bridge_active || !g_run_ctx->lua_exch) {
+        g_run_ctx ? (g_run_ctx->ecall_trapped = true) : (void)0;
+        rv_halt(rv);
+        return;
+    }
+    lua_State *EX = g_run_ctx->lua_exch;
+    uint32_t opcode = rv_get_reg(rv, rv_reg_a0);
+    uint32_t token = rv_get_reg(rv, rv_reg_a1);
+    if (token != g_run_ctx->lua_bridge_token) {
+        g_run_ctx->ecall_trapped = true;
+        rv_halt(rv);
+        return;
+    }
+    uint32_t a2 = rv_get_reg(rv, rv_reg_a2);
+    uint32_t a3 = rv_get_reg(rv, rv_reg_a3);
+    uint32_t a4 = rv_get_reg(rv, rv_reg_a4);
+    uint32_t st = BLYT_LUA_ST_OK, val = 0, aux = 0;
+    char *hstr = NULL;
+    g_bridge_opctx.opcode = opcode;
+
+    switch (opcode) {
+    case BLYT_LUA_OP_GETTOP:
+        val = (uint32_t)lua_gettop(EX);
+        break;
+
+    case BLYT_LUA_OP_SETTOP: {
+        int32_t idx = (int32_t)a2;
+        int top = lua_gettop(EX);
+        /* idx in [0, top] (shrink/keep) or [-top, -1] (pop) — growth with
+         * nils is allowed by the real API; permit a bounded version. */
+        if (idx >= 0 && idx <= top + 64) {
+            if (idx > top && !lua_checkstack(EX, idx - top)) {
+                bridge_fail_msg(rv, EX, "blyt bridge: settop overflow");
+                return;
+            }
+            lua_settop(EX, idx);
+        } else if (idx < 0 && -idx <= top) {
+            lua_settop(EX, idx);
+        } else {
+            bridge_fail_msg(rv, EX, "blyt bridge: settop index out of range");
+            return;
+        }
+        break;
+    }
+
+    case BLYT_LUA_OP_PUSHVALUE: {
+        int ai;
+        if (!bridge_abs_index(EX, (int32_t)a2, &ai)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: invalid stack index");
+            return;
+        }
+        if (!lua_checkstack(EX, 1)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: exchange stack overflow");
+            return;
+        }
+        lua_pushvalue(EX, ai);
+        break;
+    }
+
+    case BLYT_LUA_OP_TYPE: {
+        int ai;
+        if (!bridge_abs_index(EX, (int32_t)a2, &ai)) {
+            val = (uint32_t)LUA_TNONE;
+        } else {
+            val = (uint32_t)lua_type(EX, ai);
+        }
+        break;
+    }
+
+    case BLYT_LUA_OP_PUSHNIL:
+    case BLYT_LUA_OP_PUSHBOOLEAN:
+    case BLYT_LUA_OP_PUSHINTEGER:
+    case BLYT_LUA_OP_PUSHNUMBER: {
+        if (!lua_checkstack(EX, 1)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: exchange stack overflow");
+            return;
+        }
+        if (opcode == BLYT_LUA_OP_PUSHNIL) {
+            lua_pushnil(EX);
+        } else if (opcode == BLYT_LUA_OP_PUSHBOOLEAN) {
+            lua_pushboolean(EX, a2 ? 1 : 0);
+        } else if (opcode == BLYT_LUA_OP_PUSHINTEGER) {
+            lua_pushinteger(EX, (lua_Integer)(int32_t)a2);
+        } else {
+            float f;
+            memcpy(&f, &a2, 4);
+            lua_pushnumber(EX, (lua_Number)f);
+        }
+        break;
+    }
+
+    case BLYT_LUA_OP_TOINTEGERX:
+    case BLYT_LUA_OP_TONUMBERX:
+    case BLYT_LUA_OP_TOBOOLEAN: {
+        int ai;
+        if (!bridge_abs_index(EX, (int32_t)a2, &ai)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: invalid stack index");
+            return;
+        }
+        if (opcode == BLYT_LUA_OP_TOINTEGERX) {
+            int isnum = 0;
+            lua_Integer n = lua_tointegerx(EX, ai, &isnum);
+            val = (uint32_t)(int32_t)n;
+            aux = (uint32_t)isnum;
+        } else if (opcode == BLYT_LUA_OP_TONUMBERX) {
+            int isnum = 0;
+            float f = (float)lua_tonumberx(EX, ai, &isnum);
+            memcpy(&val, &f, 4);
+            aux = (uint32_t)isnum;
+        } else {
+            val = (uint32_t)lua_toboolean(EX, ai);
+        }
+        break;
+    }
+
+    case BLYT_LUA_OP_TOLSTRING: {
+        int ai;
+        if (!bridge_abs_index(EX, (int32_t)a2, &ai)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: invalid stack index");
+            return;
+        }
+        int t = lua_type(EX, ai);
+        if (t != LUA_TSTRING && t != LUA_TNUMBER) {
+            st = BLYT_LUA_ST_NIL; /* real lua_tolstring returns NULL */
+            break;
+        }
+        g_bridge_opctx.str = NULL;
+        g_bridge_opctx.str_len = 0;
+        int args[1] = {ai};
+        if (!bridge_pcall(rv, EX, args, 1))
+            return;
+        /* bridge_protected left the (possibly converted) copy on top; the
+         * interned string pointer in opctx.str is valid while it stays. */
+        const char *sp = g_bridge_opctx.str;
+        size_t slen = g_bridge_opctx.str_len;
+        uint32_t buf = a3, cap = a4;
+        aux = (uint32_t)slen;
+        if (slen + 1 > cap) {
+            st = BLYT_LUA_ST_RETRY;
+            lua_pop(EX, 1);
+            break;
+        }
+        vm_attr_t *attr = PRIV(rv);
+        memory_t *mem = attr->mem;
+        if (!GUEST_RAM_CONTAINS(mem, buf, (uint32_t)slen + 1)) {
+            lua_pop(EX, 1);
+            bridge_fail_msg(rv, EX, "blyt bridge: tolstring buffer out of bounds");
+            return;
+        }
+        memory_write(mem, buf, (const uint8_t *)sp, (uint32_t)slen);
+        const uint8_t nul = 0;
+        memory_write(mem, buf + (uint32_t)slen, &nul, 1);
+        val = (uint32_t)slen;
+        lua_pop(EX, 1); /* drop the copy */
+        break;
+    }
+
+    case BLYT_LUA_OP_PUSHLSTRING: {
+        size_t slen = 0;
+        hstr = bridge_read_guest_str(rv, a2, a3, true, &slen);
+        if (!hstr) {
+            bridge_fail_msg(rv, EX, "blyt bridge: bad string pointer/length");
+            return;
+        }
+        g_bridge_opctx.str = hstr;
+        g_bridge_opctx.str_len = slen;
+        if (!bridge_pcall(rv, EX, NULL, 0)) {
+            free(hstr);
+            return;
+        }
+        free(hstr);
+        break;
+    }
+
+    case BLYT_LUA_OP_CREATETABLE: {
+        g_bridge_opctx.narr = (int)(int32_t)a2;
+        g_bridge_opctx.nrec = (int)(int32_t)a3;
+        if (g_bridge_opctx.narr < 0 || g_bridge_opctx.narr > (1 << 20) ||
+            g_bridge_opctx.nrec < 0 || g_bridge_opctx.nrec > (1 << 20)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: createtable size out of range");
+            return;
+        }
+        if (!bridge_pcall(rv, EX, NULL, 0))
+            return;
+        break;
+    }
+
+    case BLYT_LUA_OP_GETFIELD:
+    case BLYT_LUA_OP_SETFIELD: {
+        int ai;
+        if (!bridge_abs_index(EX, (int32_t)a2, &ai)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: invalid stack index");
+            return;
+        }
+        size_t klen = 0;
+        hstr = bridge_read_guest_str(rv, a3, a4, false, &klen);
+        if (!hstr) {
+            bridge_fail_msg(rv, EX, "blyt bridge: bad field key");
+            return;
+        }
+        g_bridge_opctx.str = hstr;
+        if (opcode == BLYT_LUA_OP_GETFIELD) {
+            int args[1] = {ai};
+            if (!bridge_pcall(rv, EX, args, 1)) {
+                free(hstr);
+                return;
+            }
+            val = (uint32_t)g_bridge_opctx.out_type;
+        } else {
+            /* setfield pops the value (top of outer stack). */
+            int top = lua_gettop(EX);
+            if (top < 1 || ai == top) {
+                free(hstr);
+                bridge_fail_msg(rv, EX, "blyt bridge: setfield needs a value on the stack");
+                return;
+            }
+            int args[2] = {ai, top};
+            if (!bridge_pcall(rv, EX, args, 2)) {
+                free(hstr);
+                return;
+            }
+            lua_pop(EX, 1); /* consume the original value */
+        }
+        free(hstr);
+        hstr = NULL;
+        break;
+    }
+
+    case BLYT_LUA_OP_GETI:
+    case BLYT_LUA_OP_SETI: {
+        int ai;
+        if (!bridge_abs_index(EX, (int32_t)a2, &ai)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: invalid stack index");
+            return;
+        }
+        g_bridge_opctx.i = (lua_Integer)(int32_t)a3;
+        if (opcode == BLYT_LUA_OP_GETI) {
+            int args[1] = {ai};
+            if (!bridge_pcall(rv, EX, args, 1))
+                return;
+            val = (uint32_t)g_bridge_opctx.out_type;
+        } else {
+            int top = lua_gettop(EX);
+            if (top < 1 || ai == top) {
+                bridge_fail_msg(rv, EX, "blyt bridge: seti needs a value on the stack");
+                return;
+            }
+            int args[2] = {ai, top};
+            if (!bridge_pcall(rv, EX, args, 2))
+                return;
+            lua_pop(EX, 1);
+        }
+        break;
+    }
+
+    case BLYT_LUA_OP_RAWLEN: {
+        int ai;
+        if (!bridge_abs_index(EX, (int32_t)a2, &ai)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: invalid stack index");
+            return;
+        }
+        int t = lua_type(EX, ai);
+        if (t != LUA_TTABLE && t != LUA_TSTRING) {
+            bridge_fail_msg(rv, EX, "blyt bridge: rawlen on non-table/string");
+            return;
+        }
+        val = (uint32_t)lua_rawlen(EX, ai);
+        break;
+    }
+
+    case BLYT_LUA_OP_NEXT: {
+        int ai;
+        if (!bridge_abs_index(EX, (int32_t)a2, &ai)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: invalid stack index");
+            return;
+        }
+        if (lua_type(EX, ai) != LUA_TTABLE) {
+            bridge_fail_msg(rv, EX, "blyt bridge: next on non-table");
+            return;
+        }
+        int top = lua_gettop(EX);
+        if (top < 1 || ai == top) {
+            bridge_fail_msg(rv, EX, "blyt bridge: next needs a key on the stack");
+            return;
+        }
+        g_bridge_opctx.out_more = 0;
+        int args[2] = {ai, top};
+        if (!bridge_pcall(rv, EX, args, 2))
+            return;
+        /* Outer stack: [.. tbl .. key] (+ key' value if more).  Remove the
+         * consumed original key to match real lua_next semantics. */
+        if (g_bridge_opctx.out_more) {
+            lua_remove(EX, top);
+            val = 1;
+        } else {
+            lua_pop(EX, 1);
+            val = 0;
+        }
+        break;
+    }
+
+    case BLYT_LUA_OP_GETGLOBAL:
+    case BLYT_LUA_OP_SETGLOBAL: {
+        size_t nlen = 0;
+        hstr = bridge_read_guest_str(rv, a2, a3, false, &nlen);
+        if (!hstr) {
+            bridge_fail_msg(rv, EX, "blyt bridge: bad global name");
+            return;
+        }
+        g_bridge_opctx.str = hstr;
+        if (opcode == BLYT_LUA_OP_GETGLOBAL) {
+            if (!bridge_pcall(rv, EX, NULL, 0)) {
+                free(hstr);
+                return;
+            }
+            val = (uint32_t)g_bridge_opctx.out_type;
+        } else {
+            int top = lua_gettop(EX);
+            if (top < 1) {
+                free(hstr);
+                bridge_fail_msg(rv, EX, "blyt bridge: setglobal needs a value on the stack");
+                return;
+            }
+            int args[1] = {top};
+            if (!bridge_pcall(rv, EX, args, 1)) {
+                free(hstr);
+                return;
+            }
+            lua_pop(EX, 1);
+        }
+        free(hstr);
+        hstr = NULL;
+        break;
+    }
+
+    case BLYT_LUA_OP_ERROR: {
+        /* Error value = top of the exchange stack (wrapper pushed it). */
+        if (lua_gettop(EX) < 1) {
+            bridge_fail_msg(rv, EX, "blyt bridge: error with empty stack");
+            return;
+        }
+        bridge_fail(rv);
+        return;
+    }
+
+    case BLYT_LUA_OP_ERRMSG: {
+        size_t mlen = 0;
+        hstr = bridge_read_guest_str(rv, a2, a3, false, &mlen);
+        lua_checkstack(EX, 1);
+        if (hstr) {
+            lua_pushlstring(EX, hstr, mlen);
+            free(hstr);
+        } else {
+            lua_pushstring(EX, "blyt bridge: (unreadable error message)");
+        }
+        bridge_fail(rv);
+        return;
+    }
+
+    default:
+        g_run_ctx->ecall_trapped = true;
+        rv_halt(rv);
+        return;
+    }
+
+    rv_set_reg(rv, rv_reg_a0, st);
+    rv_set_reg(rv, rv_reg_a1, val);
+    rv_set_reg(rv, rv_reg_a2, aux);
+    rv->PC += 4;
+}
+#endif /* BLYT_LUA */
 
 /* -------------------------------------------------------------------------
  * ECALL handler (ADR-0085: a0=ptr, a1=len, a7=ecall_number)
@@ -608,6 +1154,13 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 #endif /* BLYT_DAP */
+
+#ifdef BLYT_LUA
+    case BLYT_ECALL_LUA_OP: {
+        bridge_lua_op(rv);
+        return;
+    }
+#endif
 
     case BLYT_ECALL_HOST_FN_RETURN: {
         /* Guest function called via blyt_session_begin_fn_call() returned.
@@ -1221,7 +1774,19 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
                 uint32_t addr = symtab_lookup(all_syms, ent[i].fn_sym);
                 if (!addr)
                     continue;
+                /* ADR-0130: bridged exports are invoked through their wrapper
+                 * (wrap_sym) instead of typed argument conversion.  A bridged
+                 * entry with an unresolvable wrapper is skipped. */
+                uint8_t flags = ent[i]._pad[0];
+                uint32_t wrap_addr = 0;
+                if (flags & BLYT_LUA_EXPORT_FLAG_BRIDGED) {
+                    wrap_addr = symtab_lookup(all_syms, ent[i].wrap_sym);
+                    if (!wrap_addr)
+                        continue;
+                }
                 s->lua_exports[s->lua_nexports].fn_guest_addr = addr;
+                s->lua_exports[s->lua_nexports].wrap_guest_addr = wrap_addr;
+                s->lua_exports[s->lua_nexports].flags = flags;
                 memcpy(s->lua_exports[s->lua_nexports].lua_name, ent[i].lua_name, 32);
                 s->lua_exports[s->lua_nexports].nargs = ent[i].nargs;
                 memcpy(s->lua_exports[s->lua_nexports].arg_types, ent[i].arg_types, 4);
@@ -1296,6 +1861,21 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
 
     return s;
 }
+
+#ifdef BLYT_LUA
+/* ADR-0130: a bridged wrapper raised a Lua error.  Restore the register
+ * snapshot taken at begin_bridged_call so the abandoned guest frame does not
+ * leak guest stack, and clear the bridged-call window.  The error value is
+ * on top of the exchange thread; the frontend raises it from the trampoline
+ * continuation. */
+static void blyt_bridge_error_unwind(blyt_session_t *session) {
+    for (uint32_t i = 1; i < 32; i++) /* x0 is hardwired */
+        rv_set_reg(session->rv, i, session->bridge_saved_regs[i]);
+    session->rv->csr_fcsr = session->bridge_saved_fcsr;
+    session->ctx.lua_bridge_active = false;
+    session->ctx.lua_bridge_error = false;
+}
+#endif
 
 blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     g_run_ctx = &session->ctx;
@@ -1520,15 +2100,35 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             return BLYT_RUN_FRAME_DONE;
         }
         if (session->ctx.fn_return_done) {
+#ifdef BLYT_LUA
+            session->ctx.lua_bridge_active = false;
+#endif
             g_run_ctx = NULL;
             return BLYT_RUN_FN_DONE;
         }
+#ifdef BLYT_LUA
+        if (session->ctx.lua_bridge_error) {
+            blyt_bridge_error_unwind(session);
+            g_run_ctx = NULL;
+            return BLYT_RUN_FN_ERROR;
+        }
+#endif
     }
 
     if (session->ctx.fn_return_done) {
+#ifdef BLYT_LUA
+        session->ctx.lua_bridge_active = false;
+#endif
         g_run_ctx = NULL;
         return BLYT_RUN_FN_DONE;
     }
+#ifdef BLYT_LUA
+    if (session->ctx.lua_bridge_error) {
+        blyt_bridge_error_unwind(session);
+        g_run_ctx = NULL;
+        return BLYT_RUN_FN_ERROR;
+    }
+#endif
 
     bool trapped = session->ctx.ecall_trapped;
     bool aborted = session->ctx.ecall_aborted;
@@ -1572,11 +2172,44 @@ uint32_t blyt_session_fn_return_value(const blyt_session_t *s) {
     return rv_get_reg(s->rv, rv_reg_a0);
 }
 
+void blyt_session_lua_bridge_attach(blyt_session_t *s, struct lua_State *exch) {
+#ifdef BLYT_LUA
+    s->ctx.lua_exch = exch;
+#else
+    (void)s;
+    (void)exch;
+#endif
+}
+
+int blyt_session_begin_bridged_call(blyt_session_t *s, uint32_t wrap_addr) {
+#ifdef BLYT_LUA
+    if (!s->ctx.lua_exch)
+        return -1;
+    /* Snapshot registers so a Lua error can unwind the abandoned frame. */
+    for (uint32_t i = 0; i < 32; i++)
+        s->bridge_saved_regs[i] = rv_get_reg(s->rv, i);
+    s->bridge_saved_fcsr = s->rv->csr_fcsr;
+    if (++s->lua_bridge_next_token == 0)
+        ++s->lua_bridge_next_token; /* token is nonzero */
+    s->ctx.lua_bridge_token = s->lua_bridge_next_token;
+    s->ctx.lua_bridge_active = true;
+    s->ctx.lua_bridge_error = false;
+    /* The wrapper receives the token as its opaque lua_State* (a0). */
+    uint32_t args[1] = {s->ctx.lua_bridge_token};
+    return blyt_session_begin_fn_call(s, wrap_addr, 1, args);
+#else
+    (void)s;
+    (void)wrap_addr;
+    return -1;
+#endif
+}
+
 void blyt_session_visit_lua_exports(blyt_session_t *s, blyt_lua_export_visitor_t cb,
                                     void *userdata) {
 #ifdef BLYT_LUA
     for (int i = 0; i < s->lua_nexports; i++)
-        cb(s->lua_exports[i].lua_name, s->lua_exports[i].fn_guest_addr, s->lua_exports[i].nargs,
+        cb(s->lua_exports[i].lua_name, s->lua_exports[i].fn_guest_addr,
+           s->lua_exports[i].wrap_guest_addr, s->lua_exports[i].flags, s->lua_exports[i].nargs,
            s->lua_exports[i].arg_types, s->lua_exports[i].ret_type, userdata);
 #else
     (void)s;

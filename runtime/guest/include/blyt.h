@@ -80,6 +80,11 @@ void blyt_console_debug(const char *s);
 #define BLYT_LUA_TYPE_F32 3
 #define BLYT_LUA_TYPE_BOOL 4
 
+/* Export entry flags (ADR-0130).  BRIDGED: the WASM host invokes the wrapper
+ * (wrap_sym) through the ECALL-bridged Lua C API instead of typed register
+ * conversion — enables strings, tables, >4 args, and multiple returns. */
+#define BLYT_LUA_EXPORT_FLAG_BRIDGED 0x01
+
 /* One entry per exported function, placed in .lua_exports by the macros below.
  * The host reads this section to resolve guest addresses without raw pointers
  * (which would require relocation processing).
@@ -91,7 +96,8 @@ typedef struct {
     uint8_t nargs;
     uint8_t arg_types[4]; /* BLYT_LUA_TYPE_* for each arg */
     uint8_t ret_type; /* BLYT_LUA_TYPE_* */
-    uint8_t _pad[2];
+    uint8_t flags; /* BLYT_LUA_EXPORT_FLAG_* (was _pad[0]; 0 in old carts) */
+    uint8_t _pad;
 } blyt_lua_export_entry_t; /* 168 bytes */
 
 /* One entry per exported function, placed in .lua_regtab by the macros below.
@@ -109,7 +115,7 @@ typedef struct {
 /* 0 args, void return, global export */
 #define BLYT_LUA_EXPORT_VOID(name) \
     void name(void); \
-    static int __lua_export_##name(lua_State *L) { \
+    int __lua_export_##name(lua_State *L) { \
         (void)L; name(); return 0; \
     } \
     static const blyt_lua_regtab_entry_t __lua_regtab_##name \
@@ -119,7 +125,7 @@ typedef struct {
     static const blyt_lua_export_entry_t __export_##name \
         __attribute__((used, retain, section(".lua_exports"))) = { \
         #name, #name, "__lua_export_" #name, \
-        0, {0, 0, 0, 0}, BLYT_LUA_TYPE_VOID, {0, 0} \
+        0, {0, 0, 0, 0}, BLYT_LUA_TYPE_VOID, 0, 0 \
     }; \
     void name(void)
 
@@ -127,7 +133,7 @@ typedef struct {
  * The variadic arg is the C parameter declaration (e.g. "int32_t x"). */
 #define BLYT_LUA_EXPORT_I32(name, ...) \
     int32_t name(__VA_ARGS__); \
-    static int __lua_export_##name(lua_State *L) { \
+    int __lua_export_##name(lua_State *L) { \
         int32_t _a0 = (int32_t)lua_tointeger(L, 1); \
         int32_t _r = name(_a0); \
         lua_pushinteger(L, (lua_Integer)_r); \
@@ -140,7 +146,7 @@ typedef struct {
     static const blyt_lua_export_entry_t __export_##name \
         __attribute__((used, retain, section(".lua_exports"))) = { \
         #name, #name, "__lua_export_" #name, \
-        1, {BLYT_LUA_TYPE_I32, 0, 0, 0}, BLYT_LUA_TYPE_I32, {0, 0} \
+        1, {BLYT_LUA_TYPE_I32, 0, 0, 0}, BLYT_LUA_TYPE_I32, 0, 0 \
     }; \
     int32_t name(__VA_ARGS__)
 
@@ -149,7 +155,7 @@ typedef struct {
  * "module.fn_name" accessible via require("module").fn_name(). */
 #define BLYT_LUA_MODULE_EXPORT_VOID(module, fn_name) \
     void module##_##fn_name(void); \
-    static int __lua_export_##module##_##fn_name(lua_State *L) { \
+    int __lua_export_##module##_##fn_name(lua_State *L) { \
         (void)L; module##_##fn_name(); return 0; \
     } \
     static const blyt_lua_regtab_entry_t __lua_regtab_##module##_##fn_name \
@@ -160,14 +166,14 @@ typedef struct {
         __attribute__((used, retain, section(".lua_exports"))) = { \
         #module "." #fn_name, #module "_" #fn_name, \
         "__lua_export_" #module "_" #fn_name, \
-        0, {0, 0, 0, 0}, BLYT_LUA_TYPE_VOID, {0, 0} \
+        0, {0, 0, 0, 0}, BLYT_LUA_TYPE_VOID, 0, 0 \
     }; \
     void module##_##fn_name(void)
 
 /* 1 I32 arg, I32 return, module export. */
 #define BLYT_LUA_MODULE_EXPORT_I32(module, fn_name, ...) \
     int32_t module##_##fn_name(__VA_ARGS__); \
-    static int __lua_export_##module##_##fn_name(lua_State *L) { \
+    int __lua_export_##module##_##fn_name(lua_State *L) { \
         int32_t _a0 = (int32_t)lua_tointeger(L, 1); \
         int32_t _r = module##_##fn_name(_a0); \
         lua_pushinteger(L, (lua_Integer)_r); \
@@ -181,9 +187,52 @@ typedef struct {
         __attribute__((used, retain, section(".lua_exports"))) = { \
         #module "." #fn_name, #module "_" #fn_name, \
         "__lua_export_" #module "_" #fn_name, \
-        1, {BLYT_LUA_TYPE_I32, 0, 0, 0}, BLYT_LUA_TYPE_I32, {0, 0} \
+        1, {BLYT_LUA_TYPE_I32, 0, 0, 0}, BLYT_LUA_TYPE_I32, 0, 0 \
     }; \
     int32_t module##_##fn_name(__VA_ARGS__)
+
+/* Raw exports (ADR-0130): the author writes the Lua C wrapper body directly
+ * against the restricted Lua C API (blyt_lua_internal.h) — strings, tables,
+ * any number of arguments, multiple returns, luaL_error.  The body has the
+ * shape of a lua_CFunction: read args from the stack, push results, return
+ * the result count.  The same body runs on every target: real Lua C API on
+ * rv32; ECALL-bridged on WASM (flags = BLYT_LUA_EXPORT_FLAG_BRIDGED).
+ *
+ * Usage:
+ *   BLYT_LUA_EXPORT_RAW(greet) {
+ *       const char *who = luaL_checkstring(L, 1);
+ *       ...
+ *       lua_pushstring(L, out);
+ *       return 1;
+ *   }
+ */
+#define BLYT_LUA_EXPORT_RAW(name) \
+    int __blyt_lua_raw_##name(lua_State *L); \
+    static const blyt_lua_regtab_entry_t __lua_regtab_##name \
+        __attribute__((used, retain, section(".lua_regtab"))) = { \
+        0, #name, __blyt_lua_raw_##name \
+    }; \
+    static const blyt_lua_export_entry_t __export_##name \
+        __attribute__((used, retain, section(".lua_exports"))) = { \
+        #name, "__blyt_lua_raw_" #name, "__blyt_lua_raw_" #name, \
+        0, {0, 0, 0, 0}, BLYT_LUA_TYPE_VOID, BLYT_LUA_EXPORT_FLAG_BRIDGED, 0 \
+    }; \
+    int __blyt_lua_raw_##name(lua_State *L)
+
+#define BLYT_LUA_MODULE_EXPORT_RAW(module, fn_name) \
+    int __blyt_lua_raw_##module##_##fn_name(lua_State *L); \
+    static const blyt_lua_regtab_entry_t __lua_regtab_##module##_##fn_name \
+        __attribute__((used, retain, section(".lua_regtab"))) = { \
+        #module, #fn_name, __blyt_lua_raw_##module##_##fn_name \
+    }; \
+    static const blyt_lua_export_entry_t __export_##module##_##fn_name \
+        __attribute__((used, retain, section(".lua_exports"))) = { \
+        #module "." #fn_name, \
+        "__blyt_lua_raw_" #module "_" #fn_name, \
+        "__blyt_lua_raw_" #module "_" #fn_name, \
+        0, {0, 0, 0, 0}, BLYT_LUA_TYPE_VOID, BLYT_LUA_EXPORT_FLAG_BRIDGED, 0 \
+    }; \
+    int __blyt_lua_raw_##module##_##fn_name(lua_State *L)
 
 /* clang-format on */
 

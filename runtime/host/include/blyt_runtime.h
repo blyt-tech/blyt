@@ -101,6 +101,8 @@ typedef enum blyt_cart_run_err {
     BLYT_RUN_GDB_PAUSED = 5, /* WASM: CPU is paused at a GDB breakpoint; poll GDB */
     BLYT_RUN_RESTART = 6, /* DAP client sent restart; call blyt_session_dap_reattach then wait */
     BLYT_RUN_FN_DONE = 7, /* host→guest fn call completed; call blyt_session_fn_return_value */
+    BLYT_RUN_FN_ERROR = 8, /* ADR-0130: bridged Lua→native call raised a Lua error;
+                            * the error value is on top of the exchange thread */
 } blyt_cart_run_err_t;
 
 /*
@@ -219,14 +221,42 @@ int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr, int nargs,
 /* After BLYT_RUN_FN_DONE: read the function's return value from rv register a0. */
 uint32_t blyt_session_fn_return_value(const blyt_session_t *s);
 
+/* --- ECALL-bridged Lua C API (ADR-0130, WASM hybrid carts) ----------------- */
+
+/* .lua_exports entry flags (byte after ret_type; 0 in pre-ADR-0130 carts). */
+#define BLYT_LUA_EXPORT_FLAG_BRIDGED 0x01u
+
+struct lua_State; /* opaque here; only the WASM frontend passes a real one */
+
+/*
+ * Attach the exchange thread for bridged Lua→native calls.  The frontend
+ * creates it (lua_newthread, registry-anchored) and the bridge executes all
+ * BLYT_ECALL_LUA_OP operations against its stack.  No-op without BLYT_LUA.
+ */
+void blyt_session_lua_bridge_attach(blyt_session_t *s, struct lua_State *exch);
+
+/*
+ * Begin a bridged Lua→native call: the wrapper at wrap_addr is invoked with
+ * an opaque call token as its lua_State*; its Lua arguments must already be
+ * on the exchange thread (lua_xmove'd from the calling coroutine).  Drive
+ * with blyt_session_run_frame() until BLYT_RUN_FN_DONE (a0 = number of
+ * return values left on the exchange thread, read via
+ * blyt_session_fn_return_value) or BLYT_RUN_FN_ERROR (error value on top of
+ * the exchange thread; guest registers restored).
+ */
+int blyt_session_begin_bridged_call(blyt_session_t *s, uint32_t wrap_addr);
+
 /*
  * Visitor callback for blyt_session_visit_lua_exports.
  * Called once per exported function with its Lua name, guest function address,
- * argument count, argument types (BLYT_LUA_TYPE_* constants), and return type.
+ * wrapper address (nonzero only for bridged exports), flags
+ * (BLYT_LUA_EXPORT_FLAG_*), argument count, argument types (BLYT_LUA_TYPE_*
+ * constants), and return type.
  */
 typedef void (*blyt_lua_export_visitor_t)(const char *lua_name, uint32_t fn_guest_addr,
-                                          uint8_t nargs, const uint8_t arg_types[4],
-                                          uint8_t ret_type, void *userdata);
+                                          uint32_t wrap_guest_addr, uint8_t flags, uint8_t nargs,
+                                          const uint8_t arg_types[4], uint8_t ret_type,
+                                          void *userdata);
 
 /*
  * Iterate all Lua exports parsed from the cart's .lua_exports section.

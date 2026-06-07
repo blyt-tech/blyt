@@ -289,6 +289,62 @@ static int wasm_make_trampoline(lua_State *L) {
     return lua_yieldk(L, 0, (lua_KContext)(uintptr_t)fn_addr, wasm_trampoline_cont);
 }
 
+/* -------------------------------------------------------------------------
+ * ECALL-bridged trampoline (ADR-0130)
+ *
+ * For exports flagged BLYT_LUA_EXPORT_FLAG_BRIDGED the guest-side WRAPPER is
+ * invoked (with an opaque call token as its lua_State*) and reads/pushes its
+ * Lua values itself through BLYT_ECALL_LUA_OP, executed by the host against
+ * the exchange thread g_lua_exch.  Arguments are lua_xmove'd from the
+ * calling coroutine to the exchange thread before the call; results (and
+ * raised errors) travel back the same way in the continuation.
+ * ------------------------------------------------------------------------- */
+
+static lua_State *g_lua_exch = NULL; /* registry-anchored exchange thread */
+static int g_lua_exch_ref = LUA_NOREF;
+static bool g_trampoline_failed = false; /* FN_ERROR: error value on g_lua_exch */
+
+static int wasm_bridged_cont(lua_State *L, int status, lua_KContext ctx) {
+    (void)status;
+    (void)ctx;
+    if (g_trampoline_failed) {
+        g_trampoline_failed = false;
+        /* Error value is on top of the exchange thread; raise it inside the
+         * coroutine so a script-level pcall around the native call catches
+         * it (ADR-0084). */
+        luaL_checkstack(L, 1, "bridged error");
+        if (lua_gettop(g_lua_exch) < 1)
+            lua_pushstring(g_lua_exch, "blyt bridge: unknown error");
+        lua_xmove(g_lua_exch, L, 1);
+        lua_settop(g_lua_exch, 0);
+        return lua_error(L);
+    }
+    /* a0 = the wrapper's lua_CFunction-style return count: the top m values
+     * of the exchange thread are the results. */
+    int m = (int)g_trampoline_ret;
+    int avail = lua_gettop(g_lua_exch);
+    if (m < 0 || m > avail)
+        m = 0; /* malformed count: return nothing rather than junk */
+    luaL_checkstack(L, m + 1, "bridged results");
+    lua_xmove(g_lua_exch, L, m);
+    lua_settop(g_lua_exch, 0);
+    return m;
+}
+
+/* Upvalues: [1]=wrap_guest_addr */
+static int wasm_make_bridged_trampoline(lua_State *L) {
+    uint32_t wrap_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
+    int n = lua_gettop(L);
+    if (!lua_checkstack(g_lua_exch, n + 2))
+        return luaL_error(L, "blyt bridge: exchange stack overflow");
+    lua_settop(g_lua_exch, 0); /* defensive: previous call always cleans up */
+    lua_xmove(L, g_lua_exch, n); /* wrapper sees args at exch indices 1..n */
+    if (blyt_session_begin_bridged_call(g_session, wrap_addr) != 0)
+        return luaL_error(L, "blyt bridge: call setup failed");
+    g_trampoline_active = true;
+    return lua_yieldk(L, 0, 0, wasm_bridged_cont);
+}
+
 /* Sandboxed require() for WASM Lua carts: looks up pre-registered modules in
  * the registry _LOADED table.  Mirrors lua_blyt_require in blyt32lua.c. */
 static int wasm_lua_require(lua_State *L) {
@@ -304,15 +360,22 @@ static int wasm_lua_require(lua_State *L) {
                       name);
 }
 
-static void wasm_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr, uint8_t nargs,
+static void wasm_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr,
+                                 uint32_t wrap_guest_addr, uint8_t flags, uint8_t nargs,
                                  const uint8_t arg_types[4], uint8_t ret_type, void *userdata) {
     lua_State *L = (lua_State *)userdata;
-    lua_pushlightuserdata(L, (void *)(uintptr_t)fn_guest_addr);
-    lua_pushinteger(L, nargs);
-    for (int j = 0; j < 4; j++)
-        lua_pushinteger(L, arg_types[j]);
-    lua_pushinteger(L, ret_type);
-    lua_pushcclosure(L, wasm_make_trampoline, 7);
+    if (flags & BLYT_LUA_EXPORT_FLAG_BRIDGED) {
+        /* ADR-0130: invoke the guest wrapper through the ECALL bridge. */
+        lua_pushlightuserdata(L, (void *)(uintptr_t)wrap_guest_addr);
+        lua_pushcclosure(L, wasm_make_bridged_trampoline, 1);
+    } else {
+        lua_pushlightuserdata(L, (void *)(uintptr_t)fn_guest_addr);
+        lua_pushinteger(L, nargs);
+        for (int j = 0; j < 4; j++)
+            lua_pushinteger(L, arg_types[j]);
+        lua_pushinteger(L, ret_type);
+        lua_pushcclosure(L, wasm_make_trampoline, 7);
+    }
 
     /* Dotted lua_name (e.g. "mylib.add") → module export; plain name → global. */
     const char *dot = strchr(lua_name, '.');
@@ -378,6 +441,11 @@ static void lua_cleanup(void) {
         g_lua_co_ref = LUA_NOREF;
     }
     g_lua_co = NULL;
+    if (g_lua_exch_ref != LUA_NOREF && g_lua) {
+        luaL_unref(g_lua, LUA_REGISTRYINDEX, g_lua_exch_ref);
+        g_lua_exch_ref = LUA_NOREF;
+    }
+    g_lua_exch = NULL;
     if (g_lua) {
         lua_close(g_lua);
         g_lua = NULL;
@@ -393,6 +461,51 @@ static void lua_cleanup(void) {
 }
 
 /* Called once per animation frame by Emscripten when a Lua cart is active. */
+/* Drive the emulator one slice for the in-flight trampoline call and resume
+ * the coroutine when it completes.  Handles both the typed path (FN_DONE,
+ * a0 = scalar return) and the bridged path (FN_DONE, a0 = result count on
+ * the exchange thread; FN_ERROR, error value on the exchange thread).
+ * An error from the resumed coroutine (e.g. an uncaught bridged Lua error)
+ * is reported exactly like the outer resume site. */
+static void wasm_service_trampoline(void) {
+    blyt_cart_run_err_t ferr = blyt_session_run_frame(g_session);
+    int resume = 0;
+    if (ferr == BLYT_RUN_FN_DONE) {
+        g_trampoline_active = false;
+        g_trampoline_ret = blyt_session_fn_return_value(g_session);
+        resume = 1;
+    } else if (ferr == BLYT_RUN_FN_ERROR) {
+        /* ADR-0130: bridged wrapper raised; guest registers were restored.
+         * The continuation re-raises inside the coroutine. */
+        g_trampoline_active = false;
+        g_trampoline_failed = true;
+        resume = 1;
+    }
+#ifdef BLYT_GDB
+    else if (ferr == BLYT_RUN_GDB_PAUSED) {
+        return; /* hold the coroutine; GDB client drives next steps */
+    }
+#endif
+    if (!resume)
+        return;
+    int nres = 0;
+    int status = lua_resume(g_lua_co, g_lua, 0, &nres); /* fires the continuation */
+    if (status != LUA_YIELD && status != LUA_OK) {
+        /* Uncaught error surfaced through the trampoline continuation. */
+        const char *msg = lua_tostring(g_lua_co, -1);
+#ifdef BLYT_DAP
+        if (blyt_dap_report_exception(g_lua_co, 1)) {
+            g_lua_dap_paused = true;
+            g_lua_quit = true;
+            return;
+        }
+#endif
+        blyt_js_error(msg ? msg : "Lua runtime error");
+        g_lua_error = true;
+        g_lua_quit = true;
+    }
+}
+
 static void wasm_lua_loop(void) {
     if (!g_lua)
         return;
@@ -472,19 +585,7 @@ static void wasm_lua_loop(void) {
      * early-exit path the outer lua_resume below would resume wasm_trampoline_cont
      * with the stale g_trampoline_ret from the previous call. */
     if (g_trampoline_active) {
-        blyt_cart_run_err_t ferr = blyt_session_run_frame(g_session);
-        if (ferr == BLYT_RUN_FN_DONE) {
-            g_trampoline_active = false;
-            g_trampoline_ret = blyt_session_fn_return_value(g_session);
-            int nres = 0;
-            lua_resume(g_lua_co, g_lua, 0, &nres); /* fires wasm_trampoline_cont */
-        }
-#ifdef BLYT_GDB
-        else if (ferr == BLYT_RUN_GDB_PAUSED) {
-            blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
-            return;
-        }
-#endif
+        wasm_service_trampoline();
         blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
         return;
     }
@@ -508,20 +609,7 @@ static void wasm_lua_loop(void) {
 #endif
         /* Hybrid trampoline: Lua yielded while waiting for a native C call. */
         if (g_trampoline_active) {
-            blyt_cart_run_err_t ferr = blyt_session_run_frame(g_session);
-            if (ferr == BLYT_RUN_FN_DONE) {
-                g_trampoline_active = false;
-                g_trampoline_ret = blyt_session_fn_return_value(g_session);
-                int nres = 0;
-                lua_resume(g_lua_co, g_lua, 0, &nres); /* fires wasm_trampoline_cont */
-            }
-#ifdef BLYT_GDB
-            else if (ferr == BLYT_RUN_GDB_PAUSED) {
-                /* Hold Lua coroutine; GDB client drives next steps. */
-                blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
-                return;
-            }
-#endif
+            wasm_service_trampoline();
             blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
             return;
         }
@@ -617,6 +705,10 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
                     blyt_session_gdb_listen(g_session, &p);
             }
 #endif
+            /* ADR-0130: exchange thread for bridged Lua→native calls. */
+            g_lua_exch = lua_newthread(g_lua);
+            g_lua_exch_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
+            blyt_session_lua_bridge_attach(g_session, g_lua_exch);
             wasm_register_lua_trampolines(g_lua, g_session);
         }
     }

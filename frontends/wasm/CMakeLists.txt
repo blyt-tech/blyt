@@ -180,7 +180,15 @@ set(EMBEDDED_LIBS_C "${CMAKE_BINARY_DIR}/blytplay_embedded_libs.c")
 set(LIBBLYTCOMMON "${BLYT_GUEST_LIB_DIR}/libblytcommon.so")
 set(LIBBLYTC "${BLYT_GUEST_LIB_DIR}/libblytc.so")
 set(LIBBLYT32 "${BLYT_GUEST_LIB_DIR}/libblyt32.so")
-set(LIBBLYT32LUA "${BLYT_GUEST_LIB_DIR}/libblyt32lua.so")
+# ADR-0130: embed the ECALL-bridge variant of libblyt32lua.so when present
+# (registered under the same DT_NEEDED name).  The real Lua-VM guest library
+# is dead weight on this target — host-side Lua is authoritative — and the
+# bridge variant gives guest wrappers a working Lua C API via ECALL 10.
+if(EXISTS "${BLYT_GUEST_LIB_DIR}/libblyt32lua-bridge.so")
+  set(LIBBLYT32LUA "${BLYT_GUEST_LIB_DIR}/libblyt32lua-bridge.so")
+else()
+  set(LIBBLYT32LUA "${BLYT_GUEST_LIB_DIR}/libblyt32lua.so")
+endif()
 
 add_custom_command(
   OUTPUT "${EMBEDDED_LIBS_C}"
