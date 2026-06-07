@@ -720,7 +720,6 @@ function draw() end
             .c(r#"
 #include "blyt.h"
 #include "cart_state.h"
-#include <stdio.h>
 
 void blyt_cart_init(void) {
     int32_t slot = -1;
@@ -733,9 +732,7 @@ void blyt_cart_init(void) {
 void blyt_cart_update(void) {
     blyt_save_read(0);
     int32_t score = blyt_buffer_get_i32(S_GAME, 0, S_GAME_SCORE);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "score=%d", score);
-    blyt_console_debug(buf);
+    blyt_console_debug(score == 42 ? "score=42" : "score=fail");
     blyt_quit();
 }
 
