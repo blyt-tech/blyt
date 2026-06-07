@@ -710,8 +710,8 @@ static void bridge_lua_op(riscv_t *rv) {
     case BLYT_LUA_OP_CREATETABLE: {
         g_bridge_opctx.narr = (int)(int32_t)a2;
         g_bridge_opctx.nrec = (int)(int32_t)a3;
-        if (g_bridge_opctx.narr < 0 || g_bridge_opctx.narr > (1 << 20) ||
-            g_bridge_opctx.nrec < 0 || g_bridge_opctx.nrec > (1 << 20)) {
+        if (g_bridge_opctx.narr < 0 || g_bridge_opctx.narr > (1 << 20) || g_bridge_opctx.nrec < 0 ||
+            g_bridge_opctx.nrec > (1 << 20)) {
             bridge_fail_msg(rv, EX, "blyt bridge: createtable size out of range");
             return;
         }

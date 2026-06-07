@@ -70,10 +70,7 @@ static uint32_t bridge_op(uint32_t opcode, lua_State *L, uint32_t b2, uint32_t b
     register uint32_t a3 __asm__("a3") = b3;
     register uint32_t a4 __asm__("a4") = b4;
     register uint32_t a7 __asm__("a7") = ECALL_LUA_OP;
-    __asm__ volatile("ecall"
-                     : "+r"(a0), "+r"(a1), "+r"(a2)
-                     : "r"(a3), "r"(a4), "r"(a7)
-                     : "memory");
+    __asm__ volatile("ecall" : "+r"(a0), "+r"(a1), "+r"(a2) : "r"(a3), "r"(a4), "r"(a7) : "memory");
     if (val)
         *val = a1;
     if (aux)
@@ -375,6 +372,9 @@ void lua_pushcclosure(lua_State *L, lua_CFunction f, int n) {
  * only to satisfy libblytcommon.so's strong-symbol check at load time.
  * ------------------------------------------------------------------------- */
 
-void blyt_cart_init(void) {}
-void blyt_cart_update(void) {}
-void blyt_cart_draw(void) {}
+void blyt_cart_init(void) {
+}
+void blyt_cart_update(void) {
+}
+void blyt_cart_draw(void) {
+}

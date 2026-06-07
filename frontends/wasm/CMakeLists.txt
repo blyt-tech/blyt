@@ -181,9 +181,9 @@ set(LIBBLYTCOMMON "${BLYT_GUEST_LIB_DIR}/libblytcommon.so")
 set(LIBBLYTC "${BLYT_GUEST_LIB_DIR}/libblytc.so")
 set(LIBBLYT32 "${BLYT_GUEST_LIB_DIR}/libblyt32.so")
 # ADR-0130: embed the ECALL-bridge variant of libblyt32lua.so when present
-# (registered under the same DT_NEEDED name).  The real Lua-VM guest library
-# is dead weight on this target — host-side Lua is authoritative — and the
-# bridge variant gives guest wrappers a working Lua C API via ECALL 10.
+# (registered under the same DT_NEEDED name).  The real Lua-VM guest library is
+# dead weight on this target — host-side Lua is authoritative — and the bridge
+# variant gives guest wrappers a working Lua C API via ECALL 10.
 if(EXISTS "${BLYT_GUEST_LIB_DIR}/libblyt32lua-bridge.so")
   set(LIBBLYT32LUA "${BLYT_GUEST_LIB_DIR}/libblyt32lua-bridge.so")
 else()
@@ -334,9 +334,9 @@ if(BLYT_LUA_SOURCES)
   list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 LUA_32BITS=1 LUA_USE_LONGJMP=1)
   # Fixed Lua hash seed (ADR-0130/ADR-0066): identical string hashing — and
   # therefore pairs()/lua_next order, table.sort pivots, math.random streams —
-  # across the rv32 and WASM execution paths.  0x424C5954 = "BLYT".
-  # NOTE: must be a compile *option* — CMake COMPILE_DEFINITIONS silently
-  # drops function-style macro definitions.
+  # across the rv32 and WASM execution paths.  0x424C5954 = "BLYT". NOTE: must
+  # be a compile *option* — CMake COMPILE_DEFINITIONS silently drops
+  # function-style macro definitions.
   target_compile_options(blytplay PRIVATE "-Dluai_makeseed()=0x424C5954u")
 endif()
 
