@@ -618,41 +618,71 @@ if(CLANG_RV32
     set(LIBBLYT32_NATIVE_OUT "${CMAKE_BINARY_DIR}/native/libblyt32.so")
     file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/native")
 
+    # ld-blyt.so.1 stub: empty shared lib with SONAME=ld-blyt.so.1.
+    # Used only at link time so lld emits DT_NEEDED: ld-blyt.so.1 in
+    # libblytc.so.  Never staged to QEMU; the real /lib/ld-blyt.so.1
+    # (system musl) is loaded by the kernel as the ELF interpreter.
+    set(LD_BLYT_STUB_SRC
+        "${CMAKE_SOURCE_DIR}/frontends/native/src/libblytc/ld_blyt_stub.c")
+    set(LD_BLYT_STUB_OUT "${CMAKE_BINARY_DIR}/native/ld-blyt.so.1.stub")
+    add_custom_command(
+      OUTPUT "${LD_BLYT_STUB_OUT}"
+      COMMAND "${CLANG_RV32}" ${RV32_FLAGS} -shared -Wl,-soname,ld-blyt.so.1
+              -o "${LD_BLYT_STUB_OUT}" "${LD_BLYT_STUB_SRC}"
+      DEPENDS "${LD_BLYT_STUB_SRC}"
+      COMMENT "Cross-compiling ld-blyt.so.1 stub (build-time only)"
+      VERBATIM)
+
+    # Native libblytc.so: thin wrapper whose only job is to carry
+    # DT_NEEDED: ld-blyt.so.1 so carts and libblyt32.so can resolve
+    # stdlib symbols (malloc, getenv, snprintf, …) from the system musl
+    # interpreter at runtime on QEMU.
+    set(LIBBLYTC_NATIVE_SRC
+        "${CMAKE_SOURCE_DIR}/frontends/native/src/libblytc/libblytc_native.c")
+    set(LIBBLYTC_NATIVE_OUT "${CMAKE_BINARY_DIR}/native/libblytc.so")
+    add_custom_command(
+      OUTPUT "${LIBBLYTC_NATIVE_OUT}"
+      COMMAND
+        "${CLANG_RV32}" ${RV32_FLAGS} -shared -Wl,-soname,libblytc.so
+        -Wl,-Bdynamic -Wl,--no-as-needed "${LD_BLYT_STUB_OUT}" -Wl,--as-needed
+        -o "${LIBBLYTC_NATIVE_OUT}" "${LIBBLYTC_NATIVE_SRC}"
+      DEPENDS "${LIBBLYTC_NATIVE_SRC}" "${LD_BLYT_STUB_OUT}"
+      COMMENT
+        "Cross-compiling libblytc.so (RV32IMAFC, native, DT_NEEDED: ld-blyt.so.1)"
+      VERBATIM)
+
     set(LIBBLYT32_NATIVE_DEPS
         "${LIBBLYT32_NATIVE_SRC}"
         "${LIBBLYT32_NATIVE_INC}/seccomp_restricted.h" "${BLYT_H}"
-        "${LIBBLYTCOMMON_OUT}")
+        "${LIBBLYTCOMMON_OUT}" "${LIBBLYTC_NATIVE_OUT}")
 
-    # Native link flags: --no-as-needed forces libblytcommon.so into DT_NEEDED.
-    # Without it, --as-needed (the default) would silently drop libblytcommon.so
-    # because native blyt32.c uses no symbols from it directly; blyt_main and
-    # other libblytcommon exports would then be unresolvable at cart load time,
-    # causing a crash before any constructor fires.  libblytc.so is
-    # intentionally omitted — the native process C library comes from the musl
-    # ld.so interpreter.  Use full path to avoid lld -Bstatic on bare-metal
-    # targets.
+    # Native link: --no-as-needed forces both libblytcommon.so and
+    # libblytc.so into DT_NEEDED.  libblytc.so chains to ld-blyt.so.1
+    # (system musl), making malloc/getenv/snprintf/... available to
+    # libblyt32.so and to native carts at runtime on QEMU.
     set(LIBBLYT32_NATIVE_LINK -Wl,-Bdynamic -Wl,--no-as-needed
-                              "${LIBBLYTCOMMON_OUT}" -Wl,--as-needed)
+                              "${LIBBLYTCOMMON_OUT}" "${LIBBLYTC_NATIVE_OUT}"
+                              -Wl,--as-needed)
 
     add_custom_command(
       OUTPUT "${LIBBLYT32_NATIVE_OUT}"
       COMMAND
-        # The native lib is trusted-exec, links no libc, and implements its own
-        # string ops. Match the SDK native build (no -O): trailing -O0 overrides
-        # RV32_FLAGS' release -O2, and -fno-builtin stops loop-idiom recognition
-        # from rewriting hand-rolled routines into unresolved libcalls
-        # (ADR-0129).
-        "${CLANG_RV32}" ${RV32_FLAGS} -O0 -fno-builtin -Wl,-soname,libblyt32.so
+        # Keep -O0: blyt32.c uses hand-rolled string helpers prefixed
+        # blyt32_native_* so the compiler won't recognize them as stdlib
+        # functions; -O0 avoids any loop-idiom rewrites into libcalls.
+        # -fno-builtin removed: stdlib is now available via the DT_NEEDED
+        # chain libblyt32.so → libblytc.so → ld-blyt.so.1 (system musl).
+        "${CLANG_RV32}" ${RV32_FLAGS} -O0 -Wl,-soname,libblyt32.so
         ${RV32_INCLUDE} -I "${LIBBLYT32_NATIVE_INC}" ${LIBBLYT32_NATIVE_LINK} -o
         "${LIBBLYT32_NATIVE_OUT}" "${LIBBLYT32_NATIVE_SRC}"
       DEPENDS ${LIBBLYT32_NATIVE_DEPS}
       COMMENT "Cross-compiling libblyt32.so (RV32IMAFC, native build)"
       VERBATIM)
 
-    # Stage libblytcommon.so alongside native libblyt32.so. libblytc.so is
-    # intentionally NOT staged: the native cart process gets its C library from
-    # the musl ld.so interpreter; staging libblytc.so (our musl subset) would
-    # load a second musl instance, conflicting with the interpreter.
+    # Stage libblytcommon.so and libblytc.so alongside native libblyt32.so.
+    # libblytc.so on the native path is the thin wrapper that DT_NEEDs
+    # ld-blyt.so.1; it does NOT conflict with the musl interpreter because
+    # it exports no libc symbols of its own — it only carries the DT_NEEDED.
     add_custom_command(
       OUTPUT "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
       COMMAND "${CMAKE_COMMAND}" -E copy "${LIBBLYTCOMMON_OUT}"
@@ -664,7 +694,8 @@ if(CLANG_RV32
     add_custom_target(
       libblyt32_native_so ALL
       DEPENDS "${LIBBLYT32_NATIVE_OUT}"
-              "${CMAKE_BINARY_DIR}/native/libblytcommon.so")
+              "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
+              "${LIBBLYTC_NATIVE_OUT}")
     message(STATUS "libblyt32.so (native build): will be built → build/native/")
   else()
     message(

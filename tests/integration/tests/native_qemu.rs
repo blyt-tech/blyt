@@ -391,10 +391,9 @@ function draw() end
     );
     qemu.ssh_ok("chmod +x /tmp/blyt_gate/blyt_native");
 
-    // Native RV32 runtime libraries.  libblytc.so is intentionally omitted:
-    // the native process gets its C library from the musl ld.so interpreter;
-    // loading our musl subset would create two conflicting musl instances.
-    for lib in ["libblyt32.so", "libblytcommon.so"] {
+    // Native RV32 runtime libraries.  libblytc.so is the thin wrapper that
+    // DT_NEEDs ld-blyt.so.1 (system musl) so carts can resolve stdlib symbols.
+    for lib in ["libblyt32.so", "libblytcommon.so", "libblytc.so"] {
         let p = native_dir.join(lib);
         if p.exists() {
             assert!(
@@ -703,14 +702,12 @@ function draw() end
         println!("Gate 8: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
-    // ── Gate 9: cart with .cart.layouts section loads on metal ────────
+    // ── Gate 9: state buffer save/load round-trip on metal ───────────
     //
-    // blyt_buffer_*/blyt_save_* are not implemented in the native libblyt32.so
-    // — the native path has no host runtime to back the SOA store and the
-    // restricted seccomp filter blocks the required filesystem syscalls.
-    // This gate checks that the loader accepts a cart with a .cart.layouts
-    // section and that the cart lifecycle runs without crashing.
-    println!("Gate 9: .cart.layouts cart loads and runs on metal...");
+    // Verifies the full Phase 9 native path: alloc slot, write score=42,
+    // save (blyt_save_write), clobber score, reload (blyt_save_read), read
+    // back, confirm value.  BLYT_SAVE_DIR points to a tmpdir on the VM.
+    println!("Gate 9: state buffer save/load round-trip on metal...");
     {
         let sb_project = tmp.path().join("sb_metal");
         CartProject::new()
@@ -720,9 +717,32 @@ function draw() end
             )
             .c(r#"
 #include "blyt.h"
+#include "cart_state.h"
 
-void blyt_cart_init(void) { blyt_console_debug("sb-init"); }
-void blyt_cart_update(void) { blyt_quit(); }
+static int32_t g_slot = -1;
+static int g_phase = 0;
+
+void blyt_cart_init(void) {
+    blyt_buffer_alloc_slot(S_GAME, &g_slot);
+    blyt_console_debug("sb-init");
+}
+void blyt_cart_update(void) {
+    if (g_phase == 0) {
+        blyt_buffer_set_i32(S_GAME, g_slot, S_GAME_SCORE, 42);
+        blyt_save_write(0);
+        blyt_buffer_set_i32(S_GAME, g_slot, S_GAME_SCORE, 0);
+        g_phase = 1;
+    } else {
+        blyt_save_read(0);
+        int32_t v = blyt_buffer_get_i32(S_GAME, g_slot, S_GAME_SCORE);
+        if (v == 42) {
+            blyt_console_debug("score-ok");
+        } else {
+            blyt_console_debug("score-fail");
+        }
+        blyt_quit();
+    }
+}
 void blyt_cart_draw(void) {}
 "#)
             .write(&sb_project);
@@ -739,7 +759,8 @@ void blyt_cart_draw(void) {}
         );
 
         let out = qemu.ssh(
-            "/tmp/blyt_gate/blyt_native \
+            "BLYT_SAVE_DIR=/tmp/blyt_save_gate \
+             /tmp/blyt_gate/blyt_native \
              --lib-dir /tmp/blyt_gate/native \
              -- /tmp/blyt_gate/sb_metal.blyt 2>&1",
         );
@@ -752,6 +773,10 @@ void blyt_cart_draw(void) {}
         assert!(
             output.contains("sb-init"),
             "expected 'sb-init' in output\noutput: {output}"
+        );
+        assert!(
+            output.contains("score-ok"),
+            "expected 'score-ok' in output (save/load round-trip)\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
     }

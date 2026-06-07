@@ -10,12 +10,18 @@
  * linux/seccomp.h dependency — so this header compiles for the bare-metal
  * RV32IMAFC target used to cross-compile the guest libraries.
  *
- * Allowlist (empirically validated, Spike S 2026-05-13):
+ * Allowlist (Spike S 2026-05-13; Phase 9 file-I/O additions):
  *   29  ioctl       isatty probe in stdio
- *   63  read        cart input
- *   64  write       SYS_write — blyt_console_debug and other output
+ *   34  mkdirat     save directory creation
+ *   56  openat      save/load file open
+ *   57  close       file descriptor close
+ *   63  read        cart input + save/load reads
+ *   64  write       blyt_console_debug, save file writes
+ *   72  fsync       flush save files to disk
  *   93  exit        single-thread exit
  *   94  exit_group  cart exits
+ *  215  munmap      Lua VM heap (lua_native_malloc.c)
+ *  222  mmap        Lua VM heap + system musl malloc
  */
 
 #ifndef BLYT_SECCOMP_RESTRICTED_H
@@ -60,12 +66,16 @@ struct blyt_sock_fprog {
 
 static const unsigned int blyt_restricted_nrs[] = {
     29u, /* ioctl      */
+    34u, /* mkdirat    — save directory creation */
+    56u, /* openat     — save/load file I/O */
+    57u, /* close      — file descriptor close */
     63u, /* read       */
     64u, /* write      */
+    72u, /* fsync      — flush save files */
     93u, /* exit       */
     94u, /* exit_group */
     215u, /* munmap     — Lua VM heap (lua_native_malloc.c) */
-    222u, /* mmap       — Lua VM heap (lua_native_malloc.c) */
+    222u, /* mmap       — Lua VM heap + system musl malloc */
 };
 #define BLYT_RESTRICTED_N ((int)(sizeof(blyt_restricted_nrs) / sizeof(blyt_restricted_nrs[0])))
 
@@ -91,6 +101,53 @@ static inline int blyt_rs_seccomp(unsigned int mode, unsigned int flags, void *p
     register long a1 __asm__("a1") = flags;
     register long a2 __asm__("a2") = (long)prog;
     register long a7 __asm__("a7") = 277; /* SYS_seccomp */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return (int)a0;
+}
+
+/* SYS_read: a0=fd, a1=buf, a2=count → returns bytes read or -errno */
+static inline int blyt_rs_read(int fd, void *buf, unsigned int count) {
+    register long a0 __asm__("a0") = fd;
+    register void *a1 __asm__("a1") = buf;
+    register long a2 __asm__("a2") = count;
+    register long a7 __asm__("a7") = 63; /* SYS_read */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return (int)a0;
+}
+
+/* SYS_openat: a0=dirfd, a1=path, a2=flags, a3=mode → fd or -errno */
+static inline int blyt_rs_openat(int dirfd, const char *path, int flags, int mode) {
+    register long a0 __asm__("a0") = dirfd;
+    register const char *a1 __asm__("a1") = path;
+    register long a2 __asm__("a2") = flags;
+    register long a3 __asm__("a3") = mode;
+    register long a7 __asm__("a7") = 56; /* SYS_openat */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory");
+    return (int)a0;
+}
+
+/* SYS_close: a0=fd → 0 or -errno */
+static inline int blyt_rs_close(int fd) {
+    register long a0 __asm__("a0") = fd;
+    register long a7 __asm__("a7") = 57; /* SYS_close */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return (int)a0;
+}
+
+/* SYS_fsync: a0=fd → 0 or -errno */
+static inline int blyt_rs_fsync(int fd) {
+    register long a0 __asm__("a0") = fd;
+    register long a7 __asm__("a7") = 72; /* SYS_fsync */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return (int)a0;
+}
+
+/* SYS_mkdirat: a0=dirfd, a1=path, a2=mode → 0 or -errno */
+static inline int blyt_rs_mkdirat(int dirfd, const char *path, int mode) {
+    register long a0 __asm__("a0") = dirfd;
+    register const char *a1 __asm__("a1") = path;
+    register long a2 __asm__("a2") = mode;
+    register long a7 __asm__("a7") = 34; /* SYS_mkdirat */
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
     return (int)a0;
 }

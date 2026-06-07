@@ -112,6 +112,9 @@ static const unsigned int blytal_rv32_nrs[] = {
     64u, /* write            */
     93u, /* exit             */
     94u, /* exit_group       */
+    /* ── Phase 9 save/load (must mirror restricted allowlist additions) ── */
+    34u, /* mkdirat          — save directory creation */
+    72u, /* fsync            — flush save files */
 };
 #define BLYTAL_RV32_N ((int)(sizeof(blytal_rv32_nrs) / sizeof(blytal_rv32_nrs[0])))
 
