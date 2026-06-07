@@ -570,11 +570,7 @@ pub fn run_cart_wasm(cart: &std::path::Path, expected: &str) {
 /// object, read by `module_pre.js` into Emscripten's `ENV` table before C
 /// startup.  This is needed because Emscripten does not inherit Node.js
 /// `process.env` for the multi-environment (web+node) build.
-pub fn run_cart_wasm_with_env(
-    cart: &std::path::Path,
-    extra_env: &[(&str, &str)],
-    expected: &str,
-) {
+pub fn run_cart_wasm_with_env(cart: &std::path::Path, extra_env: &[(&str, &str)], expected: &str) {
     use assert_cmd::Command;
     let driver = repo_root().join("tests/wasm/run_cart.js");
     let wasm_dir = find_wasm_dir();
@@ -588,7 +584,13 @@ pub fn run_cart_wasm_with_env(
         // Build a minimal JSON object {"KEY":"VALUE",...} without serde_json.
         let pairs: Vec<String> = extra_env
             .iter()
-            .map(|(k, v)| format!("\"{}\":\"{}\"", k, v.replace('\\', "\\\\").replace('"', "\\\"")))
+            .map(|(k, v)| {
+                format!(
+                    "\"{}\":\"{}\"",
+                    k,
+                    v.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
             .collect();
         let env_json = format!("{{{}}}", pairs.join(","));
         // 4th arg = frame0OutPath (empty); 5th arg = env JSON

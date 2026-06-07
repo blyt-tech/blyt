@@ -878,14 +878,16 @@ fn lua_cart_proxy_count() {
 
     CartProject::new()
         .config(MULTI_SLOT_CONFIG)
-        .lua(r#"
+        .lua(
+            r#"
 function init()
     local c = S.entity.count
     blyt.debug.print("count=" .. tostring(c))
 end
 function update() blyt.quit() end
 function draw() end
-"#)
+"#,
+        )
         .write(&project);
 
     let cart = build_lua_cart(&project);
@@ -905,7 +907,8 @@ fn lua_cart_proxy_multiple_slots() {
 
     CartProject::new()
         .config(MULTI_SLOT_CONFIG)
-        .lua(r#"
+        .lua(
+            r#"
 function init()
     for i = 0, 3 do
         blyt.buf.alloc_slot(S.ENTITY)
@@ -931,7 +934,8 @@ function update()
 end
 
 function draw() end
-"#)
+"#,
+        )
         .write(&project);
 
     let cart = build_lua_cart(&project);
