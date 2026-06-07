@@ -324,6 +324,12 @@ set_target_properties(blytplay PROPERTIES OUTPUT_NAME "${BLYT_WASM_NAME}"
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)
   list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 LUA_32BITS=1 LUA_USE_LONGJMP=1)
+  # Fixed Lua hash seed (ADR-0130/ADR-0066): identical string hashing — and
+  # therefore pairs()/lua_next order, table.sort pivots, math.random streams —
+  # across the rv32 and WASM execution paths.  0x424C5954 = "BLYT".
+  # NOTE: must be a compile *option* — CMake COMPILE_DEFINITIONS silently
+  # drops function-style macro definitions.
+  target_compile_options(blytplay PRIVATE "-Dluai_makeseed()=0x424C5954u")
 endif()
 
 target_compile_definitions(

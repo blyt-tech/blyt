@@ -530,7 +530,8 @@ if(CLANG_RV32
         OUTPUT "${LIBBLYT32LUA_OUT}"
         COMMAND
           "${CLANG_RV32}" ${RV32_FLAGS} ${RV32_INCLUDE} ${_LUA_MUSL_INC}
-          ${LIBBLYTC_CFLAGS} -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -DBLYT_DAP=1 -I
+          ${LIBBLYTC_CFLAGS} -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1
+          "-Dluai_makeseed()=0x424C5954u" -DBLYT_DAP=1 -I
           "${_LUA_DIR}" -I "${_SF_SRC}/include" -I "${_SF_SRC}/RISCV" -I
           "${_SF_PLATFORM_DIR}" -I "${CMAKE_SOURCE_DIR}/runtime/host/src/dap"
           -DSOFTFLOAT_FAST_INT64=1 -DSOFTFLOAT_ROUND_ODD=1

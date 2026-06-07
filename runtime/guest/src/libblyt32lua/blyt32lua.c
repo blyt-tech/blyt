@@ -134,7 +134,21 @@ static lua_State *open_state(void) {
     if (!L)
         return NULL;
 
-    blyt_console_debug("open_state: skipping requiref");
+    /* Open the same library set as the WASM host-side state (wasm_main.c
+     * run_lua_cart): base, math, string, table, coroutine.  The two paths
+     * must expose identical globals or carts behave differently per target
+     * (Spike T stage 1 found pairs() present on WASM, absent here). */
+    luaL_requiref(L, "_G", luaopen_base, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, "math", luaopen_math, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, "string", luaopen_string, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, "table", luaopen_table, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, "coroutine", luaopen_coroutine, 1);
+    lua_pop(L, 1);
+    blyt_console_debug("open_state: stdlib subset opened");
 
     blyt_console_debug("open_state: before register_blyt32");
     register_blyt32(L);

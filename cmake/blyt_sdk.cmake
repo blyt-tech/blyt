@@ -570,11 +570,17 @@ else()
       -I
       "${LIBBLYTC_BITS_DIR}/..")
 
+  # Fixed Lua hash seed (ADR-0130/ADR-0066): identical string hashing — and
+  # therefore pairs()/lua_next order, table.sort pivots, math.random streams —
+  # across the rv32 and WASM execution paths.  Must match every Lua build
+  # (guest libraries, host WASM Lua, blyt-luac).  0x424C5954 = "BLYT".
+  set(LUA_SEED_DEF "-Dluai_makeseed()=0x424C5954u")
+
   message(STATUS "Building libblytcommonlua.so…")
   execute_process(
     COMMAND
       "${FOUND_CLANG}" ${RV32_BASE} ${LUA_MUSL_INCLUDES} ${LIBBLYTC_CFLAGS}
-      -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 -I "${LUA_DIR}"
+      -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1 ${LUA_SEED_DEF} -I "${LUA_DIR}"
       -Wl,-soname,libblytcommonlua.so -o "${SDK_LIB}/libblytcommonlua.so"
       ${LUA_ALL_SRCS}
     RESULT_VARIABLE R)
@@ -632,6 +638,7 @@ else()
       ${_VOPT}
       -DLUA_32BITS=1
       -DLUA_USE_LONGJMP=1
+      ${LUA_SEED_DEF}
       ${_VLUA_DAP_FLAGS}
       -I
       "${LUA_DIR}"
@@ -769,6 +776,7 @@ else()
       -O2
       -DLUA_32BITS=1
       -DLUA_USE_LONGJMP=1
+      ${LUA_SEED_DEF}
       -I "${LUA_DIR}"
       -I "${SF_INC}"
       -I "${SF_SRC}/RISCV"
@@ -830,7 +838,7 @@ else()
   message(STATUS "Building blyt-luac (host-native, LUA_32BITS=1)…")
   execute_process(
     COMMAND
-      "${FOUND_CLANG}" -DLUA_32BITS=1 -O2 -I "${LUA_DIR}" -Wno-unused-parameter
+      "${FOUND_CLANG}" -DLUA_32BITS=1 ${LUA_SEED_DEF} -O2 -I "${LUA_DIR}" -Wno-unused-parameter
       -Wno-sign-compare -Wno-implicit-fallthrough -Wno-deprecated-non-prototype
       -o "${SDK_BIN}/blyt-luac" ${LUA_HOST_SRCS}
       "${BLYT_SOURCE_DIR}/runtime/tools/blyt-luac.c" -lm
