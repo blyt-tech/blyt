@@ -468,41 +468,62 @@ static void lua_cleanup(void) {
  * An error from the resumed coroutine (e.g. an uncaught bridged Lua error)
  * is reported exactly like the outer resume site. */
 static void wasm_service_trampoline(void) {
-    blyt_cart_run_err_t ferr = blyt_session_run_frame(g_session);
-    int resume = 0;
-    if (ferr == BLYT_RUN_FN_DONE) {
-        g_trampoline_active = false;
-        g_trampoline_ret = blyt_session_fn_return_value(g_session);
-        resume = 1;
-    } else if (ferr == BLYT_RUN_FN_ERROR) {
-        /* ADR-0130: bridged wrapper raised; guest registers were restored.
-         * The continuation re-raises inside the coroutine. */
-        g_trampoline_active = false;
-        g_trampoline_failed = true;
-        resume = 1;
-    }
+    /* Drain consecutive native calls within this tick: if the resumed script
+     * immediately makes another native call (yielding again with
+     * g_trampoline_active set), service it now rather than burning one
+     * animation frame per call.  The loop exits on the frame-boundary
+     * coroutine.yield(), cart quit/error, or a GDB pause. */
+    while (g_trampoline_active) {
+        blyt_cart_run_err_t ferr = blyt_session_run_frame(g_session);
+        int resume = 0;
+        if (ferr == BLYT_RUN_FN_DONE) {
+            g_trampoline_active = false;
+            g_trampoline_ret = blyt_session_fn_return_value(g_session);
+            resume = 1;
+        } else if (ferr == BLYT_RUN_FN_ERROR) {
+            /* ADR-0130: bridged wrapper raised; guest registers were
+             * restored.  The continuation re-raises inside the coroutine. */
+            g_trampoline_active = false;
+            g_trampoline_failed = true;
+            resume = 1;
+        }
 #ifdef BLYT_GDB
-    else if (ferr == BLYT_RUN_GDB_PAUSED) {
-        return; /* hold the coroutine; GDB client drives next steps */
-    }
-#endif
-    if (!resume)
-        return;
-    int nres = 0;
-    int status = lua_resume(g_lua_co, g_lua, 0, &nres); /* fires the continuation */
-    if (status != LUA_YIELD && status != LUA_OK) {
-        /* Uncaught error surfaced through the trampoline continuation. */
-        const char *msg = lua_tostring(g_lua_co, -1);
-#ifdef BLYT_DAP
-        if (blyt_dap_report_exception(g_lua_co, 1)) {
-            g_lua_dap_paused = true;
-            g_lua_quit = true;
-            return;
+        else if (ferr == BLYT_RUN_GDB_PAUSED) {
+            return; /* hold the coroutine; GDB client drives next steps */
         }
 #endif
-        blyt_js_error(msg ? msg : "Lua runtime error");
-        g_lua_error = true;
+        if (!resume)
+            return;
+        int nres = 0;
+        int status = lua_resume(g_lua_co, g_lua, 0, &nres); /* fires the continuation */
+        if (status == LUA_YIELD) {
+            if (g_trampoline_active)
+                continue; /* script made another native call — service it now */
+#ifdef BLYT_DAP
+            if (fc_dap_hook_yielded()) {
+                g_lua_dap_paused = true;
+                return;
+            }
+#endif
+            lua_settop(g_lua_co, 0); /* normal frame yield */
+            return;
+        }
+        if (status != LUA_OK) {
+            /* Uncaught error surfaced through the trampoline continuation. */
+            const char *msg = lua_tostring(g_lua_co, -1);
+#ifdef BLYT_DAP
+            if (blyt_dap_report_exception(g_lua_co, 1)) {
+                g_lua_dap_paused = true;
+                g_lua_quit = true;
+                return;
+            }
+#endif
+            blyt_js_error(msg ? msg : "Lua runtime error");
+            g_lua_error = true;
+        }
+        /* LUA_OK (coroutine body finished) or error: stop the cart. */
         g_lua_quit = true;
+        return;
     }
 }
 
