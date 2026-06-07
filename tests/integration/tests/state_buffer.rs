@@ -134,19 +134,19 @@ fn lua_cart_state_buffer_round_trips() {
         .config(CART_CONFIG)
         .lua(
             r#"
--- S is the generated constants module (require("S") or global S).
+-- S.game is the proxy table; S.game[slot].score reads/writes via blyt.buf.
 local slot = -1
 
 function init()
     slot = blyt.buf.alloc_slot(S.GAME)
-    blyt.buf.set_i32(S.GAME, slot, S.GAME_SCORE, 42)
+    S.game[slot].score = 42
     blyt.save_write(0)
-    blyt.buf.set_i32(S.GAME, slot, S.GAME_SCORE, 99)
+    S.game[slot].score = 99
 end
 
 function update()
     blyt.save_read(0)
-    local score = blyt.buf.get_i32(S.GAME, slot, S.GAME_SCORE)
+    local score = S.game[slot].score
     blyt.debug.print("score=" .. tostring(score))
     blyt.quit()
 end

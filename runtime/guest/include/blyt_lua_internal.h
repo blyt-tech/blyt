@@ -57,6 +57,13 @@ extern void lua_pushvalue(lua_State *L, int idx);
 /* Closure registration — lua_pushcfunction is a macro for lua_pushcclosure(f,0). */
 extern void lua_pushcclosure(lua_State *L, lua_CFunction f, int n);
 #define lua_pushcfunction(L, f) lua_pushcclosure((L), (f), 0)
+/* Upvalue access index for closures created with lua_pushcclosure. */
+#define lua_upvalueindex(i) (LUA_REGISTRYINDEX - (i))
+
+/* Metatable and raw table operations — used by devtool-generated proxy setup. */
+extern int lua_setmetatable(lua_State *L, int objindex);
+extern int lua_rawgeti(lua_State *L, int idx, lua_Integer n);
+extern void lua_rawseti(lua_State *L, int idx, lua_Integer n);
 
 /* Error reporting. */
 extern int luaL_error(lua_State *L, const char *fmt, ...);

@@ -365,6 +365,27 @@ void lua_pushcclosure(lua_State *L, lua_CFunction f, int n) {
     luaL_error(L, "blyt bridge: lua_pushcclosure is not available on this target");
 }
 
+/* ADR-0011: proxy metatable construction.  The WASM host drives Lua directly so
+ * these are never called (lua_pushcclosure errors first); stubs satisfy the ABI. */
+int lua_setmetatable(lua_State *L, int objindex) {
+    (void)objindex;
+    luaL_error(L, "blyt bridge: lua_setmetatable is not available on this target");
+    return 0;
+}
+
+int lua_rawgeti(lua_State *L, int idx, lua_Integer n) {
+    (void)idx;
+    (void)n;
+    luaL_error(L, "blyt bridge: lua_rawgeti is not available on this target");
+    return 0;
+}
+
+void lua_rawseti(lua_State *L, int idx, lua_Integer n) {
+    (void)idx;
+    (void)n;
+    luaL_error(L, "blyt bridge: lua_rawseti is not available on this target");
+}
+
 /* -------------------------------------------------------------------------
  * Cart lifecycle no-ops.
  *

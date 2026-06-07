@@ -37,6 +37,10 @@
     lua_next;
     lua_typename;
     luaL_checklstring;
+    /* ADR-0011: proxy metatable construction in devtool-generated glue */
+    lua_setmetatable;
+    lua_rawgeti;
+    lua_rawseti;
     /* blyt32 cart lifecycle (called by libblytcommon.so);
      * cart_lua_modules is provided by the devtool-generated __blyt_lua_glue.c */
     blyt_cart_init;
