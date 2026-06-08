@@ -284,6 +284,21 @@ int blyt_session_gdb_wait_attached(blyt_session_t *s);
  */
 void blyt_session_gdb_continue_initial_halt(blyt_session_t *s);
 
+/* --- --nostate cycle (save-state stress testing) -------------------------- */
+
+/*
+ * Execute one nostate cycle against an active session:
+ *   1. Call blyt_cart_on_save_state() in the guest.
+ *   2. Snapshot all state buffer contents.
+ *   3. Zero state buffers and guest BSS (static vars reset to 0).
+ *   4. Call blyt_cart_init() with console output suppressed.
+ *   5. Restore state buffer snapshot.
+ *   6. Call blyt_cart_on_load_state(HOT_RELOAD) in the guest.
+ * The emulator's PC and registers are saved before the cycle and restored
+ * afterwards, so the normal game loop continues from the same point.
+ */
+void blyt_nostate_cycle(blyt_session_t *s);
+
 #ifdef __cplusplus
 }
 #endif

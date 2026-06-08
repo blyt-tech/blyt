@@ -385,3 +385,10 @@ void blyt_cart_update(void) {
 void blyt_cart_draw(void) {
     call_global("draw");
 }
+void blyt_cart_on_save_state(void) {
+    call_global("on_save_state");
+}
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
+    call_global("on_load_state");
+}

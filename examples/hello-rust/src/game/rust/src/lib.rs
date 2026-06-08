@@ -11,6 +11,7 @@ static S_SLOT: AtomicI32 = AtomicI32::new(-1);
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_init() {
+    alloc_slot(S_GLOBALS);
     let slot = alloc_slot(S_PLAYER);
     S_SLOT.store(slot, Ordering::Relaxed);
     set_i32(S_PLAYER, slot, S_PLAYER_X, 0);
@@ -40,4 +41,23 @@ pub extern "C" fn blyt_cart_draw() {
         let y = get_i32(S_PLAYER, slot, S_PLAYER_Y);
         blyt::console_debug(&format!("draw frame {} player pos: {}, {}", frame, x, y));
     }
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_on_save_state() {
+    set_i32(
+        S_GLOBALS,
+        0,
+        S_GLOBALS_FRAME,
+        S_FRAME.load(Ordering::Relaxed) as i32,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_on_load_state(_reason: u32, _saved_version: u32, _buffers: u32) {
+    S_FRAME.store(
+        get_i32(S_GLOBALS, 0, S_GLOBALS_FRAME) as u32,
+        Ordering::Relaxed,
+    );
+    S_SLOT.store(0, Ordering::Relaxed);
 }

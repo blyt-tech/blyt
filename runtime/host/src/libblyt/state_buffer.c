@@ -228,6 +228,86 @@ int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t *out_s
     return -1;
 }
 
+/* -------------------------------------------------------------------------
+ * Snapshot / restore / zero (for --nostate cycle)
+ * ------------------------------------------------------------------------- */
+
+struct blyt_state_snapshot {
+    uint32_t n_buffers;
+    struct {
+        uint32_t count;
+        uint32_t n_fields;
+        uint8_t field_types[BLYT_MAX_FIELDS];
+        void *field_data[BLYT_MAX_FIELDS];
+        uint8_t slot_bitset[BLYT_MAX_SLOTS / 8];
+    } buffers[BLYT_MAX_BUFFERS];
+};
+
+blyt_state_snapshot_t *blyt_state_ctx_snapshot(const blyt_state_ctx_t *ctx) {
+    blyt_state_snapshot_t *snap = calloc(1, sizeof(*snap));
+    if (!snap)
+        return NULL;
+    snap->n_buffers = ctx->n_buffers;
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++) {
+        const blyt_buffer_ctx_t *bc = &ctx->buffers[bi];
+        snap->buffers[bi].count = bc->count;
+        snap->buffers[bi].n_fields = bc->n_fields;
+        memcpy(snap->buffers[bi].field_types, bc->field_types, sizeof(bc->field_types));
+        memcpy(snap->buffers[bi].slot_bitset, bc->slot_bitset, sizeof(bc->slot_bitset));
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            size_t sz = (size_t)bc->count * field_sizeof(bc->field_types[fi]);
+            snap->buffers[bi].field_data[fi] = malloc(sz);
+            if (!snap->buffers[bi].field_data[fi]) {
+                blyt_state_snapshot_free(snap);
+                return NULL;
+            }
+            memcpy(snap->buffers[bi].field_data[fi], bc->field_data[fi], sz);
+        }
+    }
+    return snap;
+}
+
+void blyt_state_ctx_restore_snapshot(blyt_state_ctx_t *ctx, const blyt_state_snapshot_t *snap) {
+    if (!snap || snap->n_buffers != ctx->n_buffers)
+        return;
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++) {
+        blyt_buffer_ctx_t *bc = &ctx->buffers[bi];
+        const void *sb_slot = snap->buffers[bi].slot_bitset;
+        if (snap->buffers[bi].n_fields != bc->n_fields || snap->buffers[bi].count != bc->count)
+            continue;
+        memcpy(bc->slot_bitset, sb_slot, sizeof(bc->slot_bitset));
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            if (!snap->buffers[bi].field_data[fi] || !bc->field_data[fi])
+                continue;
+            size_t sz = (size_t)bc->count * field_sizeof(bc->field_types[fi]);
+            memcpy(bc->field_data[fi], snap->buffers[bi].field_data[fi], sz);
+        }
+    }
+}
+
+void blyt_state_snapshot_free(blyt_state_snapshot_t *snap) {
+    if (!snap)
+        return;
+    for (uint32_t bi = 0; bi < snap->n_buffers; bi++) {
+        for (uint32_t fi = 0; fi < snap->buffers[bi].n_fields; fi++)
+            free(snap->buffers[bi].field_data[fi]);
+    }
+    free(snap);
+}
+
+void blyt_state_ctx_zero_data(blyt_state_ctx_t *ctx) {
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++) {
+        blyt_buffer_ctx_t *bc = &ctx->buffers[bi];
+        memset(bc->slot_bitset, 0, sizeof(bc->slot_bitset));
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            if (!bc->field_data[fi])
+                continue;
+            size_t sz = (size_t)bc->count * field_sizeof(bc->field_types[fi]);
+            memset(bc->field_data[fi], 0, sz);
+        }
+    }
+}
+
 int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot) {
     blyt_buffer_ctx_t *bc = find_buffer(ctx, buf_id);
     if (!bc)

@@ -74,3 +74,23 @@ int blyt_state_set(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_
 
 int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t *out_slot);
 int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot);
+
+/* -------------------------------------------------------------------------
+ * State snapshot (for --nostate cycle / hot-reload save-restore)
+ * ------------------------------------------------------------------------- */
+
+/* Opaque deep copy of all SOA field arrays + slot bitsets. */
+typedef struct blyt_state_snapshot blyt_state_snapshot_t;
+
+/* Deep-copy all SOA field arrays + slot bitsets into a heap allocation.
+ * Returns NULL on allocation failure. */
+blyt_state_snapshot_t *blyt_state_ctx_snapshot(const blyt_state_ctx_t *ctx);
+
+/* Overwrite SOA arrays + bitsets from snap (n_buffers/count/n_fields must match). */
+void blyt_state_ctx_restore_snapshot(blyt_state_ctx_t *ctx, const blyt_state_snapshot_t *snap);
+
+/* Free a snapshot returned by blyt_state_ctx_snapshot. */
+void blyt_state_snapshot_free(blyt_state_snapshot_t *snap);
+
+/* Zero all SOA field arrays and slot bitsets in-place (does not reallocate). */
+void blyt_state_ctx_zero_data(blyt_state_ctx_t *ctx);

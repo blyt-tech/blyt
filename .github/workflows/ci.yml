@@ -221,6 +221,13 @@ jobs:
                 ok=false
               fi
             done
+            out_ns=$(build/sdk/bin/blytplay --headless --nostate --quit-after 10 "${cart}" 2>&1)
+            for line in "${expected[@]}"; do
+              if ! printf '%s' "${out_ns}" | grep -qF "${line}"; then
+                echo "::error::${name} (--nostate): missing: ${line}"
+                ok=false
+              fi
+            done
             if ${ok}; then
               echo "ok: ${name}"
             else

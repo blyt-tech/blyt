@@ -130,8 +130,11 @@ enum {
  *   addi x17, x0, 0   ; li a7, BLYT_ECALL_EXIT
  *   ecall
  *   unimp              ; 0x00000000 — should never be reached
+ *
+ * Address chosen to be above the 16 MiB cart RAM limit and below the
+ * 64 MiB arena and 128 MiB library base.
  */
-#define BLYT_TRAMPOLINE_BASE 0x00003000u
+#define BLYT_TRAMPOLINE_BASE 0x01000000u
 #define BLYT_TRAMPOLINE_EXIT_ADDR BLYT_TRAMPOLINE_BASE
 /* FN_RETURN stub at +64 from exit (16 bytes each, 48 bytes gap for growth). */
 #define BLYT_TRAMPOLINE_FN_RETURN_ADDR (BLYT_TRAMPOLINE_EXIT_ADDR + 64u)

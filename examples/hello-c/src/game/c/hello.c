@@ -6,6 +6,7 @@ static int s_frame = 0;
 static int32_t s_slot = -1;
 
 void blyt_cart_init(void) {
+    blyt_buffer_alloc_slot(S_GLOBALS, &(int32_t){-1});
     blyt_buffer_alloc_slot(S_PLAYER, &s_slot);
     blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_X, 0);
     blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_Y, 0);
@@ -33,4 +34,14 @@ void blyt_cart_draw(void) {
         snprintf(buf, sizeof(buf), "draw frame %d player pos: %d, %d", s_frame, x, y);
         blyt_console_debug(buf);
     }
+}
+
+void blyt_cart_on_save_state(void) {
+    blyt_buffer_set_i32(S_GLOBALS, 0, S_GLOBALS_FRAME, s_frame);
+}
+
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
+    s_frame = blyt_buffer_get_i32(S_GLOBALS, 0, S_GLOBALS_FRAME);
+    s_slot = 0;
 }

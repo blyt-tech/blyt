@@ -64,6 +64,9 @@
 /* Maximum number of runtime libraries loaded per cart execution. */
 #define MAX_RUNTIME_LIBS 8
 
+/* Maximum PT_LOAD BSS regions tracked from the cart ELF (for nostate reset). */
+#define MAX_BSS_REGIONS 16
+
 /* Cart heap arena (ADR-0120): 16 MiB region in guest address space.
  * Placed at 64 MiB — well above the cart/trampoline region (~64 KiB) and
  * below the runtime library region (128 MiB). */
@@ -230,6 +233,18 @@ struct blyt_session {
     blyt_gdb_bp_t gdb_bps[MAX_GDB_BREAKS];
     int gdb_nbp;
 #endif
+
+    /* Cart BSS regions (recorded at create time for blyt_nostate_cycle). */
+    struct {
+        uint32_t start; /* guest vaddr = p_vaddr + p_filesz */
+        uint32_t size; /* = p_memsz - p_filesz */
+    } cart_bss[MAX_BSS_REGIONS];
+    int n_cart_bss;
+
+    /* Cached guest addresses of cart lifecycle callbacks (0 = not found). */
+    uint32_t fn_on_save_state;
+    uint32_t fn_init;
+    uint32_t fn_on_load_state;
 };
 
 #ifdef BLYT_GDB
@@ -1905,6 +1920,12 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
     }
 #endif
 
+    if (ok) {
+        s->fn_on_save_state = symtab_lookup(all_syms, "blyt_cart_on_save_state");
+        s->fn_init = symtab_lookup(all_syms, "blyt_cart_init");
+        s->fn_on_load_state = symtab_lookup(all_syms, "blyt_cart_on_load_state");
+    }
+
     free(all_syms);
     return ok ? BLYT_RUN_OK : BLYT_RUN_ERR_EMU;
 }
@@ -1947,6 +1968,22 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
         rv_delete(s->rv);
         free(s);
         return NULL;
+    }
+
+    /* Record cart BSS regions for blyt_nostate_cycle guest BSS zeroing. */
+    {
+        const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
+        for (uint16_t pi = 0; pi < eh->e_phnum && s->n_cart_bss < MAX_BSS_REGIONS; pi++) {
+            size_t off = (size_t)eh->e_phoff + (size_t)pi * eh->e_phentsize;
+            if (off + sizeof(Elf32_Phdr) > cart->map_size)
+                break;
+            const Elf32_Phdr *ph = (const Elf32_Phdr *)((const uint8_t *)cart->map + off);
+            if (ph->p_type != PT_LOAD || ph->p_memsz <= ph->p_filesz)
+                continue;
+            s->cart_bss[s->n_cart_bss].start = ph->p_vaddr + ph->p_filesz;
+            s->cart_bss[s->n_cart_bss].size = ph->p_memsz - ph->p_filesz;
+            s->n_cart_bss++;
+        }
     }
 
     /* Initialise state buffer context from .cart.layouts (if present). */
@@ -2519,6 +2556,102 @@ void blyt_session_gdb_continue_initial_halt(blyt_session_t *s) {
 #else
     (void)s;
 #endif
+}
+
+/* -------------------------------------------------------------------------
+ * --nostate cycle helpers
+ * ------------------------------------------------------------------------- */
+
+static void blyt_session_zero_guest_bss(blyt_session_t *s) {
+    vm_attr_t *attr = PRIV(s->rv);
+    for (int i = 0; i < s->n_cart_bss; i++)
+        memory_fill(attr->mem, s->cart_bss[i].start, s->cart_bss[i].size, 0);
+}
+
+static void noop_log(const char *msg) {
+    (void)msg;
+}
+
+/* Run blyt_session_run_frame until FN_DONE (skipping any FRAME_DONE returns).
+ * Returns BLYT_RUN_FN_DONE on success, an error code otherwise. */
+static blyt_cart_run_err_t call_until_fn_done(blyt_session_t *s) {
+    blyt_cart_run_err_t r;
+    do {
+        r = blyt_session_run_frame(s);
+    } while (r == BLYT_RUN_FRAME_DONE);
+    return r;
+}
+
+void blyt_nostate_cycle(blyt_session_t *s) {
+    uint32_t saved_pc;
+    uint32_t saved_regs[32];
+    uint32_t saved_fcsr;
+    blyt_state_snapshot_t *snap;
+    blyt_log_fn saved_log;
+    blyt_cart_run_err_t r;
+    uint32_t args[3];
+    uint32_t i;
+
+    if (!s || s->fn_init == 0)
+        return;
+
+    /* Preserve emulator state so the normal game loop continues after the cycle. */
+    saved_pc = s->rv->PC;
+    for (i = 0; i < 32; i++)
+        saved_regs[i] = rv_get_reg(s->rv, i);
+    saved_fcsr = s->rv->csr_fcsr;
+
+    /* 1. Ask the cart to flush any transient state into state buffers. */
+    if (s->fn_on_save_state) {
+        blyt_session_begin_fn_call(s, s->fn_on_save_state, 0, NULL);
+        r = call_until_fn_done(s);
+        if (r != BLYT_RUN_FN_DONE)
+            goto restore;
+    }
+
+    /* 2. Snapshot state buffers. */
+    snap = blyt_state_ctx_snapshot(&s->state_ctx);
+    if (!snap)
+        goto restore;
+
+    /* 3. Zero state buffers and guest BSS (static vars). */
+    blyt_state_ctx_zero_data(&s->state_ctx);
+    blyt_session_zero_guest_bss(s);
+
+    /* 4. Re-run init with log suppressed so output stays clean. */
+    saved_log = s->ctx.log_fn;
+    s->ctx.log_fn = noop_log;
+    blyt_session_begin_fn_call(s, s->fn_init, 0, NULL);
+    r = call_until_fn_done(s);
+    s->ctx.log_fn = saved_log;
+    if (r != BLYT_RUN_FN_DONE) {
+        blyt_state_snapshot_free(snap);
+        goto restore;
+    }
+
+    /* 5. Restore state buffers from snapshot. */
+    blyt_state_ctx_restore_snapshot(&s->state_ctx, snap);
+    blyt_state_snapshot_free(snap);
+
+    /* 6. Notify cart that state has been restored (BLYT_LOAD_HOT_RELOAD = 3). */
+    if (s->fn_on_load_state) {
+        args[0] = 3u;
+        args[1] = 0u;
+        args[2] = 0u;
+        blyt_session_begin_fn_call(s, s->fn_on_load_state, 3, args);
+        r = call_until_fn_done(s);
+        (void)r;
+    }
+
+restore:
+    /* Restore emulator state so the game loop continues from where it left off. */
+    s->ctx.ecall_trapped = false;
+    s->ctx.ecall_aborted = false;
+    s->rv->PC = saved_pc;
+    for (i = 1; i < 32; i++)
+        rv_set_reg(s->rv, i, saved_regs[i]);
+    s->rv->csr_fcsr = saved_fcsr;
+    s->rv->halt = false;
 }
 
 /* -------------------------------------------------------------------------

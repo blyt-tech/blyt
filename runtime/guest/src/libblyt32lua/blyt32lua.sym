@@ -46,5 +46,7 @@
     blyt_cart_init;
     blyt_cart_update;
     blyt_cart_draw;
+    blyt_cart_on_save_state;
+    blyt_cart_on_load_state;
   local: *;
 };

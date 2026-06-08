@@ -6,6 +6,8 @@ static int s_frame = 0;
 static int32_t s_slot = -1;
 
 extern "C" void blyt_cart_init() {
+    int32_t tmp = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &tmp);
     blyt_buffer_alloc_slot(S_PLAYER, &s_slot);
     blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_X, 0);
     blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_Y, 0);
@@ -33,4 +35,14 @@ extern "C" void blyt_cart_draw() {
                             " player pos: " + std::to_string(x) +
                             ", " + std::to_string(y)).c_str());
     }
+}
+
+extern "C" void blyt_cart_on_save_state() {
+    blyt_buffer_set_i32(S_GLOBALS, 0, S_GLOBALS_FRAME, s_frame);
+}
+
+extern "C" void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
+    s_frame = blyt_buffer_get_i32(S_GLOBALS, 0, S_GLOBALS_FRAME);
+    s_slot = 0;
 }

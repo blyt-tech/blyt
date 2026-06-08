@@ -2074,6 +2074,8 @@ fn link_cart(
             cmd.arg("-Wl,-u,blyt_cart_init")
                 .arg("-Wl,-u,blyt_cart_update")
                 .arg("-Wl,-u,blyt_cart_draw")
+                .arg("-Wl,-u,blyt_cart_on_save_state")
+                .arg("-Wl,-u,blyt_cart_on_load_state")
                 .arg(archive);
         }
     } else if !lua_cart {

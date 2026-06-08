@@ -2,6 +2,7 @@ local slot = -1
 local frame = 0
 
 function init()
+    blyt.buf.alloc_slot(S.GLOBALS)
     slot = blyt.buf.alloc_slot(S.PLAYER)
     S.player[slot].x = 0
     S.player[slot].y = 0
@@ -25,4 +26,13 @@ function draw()
                          " player pos: " .. S.player[slot].x ..
                          ", " .. S.player[slot].y)
     end
+end
+
+function on_save_state()
+    S.globals[0].frame = frame
+end
+
+function on_load_state(info)
+    frame = S.globals[0].frame
+    slot = 0
 end

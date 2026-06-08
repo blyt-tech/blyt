@@ -354,3 +354,8 @@ void blyt_libretro_gdb_continue_initial_halt(void) {
 blyt_cart_run_err_t blyt_libretro_run_err(void) {
     return g_run_err;
 }
+
+void retro_nostate_cycle(void) {
+    if (g_session)
+        blyt_nostate_cycle(g_session);
+}

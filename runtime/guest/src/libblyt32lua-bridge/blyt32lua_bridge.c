@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "blyt.h"
 #include "blyt_lua_internal.h"
 
 /* Provided by libblyt32.so (absorbed libblytc). */
@@ -398,4 +399,9 @@ void blyt_cart_init(void) {
 void blyt_cart_update(void) {
 }
 void blyt_cart_draw(void) {
+}
+void blyt_cart_on_save_state(void) {
+}
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
 }
