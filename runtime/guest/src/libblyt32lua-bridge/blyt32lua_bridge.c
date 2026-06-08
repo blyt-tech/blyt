@@ -400,6 +400,8 @@ void blyt_cart_update(void) {
 }
 void blyt_cart_draw(void) {
 }
+void blyt_cart_on_new_state(void) {
+}
 void blyt_cart_on_save_state(void) {
 }
 void blyt_cart_on_load_state(blyt_load_info_t info) {

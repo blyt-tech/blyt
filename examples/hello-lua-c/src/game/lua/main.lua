@@ -5,9 +5,12 @@ local frame = 0
 function init()
     blyt.buf.alloc_slot(S.GLOBALS)
     slot = blyt.buf.alloc_slot(S.PLAYER)
-    S.player[slot].x = 0
-    S.player[slot].y = 0
-    greeting.log("init player pos: 0, 0")
+end
+
+function on_new_state()
+    S.player[slot].x = 160
+    S.player[slot].y = 120
+    greeting.log("init player pos: 160, 120")
 end
 
 function update()

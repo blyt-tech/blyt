@@ -204,9 +204,9 @@ jobs:
         run: |
           failed=()
           expected=(
-            "init player pos: 0, 0"
-            "update frame 10 player pos: 1, 1"
-            "draw frame 10 player pos: 1, 1"
+            "init player pos: 160, 120"
+            "update frame 10 player pos: 161, 121"
+            "draw frame 10 player pos: 161, 121"
           )
           for ex in examples/*/; do
             [ -f "${ex}blyt.info.yaml" ] || continue

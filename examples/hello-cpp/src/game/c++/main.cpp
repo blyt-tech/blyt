@@ -9,9 +9,12 @@ extern "C" void blyt_cart_init() {
     int32_t tmp = -1;
     blyt_buffer_alloc_slot(S_GLOBALS, &tmp);
     blyt_buffer_alloc_slot(S_PLAYER, &s_slot);
-    blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_X, 0);
-    blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_Y, 0);
-    blyt_console_debug("init player pos: 0, 0");
+}
+
+extern "C" void blyt_cart_on_new_state() {
+    blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_X, 160);
+    blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_Y, 120);
+    blyt_console_debug("init player pos: 160, 120");
 }
 
 extern "C" void blyt_cart_update() {

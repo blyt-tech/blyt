@@ -14,9 +14,14 @@ pub extern "C" fn blyt_cart_init() {
     alloc_slot(S_GLOBALS);
     let slot = alloc_slot(S_PLAYER);
     S_SLOT.store(slot, Ordering::Relaxed);
-    set_i32(S_PLAYER, slot, S_PLAYER_X, 0);
-    set_i32(S_PLAYER, slot, S_PLAYER_Y, 0);
-    blyt::console_debug("init player pos: 0, 0");
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_on_new_state() {
+    let slot = S_SLOT.load(Ordering::Relaxed);
+    set_i32(S_PLAYER, slot, S_PLAYER_X, 160);
+    set_i32(S_PLAYER, slot, S_PLAYER_Y, 120);
+    blyt::console_debug("init player pos: 160, 120");
 }
 
 #[no_mangle]

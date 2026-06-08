@@ -385,6 +385,9 @@ void blyt_cart_update(void) {
 void blyt_cart_draw(void) {
     call_global("draw");
 }
+void blyt_cart_on_new_state(void) {
+    call_global("on_new_state");
+}
 void blyt_cart_on_save_state(void) {
     call_global("on_save_state");
 }
