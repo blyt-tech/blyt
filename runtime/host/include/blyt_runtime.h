@@ -50,6 +50,15 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out);
 /* Close a cart opened with blyt_cart_open and free all resources. */
 void blyt_cart_close(blyt_cart_t *cart);
 
+/*
+ * Return non-zero if the cart exports at least one lifecycle callback
+ * (blyt_cart_init, blyt_cart_update, blyt_cart_draw, blyt_cart_on_new_state,
+ * blyt_cart_on_quit, blyt_cart_cleanup) as a cart-native symbol (i.e. the
+ * symbol is defined in the cart itself, not delegated to a runtime library).
+ * Scans the cart's .dynsym directly — no emulator allocation.
+ */
+int blyt_cart_has_native_lifecycle(const blyt_cart_t *cart);
+
 /* Return a static human-readable string for a blyt_cart_err_t value. */
 const char *blyt_cart_err_str(blyt_cart_err_t err);
 
@@ -221,6 +230,30 @@ int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr, int nargs,
 
 /* After BLYT_RUN_FN_DONE: read the function's return value from rv register a0. */
 uint32_t blyt_session_fn_return_value(const blyt_session_t *s);
+
+/*
+ * Check whether cart-native code called blyt_quit() during the last
+ * trampoline invocation.  Internally calls blyt_is_quit_requested() in the
+ * RV32 guest and returns 1 if quit was requested, 0 otherwise.
+ * The WASM frontend calls this after each BLYT_RUN_FN_DONE to propagate the
+ * guest quit signal to the Lua coroutine's blyt.should_quit() check.
+ * Returns 0 when blyt_is_quit_requested is absent from the session's symtab.
+ */
+int blyt_session_check_guest_quit(blyt_session_t *s);
+
+/*
+ * Cart-native lifecycle callback addresses for WASM hybrid dispatch.
+ * Each function returns the resolved guest address of the named lifecycle symbol
+ * if it is defined in the cart's own code (bias=0, addr < GUEST_LIB_BASE), or 0
+ * if the symbol resolves to a runtime library stub.  The WASM frontend uses
+ * these to inject Lua trampolines for cart-native lifecycle overrides.
+ */
+uint32_t blyt_session_cart_fn_init(blyt_session_t *s);
+uint32_t blyt_session_cart_fn_on_new_state(blyt_session_t *s);
+uint32_t blyt_session_cart_fn_update(blyt_session_t *s);
+uint32_t blyt_session_cart_fn_draw(blyt_session_t *s);
+uint32_t blyt_session_cart_fn_on_quit(blyt_session_t *s);
+uint32_t blyt_session_cart_fn_cleanup(blyt_session_t *s);
 
 /* --- ECALL-bridged Lua C API (ADR-0130, WASM hybrid carts) ----------------- */
 

@@ -938,3 +938,97 @@ fn lua_rust_module_export_wasm() {
     let cart = build_lua_rust_module_export_cart(tmp.path());
     run_cart_wasm(&cart, "rust module export ok");
 }
+
+// -------------------------------------------------------------------------
+// Native lifecycle callbacks in hybrid Lua+C/Rust carts
+//
+// Verifies that when C/Rust defines cart lifecycle callbacks (blyt_cart_init,
+// blyt_cart_on_new_state, blyt_cart_update, blyt_cart_draw, blyt_cart_on_quit,
+// blyt_cart_cleanup), they are called correctly on both the emulator and WASM
+// runtimes.  On WASM the Lua coroutine injects native trampolines for the
+// callbacks so they dispatch into the RV32 session; blyt_quit() called inside
+// a native callback is propagated to blyt.should_quit() via
+// blyt_session_check_guest_quit().
+// -------------------------------------------------------------------------
+
+fn build_lua_c_native_lifecycle_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_native_lifecycle");
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+void blyt_cart_init(void)         { blyt_console_debug("c native init"); }
+void blyt_cart_on_new_state(void) { blyt_console_debug("c native on_new_state"); }
+void blyt_cart_update(void)       { blyt_quit(); }
+void blyt_cart_draw(void)         { blyt_console_debug("c native draw"); }
+void blyt_cart_on_quit(void)      { blyt_console_debug("c native on_quit"); }
+void blyt_cart_cleanup(void)      { blyt_console_debug("c native lifecycle ok"); }
+"#)
+        .lua("")
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_cart_c_native_lifecycle_native() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_native_lifecycle_cart(tmp.path());
+    run_cart_native(&cart, "c native lifecycle ok");
+}
+
+#[test]
+fn lua_cart_c_native_lifecycle_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_native_lifecycle_cart(tmp.path());
+    run_cart_wasm(&cart, "c native lifecycle ok");
+}
+
+fn build_lua_rust_native_lifecycle_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_rust_native_lifecycle");
+    CartProject::new()
+        .rust(
+            r#"#![no_std]
+extern crate blyt;
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() { blyt::console_debug("rust native init"); }
+#[no_mangle]
+pub extern "C" fn blyt_cart_on_new_state() { blyt::console_debug("rust native on_new_state"); }
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() { blyt::quit(); }
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() { blyt::console_debug("rust native draw"); }
+#[no_mangle]
+pub extern "C" fn blyt_cart_on_quit() { blyt::console_debug("rust native on_quit"); }
+#[no_mangle]
+pub extern "C" fn blyt_cart_cleanup() { blyt::console_debug("rust native lifecycle ok"); }
+"#,
+        )
+        .lua("")
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_cart_rust_native_lifecycle_native() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_native_lifecycle_cart(tmp.path());
+    run_cart_native(&cart, "rust native lifecycle ok");
+}
+
+#[test]
+fn lua_cart_rust_native_lifecycle_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_native_lifecycle_cart(tmp.path());
+    run_cart_wasm(&cart, "rust native lifecycle ok");
+}

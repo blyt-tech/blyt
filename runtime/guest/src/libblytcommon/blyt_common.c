@@ -22,6 +22,14 @@ void blyt_quit(void) {
     g_quit_requested = 1;
 }
 
+/* Callable by the host (via blyt_session_begin_fn_call) to check whether
+ * cart-native code called blyt_quit() inside a trampoline invocation.
+ * The WASM frontend uses this to propagate the guest quit signal to the
+ * Lua coroutine's blyt.should_quit() check after each lifecycle callback. */
+int blyt_is_quit_requested(void) {
+    return g_quit_requested;
+}
+
 /* -------------------------------------------------------------------------
  * blyt_frame_done — end-of-frame signal (ECALL 2)
  *

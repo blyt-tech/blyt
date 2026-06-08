@@ -1038,6 +1038,46 @@ int blyt_cart_has_dwarf(const blyt_cart_t *cart) {
     return cart ? cart->has_dwarf : 0;
 }
 
+int blyt_cart_has_native_lifecycle(const blyt_cart_t *cart) {
+    static const char *const names[] = {
+        "blyt_cart_init",
+        "blyt_cart_on_new_state",
+        "blyt_cart_update",
+        "blyt_cart_draw",
+        "blyt_cart_on_quit",
+        "blyt_cart_cleanup",
+        NULL,
+    };
+    if (!cart)
+        return 0;
+    const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
+    const uint8_t *base = (const uint8_t *)cart->map;
+    const Elf32_Shdr *shdrs = (const Elf32_Shdr *)(base + eh->e_shoff);
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        if (shdrs[i].sh_type != SHT_DYNSYM)
+            continue;
+        uint32_t stridx = shdrs[i].sh_link;
+        if (stridx >= eh->e_shnum)
+            break;
+        const char *strtab = (const char *)(base + shdrs[stridx].sh_offset);
+        const Elf32_Sym *syms = (const Elf32_Sym *)(base + shdrs[i].sh_offset);
+        uint32_t nsyms = shdrs[i].sh_size / sizeof(Elf32_Sym);
+        for (uint32_t j = 0; j < nsyms; j++) {
+            if (syms[j].st_shndx == SHN_UNDEF)
+                continue;
+            if (ELF32_ST_BIND(syms[j].st_info) == STB_LOCAL)
+                continue;
+            const char *sym_name = strtab + syms[j].st_name;
+            for (int k = 0; names[k]; k++) {
+                if (strcmp(sym_name, names[k]) == 0)
+                    return 1;
+            }
+        }
+        break;
+    }
+    return 0;
+}
+
 void blyt_cart_close(blyt_cart_t *cart) {
     if (!cart)
         return;

@@ -245,6 +245,14 @@ struct blyt_session {
     uint32_t fn_on_save_state;
     uint32_t fn_init;
     uint32_t fn_on_load_state;
+    uint32_t fn_on_new_state;
+    uint32_t fn_update;
+    uint32_t fn_draw;
+    uint32_t fn_on_quit;
+    uint32_t fn_cleanup;
+    /* blyt_is_quit_requested() from libblytcommon.so: called by the WASM
+     * frontend after each lifecycle trampoline to propagate blyt_quit(). */
+    uint32_t fn_is_quit_requested;
 };
 
 #ifdef BLYT_GDB
@@ -1924,6 +1932,12 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
         s->fn_on_save_state = symtab_lookup(all_syms, "blyt_cart_on_save_state");
         s->fn_init = symtab_lookup(all_syms, "blyt_cart_init");
         s->fn_on_load_state = symtab_lookup(all_syms, "blyt_cart_on_load_state");
+        s->fn_on_new_state = symtab_lookup(all_syms, "blyt_cart_on_new_state");
+        s->fn_update = symtab_lookup(all_syms, "blyt_cart_update");
+        s->fn_draw = symtab_lookup(all_syms, "blyt_cart_draw");
+        s->fn_on_quit = symtab_lookup(all_syms, "blyt_cart_on_quit");
+        s->fn_cleanup = symtab_lookup(all_syms, "blyt_cart_cleanup");
+        s->fn_is_quit_requested = symtab_lookup(all_syms, "blyt_is_quit_requested");
     }
 
     free(all_syms);
@@ -1933,6 +1947,51 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
 /* -------------------------------------------------------------------------
  * Session API — public entry points
  * ------------------------------------------------------------------------- */
+
+/* Returns addr if it is in cart-native address space (bias=0, < GUEST_LIB_BASE),
+ * else 0.  Used by the WASM frontend to decide whether to dispatch lifecycle
+ * callbacks via the RV32 session or fall back to the Lua global. */
+static uint32_t session_cart_fn(uint32_t addr) {
+    return (addr && addr < GUEST_LIB_BASE) ? addr : 0;
+}
+uint32_t blyt_session_cart_fn_init(blyt_session_t *s) {
+    return session_cart_fn(s->fn_init);
+}
+uint32_t blyt_session_cart_fn_on_new_state(blyt_session_t *s) {
+    return session_cart_fn(s->fn_on_new_state);
+}
+uint32_t blyt_session_cart_fn_update(blyt_session_t *s) {
+    return session_cart_fn(s->fn_update);
+}
+uint32_t blyt_session_cart_fn_draw(blyt_session_t *s) {
+    return session_cart_fn(s->fn_draw);
+}
+uint32_t blyt_session_cart_fn_on_quit(blyt_session_t *s) {
+    return session_cart_fn(s->fn_on_quit);
+}
+uint32_t blyt_session_cart_fn_cleanup(blyt_session_t *s) {
+    return session_cart_fn(s->fn_cleanup);
+}
+
+/*
+ * Call blyt_is_quit_requested() in the guest and return 1 if the guest called
+ * blyt_quit() since the last check.  Used by the WASM frontend to propagate
+ * a C-native lifecycle callback's blyt_quit() call to the Lua coroutine's
+ * blyt.should_quit() check.  Returns 0 when not applicable (NULL session, or
+ * blyt_is_quit_requested not in the symtab — i.e. pre-SDK carts).
+ */
+int blyt_session_check_guest_quit(blyt_session_t *s) {
+    if (!s || !s->fn_is_quit_requested)
+        return 0;
+    blyt_session_begin_fn_call(s, s->fn_is_quit_requested, 0, NULL);
+    blyt_cart_run_err_t ferr;
+    do {
+        ferr = blyt_session_run_frame(s);
+    } while (ferr != BLYT_RUN_FN_DONE && ferr != BLYT_RUN_OK);
+    if (ferr != BLYT_RUN_FN_DONE)
+        return 0;
+    return (int)blyt_session_fn_return_value(s) != 0;
+}
 
 blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     blyt_session_t *s = calloc(1, sizeof(*s));

@@ -90,7 +90,8 @@ static uint32_t g_xrgb[BLYT_FRAME_W * BLYT_FRAME_H];
 static lua_State *g_lua = NULL;
 static lua_State *g_lua_co = NULL; /* game-loop coroutine */
 static int g_lua_co_ref = LUA_NOREF;
-static bool g_lua_quit = false;
+static bool g_lua_quit = false; /* blyt.quit() called; coroutine exits via should_quit() */
+static bool g_lua_fatal = false; /* hard stop: error or DAP exception; cancel on next tick */
 static bool g_lua_error = false;
 static bool g_lua_active = false;
 #ifdef BLYT_DAP
@@ -218,6 +219,11 @@ static int lua_wasm_quit(lua_State *L) {
     (void)L;
     g_lua_quit = true;
     return 0;
+}
+
+static int lua_wasm_should_quit(lua_State *L) {
+    lua_pushboolean(L, g_lua_quit);
+    return 1;
 }
 
 /* -------------------------------------------------------------------------
@@ -416,6 +422,23 @@ static void wasm_register_lua_trampolines(lua_State *L, blyt_session_t *s) {
     blyt_session_visit_lua_exports(s, wasm_visit_export_cb, L);
 }
 
+/* If fn is a cart-native address (non-zero), register a zero-arg void trampoline
+ * as the Lua global lua_name.  Used to inject lifecycle callbacks for hybrid carts
+ * that define them natively rather than as Lua functions. */
+static void maybe_inject_lifecycle_cb(lua_State *L, const char *lua_name, uint32_t fn) {
+    if (!fn)
+        return;
+    lua_pushlightuserdata(L, (void *)(uintptr_t)fn);
+    lua_pushinteger(L, 0); /* nargs = 0 */
+    lua_pushinteger(L, WASM_LUA_TYPE_VOID); /* arg_types[0..3] */
+    lua_pushinteger(L, WASM_LUA_TYPE_VOID);
+    lua_pushinteger(L, WASM_LUA_TYPE_VOID);
+    lua_pushinteger(L, WASM_LUA_TYPE_VOID);
+    lua_pushinteger(L, WASM_LUA_TYPE_VOID); /* ret_type */
+    lua_pushcclosure(L, wasm_make_trampoline, 7);
+    lua_setglobal(L, lua_name);
+}
+
 /* Set by host-provided blyt32 drawing functions; cleared each frame before draw(). */
 static bool g_lua_drawn = false;
 
@@ -479,6 +502,10 @@ static void wasm_service_trampoline(void) {
         if (ferr == BLYT_RUN_FN_DONE) {
             g_trampoline_active = false;
             g_trampoline_ret = blyt_session_fn_return_value(g_session);
+            /* Propagate blyt_quit() called from C-native lifecycle callbacks
+             * to the Lua coroutine's blyt.should_quit() check. */
+            if (!g_lua_quit && blyt_session_check_guest_quit(g_session))
+                g_lua_quit = true;
             resume = 1;
         } else if (ferr == BLYT_RUN_FN_ERROR) {
             /* ADR-0130: bridged wrapper raised; guest registers were
@@ -508,21 +535,28 @@ static void wasm_service_trampoline(void) {
             lua_settop(g_lua_co, 0); /* normal frame yield */
             return;
         }
-        if (status != LUA_OK) {
-            /* Uncaught error surfaced through the trampoline continuation. */
+        if (status == LUA_OK) {
+            /* Coroutine finished normally (on_quit/cleanup complete). */
+            emscripten_cancel_main_loop();
+            lua_cleanup();
+            return;
+        }
+        /* Uncaught error surfaced through the trampoline continuation. */
+        {
             const char *msg = lua_tostring(g_lua_co, -1);
 #ifdef BLYT_DAP
             if (blyt_dap_report_exception(g_lua_co, 1)) {
                 g_lua_dap_paused = true;
-                g_lua_quit = true;
+                g_lua_fatal = true;
                 return;
             }
 #endif
             blyt_js_error(msg ? msg : "Lua runtime error");
             g_lua_error = true;
         }
-        /* LUA_OK (coroutine body finished) or error: stop the cart. */
-        g_lua_quit = true;
+        emscripten_cancel_main_loop();
+        lua_cleanup();
+        emscripten_force_exit(1);
         return;
     }
 }
@@ -548,13 +582,16 @@ static void wasm_lua_loop(void) {
         g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
         static const char co_body[] = "init() "
                                       "if type(on_new_state) == 'function' then on_new_state() end "
-                                      "while true do "
+                                      "while not blyt.should_quit() do "
                                       "  update() "
                                       "  if type(draw) == 'function' then draw() end "
                                       "  coroutine.yield() "
-                                      "end";
+                                      "end "
+                                      "if type(on_quit) == 'function' then on_quit() end "
+                                      "if type(cleanup) == 'function' then cleanup() end";
         luaL_loadstring(g_lua_co, co_body);
         g_lua_quit = false;
+        g_lua_fatal = false;
         g_lua_dap_paused = false;
         g_lua_needs_start = true; /* wait for new configurationDone */
         blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
@@ -589,7 +626,7 @@ static void wasm_lua_loop(void) {
     }
 #endif
 
-    if (g_lua_quit) {
+    if (g_lua_fatal) {
         emscripten_cancel_main_loop();
         lua_cleanup();
         if (g_lua_error)
@@ -637,24 +674,28 @@ static void wasm_lua_loop(void) {
         }
         lua_settop(g_lua_co, 0); /* discard yielded values — normal frame yield */
         /* Normal frame-end yield — fall through to render. */
+    } else if (status == LUA_OK) {
+        /* Coroutine finished normally — on_quit/cleanup ran successfully. */
+        emscripten_cancel_main_loop();
+        lua_cleanup();
+        return;
     } else {
-        /* LUA_OK = coroutine finished (shouldn't happen with while true);
-         * anything else = Lua error. */
-        if (status != LUA_OK) {
-            const char *msg = lua_tostring(g_lua_co, -1);
+        /* Lua error. */
+        const char *msg = lua_tostring(g_lua_co, -1);
 #ifdef BLYT_DAP
-            if (blyt_dap_report_exception(g_lua_co, 1)) {
-                /* Exception breakpoint active: pause for DAP inspect, quit on continue. */
-                g_lua_dap_paused = true;
-                g_lua_quit = true;
-                blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
-                return;
-            }
-#endif
-            blyt_js_error(msg ? msg : "Lua runtime error");
-            g_lua_error = true;
+        if (blyt_dap_report_exception(g_lua_co, 1)) {
+            /* Exception breakpoint: pause for DAP inspect, hard-stop on continue. */
+            g_lua_dap_paused = true;
+            g_lua_fatal = true;
+            blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+            return;
         }
-        g_lua_quit = true;
+#endif
+        blyt_js_error(msg ? msg : "Lua runtime error");
+        g_lua_error = true;
+        emscripten_cancel_main_loop();
+        lua_cleanup();
+        emscripten_force_exit(1);
         return;
     }
 
@@ -704,6 +745,8 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     lua_setfield(g_lua, -2, "debug");
     lua_pushcfunction(g_lua, lua_wasm_quit);
     lua_setfield(g_lua, -2, "quit");
+    lua_pushcfunction(g_lua, lua_wasm_should_quit);
+    lua_setfield(g_lua, -2, "should_quit");
     lua_setglobal(g_lua, "blyt");
     lua_pushcfunction(g_lua, lua_wasm_quit);
     lua_setglobal(g_lua, "blyt_quit");
@@ -712,11 +755,18 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     lua_pushcfunction(g_lua, wasm_lua_require);
     lua_setglobal(g_lua, "require");
 
-    /* Hybrid cart: create rv32emu session and register trampolines BEFORE the
-     * Lua bytecode runs so top-level require() calls resolve correctly. */
+    /* Hybrid Lua+native cart: create rv32emu session when the cart has either
+     * bridged Lua exports (.lua_exports section) or cart-native lifecycle
+     * callbacks (blyt_cart_has_native_lifecycle ELF dynsym scan).  This covers
+     * carts that only override lifecycle symbols in C/Rust with no Lua exports,
+     * as well as the common case where both are present.  Pure-Lua carts (no
+     * native code at all) skip this block entirely to avoid the 256 MB emulator
+     * allocation. */
     {
         size_t exports_sz = 0;
-        if (blyt_cart_find_section(g_cart, ".lua_exports", &exports_sz)) {
+        int has_lua_exports = (blyt_cart_find_section(g_cart, ".lua_exports", &exports_sz) != NULL);
+        int has_native_lifecycle = blyt_cart_has_native_lifecycle(g_cart);
+        if (has_lua_exports || has_native_lifecycle) {
             g_session = blyt_session_create(g_cart, wasm_log);
             if (!g_session) {
                 blyt_js_error("hybrid session failed");
@@ -731,11 +781,23 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
                     blyt_session_gdb_listen(g_session, &p);
             }
 #endif
-            /* ADR-0130: exchange thread for bridged Lua→native calls. */
-            g_lua_exch = lua_newthread(g_lua);
-            g_lua_exch_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
-            blyt_session_lua_bridge_attach(g_session, g_lua_exch);
-            wasm_register_lua_trampolines(g_lua, g_session);
+            if (has_lua_exports) {
+                /* ADR-0130: exchange thread for bridged Lua→native calls. */
+                g_lua_exch = lua_newthread(g_lua);
+                g_lua_exch_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
+                blyt_session_lua_bridge_attach(g_session, g_lua_exch);
+                wasm_register_lua_trampolines(g_lua, g_session);
+            }
+            /* Inject native trampolines for any lifecycle callbacks defined in
+             * cart-native code.  These override the corresponding Lua globals so
+             * the coroutine body's type() checks dispatch to the RV32 session. */
+            maybe_inject_lifecycle_cb(g_lua, "init", blyt_session_cart_fn_init(g_session));
+            maybe_inject_lifecycle_cb(g_lua, "on_new_state",
+                                      blyt_session_cart_fn_on_new_state(g_session));
+            maybe_inject_lifecycle_cb(g_lua, "update", blyt_session_cart_fn_update(g_session));
+            maybe_inject_lifecycle_cb(g_lua, "draw", blyt_session_cart_fn_draw(g_session));
+            maybe_inject_lifecycle_cb(g_lua, "on_quit", blyt_session_cart_fn_on_quit(g_session));
+            maybe_inject_lifecycle_cb(g_lua, "cleanup", blyt_session_cart_fn_cleanup(g_session));
         }
     }
 
@@ -774,11 +836,13 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
      * The first lua_resume() will invoke this chunk. */
     static const char co_body[] = "init() "
                                   "if type(on_new_state) == 'function' then on_new_state() end "
-                                  "while true do "
+                                  "while not blyt.should_quit() do "
                                   "  update() "
                                   "  if type(draw) == 'function' then draw() end "
                                   "  coroutine.yield() "
-                                  "end";
+                                  "end "
+                                  "if type(on_quit) == 'function' then on_quit() end "
+                                  "if type(cleanup) == 'function' then cleanup() end";
     if (luaL_loadstring(g_lua_co, co_body) != LUA_OK) {
         blyt_js_error(lua_tostring(g_lua_co, -1));
         lua_close(g_lua);
