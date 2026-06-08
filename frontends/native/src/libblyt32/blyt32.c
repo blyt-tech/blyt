@@ -37,8 +37,8 @@ extern char *getenv(const char *name);
 #define NATIVE_AT_FDCWD (-100)
 #define NATIVE_O_RDONLY 0
 #define NATIVE_O_WRONLY 1
-#define NATIVE_O_CREAT  64   /* 0100 octal */
-#define NATIVE_O_TRUNC  512  /* 01000 octal */
+#define NATIVE_O_CREAT 64 /* 0100 octal */
+#define NATIVE_O_TRUNC 512 /* 01000 octal */
 
 /* ── Minimal string helpers (no external deps) ──────────────────────────── */
 
@@ -58,8 +58,8 @@ static void blyt32_native_memset(void *d, int c, unsigned int n) {
 }
 
 /* Build a save path: <save_dir>/slot_<slot_num>.blys (no snprintf needed). */
-static unsigned int build_save_path(char *dst, unsigned int cap,
-                                    const char *save_dir, uint32_t slot_num) {
+static unsigned int build_save_path(char *dst, unsigned int cap, const char *save_dir,
+                                    uint32_t slot_num) {
     unsigned int i = 0;
     /* copy save_dir */
     while (save_dir[i] && i + 1 < cap) {
@@ -130,8 +130,8 @@ static int read_all(int fd, void *buf, unsigned int len) {
 
 /* Fixed-dimension limits.  Field handles encode (buf_id-1, field_index-1);
  * slot indices are zero-based.  These must be ≥ the cart's declared values. */
-#define NATIVE_MAX_BUF    8
-#define NATIVE_MAX_SLOTS  64
+#define NATIVE_MAX_BUF 8
+#define NATIVE_MAX_SLOTS 64
 #define NATIVE_MAX_FIELDS 64
 
 /* SOA: one uint32_t per (buffer, slot, field).  All types stored as 32-bit
@@ -160,9 +160,8 @@ static uint32_t canon_f32(uint32_t bits) {
 
 /* Validate a (buffer, slot, field) reference — all values are zero-based. */
 static int ref_ok(uint32_t bi, int32_t slot, uint32_t fi) {
-    return bi < NATIVE_MAX_BUF
-        && slot >= 0 && (uint32_t)slot < NATIVE_MAX_SLOTS
-        && fi < NATIVE_MAX_FIELDS;
+    return bi < NATIVE_MAX_BUF && slot >= 0 && (uint32_t)slot < NATIVE_MAX_SLOTS &&
+           fi < NATIVE_MAX_FIELDS;
 }
 
 /* ── Seccomp constructor ─────────────────────────────────────────────────
@@ -480,8 +479,8 @@ blyt_result_t blyt_save_read(uint32_t slot) {
         return BLYT_ERR_IO;
     }
 
-    if (hdr[0] != NATIVE_SAVE_MAGIC_0 || hdr[1] != NATIVE_SAVE_MAGIC_1
-        || hdr[2] != NATIVE_SAVE_MAGIC_2 || hdr[3] != NATIVE_SAVE_MAGIC_3) {
+    if (hdr[0] != NATIVE_SAVE_MAGIC_0 || hdr[1] != NATIVE_SAVE_MAGIC_1 ||
+        hdr[2] != NATIVE_SAVE_MAGIC_2 || hdr[3] != NATIVE_SAVE_MAGIC_3) {
         blyt_rs_close(fd);
         return BLYT_ERR_IO;
     }
