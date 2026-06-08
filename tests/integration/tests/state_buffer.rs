@@ -3,7 +3,7 @@ mod common;
 use common::{
     CartProject, build_cart, build_lua_cart, require_cpp_sdk, require_lua_sdk,
     require_rust_riscv_target, require_sdk, require_wasm, run_cart_native_with_env,
-    run_cart_wasm_with_env,
+    run_cart_native_with_flags, run_cart_wasm, run_cart_wasm_with_env,
 };
 use tempfile::TempDir;
 
@@ -1051,4 +1051,415 @@ void blyt_cart_draw(void) {}
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
     run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "types_ok");
+}
+
+// ── Lua lifecycle callbacks ────────────────────────────────────────────────
+
+/// blyt_cart_on_new_state is dispatched to the Lua `on_new_state` global.
+/// Without the dispatch in blyt32lua.c (or the sym export), the callback is
+/// silently swallowed — this test catches that regression.
+#[test]
+fn lua_cart_lifecycle_on_new_state() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_lifecycle_new");
+
+    CartProject::new()
+        .lua(
+            r#"
+function on_new_state()
+    blyt.debug.print("new_state_called")
+end
+
+function init()   end
+function update() blyt.quit() end
+function draw()   end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    common::run_cart_native(&cart, "new_state_called");
+}
+
+/// blyt_cart_on_save_state and blyt_cart_on_load_state are dispatched to
+/// the Lua `on_save_state` / `on_load_state` globals.
+#[test]
+fn lua_cart_lifecycle_on_save_load_state() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_lifecycle_sl");
+
+    CartProject::new()
+        .config(CART_CONFIG)
+        .lua(
+            r#"
+local slot = -1
+
+function on_save_state()
+    blyt.debug.print("save_called")
+end
+
+function on_load_state(info)
+    blyt.debug.print("load_called")
+end
+
+function init()
+    slot = blyt.buf.alloc_slot(S.GAME)
+    blyt.save_write(0)
+end
+
+function update()
+    blyt.save_read(0)
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let save_str = save_dir.path().to_str().unwrap();
+    run_cart_native_with_env(&cart, &[("BLYT_SAVE_DIR", save_str)], "save_called");
+    run_cart_native_with_env(&cart, &[("BLYT_SAVE_DIR", save_str)], "load_called");
+}
+
+// ── Rust lifecycle callbacks ───────────────────────────────────────────────
+
+/// blyt_cart_on_new_state fires for Rust carts.
+#[test]
+fn rust_cart_lifecycle_on_new_state() {
+    require_sdk();
+    require_rust_riscv_target();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_lifecycle_new");
+
+    CartProject::new()
+        .rust(
+            r#"#![no_std]
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_on_new_state() {
+    blyt::console_debug("new_state_called");
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() { blyt::quit(); }
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    common::run_cart_native(&cart, "new_state_called");
+}
+
+/// blyt_cart_on_save_state and blyt_cart_on_load_state fire for Rust carts.
+#[test]
+fn rust_cart_lifecycle_on_save_load_state() {
+    require_sdk();
+    require_rust_riscv_target();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_lifecycle_sl");
+
+    CartProject::new()
+        .config(CART_CONFIG)
+        .rust(
+            r#"#![no_std]
+include!(env!("BLYT_CART_STATE_RS"));
+
+use blyt::buffer::alloc_slot;
+use blyt::save::{save_read, save_write};
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_on_save_state() {
+    blyt::console_debug("save_called");
+}
+
+#[repr(C)]
+pub struct BlytLoadInfo { _reason: u32, _version: u32, _buffers: u32 }
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_on_load_state(_info: BlytLoadInfo) {
+    blyt::console_debug("load_called");
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {
+    let _slot = alloc_slot(S_GAME);
+    save_write(0);
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    save_read(0);
+    blyt::quit();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let save_str = save_dir.path().to_str().unwrap();
+    run_cart_native_with_env(&cart, &[("BLYT_SAVE_DIR", save_str)], "save_called");
+    run_cart_native_with_env(&cart, &[("BLYT_SAVE_DIR", save_str)], "load_called");
+}
+
+// ── C++ lifecycle callbacks ────────────────────────────────────────────────
+
+/// blyt_cart_on_new_state fires for C++ carts.
+#[test]
+fn cpp_cart_lifecycle_on_new_state() {
+    require_sdk();
+    require_cpp_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("cpp_lifecycle_new");
+
+    CartProject::new()
+        .cpp(
+            r#"
+#include "blyt.h"
+
+extern "C" void blyt_cart_on_new_state() {
+    blyt_console_debug("new_state_called");
+}
+
+extern "C" void blyt_cart_init()   {}
+extern "C" void blyt_cart_update() { blyt_quit(); }
+extern "C" void blyt_cart_draw()   {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    common::run_cart_native(&cart, "new_state_called");
+}
+
+/// blyt_cart_on_save_state and blyt_cart_on_load_state fire for C++ carts.
+#[test]
+fn cpp_cart_lifecycle_on_save_load_state() {
+    require_sdk();
+    require_cpp_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+    let project = tmp.path().join("cpp_lifecycle_sl");
+
+    CartProject::new()
+        .config(CART_CONFIG)
+        .cpp(
+            r#"
+#include "blyt.h"
+#include "cart_state.h"
+
+extern "C" void blyt_cart_on_save_state() {
+    blyt_console_debug("save_called");
+}
+
+extern "C" void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
+    blyt_console_debug("load_called");
+}
+
+extern "C" void blyt_cart_init() {
+    int32_t slot = -1;
+    blyt_buffer_alloc_slot(S_GAME, &slot);
+    blyt_save_write(0);
+}
+
+extern "C" void blyt_cart_update() {
+    blyt_save_read(0);
+    blyt_quit();
+}
+
+extern "C" void blyt_cart_draw() {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let save_str = save_dir.path().to_str().unwrap();
+    run_cart_native_with_env(&cart, &[("BLYT_SAVE_DIR", save_str)], "save_called");
+    run_cart_native_with_env(&cart, &[("BLYT_SAVE_DIR", save_str)], "load_called");
+}
+
+// ── --reset-every-frame integration ───────────────────────────────────────
+
+const GLOBALS_CONFIG: &str = "\
+records:
+  Globals:
+    fields:
+      - { name: frame, type: i32 }
+state_buffers:
+  globals:
+    record: Globals
+    count: 1
+";
+
+/// A C cart that properly stores its frame counter in a state buffer survives
+/// the --reset-every-frame cycle: on_save_state → zero BSS → init → on_load_state.
+#[test]
+fn c_cart_reset_every_frame() {
+    require_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("c_ref");
+
+    CartProject::new()
+        .config(GLOBALS_CONFIG)
+        .c(r#"
+#include "blyt.h"
+#include "cart_state.h"
+#include <stdio.h>
+
+static int32_t s_frame = 0;
+
+void blyt_cart_on_new_state(void) {}
+
+void blyt_cart_on_save_state(void) {
+    blyt_buffer_set_i32(S_GLOBALS, 0, S_GLOBALS_FRAME, s_frame);
+}
+
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
+    s_frame = blyt_buffer_get_i32(S_GLOBALS, 0, S_GLOBALS_FRAME);
+}
+
+void blyt_cart_init(void) {
+    int32_t slot = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &slot);
+}
+
+void blyt_cart_update(void) {
+    s_frame++;
+    if (s_frame == 10) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "frame=%d", s_frame);
+        blyt_console_debug(buf);
+    }
+}
+
+void blyt_cart_draw(void) {}
+"#)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_native_with_flags(
+        &cart,
+        &["--reset-every-frame", "--quit-after", "10"],
+        "frame=10",
+    );
+}
+
+/// A Lua cart that properly stores its frame counter in a state buffer survives
+/// the --reset-every-frame cycle. Also covers the Lua lifecycle dispatch path
+/// (blyt32lua.c) during each cycle's init/on_load_state calls.
+#[test]
+fn lua_cart_reset_every_frame() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_ref");
+
+    CartProject::new()
+        .config(GLOBALS_CONFIG)
+        .lua(
+            r#"
+local frame = 0
+
+function on_new_state() end
+
+function on_save_state()
+    S.globals[0].frame = frame
+end
+
+function on_load_state(info)
+    frame = S.globals[0].frame
+end
+
+function init()
+    blyt.buf.alloc_slot(S.GLOBALS)
+end
+
+function update()
+    frame = frame + 1
+    if frame == 10 then
+        blyt.debug.print("frame=" .. frame)
+    end
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_native_with_flags(
+        &cart,
+        &["--reset-every-frame", "--quit-after", "10"],
+        "frame=10",
+    );
+}
+
+// ── WASM Lua lifecycle ─────────────────────────────────────────────────────
+
+/// blyt_cart_on_new_state stub in blyt32lua_bridge.c (WASM path) is present and
+/// does not crash. If the stub were missing the linker would error; if the bridge
+/// tried to dispatch it as a real Lua call the WASM host would error.
+#[test]
+fn wasm_lua_cart_lifecycle_on_new_state() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_lua_lifecycle_new");
+
+    CartProject::new()
+        .lua(
+            r#"
+function on_new_state()
+    blyt.debug.print("new_state_called")
+end
+
+function init()   end
+function update() blyt.quit() end
+function draw()   end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm(&cart, "new_state_called");
 }

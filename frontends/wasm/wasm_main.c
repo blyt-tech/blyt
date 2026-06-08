@@ -547,6 +547,7 @@ static void wasm_lua_loop(void) {
         g_lua_co = lua_newthread(g_lua);
         g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
         static const char co_body[] = "init() "
+                                      "if type(on_new_state) == 'function' then on_new_state() end "
                                       "while true do "
                                       "  update() "
                                       "  if type(draw) == 'function' then draw() end "
@@ -695,8 +696,12 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     lua_setfield(g_lua, -2, "debug");
     lua_setglobal(g_lua, "blyt32");
 
-    /* Register blyt.quit() — also exposed as blyt_quit() for compatibility. */
+    /* Register blyt API: blyt.debug.print (same as blyt32.debug.print) + blyt.quit. */
     lua_newtable(g_lua);
+    lua_newtable(g_lua);
+    lua_pushcfunction(g_lua, lua_wasm_debug_print);
+    lua_setfield(g_lua, -2, "print");
+    lua_setfield(g_lua, -2, "debug");
     lua_pushcfunction(g_lua, lua_wasm_quit);
     lua_setfield(g_lua, -2, "quit");
     lua_setglobal(g_lua, "blyt");
@@ -768,6 +773,7 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     /* Compile the loop body and push it onto the coroutine's stack.
      * The first lua_resume() will invoke this chunk. */
     static const char co_body[] = "init() "
+                                  "if type(on_new_state) == 'function' then on_new_state() end "
                                   "while true do "
                                   "  update() "
                                   "  if type(draw) == 'function' then draw() end "

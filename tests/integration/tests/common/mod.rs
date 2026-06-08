@@ -536,6 +536,25 @@ pub fn run_cart_native(cart: &std::path::Path, expected: &str) {
     run_cart_native_with_env(cart, &[], expected)
 }
 
+/// Run a cart with blytplay --headless {extra_flags...} {cart}; assert `expected`
+/// appears in stdout.
+pub fn run_cart_native_with_flags(cart: &std::path::Path, extra_flags: &[&str], expected: &str) {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(blytplay());
+    cmd.arg("--headless");
+    for f in extra_flags {
+        cmd.arg(f);
+    }
+    cmd.arg(cart.to_str().unwrap());
+    let output = cmd.assert().success().get_output().stdout.clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in native output, got: {}",
+        expected,
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// Run a cart with blytplay --headless plus extra environment variables; assert
 /// `expected` appears in stdout.
 pub fn run_cart_native_with_env(
