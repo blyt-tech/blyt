@@ -12,7 +12,6 @@
  *
  * Allowlist (Spike S 2026-05-13; Phase 9 file-I/O additions):
  *   29  ioctl       isatty probe in stdio
- *   34  mkdirat     save directory creation
  *   56  openat      save/load file open
  *   57  close       file descriptor close
  *   63  read        cart input + save/load reads
@@ -22,6 +21,9 @@
  *   94  exit_group  cart exits
  *  215  munmap      Lua VM heap (lua_native_malloc.c)
  *  222  mmap        Lua VM heap + system musl malloc
+ *
+ * mkdirat is intentionally absent: the launcher pre-creates BLYT_SAVE_DIR
+ * and BLYT_WORK_DIR before execve (ADR-0131).
  */
 
 #ifndef BLYT_SECCOMP_RESTRICTED_H
@@ -66,7 +68,6 @@ struct blyt_sock_fprog {
 
 static const unsigned int blyt_restricted_nrs[] = {
     29u, /* ioctl      */
-    34u, /* mkdirat    — save directory creation */
     56u, /* openat     — save/load file I/O */
     57u, /* close      — file descriptor close */
     63u, /* read       */
@@ -139,16 +140,6 @@ static inline int blyt_rs_fsync(int fd) {
     register long a0 __asm__("a0") = fd;
     register long a7 __asm__("a7") = 72; /* SYS_fsync */
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
-    return (int)a0;
-}
-
-/* SYS_mkdirat: a0=dirfd, a1=path, a2=mode → 0 or -errno */
-static inline int blyt_rs_mkdirat(int dirfd, const char *path, int mode) {
-    register long a0 __asm__("a0") = dirfd;
-    register const char *a1 __asm__("a1") = path;
-    register long a2 __asm__("a2") = mode;
-    register long a7 __asm__("a7") = 34; /* SYS_mkdirat */
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
     return (int)a0;
 }
 

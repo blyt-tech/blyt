@@ -758,6 +758,10 @@ void blyt_cart_draw(void) {}
             "scp sb_metal.blyt failed"
         );
 
+        // Pre-create the save directory; the cart no longer calls mkdirat
+        // (ADR-0131: launcher responsibility, mkdirat removed from seccomp).
+        assert!(qemu.ssh_ok("mkdir -p /tmp/blyt_save_gate"));
+
         let out = qemu.ssh(
             "BLYT_SAVE_DIR=/tmp/blyt_save_gate \
              /tmp/blyt_gate/blyt_native \

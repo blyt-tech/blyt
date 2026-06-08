@@ -31,8 +31,10 @@
  *     261  prlimit64    libc stack-size probe
  *      29  ioctl        isatty probe
  *      64  write        cart output
+ *      72  fsync        flush save files
  *      93  exit         single-thread exit
  *      94  exit_group   cart exits
+ *     mkdirat intentionally absent: launcher pre-creates directories (ADR-0131).
  *
  * All constants are defined inline; no linux/filter.h dependency.
  */
@@ -110,11 +112,9 @@ static const unsigned int blytal_rv32_nrs[] = {
     261u, /* prlimit64        */
     29u, /* ioctl            */
     64u, /* write            */
+    72u, /* fsync            — flush save files */
     93u, /* exit             */
     94u, /* exit_group       */
-    /* ── Phase 9 save/load (must mirror restricted allowlist additions) ── */
-    34u, /* mkdirat          — save directory creation */
-    72u, /* fsync            — flush save files */
 };
 #define BLYTAL_RV32_N ((int)(sizeof(blytal_rv32_nrs) / sizeof(blytal_rv32_nrs[0])))
 

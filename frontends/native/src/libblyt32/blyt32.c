@@ -421,9 +421,6 @@ blyt_result_t blyt_save_write(uint32_t slot) {
         return BLYT_ERR_IO;
     }
 
-    /* Ensure the save directory exists (ignore errors — it may already exist). */
-    blyt_rs_mkdirat(NATIVE_AT_FDCWD, save_dir, 0755);
-
     char path[512];
     build_save_path(path, sizeof(path), save_dir, slot);
 
