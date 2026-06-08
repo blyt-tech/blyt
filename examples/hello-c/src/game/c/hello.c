@@ -1,25 +1,36 @@
 #include "blyt.h"
+#include "cart_state.h"
 #include <stdio.h>
 
 static int s_frame = 0;
+static int32_t s_slot = -1;
 
 void blyt_cart_init(void) {
-    blyt_console_debug("hello from c");
+    blyt_buffer_alloc_slot(S_PLAYER, &s_slot);
+    blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_X, 0);
+    blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_Y, 0);
+    blyt_console_debug("init player pos: 0, 0");
 }
 
 void blyt_cart_update(void) {
-    char buf[32];
     s_frame++;
-    if (s_frame % 60 == 0) {
-        snprintf(buf, sizeof(buf), "update %d", s_frame);
+    if (s_frame % 10 == 0) {
+        int32_t x = (blyt_buffer_get_i32(S_PLAYER, s_slot, S_PLAYER_X) + 1) % 320;
+        int32_t y = (blyt_buffer_get_i32(S_PLAYER, s_slot, S_PLAYER_Y) + 1) % 240;
+        blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_X, x);
+        blyt_buffer_set_i32(S_PLAYER, s_slot, S_PLAYER_Y, y);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "update frame %d player pos: %d, %d", s_frame, x, y);
         blyt_console_debug(buf);
     }
 }
 
 void blyt_cart_draw(void) {
-    char buf[32];
-    if (s_frame % 60 == 0) {
-        snprintf(buf, sizeof(buf), "draw %d", s_frame);
+    if (s_frame % 10 == 0) {
+        int32_t x = blyt_buffer_get_i32(S_PLAYER, s_slot, S_PLAYER_X);
+        int32_t y = blyt_buffer_get_i32(S_PLAYER, s_slot, S_PLAYER_Y);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "draw frame %d player pos: %d, %d", s_frame, x, y);
         blyt_console_debug(buf);
     }
 }

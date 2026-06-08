@@ -197,3 +197,38 @@ jobs:
             echo "Examples failed to build: ${failed[*]}"
             exit 1
           fi
+
+      # Run every built example for 10 frames and assert the expected output.
+      # All carts emit the same three lines (same Player state, same cadence).
+      - name: Smoke-test examples
+        run: |
+          failed=()
+          expected=(
+            "init player pos: 0, 0"
+            "update frame 10 player pos: 1, 1"
+            "draw frame 10 player pos: 1, 1"
+          )
+          for ex in examples/*/; do
+            [ -f "${ex}blyt.info.yaml" ] || continue
+            name="${ex%/}"
+            cart="${ex}build/$(basename "${name}").blyt"
+            echo "::group::smoke ${name}"
+            out=$(build/sdk/bin/blytplay --headless --quit-after 10 "${cart}" 2>&1)
+            ok=true
+            for line in "${expected[@]}"; do
+              if ! printf '%s' "${out}" | grep -qF "${line}"; then
+                echo "::error::${name}: missing: ${line}"
+                ok=false
+              fi
+            done
+            if ${ok}; then
+              echo "ok: ${name}"
+            else
+              failed+=("${name}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Example smoke tests failed: ${failed[*]}"
+            exit 1
+          fi

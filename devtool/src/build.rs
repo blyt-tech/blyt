@@ -1593,7 +1593,8 @@ fn build_rust_archive(
 
     let mut cargo_cmd = cmd;
     if let Some(rs_path) = cart_state_rs {
-        cargo_cmd.env("BLYT_CART_STATE_RS", rs_path);
+        let abs = std::fs::canonicalize(rs_path).unwrap_or_else(|_| rs_path.to_path_buf());
+        cargo_cmd.env("BLYT_CART_STATE_RS", abs);
     }
     let status = cargo_cmd
         .env("RUSTFLAGS", cart_rustflags(extra_rustflags))

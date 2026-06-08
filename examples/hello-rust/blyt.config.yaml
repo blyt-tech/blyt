@@ -1,0 +1,9 @@
+records:
+  Player:
+    fields:
+      - { name: x, type: i32 }
+      - { name: y, type: i32 }
+state_buffers:
+  player:
+    record: Player
+    count: 1
