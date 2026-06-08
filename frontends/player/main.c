@@ -145,7 +145,8 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index, unsig
 static int g_dap_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static int g_gdb_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static int g_quit_after = -1; /* -1 = disabled; >=0 = exit after N frames */
-static bool g_reset_every_frame = false; /* --reset-every-frame: run a save/clear/restore cycle after each frame */
+static bool g_reset_every_frame =
+    false; /* --reset-every-frame: run a save/clear/restore cycle after each frame */
 
 /* If BLYT_LIB_DIR is unset, try to infer it as <binary_dir>/../lib.
  * This lets blytplay/blytdebug work without any environment setup when
