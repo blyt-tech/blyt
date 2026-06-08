@@ -229,7 +229,7 @@ int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t *out_s
 }
 
 /* -------------------------------------------------------------------------
- * Snapshot / restore / zero (for --nostate cycle)
+ * Snapshot / restore / zero (for --reset-every-frame cycle)
  * ------------------------------------------------------------------------- */
 
 struct blyt_state_snapshot {

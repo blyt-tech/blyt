@@ -355,7 +355,7 @@ blyt_cart_run_err_t blyt_libretro_run_err(void) {
     return g_run_err;
 }
 
-void retro_nostate_cycle(void) {
+void retro_reset_every_frame_cycle(void) {
     if (g_session)
-        blyt_nostate_cycle(g_session);
+        blyt_reset_every_frame_cycle(g_session);
 }

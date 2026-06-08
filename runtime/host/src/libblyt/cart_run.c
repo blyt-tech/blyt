@@ -64,7 +64,7 @@
 /* Maximum number of runtime libraries loaded per cart execution. */
 #define MAX_RUNTIME_LIBS 8
 
-/* Maximum PT_LOAD BSS regions tracked from the cart ELF (for nostate reset). */
+/* Maximum PT_LOAD BSS regions tracked from the cart ELF (for --reset-every-frame). */
 #define MAX_BSS_REGIONS 16
 
 /* Cart heap arena (ADR-0120): 16 MiB region in guest address space.
@@ -234,7 +234,7 @@ struct blyt_session {
     int gdb_nbp;
 #endif
 
-    /* Cart BSS regions (recorded at create time for blyt_nostate_cycle). */
+    /* Cart BSS regions (recorded at create time for blyt_reset_every_frame_cycle). */
     struct {
         uint32_t start; /* guest vaddr = p_vaddr + p_filesz */
         uint32_t size; /* = p_memsz - p_filesz */
@@ -1970,7 +1970,7 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
         return NULL;
     }
 
-    /* Record cart BSS regions for blyt_nostate_cycle guest BSS zeroing. */
+    /* Record cart BSS regions for blyt_reset_every_frame_cycle guest BSS zeroing. */
     {
         const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
         for (uint16_t pi = 0; pi < eh->e_phnum && s->n_cart_bss < MAX_BSS_REGIONS; pi++) {
@@ -2559,7 +2559,7 @@ void blyt_session_gdb_continue_initial_halt(blyt_session_t *s) {
 }
 
 /* -------------------------------------------------------------------------
- * --nostate cycle helpers
+ * --reset-every-frame cycle helpers
  * ------------------------------------------------------------------------- */
 
 static void blyt_session_zero_guest_bss(blyt_session_t *s) {
@@ -2582,7 +2582,7 @@ static blyt_cart_run_err_t call_until_fn_done(blyt_session_t *s) {
     return r;
 }
 
-void blyt_nostate_cycle(blyt_session_t *s) {
+void blyt_reset_every_frame_cycle(blyt_session_t *s) {
     uint32_t saved_pc;
     uint32_t saved_regs[32];
     uint32_t saved_fcsr;

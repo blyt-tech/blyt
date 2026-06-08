@@ -36,7 +36,7 @@ void retro_run(void);
  * status — not part of the standard libretro interface. */
 bool blyt_libretro_is_done(void);
 blyt_cart_run_err_t blyt_libretro_run_err(void);
-void retro_nostate_cycle(void);
+void retro_reset_every_frame_cycle(void);
 #ifdef BLYT_DAP
 bool blyt_libretro_dap_wait_ready(void);
 #endif
@@ -145,7 +145,7 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index, unsig
 static int g_dap_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static int g_gdb_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static int g_quit_after = -1; /* -1 = disabled; >=0 = exit after N frames */
-static bool g_nostate = false; /* --nostate: run a save/clear/restore cycle after each frame */
+static bool g_reset_every_frame = false; /* --reset-every-frame: run a save/clear/restore cycle after each frame */
 
 /* If BLYT_LIB_DIR is unset, try to infer it as <binary_dir>/../lib.
  * This lets blytplay/blytdebug work without any environment setup when
@@ -236,8 +236,8 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
                 g_gdb_port = 0;
         } else if (strcmp(argv[i], "--quit-after") == 0 && i + 1 < argc) {
             g_quit_after = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--nostate") == 0) {
-            g_nostate = true;
+        } else if (strcmp(argv[i], "--reset-every-frame") == 0) {
+            g_reset_every_frame = true;
         } else if (argv[i][0] != '-') {
             cart = argv[i];
         } else {
@@ -348,8 +348,8 @@ int main(int argc, char *argv[]) {
         retro_run();
         if (g_quit_after >= 0 && ++frame_count >= g_quit_after)
             g_quit = true;
-        if (g_nostate && !g_quit)
-            retro_nostate_cycle();
+        if (g_reset_every_frame && !g_quit)
+            retro_reset_every_frame_cycle();
         if (g_sdl_ready) {
             uint32_t elapsed = SDL_GetTicks() - t0;
             if (elapsed < frame_ms)

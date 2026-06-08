@@ -221,10 +221,10 @@ jobs:
                 ok=false
               fi
             done
-            out_ns=$(build/sdk/bin/blytplay --headless --nostate --quit-after 10 "${cart}" 2>&1)
+            out_ns=$(build/sdk/bin/blytplay --headless --reset-every-frame --quit-after 10 "${cart}" 2>&1)
             for line in "${expected[@]}"; do
               if ! printf '%s' "${out_ns}" | grep -qF "${line}"; then
-                echo "::error::${name} (--nostate): missing: ${line}"
+                echo "::error::${name} (--reset-every-frame): missing: ${line}"
                 ok=false
               fi
             done

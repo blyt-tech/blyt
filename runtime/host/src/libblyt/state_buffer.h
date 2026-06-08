@@ -76,7 +76,7 @@ int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t *out_s
 int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot);
 
 /* -------------------------------------------------------------------------
- * State snapshot (for --nostate cycle / hot-reload save-restore)
+ * State snapshot (for --reset-every-frame cycle / hot-reload save-restore)
  * ------------------------------------------------------------------------- */
 
 /* Opaque deep copy of all SOA field arrays + slot bitsets. */
