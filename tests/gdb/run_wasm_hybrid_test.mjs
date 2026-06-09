@@ -241,6 +241,17 @@ function startRelays() {
                 waitForWasmConnections: () =>
                     Promise.all([wsPromises['/dap'], wsPromises['/gdb']]),
                 shutdown: () => {
+                    /* Destroy the WASM-side WebSocket sockets first so the WASM
+                     * runtime loses its WebSocket keepalives and can exit via its
+                     * normal NO_EXIT_RUNTIME=0 keepalive mechanism.  Without this,
+                     * on Linux the open socket handles prevent Node.js from exiting
+                     * after emscripten_cancel_main_loop(), causing a permanent hang
+                     * at `await runtimeDone` below. */
+                    for (const p of ['/dap', '/gdb']) {
+                        if (wsSides[p] && !wsSides[p].closed) {
+                            wsSides[p].socket.destroy();
+                        }
+                    }
                     httpServer.close();
                     dapTcpServer.close();
                     gdbTcpServer.close();
