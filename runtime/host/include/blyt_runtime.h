@@ -59,6 +59,15 @@ void blyt_cart_close(blyt_cart_t *cart);
  */
 int blyt_cart_has_native_lifecycle(const blyt_cart_t *cart);
 
+/*
+ * Bitmask of lifecycle callbacks defined in native (.dynsym) or Lua (.cart.lua).
+ * Bit 0=init, 1=update, 2=draw, 3=on_new_state, 4=on_save_state,
+ * 5=on_load_state, 6=on_quit, 7=cleanup.
+ * blyt_cart_lua_lifecycle_mask requires BLYT_HAVE_HOST_LUA; returns 0 otherwise.
+ */
+uint32_t blyt_cart_native_lifecycle_mask(const blyt_cart_t *cart);
+uint32_t blyt_cart_lua_lifecycle_mask(const blyt_cart_t *cart);
+
 /* Return non-zero if the cart has a .cart.layouts section. */
 int blyt_cart_has_layouts(const blyt_cart_t *cart);
 

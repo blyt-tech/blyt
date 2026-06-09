@@ -3,7 +3,8 @@ mod common;
 use assert_cmd::Command;
 use common::{
     CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_lua_sdk,
-    require_rust_riscv_target, require_sdk, require_wasm, run_cart_native, run_cart_wasm, sdk_dir,
+    require_rust_riscv_target, require_sdk, require_wasm, run_cart_native,
+    run_cart_native_expect_fail, run_cart_wasm, sdk_dir,
 };
 use tempfile::TempDir;
 
@@ -1031,4 +1032,87 @@ fn lua_cart_rust_native_lifecycle_wasm() {
     let tmp = TempDir::new().unwrap();
     let cart = build_lua_rust_native_lifecycle_cart(tmp.path());
     run_cart_wasm(&cart, "rust native lifecycle ok");
+}
+
+// -------------------------------------------------------------------------
+// Lifecycle callback precedence: Lua wins when both Lua and native define
+// the same callback.  On the native/emulated path the conflict is detected
+// at session-create time and blytplay exits non-zero.  On WASM the Lua
+// definition silently wins (native trampoline is not installed).
+// -------------------------------------------------------------------------
+
+fn build_lua_overrides_native_lifecycle_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_overrides_native_lifecycle");
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+void blyt_cart_init(void)   { blyt_console_debug("native-init"); blyt_quit(); }
+void blyt_cart_update(void) { blyt_quit(); }
+"#)
+        .lua(r#"function init() blyt.debug.print("lua-init") blyt.quit() end"#)
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+fn build_lua_per_callback_mix_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_per_callback_mix");
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+void blyt_cart_update(void) { blyt_console_debug("native-update"); blyt_quit(); }
+"#)
+        .lua(r#"function init() blyt.debug.print("lua-init") end"#)
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+#[test]
+fn lua_overrides_native_lifecycle_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_overrides_native_lifecycle_cart(tmp.path());
+    // Conflict detected at startup — WASM runner must exit non-zero.
+    Command::new("node")
+        .args([
+            common::repo_root()
+                .join("tests/wasm/run_cart.js")
+                .to_str()
+                .unwrap(),
+            common::find_wasm_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn lua_native_lifecycle_conflict_native() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_overrides_native_lifecycle_cart(tmp.path());
+    // Conflict detected in blyt_session_create → blytplay exits non-zero.
+    run_cart_native_expect_fail(&cart);
+}
+
+#[test]
+fn lua_per_callback_mix_native() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_per_callback_mix_cart(tmp.path());
+    // No conflict: Lua owns init, native owns update.
+    run_cart_native(&cart, "lua-init");
+    run_cart_native(&cart, "native-update");
+}
+
+#[test]
+fn lua_per_callback_mix_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_per_callback_mix_cart(tmp.path());
+    run_cart_wasm(&cart, "lua-init");
+    run_cart_wasm(&cart, "native-update");
 }

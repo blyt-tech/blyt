@@ -2008,6 +2008,17 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     if (!s)
         return NULL;
 
+    {
+        uint32_t lua_mask = blyt_cart_lua_lifecycle_mask(cart);
+        uint32_t native_mask = blyt_cart_native_lifecycle_mask(cart);
+        if (lua_mask & native_mask) {
+            if (log_fn)
+                log_fn("lifecycle conflict: callbacks defined in both Lua and native");
+            free(s);
+            return NULL;
+        }
+    }
+
     s->ctx.log_fn = log_fn;
 
     s->attr.mem_size = BLYT_EMU_MEM_SIZE;

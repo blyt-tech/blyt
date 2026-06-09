@@ -536,6 +536,15 @@ pub fn run_cart_native(cart: &std::path::Path, expected: &str) {
     run_cart_native_with_env(cart, &[], expected)
 }
 
+/// Run a cart with blytplay --headless; assert the process exits with a non-zero status.
+pub fn run_cart_native_expect_fail(cart: &std::path::Path) {
+    use assert_cmd::Command;
+    Command::new(blytplay())
+        .args(["--headless", cart.to_str().unwrap()])
+        .assert()
+        .failure();
+}
+
 /// Run a cart with blytplay --headless {extra_flags...} {cart}; assert `expected`
 /// appears in stdout.
 pub fn run_cart_native_with_flags(cart: &std::path::Path, extra_flags: &[&str], expected: &str) {

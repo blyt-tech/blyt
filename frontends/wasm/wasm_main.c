@@ -869,15 +869,42 @@ static void wasm_lua_reset_cycle(void) {
         return;
     }
 
-    /* Step 10: re-inject lifecycle trampolines */
+    /* Step 10: re-inject lifecycle trampolines. Error if both Lua and native
+     * define the same callback; otherwise install native trampoline when
+     * Lua hasn't defined it. */
     if (g_session) {
-        maybe_inject_lifecycle_cb(g_lua, "init", blyt_session_cart_fn_init(g_session));
-        maybe_inject_lifecycle_cb(g_lua, "on_new_state",
-                                  blyt_session_cart_fn_on_new_state(g_session));
-        maybe_inject_lifecycle_cb(g_lua, "update", blyt_session_cart_fn_update(g_session));
-        maybe_inject_lifecycle_cb(g_lua, "draw", blyt_session_cart_fn_draw(g_session));
-        maybe_inject_lifecycle_cb(g_lua, "on_quit", blyt_session_cart_fn_on_quit(g_session));
-        maybe_inject_lifecycle_cb(g_lua, "cleanup", blyt_session_cart_fn_cleanup(g_session));
+        static const struct {
+            const char *name;
+            uint32_t (*fn)(blyt_session_t *);
+        } cbs[] = {
+            {"init", blyt_session_cart_fn_init},
+            {"on_new_state", blyt_session_cart_fn_on_new_state},
+            {"update", blyt_session_cart_fn_update},
+            {"draw", blyt_session_cart_fn_draw},
+            {"on_quit", blyt_session_cart_fn_on_quit},
+            {"cleanup", blyt_session_cart_fn_cleanup},
+        };
+        for (int i = 0; i < 6; i++) {
+            uint32_t fn = cbs[i].fn(g_session);
+            if (!fn)
+                continue;
+            lua_getglobal(g_lua, cbs[i].name);
+            int has_lua = lua_isfunction(g_lua, -1);
+            lua_pop(g_lua, 1);
+            if (has_lua) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "lifecycle '%s' defined in both native and Lua",
+                         cbs[i].name);
+                blyt_js_error(buf);
+                lua_close(g_lua);
+                g_lua = NULL;
+                if (snap)
+                    blyt_state_snapshot_free(snap);
+                g_lua_fatal = true;
+                return;
+            }
+            maybe_inject_lifecycle_cb(g_lua, cbs[i].name, fn);
+        }
     }
 
     /* Step 11: if has_lua_exports, recreate exchange thread and bridge */
@@ -1170,13 +1197,6 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
                 blyt_session_lua_bridge_attach(g_session, g_lua_exch);
                 wasm_register_lua_trampolines(g_lua, g_session);
             }
-            maybe_inject_lifecycle_cb(g_lua, "init", blyt_session_cart_fn_init(g_session));
-            maybe_inject_lifecycle_cb(g_lua, "on_new_state",
-                                      blyt_session_cart_fn_on_new_state(g_session));
-            maybe_inject_lifecycle_cb(g_lua, "update", blyt_session_cart_fn_update(g_session));
-            maybe_inject_lifecycle_cb(g_lua, "draw", blyt_session_cart_fn_draw(g_session));
-            maybe_inject_lifecycle_cb(g_lua, "on_quit", blyt_session_cart_fn_on_quit(g_session));
-            maybe_inject_lifecycle_cb(g_lua, "cleanup", blyt_session_cart_fn_cleanup(g_session));
         } else if (has_layouts) {
             /* Pure Lua cart with state buffers: lightweight ctx, no emulator. */
             g_lua_state_ctx = malloc(sizeof(blyt_state_ctx_t));
@@ -1216,6 +1236,41 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         lua_close(g_lua);
         g_lua = NULL;
         return 1;
+    }
+
+    /* Inject native lifecycle trampolines for hybrid carts — after bytecode so
+     * Lua globals are already defined.  Error if both Lua and native define the
+     * same callback; otherwise install native trampoline when Lua hasn't defined it. */
+    if (g_session) {
+        static const struct {
+            const char *name;
+            uint32_t (*fn)(blyt_session_t *);
+        } cbs[] = {
+            {"init", blyt_session_cart_fn_init},
+            {"on_new_state", blyt_session_cart_fn_on_new_state},
+            {"update", blyt_session_cart_fn_update},
+            {"draw", blyt_session_cart_fn_draw},
+            {"on_quit", blyt_session_cart_fn_on_quit},
+            {"cleanup", blyt_session_cart_fn_cleanup},
+        };
+        for (int i = 0; i < 6; i++) {
+            uint32_t fn = cbs[i].fn(g_session);
+            if (!fn)
+                continue;
+            lua_getglobal(g_lua, cbs[i].name);
+            int has_lua = lua_isfunction(g_lua, -1);
+            lua_pop(g_lua, 1);
+            if (has_lua) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "lifecycle '%s' defined in both native and Lua",
+                         cbs[i].name);
+                blyt_js_error(buf);
+                lua_close(g_lua);
+                g_lua = NULL;
+                return 1;
+            }
+            maybe_inject_lifecycle_cb(g_lua, cbs[i].name, fn);
+        }
     }
 
     /* Create the INIT phase coroutine.

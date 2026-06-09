@@ -1083,6 +1083,94 @@ int blyt_cart_has_layouts(const blyt_cart_t *cart) {
     return blyt_cart_find_section(cart, ".cart.layouts", NULL) != NULL;
 }
 
+/* Lifecycle name→bit mapping shared by the two mask functions below.
+ * init=0, update=1, draw=2, on_new_state=3, on_save_state=4,
+ * on_load_state=5, on_quit=6, cleanup=7. */
+static const struct {
+    const char *native_name;
+    const char *lua_name;
+} lifecycle_map[8] = {
+    {"blyt_cart_init", "init"},
+    {"blyt_cart_update", "update"},
+    {"blyt_cart_draw", "draw"},
+    {"blyt_cart_on_new_state", "on_new_state"},
+    {"blyt_cart_on_save_state", "on_save_state"},
+    {"blyt_cart_on_load_state", "on_load_state"},
+    {"blyt_cart_on_quit", "on_quit"},
+    {"blyt_cart_cleanup", "cleanup"},
+};
+
+uint32_t blyt_cart_native_lifecycle_mask(const blyt_cart_t *cart) {
+    if (!cart)
+        return 0;
+    const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
+    const uint8_t *base = (const uint8_t *)cart->map;
+    const Elf32_Shdr *shdrs = (const Elf32_Shdr *)(base + eh->e_shoff);
+    uint32_t mask = 0;
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        if (shdrs[i].sh_type != SHT_DYNSYM)
+            continue;
+        uint32_t stridx = shdrs[i].sh_link;
+        if (stridx >= eh->e_shnum)
+            break;
+        const char *strtab = (const char *)(base + shdrs[stridx].sh_offset);
+        const Elf32_Sym *syms = (const Elf32_Sym *)(base + shdrs[i].sh_offset);
+        uint32_t nsyms = shdrs[i].sh_size / sizeof(Elf32_Sym);
+        for (uint32_t j = 0; j < nsyms; j++) {
+            if (syms[j].st_shndx == SHN_UNDEF)
+                continue;
+            if (ELF32_ST_BIND(syms[j].st_info) == STB_LOCAL)
+                continue;
+            const char *sym_name = strtab + syms[j].st_name;
+            for (int k = 0; k < 8; k++) {
+                if (strcmp(sym_name, lifecycle_map[k].native_name) == 0)
+                    mask |= (1u << k);
+            }
+        }
+        break;
+    }
+    return mask;
+}
+
+#ifdef BLYT_HAVE_HOST_LUA
+#include <lauxlib.h>
+#include <lua.h>
+
+uint32_t blyt_cart_lua_lifecycle_mask(const blyt_cart_t *cart) {
+    if (!cart)
+        return 0;
+    size_t lua_size = 0;
+    const void *lua_bytes = blyt_cart_find_section(cart, ".cart.lua", &lua_size);
+    if (!lua_bytes || !lua_size)
+        return 0;
+    lua_State *L = luaL_newstate();
+    if (!L)
+        return 0;
+    if (luaL_loadbuffer(L, (const char *)lua_bytes, lua_size, "@cart") != LUA_OK ||
+        lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        lua_close(L);
+        return 0;
+    }
+    uint32_t mask = 0;
+    for (int k = 0; k < 8; k++) {
+        lua_getglobal(L, lifecycle_map[k].lua_name);
+        if (lua_isfunction(L, -1))
+            mask |= (1u << k);
+        lua_pop(L, 1);
+    }
+    lua_close(L);
+    return mask;
+}
+
+#else
+
+uint32_t blyt_cart_lua_lifecycle_mask(const blyt_cart_t *cart) {
+    (void)cart;
+    return 0;
+}
+
+#endif /* BLYT_HAVE_HOST_LUA */
+
 void blyt_cart_close(blyt_cart_t *cart) {
     if (!cart)
         return;

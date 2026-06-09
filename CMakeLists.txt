@@ -709,6 +709,25 @@ endif()
 # -------------------------------------------------------------------------
 # Host runtime libraries (stubs for future expansion; only libblyt is real)
 # -------------------------------------------------------------------------
+
+# Host-native Lua static library for cart inspection
+# (blyt_cart_lua_lifecycle_mask). Uses onelua.c which bundles all Lua sources;
+# MAKE_LIB=1 suppresses main().
+set(_LUA_HOST_DIR "${CMAKE_SOURCE_DIR}/third_party/lua")
+if(EXISTS "${_LUA_HOST_DIR}/onelua.c")
+  add_library(liblua_host STATIC "${_LUA_HOST_DIR}/onelua.c")
+  # MAKE_LIB=1 suppresses main(). LUA_32BITS=1 matches the ilp32f guest bytecode
+  # integer/float sizes so the host VM can load cart bytecode compiled for
+  # RISC-V. LUA_32BITS=1 is PUBLIC so it propagates to callers (cart_load.c)
+  # that include lua.h — keeping function pointer types consistent with the
+  # library.
+  target_compile_definitions(
+    liblua_host
+    PRIVATE MAKE_LIB=1
+    PUBLIC LUA_32BITS=1)
+  target_include_directories(liblua_host PUBLIC "${_LUA_HOST_DIR}")
+endif()
+
 add_library(libblytcommon INTERFACE)
 add_library(libblytcommonlua INTERFACE)
 add_library(libblyt32lua INTERFACE)
@@ -736,6 +755,10 @@ target_link_libraries(
   libblyt
   PUBLIC flatccrt
   PRIVATE libblytemu)
+if(TARGET liblua_host)
+  target_link_libraries(libblyt PRIVATE liblua_host)
+  target_compile_definitions(libblyt PRIVATE BLYT_HAVE_HOST_LUA=1)
+endif()
 add_dependencies(libblyt flatbuffers_generated)
 
 # -------------------------------------------------------------------------
@@ -823,6 +846,10 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     libblyt_debug
     PUBLIC flatccrt
     PRIVATE libblytemu)
+  if(TARGET liblua_host)
+    target_link_libraries(libblyt_debug PRIVATE liblua_host)
+    target_compile_definitions(libblyt_debug PRIVATE BLYT_HAVE_HOST_LUA=1)
+  endif()
   add_dependencies(libblyt_debug flatbuffers_generated)
   if(BLYT_DAP AND TARGET dap)
     target_compile_definitions(libblyt_debug PRIVATE BLYT_DAP=1)
