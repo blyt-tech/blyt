@@ -174,6 +174,7 @@ function startRelays() {
             });
             socket.on('close', () => { side.closed = true; });
             socket.on('error', () => { side.closed = true; });
+            process.stderr.write(`[wasm_hybrid] WASM WebSocket connected: ${p}\n`);
             wsSides[p] = side;
             if (wsResolvers[p]) wsResolvers[p](side);
         });
@@ -270,10 +271,13 @@ function loadWasmRuntime(wasmDir, cartPath, wsPort) {
             onExit:   (code) => resolve(code),
         };
 
+        process.stderr.write(`[wasm_hybrid] node ${process.version}; require start\n`);
         try {
             const require = createRequire(import.meta.url);
             require(path.join(wasmDir, 'blytdebug.js'));
+            process.stderr.write('[wasm_hybrid] require returned\n');
         } catch (e) {
+            process.stderr.write(`[wasm_hybrid] require threw: ${e.message}\n`);
             reject(e);
         }
     });
@@ -283,10 +287,17 @@ function loadWasmRuntime(wasmDir, cartPath, wsPort) {
 
 async function main() {
     const relay = await startRelays();
+    process.stderr.write(`[wasm_hybrid] relays up — ws:${relay.wsPort} dap-tcp:${relay.dapTcpPort} gdb-tcp:${relay.gdbTcpPort}\n`);
 
     const runtimeDone = loadWasmRuntime(WASM_DIR, CART_PATH, relay.wsPort).catch((e) => {
         console.error('[wasm_hybrid] WASM error:', e.message);
     });
+
+    /* Emit a heartbeat every 5 s so CI logs show the process is alive. */
+    const heartbeat = setInterval(
+        () => process.stderr.write('[wasm_hybrid] waiting for WASM WebSocket connections...\n'),
+        5000
+    );
 
     /* Wait for WASM to connect both /dap and /gdb WebSocket paths.
      * Use Promise.race so the timeout properly rejects the async chain —
@@ -299,6 +310,7 @@ async function main() {
             15000
         )),
     ]);
+    clearInterval(heartbeat);
     console.log(`[wasm_hybrid] WASM connected — DAP tcp://127.0.0.1:${relay.dapTcpPort}  GDB tcp://127.0.0.1:${relay.gdbTcpPort}`);
 
     const testScript  = path.join(__dirname, 'hybrid_test.mjs');
