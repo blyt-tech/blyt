@@ -336,7 +336,8 @@ static int run_trampoline_loop(lua_State *L, int ret_type) {
     blyt_cart_run_err_t ferr;
     for (;;) {
         ferr = blyt_session_run_frame(g_session);
-        if (ferr == BLYT_RUN_FN_DONE) break;
+        if (ferr == BLYT_RUN_FN_DONE)
+            break;
         if (ferr == BLYT_RUN_FN_ERROR || ferr == BLYT_RUN_ERR_ECALL_TRAP ||
             ferr == BLYT_RUN_ERR_ABORT)
             break;
@@ -348,8 +349,7 @@ static int run_trampoline_loop(lua_State *L, int ret_type) {
              * wasm_lua_loop() will not resume the coroutine until
              * g_trampoline_gdb_paused is cleared (GDB unhalted). */
             g_trampoline_gdb_paused = true;
-            return lua_yieldk(L, 0, (lua_KContext)(intptr_t)ret_type,
-                              trampoline_gdb_resume_k);
+            return lua_yieldk(L, 0, (lua_KContext)(intptr_t)ret_type, trampoline_gdb_resume_k);
         }
 #endif
     }
