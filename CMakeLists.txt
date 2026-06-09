@@ -727,6 +727,7 @@ if(EXISTS "${_LUA_HOST_DIR}/onelua.c")
     PUBLIC LUA_32BITS=1)
   target_include_directories(liblua_host PUBLIC "${_LUA_HOST_DIR}")
   target_link_libraries(liblua_host PUBLIC m)
+  set_target_properties(liblua_host PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 add_library(libblytcommon INTERFACE)
