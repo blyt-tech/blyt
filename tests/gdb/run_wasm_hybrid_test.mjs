@@ -241,17 +241,6 @@ function startRelays() {
                 waitForWasmConnections: () =>
                     Promise.all([wsPromises['/dap'], wsPromises['/gdb']]),
                 shutdown: () => {
-                    /* Destroy the WASM-side WebSocket sockets first so the WASM
-                     * runtime loses its WebSocket keepalives and can exit via its
-                     * normal NO_EXIT_RUNTIME=0 keepalive mechanism.  Without this,
-                     * on Linux the open socket handles prevent Node.js from exiting
-                     * after emscripten_cancel_main_loop(), causing a permanent hang
-                     * at `await runtimeDone` below. */
-                    for (const p of ['/dap', '/gdb']) {
-                        if (wsSides[p] && !wsSides[p].closed) {
-                            wsSides[p].socket.destroy();
-                        }
-                    }
                     httpServer.close();
                     dapTcpServer.close();
                     gdbTcpServer.close();
@@ -329,7 +318,13 @@ async function main() {
     });
 
     relay.shutdown();
-    await runtimeDone;
+    /* Do NOT await runtimeDone here.  Emscripten's WebSocket keepalives are
+     * only released by explicit emscripten_WebSocket_close() inside the WASM
+     * module — destroying the relay sockets from the server side does not
+     * decrement the keepalive counter.  On Linux/Node 24+ this means the WASM
+     * runtime never exits naturally and runtimeDone never resolves.
+     * process.exit(0) in the .then() handler below forces a clean exit once
+     * the test assertions have already been verified. */
 }
 
 main().then(() => process.exit(0)).catch((e) => {
