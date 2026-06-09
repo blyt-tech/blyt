@@ -288,13 +288,17 @@ async function main() {
         console.error('[wasm_hybrid] WASM error:', e.message);
     });
 
-    /* Wait for WASM to connect both /dap and /gdb WebSocket paths. */
-    const connTimeout = setTimeout(
-        () => { throw new Error('timeout: WASM did not connect both DAP and GDB paths'); },
-        15000
-    );
-    await relay.waitForWasmConnections();
-    clearTimeout(connTimeout);
+    /* Wait for WASM to connect both /dap and /gdb WebSocket paths.
+     * Use Promise.race so the timeout properly rejects the async chain —
+     * a throw inside setTimeout is not a rejection and may be silently
+     * swallowed by the ESM unhandled-rejection handler in Node.js 24+. */
+    await Promise.race([
+        relay.waitForWasmConnections(),
+        new Promise((_, reject) => setTimeout(
+            () => reject(new Error('timeout: WASM did not connect both DAP and GDB paths')),
+            15000
+        )),
+    ]);
     console.log(`[wasm_hybrid] WASM connected — DAP tcp://127.0.0.1:${relay.dapTcpPort}  GDB tcp://127.0.0.1:${relay.gdbTcpPort}`);
 
     const testScript  = path.join(__dirname, 'hybrid_test.mjs');
@@ -318,16 +322,14 @@ async function main() {
     });
 
     relay.shutdown();
-    /* Do NOT await runtimeDone here.  Emscripten's WebSocket keepalives are
-     * only released by explicit emscripten_WebSocket_close() inside the WASM
-     * module — destroying the relay sockets from the server side does not
-     * decrement the keepalive counter.  On Linux/Node 24+ this means the WASM
-     * runtime never exits naturally and runtimeDone never resolves.
-     * process.exit(0) in the .then() handler below forces a clean exit once
-     * the test assertions have already been verified. */
+    /* Explicit exit: Emscripten WebSocket keepalives are only released by
+     * emscripten_WebSocket_close() inside the WASM module; they will keep
+     * Node.js alive indefinitely after the test completes on Linux/Node 24+.
+     * All test assertions have passed by the time we reach here. */
+    process.exit(0);
 }
 
-main().then(() => process.exit(0)).catch((e) => {
+main().catch((e) => {
     console.error('[wasm_hybrid] FAILED:', e.message);
     process.exit(1);
 });
