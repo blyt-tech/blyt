@@ -124,6 +124,12 @@ static char g_lua_cart_name[64];
 static bool g_lua_dap_paused = false; /* hook yielded, waiting for DAP */
 static bool g_lua_needs_start = false; /* waiting for configurationDone */
 #endif
+#ifdef BLYT_GDB
+/* Set when a Lua-to-native trampoline hits a GDB breakpoint and yields the
+ * coroutine.  wasm_lua_loop waits here (returning each tick) until the GDB
+ * client sends vCont;c, then clears the flag and resumes the coroutine. */
+static bool g_trampoline_gdb_paused = false;
+#endif
 /* BLYT_LUA_TYPE_* constants — must match blyt.h guest SDK definition. */
 #define WASM_LUA_TYPE_VOID 0
 #define WASM_LUA_TYPE_I32 1
@@ -316,9 +322,55 @@ static void wasm_rv32_to_lua(lua_State *L, uint32_t val, int type) {
     }
 }
 
+/* Forward declaration for the GDB-pause continuation. */
+#ifdef BLYT_GDB
+static int trampoline_gdb_resume_k(lua_State *L, int status, lua_KContext ctx);
+#endif
+
+/* Run blyt_session_run_frame() in a loop until the native call completes.
+ * When a GDB breakpoint fires (BLYT_RUN_GDB_PAUSED) the coroutine yields via
+ * lua_yieldk so the Node.js event loop can relay the T05 packet and receive
+ * vCont commands.  The continuation re-enters here after vCont;c is processed
+ * by wasm_lua_loop (which clears g_trampoline_gdb_paused before resuming). */
+static int run_trampoline_loop(lua_State *L, int ret_type) {
+    blyt_cart_run_err_t ferr;
+    for (;;) {
+        ferr = blyt_session_run_frame(g_session);
+        if (ferr == BLYT_RUN_FN_DONE) break;
+        if (ferr == BLYT_RUN_FN_ERROR || ferr == BLYT_RUN_ERR_ECALL_TRAP ||
+            ferr == BLYT_RUN_ERR_ABORT)
+            break;
+#ifdef BLYT_GDB
+        if (ferr == BLYT_RUN_GDB_PAUSED) {
+            /* Yield the Lua coroutine so the Node.js event loop is free to
+             * relay the T05 stop notification and receive the GDB client's
+             * response packets (register reads, steps, vCont;c).
+             * wasm_lua_loop() will not resume the coroutine until
+             * g_trampoline_gdb_paused is cleared (GDB unhalted). */
+            g_trampoline_gdb_paused = true;
+            return lua_yieldk(L, 0, (lua_KContext)(intptr_t)ret_type,
+                              trampoline_gdb_resume_k);
+        }
+#endif
+    }
+    if (ferr != BLYT_RUN_FN_DONE)
+        return luaL_error(L, "native call failed");
+    uint32_t ret_val = blyt_session_fn_return_value(g_session);
+    if (!g_lua_quit && blyt_session_check_guest_quit(g_session))
+        g_lua_quit = true;
+    wasm_rv32_to_lua(L, ret_val, ret_type);
+    return (ret_type == WASM_LUA_TYPE_VOID) ? 0 : 1;
+}
+
+#ifdef BLYT_GDB
+static int trampoline_gdb_resume_k(lua_State *L, int status, lua_KContext ctx) {
+    (void)status;
+    return run_trampoline_loop(L, (int)(intptr_t)ctx);
+}
+#endif
+
 /* Lua C closure: one per exported function, installed as a Lua global.
- * Upvalues: [1]=fn_guest_addr [2]=nargs [3..6]=arg_types [7]=ret_type
- * Drives rv32emu synchronously until the native call completes. */
+ * Upvalues: [1]=fn_guest_addr [2]=nargs [3..6]=arg_types [7]=ret_type */
 static int wasm_make_trampoline(lua_State *L) {
     uint32_t fn_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
     int nargs = (int)lua_tointeger(L, lua_upvalueindex(2));
@@ -326,19 +378,8 @@ static int wasm_make_trampoline(lua_State *L) {
     for (int i = 0; i < nargs && i < 4; i++)
         args[i] = wasm_lua_to_rv32(L, i + 1, (int)lua_tointeger(L, lua_upvalueindex(3 + i)));
     blyt_session_begin_fn_call(g_session, fn_addr, nargs, args);
-    blyt_cart_run_err_t ferr;
-    do {
-        ferr = blyt_session_run_frame(g_session);
-    } while (ferr != BLYT_RUN_FN_DONE && ferr != BLYT_RUN_FN_ERROR &&
-             ferr != BLYT_RUN_ERR_ECALL_TRAP && ferr != BLYT_RUN_ERR_ABORT);
-    if (ferr != BLYT_RUN_FN_DONE)
-        return luaL_error(L, "native call failed");
     int ret_type = (int)lua_tointeger(L, lua_upvalueindex(7));
-    uint32_t ret_val = blyt_session_fn_return_value(g_session);
-    if (!g_lua_quit && blyt_session_check_guest_quit(g_session))
-        g_lua_quit = true;
-    wasm_rv32_to_lua(L, ret_val, ret_type);
-    return (ret_type == WASM_LUA_TYPE_VOID) ? 0 : 1;
+    return run_trampoline_loop(L, ret_type);
 }
 
 /* -------------------------------------------------------------------------
@@ -1000,6 +1041,21 @@ static void wasm_lua_loop(void) {
         fc_dap_do_resume();
         g_lua_dap_paused = false;
         /* fall through to resume the coroutine */
+    }
+#endif
+
+#ifdef BLYT_GDB
+    /* Trampoline GDB pause: a Lua-to-native call hit a GDB breakpoint and
+     * yielded the coroutine.  Wait here (returning each tick to keep the
+     * event loop free) until the GDB client sends vCont;c, then fall through
+     * to resume the coroutine which will call trampoline_gdb_resume_k. */
+    if (g_trampoline_gdb_paused) {
+        if (fc_gdb_stub_is_halted()) {
+            blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
+            return;
+        }
+        g_trampoline_gdb_paused = false;
+        /* GDB unhalted — fall through to resume the coroutine */
     }
 #endif
 
