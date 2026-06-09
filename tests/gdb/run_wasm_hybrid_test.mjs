@@ -187,14 +187,18 @@ function startRelays() {
         dapTcpServer.on('connection', (sock) => {
             const ws = wsSides['/dap'];
             let tcpBuf = Buffer.alloc(0);
+            process.stderr.write(`[wasm_hybrid] DAP TCP client connected; ws=${ws ? (ws.closed ? 'closed' : 'open') : 'null'}\n`);
 
             /* Flush any WASM messages that arrived before TCP connected. */
-            for (const json of pendingDap)
+            for (const json of pendingDap) {
+                process.stderr.write(`[wasm_hybrid] DAP flush pending: ${json.slice(0, 60)}\n`);
                 sock.write(dapWrap(json), 'utf8');
+            }
             pendingDap.length = 0;
 
             /* WebSocket (WASM) → TCP (test client): add Content-Length. */
             if (ws) ws.onmsg = (json) => {
+                if (json !== null) process.stderr.write(`[wasm_hybrid] DAP WASM→TCP: ${json.slice(0, 80)}\n`);
                 if (json !== null && !sock.destroyed) sock.write(dapWrap(json), 'utf8');
             };
 
@@ -202,7 +206,9 @@ function startRelays() {
             sock.on('data', (chunk) => {
                 tcpBuf = Buffer.concat([tcpBuf, chunk]);
                 tcpBuf = dapParseFrames(tcpBuf, (json) => {
+                    process.stderr.write(`[wasm_hybrid] DAP TCP→WASM: ${json.slice(0, 80)}\n`);
                     if (ws && !ws.closed) ws.socket.write(wsFrame(json));
+                    else process.stderr.write(`[wasm_hybrid] DAP drop: ws=${ws ? 'closed' : 'null'}\n`);
                 });
             });
             sock.on('error', () => {});
