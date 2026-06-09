@@ -397,7 +397,9 @@ function draw()   end\n";
         cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
     }
 
-    cmd.assert().success();
+    cmd.timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
 }
 
 /* ── WASM equivalents of the extended SDL GDB protocol tests ─────────────── */
