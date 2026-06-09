@@ -187,18 +187,14 @@ function startRelays() {
         dapTcpServer.on('connection', (sock) => {
             const ws = wsSides['/dap'];
             let tcpBuf = Buffer.alloc(0);
-            process.stderr.write(`[wasm_hybrid] DAP TCP client connected; ws=${ws ? (ws.closed ? 'closed' : 'open') : 'null'}\n`);
 
             /* Flush any WASM messages that arrived before TCP connected. */
-            for (const json of pendingDap) {
-                process.stderr.write(`[wasm_hybrid] DAP flush pending: ${json.slice(0, 60)}\n`);
+            for (const json of pendingDap)
                 sock.write(dapWrap(json), 'utf8');
-            }
             pendingDap.length = 0;
 
             /* WebSocket (WASM) → TCP (test client): add Content-Length. */
             if (ws) ws.onmsg = (json) => {
-                if (json !== null) process.stderr.write(`[wasm_hybrid] DAP WASM→TCP: ${json.slice(0, 80)}\n`);
                 if (json !== null && !sock.destroyed) sock.write(dapWrap(json), 'utf8');
             };
 
@@ -206,9 +202,7 @@ function startRelays() {
             sock.on('data', (chunk) => {
                 tcpBuf = Buffer.concat([tcpBuf, chunk]);
                 tcpBuf = dapParseFrames(tcpBuf, (json) => {
-                    process.stderr.write(`[wasm_hybrid] DAP TCP→WASM: ${json.slice(0, 80)}\n`);
                     if (ws && !ws.closed) ws.socket.write(wsFrame(json));
-                    else process.stderr.write(`[wasm_hybrid] DAP drop: ws=${ws ? 'closed' : 'null'}\n`);
                 });
             });
             sock.on('error', () => {});
@@ -217,27 +211,20 @@ function startRelays() {
         /* Wire up GDB TCP ↔ WebSocket relay when the TCP connection arrives. */
         gdbTcpServer.on('connection', (sock) => {
             const ws = wsSides['/gdb'];
-            process.stderr.write(`[wasm_hybrid] GDB TCP client connected; ws=${ws ? (ws.closed ? 'closed' : 'open') : 'null'}\n`);
 
             /* Flush any WASM messages that arrived before TCP connected. */
-            for (const rsp of pendingGdb) {
-                process.stderr.write(`[wasm_hybrid] GDB flush pending: ${rsp.slice(0, 40)}\n`);
+            for (const rsp of pendingGdb)
                 sock.write(rsp, 'utf8');
-            }
             pendingGdb.length = 0;
 
             /* WebSocket (WASM) → TCP (test client): passthrough RSP text. */
             if (ws) ws.onmsg = (text) => {
-                if (text !== null) process.stderr.write(`[wasm_hybrid] GDB WASM→TCP: ${text.slice(0, 40)}\n`);
                 if (text !== null && !sock.destroyed) sock.write(text, 'utf8');
             };
 
             /* TCP (test client) → WebSocket (WASM): passthrough RSP text. */
             sock.on('data', (chunk) => {
-                const str = chunk.toString('utf8');
-                process.stderr.write(`[wasm_hybrid] GDB TCP→WASM: ${str.slice(0, 40)}\n`);
-                if (ws && !ws.closed) ws.socket.write(wsFrame(str));
-                else process.stderr.write(`[wasm_hybrid] GDB drop: ws=${ws ? 'closed' : 'null'}\n`);
+                if (ws && !ws.closed) ws.socket.write(wsFrame(chunk.toString('utf8')));
             });
             sock.on('error', () => {});
         });
@@ -339,7 +326,6 @@ async function main() {
             [testScript, dapEndpoint, gdbEndpoint, ...extraArgs],
             { timeout: 30000 },
             (err, stdout, stderr) => {
-                process.stderr.write(`[wasm_hybrid] execFile callback: err=${err ? err.message : 'null'} code=${err?.code}\n`);
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);
                 if (err) reject(err); else resolve();
