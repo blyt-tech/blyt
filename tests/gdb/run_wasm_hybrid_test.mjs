@@ -211,20 +211,27 @@ function startRelays() {
         /* Wire up GDB TCP ↔ WebSocket relay when the TCP connection arrives. */
         gdbTcpServer.on('connection', (sock) => {
             const ws = wsSides['/gdb'];
+            process.stderr.write(`[wasm_hybrid] GDB TCP client connected; ws=${ws ? (ws.closed ? 'closed' : 'open') : 'null'}\n`);
 
             /* Flush any WASM messages that arrived before TCP connected. */
-            for (const rsp of pendingGdb)
+            for (const rsp of pendingGdb) {
+                process.stderr.write(`[wasm_hybrid] GDB flush pending: ${rsp.slice(0, 40)}\n`);
                 sock.write(rsp, 'utf8');
+            }
             pendingGdb.length = 0;
 
             /* WebSocket (WASM) → TCP (test client): passthrough RSP text. */
             if (ws) ws.onmsg = (text) => {
+                if (text !== null) process.stderr.write(`[wasm_hybrid] GDB WASM→TCP: ${text.slice(0, 40)}\n`);
                 if (text !== null && !sock.destroyed) sock.write(text, 'utf8');
             };
 
             /* TCP (test client) → WebSocket (WASM): passthrough RSP text. */
             sock.on('data', (chunk) => {
-                if (ws && !ws.closed) ws.socket.write(wsFrame(chunk.toString('utf8')));
+                const str = chunk.toString('utf8');
+                process.stderr.write(`[wasm_hybrid] GDB TCP→WASM: ${str.slice(0, 40)}\n`);
+                if (ws && !ws.closed) ws.socket.write(wsFrame(str));
+                else process.stderr.write(`[wasm_hybrid] GDB drop: ws=${ws ? 'closed' : 'null'}\n`);
             });
             sock.on('error', () => {});
         });
@@ -326,6 +333,7 @@ async function main() {
             [testScript, dapEndpoint, gdbEndpoint, ...extraArgs],
             { timeout: 30000 },
             (err, stdout, stderr) => {
+                process.stderr.write(`[wasm_hybrid] execFile callback: err=${err ? err.message : 'null'} code=${err?.code}\n`);
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);
                 if (err) reject(err); else resolve();

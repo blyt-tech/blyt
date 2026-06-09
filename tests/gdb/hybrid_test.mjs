@@ -224,11 +224,16 @@ async function connectDap(endpointStr) {
 /* ── Main test ───────────────────────────────────────────────────────────── */
 
 async function main() {
+    process.stderr.write('[hybrid] starting\n');
     /* Connect both debuggers before the cart starts. */
+    process.stderr.write('[hybrid] connecting GDB\n');
     const gdb = await connectGdb(GDB_ENDPOINT);
+    process.stderr.write('[hybrid] GDB connected\n');
     const dap = await connectDap(DAP_ENDPOINT);
+    process.stderr.write('[hybrid] DAP connected\n');
 
     /* ── GDB handshake ────────────────────────────────────────────────────── */
+    process.stderr.write('[hybrid] sending qSupported\n');
     const supported = await gdb.exchange('qSupported:multiprocess+;qXfer:exec-file:read+');
     console.log(`[gdb] qSupported → ${supported}`);
     await gdb.exchange('qAttached');
