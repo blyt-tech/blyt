@@ -59,6 +59,9 @@ void blyt_cart_close(blyt_cart_t *cart);
  */
 int blyt_cart_has_native_lifecycle(const blyt_cart_t *cart);
 
+/* Return non-zero if the cart has a .cart.layouts section. */
+int blyt_cart_has_layouts(const blyt_cart_t *cart);
+
 /* Return a static human-readable string for a blyt_cart_err_t value. */
 const char *blyt_cart_err_str(blyt_cart_err_t err);
 
@@ -136,6 +139,7 @@ blyt_cart_run_err_t blyt_cart_run(blyt_cart_t *cart, blyt_log_fn log_fn, blyt_fr
  *   blyt_session_destroy(s)
  */
 typedef struct blyt_session blyt_session_t;
+typedef struct blyt_state_ctx blyt_state_ctx_t;
 
 /* Create a session for the given cart.  Returns NULL on failure.
  * The cart must outlive the session. */
@@ -255,6 +259,11 @@ uint32_t blyt_session_cart_fn_draw(blyt_session_t *s);
 uint32_t blyt_session_cart_fn_on_quit(blyt_session_t *s);
 uint32_t blyt_session_cart_fn_cleanup(blyt_session_t *s);
 
+/* Accessors for WASM state API wiring. */
+blyt_state_ctx_t *blyt_session_state_ctx(blyt_session_t *s);
+const char *blyt_session_save_dir(blyt_session_t *s);
+const char *blyt_session_cart_name(blyt_session_t *s);
+
 /* --- ECALL-bridged Lua C API (ADR-0130, WASM hybrid carts) ----------------- */
 
 /* .lua_exports entry flags (byte after ret_type; 0 in pre-ADR-0130 carts). */
@@ -324,7 +333,7 @@ void blyt_session_gdb_continue_initial_halt(blyt_session_t *s);
  *   1. Call blyt_cart_on_save_state() in the guest.
  *   2. Snapshot all state buffer contents.
  *   3. Zero state buffers and guest BSS (static vars reset to 0).
- *   4. Call blyt_cart_init() with console output suppressed.
+ *   4. Call blyt_cart_init().
  *   5. Restore state buffer snapshot.
  *   6. Call blyt_cart_on_load_state(HOT_RELOAD) in the guest.
  * The emulator's PC and registers are saved before the cycle and restored

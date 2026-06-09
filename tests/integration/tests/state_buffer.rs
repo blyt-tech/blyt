@@ -1463,3 +1463,157 @@ function draw()   end
     assert!(cart.exists(), "cart not found at {}", cart.display());
     run_cart_wasm(&cart, "new_state_called");
 }
+
+// ── WASM Lua state buffers ─────────────────────────────────────────────────
+
+/// blyt.buf.* and blyt.save_write/read work for a pure Lua WASM cart.
+/// Exercises the host-side wasm_register_state_api path (not the ECALL stubs
+/// used by native Lua carts).
+#[test]
+fn wasm_lua_cart_state_buffer_round_trips() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_lua_sb_rt");
+
+    CartProject::new()
+        .config(CART_CONFIG)
+        .lua(
+            r#"
+-- Use raw buffer/field IDs (buf_id=1, field_idx=1) to avoid the S proxy
+-- which is native C code not available in the WASM Lua VM.
+local slot = -1
+
+function init()
+    slot = blyt.buf.alloc_slot(1)
+    blyt.buf.set_i32(1, slot, 1, 42)
+    blyt.save_write(0)
+    blyt.buf.set_i32(1, slot, 1, 99)
+end
+
+function update()
+    blyt.save_read(0)
+    local score = blyt.buf.get_i32(1, 0, 1)
+    blyt.debug.print("score=" .. tostring(score))
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "score=42");
+}
+
+// ── WASM reset-every-frame ─────────────────────────────────────────────────
+
+/// A C cart that stores its frame counter in a state buffer survives the
+/// WASM reset-every-frame cycle (wasm_loop calls blyt_reset_every_frame_cycle
+/// after each BLYT_RUN_FRAME_DONE).
+#[test]
+fn wasm_c_cart_reset_every_frame() {
+    require_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_c_ref");
+
+    CartProject::new()
+        .config(GLOBALS_CONFIG)
+        .c(r#"
+#include "blyt.h"
+#include "cart_state.h"
+#include <stdio.h>
+
+static int32_t s_frame = 0;
+
+void blyt_cart_on_new_state(void) {}
+
+void blyt_cart_on_save_state(void) {
+    blyt_buffer_set_i32(S_GLOBALS, 0, S_GLOBALS_FRAME, s_frame);
+}
+
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
+    s_frame = blyt_buffer_get_i32(S_GLOBALS, 0, S_GLOBALS_FRAME);
+}
+
+void blyt_cart_init(void) {
+    int32_t slot = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &slot);
+}
+
+void blyt_cart_update(void) {
+    s_frame++;
+    if (s_frame == 3) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "frame=%d", s_frame);
+        blyt_console_debug(buf);
+        blyt_quit();
+    }
+}
+
+void blyt_cart_draw(void) {}
+"#)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], "frame=3");
+}
+
+/// A Lua cart that stores its frame counter in a state buffer survives the
+/// WASM reset-every-frame cycle (wasm_lua_reset_cycle: full VM teardown +
+/// recreate, on_save_state/on_load_state, state snapshot/restore).
+/// init() intentionally contains no logging — it runs on every reset cycle.
+#[test]
+fn wasm_lua_cart_reset_every_frame() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_lua_ref");
+
+    CartProject::new()
+        .config(GLOBALS_CONFIG)
+        .lua(
+            r#"
+-- Use raw buffer/field IDs (buf_id=1, field_idx=1) to avoid the S proxy
+-- which is native C code not available in the WASM Lua VM.
+local frame = 0
+
+function on_save_state()
+    blyt.buf.set_i32(1, 0, 1, frame)
+end
+
+function on_load_state(info)
+    frame = blyt.buf.get_i32(1, 0, 1)
+end
+
+function init()
+    blyt.buf.alloc_slot(1)
+end
+
+function update()
+    frame = frame + 1
+    if frame == 3 then
+        blyt.debug.print("frame=" .. tostring(frame))
+        blyt.quit()
+    end
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], "frame=3");
+}

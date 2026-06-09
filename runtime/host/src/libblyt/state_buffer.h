@@ -41,7 +41,7 @@ typedef struct {
     const char *name;
 } blyt_buffer_ctx_t;
 
-typedef struct {
+typedef struct blyt_state_ctx {
     uint32_t n_buffers;
     blyt_buffer_ctx_t buffers[BLYT_MAX_BUFFERS];
 } blyt_state_ctx_t;

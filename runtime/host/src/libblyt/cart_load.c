@@ -1023,7 +1023,8 @@ const void *blyt_cart_find_section(const blyt_cart_t *cart, const char *name, si
     for (uint16_t i = 0; i < eh->e_shnum; i++) {
         const Elf32_Shdr *sh = &shdrs[i];
         if (strcmp(shstrtab + sh->sh_name, name) == 0) {
-            *size_out = sh->sh_size;
+            if (size_out)
+                *size_out = sh->sh_size;
             return (const uint8_t *)cart->map + sh->sh_offset;
         }
     }
@@ -1076,6 +1077,10 @@ int blyt_cart_has_native_lifecycle(const blyt_cart_t *cart) {
         break;
     }
     return 0;
+}
+
+int blyt_cart_has_layouts(const blyt_cart_t *cart) {
+    return blyt_cart_find_section(cart, ".cart.layouts", NULL) != NULL;
 }
 
 void blyt_cart_close(blyt_cart_t *cart) {
@@ -1135,6 +1140,8 @@ const char *blyt_cart_err_str(blyt_cart_err_t err) {
         return "imported symbol not on allowlist";
     case BLYT_CART_ERR_MISSING_ENTRY:
         return "required cart entry point missing (blyt_cart_init/update/draw)";
+    case BLYT_CART_ERR_BAD_LAYOUTS:
+        return ".cart.layouts FlatBuffers parse error";
     }
     return "unknown error";
 }

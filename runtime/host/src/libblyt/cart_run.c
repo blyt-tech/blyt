@@ -1973,6 +1973,16 @@ uint32_t blyt_session_cart_fn_cleanup(blyt_session_t *s) {
     return session_cart_fn(s->fn_cleanup);
 }
 
+blyt_state_ctx_t *blyt_session_state_ctx(blyt_session_t *s) {
+    return &s->state_ctx;
+}
+const char *blyt_session_save_dir(blyt_session_t *s) {
+    return s->ctx.save_dir;
+}
+const char *blyt_session_cart_name(blyt_session_t *s) {
+    return s->ctx.cart_name;
+}
+
 /*
  * Call blyt_is_quit_requested() in the guest and return 1 if the guest called
  * blyt_quit() since the last check.  Used by the WASM frontend to propagate
@@ -2627,10 +2637,6 @@ static void blyt_session_zero_guest_bss(blyt_session_t *s) {
         memory_fill(attr->mem, s->cart_bss[i].start, s->cart_bss[i].size, 0);
 }
 
-static void noop_log(const char *msg) {
-    (void)msg;
-}
-
 /* Run blyt_session_run_frame until FN_DONE (skipping any FRAME_DONE returns).
  * Returns BLYT_RUN_FN_DONE on success, an error code otherwise. */
 static blyt_cart_run_err_t call_until_fn_done(blyt_session_t *s) {
@@ -2646,7 +2652,6 @@ void blyt_reset_every_frame_cycle(blyt_session_t *s) {
     uint32_t saved_regs[32];
     uint32_t saved_fcsr;
     blyt_state_snapshot_t *snap;
-    blyt_log_fn saved_log;
     blyt_cart_run_err_t r;
     uint32_t args[3];
     uint32_t i;
@@ -2677,12 +2682,9 @@ void blyt_reset_every_frame_cycle(blyt_session_t *s) {
     blyt_state_ctx_zero_data(&s->state_ctx);
     blyt_session_zero_guest_bss(s);
 
-    /* 4. Re-run init with log suppressed so output stays clean. */
-    saved_log = s->ctx.log_fn;
-    s->ctx.log_fn = noop_log;
+    /* 4. Re-run init. */
     blyt_session_begin_fn_call(s, s->fn_init, 0, NULL);
     r = call_until_fn_done(s);
-    s->ctx.log_fn = saved_log;
     if (r != BLYT_RUN_FN_DONE) {
         blyt_state_snapshot_free(snap);
         goto restore;
