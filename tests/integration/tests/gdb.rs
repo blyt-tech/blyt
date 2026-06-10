@@ -393,9 +393,15 @@ function draw()   end\n";
         cart.to_str().unwrap(),
     ]);
 
-    if let Some(a) = addr {
-        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
-    }
+    // Missing prerequisites are test failures, not silent skips: without the
+    // break address the orchestrator skips the entire GDB native-breakpoint
+    // section and the test passes vacuously (this hid a real Linux-only
+    // regression on macOS, which has no GNU readelf).
+    let a = addr.expect(
+        "blyt_native_work symbol not found in cart — \
+         install readelf or llvm-readelf (brew install llvm)",
+    );
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
 
     cmd.timeout(std::time::Duration::from_secs(60))
         .assert()

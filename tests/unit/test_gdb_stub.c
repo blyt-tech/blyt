@@ -610,6 +610,50 @@ static void test_reconnect_reinitializes(void) {
     ASSERT(fc_gdb_stub_pending_action() == -1, "pending = -1 after reconnect");
 }
 
+/* ── initial-halt clearing ───────────────────────────────────────────────── */
+
+static void test_continue_initial_halt_clears_startup_halt(void) {
+    reset_stub();
+    /* set_transport parks the stub in the startup halt. */
+    ASSERT(fc_gdb_stub_is_halted() == 1, "startup -> halted");
+    fc_gdb_stub_continue_initial_halt();
+    ASSERT(fc_gdb_stub_is_halted() == 0, "initial halt cleared");
+    ASSERT(fc_gdb_stub_pending_action() == 0, "released to continue");
+}
+
+static void test_continue_initial_halt_leaves_breakpoint_halt(void) {
+    reset_stub();
+    fc_gdb_stub_continue_initial_halt(); /* clear the startup halt */
+    /* A breakpoint/step stop parks at halted=1 / pending_action=-1 — the
+     * same shape as the startup halt.  It must NOT be released here
+     * (regression: the WASM trampoline pause called this each tick and
+     * silently resumed the guest past a hit breakpoint). */
+    fc_gdb_stub_notify_stopped();
+    ASSERT(fc_gdb_stub_is_halted() == 1, "breakpoint -> halted");
+    fc_gdb_stub_continue_initial_halt();
+    ASSERT(fc_gdb_stub_is_halted() == 1, "breakpoint halt NOT cleared");
+    ASSERT(fc_gdb_stub_pending_action() == -1, "pending_action unchanged");
+}
+
+static void test_continue_initial_halt_leaves_interrupt_halt(void) {
+    reset_stub();
+    fc_gdb_stub_continue_initial_halt();
+    drive("\x03");
+    ASSERT(fc_gdb_stub_is_halted() == 1, "interrupt -> halted");
+    fc_gdb_stub_continue_initial_halt();
+    ASSERT(fc_gdb_stub_is_halted() == 1, "interrupt halt NOT cleared");
+}
+
+static void test_continue_initial_halt_after_reconnect(void) {
+    reset_stub();
+    fc_gdb_stub_continue_initial_halt();
+    fc_gdb_stub_set_has_client(0);
+    fc_gdb_stub_set_has_client(1);
+    /* Reconnect re-arms the startup halt; clearing it again is allowed. */
+    fc_gdb_stub_continue_initial_halt();
+    ASSERT(fc_gdb_stub_is_halted() == 0, "reconnect halt cleared");
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 #define RUN(fn)                                                                                    \
@@ -680,6 +724,11 @@ int main(void) {
     RUN(test_disconnect_clears_breakpoints);
     RUN(test_disconnect_resumes);
     RUN(test_reconnect_reinitializes);
+
+    RUN(test_continue_initial_halt_clears_startup_halt);
+    RUN(test_continue_initial_halt_leaves_breakpoint_halt);
+    RUN(test_continue_initial_halt_leaves_interrupt_halt);
+    RUN(test_continue_initial_halt_after_reconnect);
 
     if (failures == 0) {
         printf("test_gdb_stub: all %d tests passed\n", 50);

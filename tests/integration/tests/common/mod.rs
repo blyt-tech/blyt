@@ -825,16 +825,28 @@ pub fn require_lldb_dap() {
 ///
 /// Returns `None` if `readelf` is not available or the symbol is not found.
 pub fn find_symbol_addr(cart: &std::path::Path, symbol: &str) -> Option<u64> {
-    let out = std::process::Command::new("readelf")
-        .args(["-s", "--wide", cart.to_str()?])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        // readelf -s format: Num: Value Size Type Bind Vis Ndx Name
-        if parts.len() >= 8 && parts[7] == symbol {
-            return u64::from_str_radix(parts[1], 16).ok();
+    // GNU readelf on Linux; llvm-readelf elsewhere (macOS has no readelf —
+    // falling through silently here used to skip the GDB native-breakpoint
+    // test sections on macOS entirely).
+    let candidates = [
+        "readelf",
+        "llvm-readelf",
+        "/opt/homebrew/opt/llvm/bin/llvm-readelf",
+    ];
+    for tool in candidates {
+        let Ok(out) = std::process::Command::new(tool)
+            .args(["-s", "--wide", cart.to_str()?])
+            .output()
+        else {
+            continue;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // readelf -s format: Num: Value Size Type Bind Vis Ndx Name
+            if parts.len() >= 8 && parts[7] == symbol {
+                return u64::from_str_radix(parts[1], 16).ok();
+            }
         }
     }
     None
