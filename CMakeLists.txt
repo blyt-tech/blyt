@@ -486,7 +486,6 @@ function(blyt_add_player target runtime_lib)
   target_include_directories(
     ${target} PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
                       "${CMAKE_SOURCE_DIR}/runtime/host/include")
-  target_compile_definitions(${target} PRIVATE BLYT_VERSION="${BLYT_VERSION}")
   # Players emit directly into the SDK layout: BLYT_LIB_DIR auto-inference
   # resolves <binary>/../lib[/debug], and tests run the sdk/bin copies — so
   # building anywhere else just creates a stale duplicate.
@@ -546,11 +545,17 @@ if(LIBBLYTC_OUT)
   # ADR-0129: the shipped libretro core is release-only — no GDB/DAP, embeds the
   # optimized release guest libs.  Debug stepping is served via blyt debug
   # (WASM) and the native blytdebug player, not the libretro core.
-  set(_blyt_libretro_defs BLYT_VERSION="${BLYT_VERSION}" BLYT_EMBED_LIBS)
+  set(_blyt_libretro_defs BLYT_EMBED_LIBS)
   if(LIBBLYT32LUA_OUT)
     list(APPEND _blyt_libretro_defs BLYT_EMBED_LUA)
   endif()
   target_compile_definitions(blyt_libretro PRIVATE ${_blyt_libretro_defs})
+  # BLYT_VERSION carries a per-run timestamp in CI dev builds; scope it to the
+  # one TU that uses it so the (large, generated) embedded-libs TU stays
+  # compiler-cacheable across runs.
+  set_source_files_properties(
+    frontends/libretro/blyt_libretro.c
+    PROPERTIES COMPILE_DEFINITIONS BLYT_VERSION="${BLYT_VERSION}")
   set_target_properties(blyt_libretro PROPERTIES PREFIX "" SUFFIX ".so")
   add_dependencies(blyt_libretro guest_libs)
   message(STATUS "blyt_libretro: will be built")

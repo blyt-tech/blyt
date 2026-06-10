@@ -366,8 +366,7 @@ endforeach()
 
 target_compile_options(
   blytplay
-  PRIVATE -DBLYT_VERSION="${BLYT_VERSION}"
-          # Softfloat
+  PRIVATE # Softfloat
           -DLITTLEENDIAN=1
           -DINLINE_LEVEL=5
           -DSOFTFLOAT_ROUND_ODD
