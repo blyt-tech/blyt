@@ -34,6 +34,15 @@ if(NOT FOUND_CLANG)
 endif()
 message(STATUS "blyt SDK: toolchain clang = ${FOUND_CLANG}")
 
+# ccache launcher args for the nested libc++/WASM configures (empty when
+# ccache was not found at configure time — expands to nothing).
+set(CCACHE_LAUNCHER_ARGS "")
+if(BLYT_CCACHE_PROGRAM)
+  list(APPEND CCACHE_LAUNCHER_ARGS
+       "-DCMAKE_C_COMPILER_LAUNCHER=${BLYT_CCACHE_PROGRAM}"
+       "-DCMAKE_CXX_COMPILER_LAUNCHER=${BLYT_CCACHE_PROGRAM}")
+endif()
+
 # -------------------------------------------------------------------------
 # Step 2: RV32 guest libraries — built by the main ninja graph
 #
@@ -123,7 +132,8 @@ else()
       ${CMAKE_COMMAND} -S "${LIBCXX_SOURCE_DIR}/runtimes" -B
       "${LIBCXX_BUILD_DIR}" -G Ninja "-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi"
       "-DCMAKE_C_COMPILER=${FOUND_CLANG}"
-      "-DCMAKE_CXX_COMPILER=${FOUND_CLANGPP}" "-DCMAKE_C_FLAGS=${_LXX_C_FLAGS}"
+      "-DCMAKE_CXX_COMPILER=${FOUND_CLANGPP}" ${CCACHE_LAUNCHER_ARGS}
+      "-DCMAKE_C_FLAGS=${_LXX_C_FLAGS}"
       "-DCMAKE_CXX_FLAGS=${_LXX_CXX_FLAGS}" -DCMAKE_BUILD_TYPE=MinSizeRel
       -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXX_ENABLE_EXCEPTIONS=OFF
       -DLIBCXX_ENABLE_RTTI=OFF -DLIBCXX_ENABLE_THREADS=OFF
@@ -227,7 +237,8 @@ else()
       "${LIBCXX_DEBUG_BUILD_DIR}" -G Ninja
       "-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi"
       "-DCMAKE_C_COMPILER=${FOUND_CLANG}"
-      "-DCMAKE_CXX_COMPILER=${FOUND_CLANGPP}" "-DCMAKE_C_FLAGS=${_LXXD_C_FLAGS}"
+      "-DCMAKE_CXX_COMPILER=${FOUND_CLANGPP}" ${CCACHE_LAUNCHER_ARGS}
+      "-DCMAKE_C_FLAGS=${_LXXD_C_FLAGS}"
       "-DCMAKE_CXX_FLAGS=${_LXXD_CXX_FLAGS}" -DCMAKE_BUILD_TYPE=Debug
       -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXX_ENABLE_EXCEPTIONS=OFF
       -DLIBCXX_ENABLE_RTTI=OFF -DLIBCXX_ENABLE_THREADS=OFF
@@ -563,7 +574,7 @@ if(EMCC)
         "${BLYT_SOURCE_DIR}/frontends/wasm" "-DBLYT_GUEST_LIB_DIR=${_WLIBS}"
         "-DBLYT_VERSION=${BLYT_VERSION}" "-DBLYT_WASM_NAME=${_WNAME}"
         "-DBLYT_WASM_OUT_DIR=${_WDEST}" "-DBLYT_DAP=${_WDBG}"
-        "-DBLYT_GDB=${_WDBG}" -G Ninja
+        "-DBLYT_GDB=${_WDBG}" ${CCACHE_LAUNCHER_ARGS} -G Ninja
       RESULT_VARIABLE R
       OUTPUT_QUIET)
     if(NOT R EQUAL 0)
