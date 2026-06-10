@@ -4,6 +4,10 @@ project(blyt C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# ccache compiler launcher (also exported to the sdk script for the nested
+# libc++/WASM trees).
+include(cmake/blyt_ccache.cmake)
+
 # Version (ADR-0128): copy version.txt to build/version.txt if not already
 # present (CI pre-creates it with a timestamp; local dev gets a verbatim copy).
 if(NOT EXISTS "${CMAKE_BINARY_DIR}/version.txt")
@@ -770,6 +774,7 @@ add_custom_target(
     -DBLYT_RV32_CLANGPP=${BLYT_RV32_CLANGPP} -DBLYT_RV32_LLD=${BLYT_RV32_LLD}
     -DBLYT_RV32_OBJCOPY=${BLYT_RV32_OBJCOPY} -DBLYT_RV32_AR=${BLYT_RV32_AR}
     -DBLYT_RV32_LLDB_DAP=${BLYT_RV32_LLDB_DAP}
+    -DBLYT_CCACHE_PROGRAM=${BLYT_CCACHE_PROGRAM}
     -DCMAKE_HOST_SYSTEM_NAME=${CMAKE_HOST_SYSTEM_NAME}
     -DCMAKE_HOST_SYSTEM_PROCESSOR=${CMAKE_HOST_SYSTEM_PROCESSOR} -P
     ${CMAKE_SOURCE_DIR}/cmake/blyt_sdk.cmake
