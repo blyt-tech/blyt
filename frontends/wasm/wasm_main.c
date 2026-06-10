@@ -1030,6 +1030,14 @@ static void wasm_lua_loop(void) {
         }
         g_lua_needs_start = false;
         fc_consolelua_master_hook_install(g_lua_co);
+#ifdef BLYT_GDB
+        /* DAP breakpoints are now registered; clear the GDB startup halt so
+         * native calls during init() can proceed without a GDB client
+         * needing to send vCont;c first.  Real halts (breakpoint/step,
+         * pending_action >= 0) are not affected. */
+        if (g_session)
+            blyt_session_gdb_continue_initial_halt(g_session);
+#endif
         /* fall through to start execution */
     }
 
@@ -1048,8 +1056,15 @@ static void wasm_lua_loop(void) {
     /* Trampoline GDB pause: a Lua-to-native call hit a GDB breakpoint and
      * yielded the coroutine.  Wait here (returning each tick to keep the
      * event loop free) until the GDB client sends vCont;c, then fall through
-     * to resume the coroutine which will call trampoline_gdb_resume_k. */
+     * to resume the coroutine which will call trampoline_gdb_resume_k.
+     *
+     * Also clears the stub's initial startup halt (pending_action < 0) so
+     * that pure-DAP debug sessions — where no GDB client ever sends vCont;c
+     * — are not permanently blocked.  Real GDB halts (breakpoint / step,
+     * pending_action >= 0) are unaffected. */
     if (g_trampoline_gdb_paused) {
+        if (g_session)
+            blyt_session_gdb_continue_initial_halt(g_session);
         if (fc_gdb_stub_is_halted()) {
             blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
             return;
