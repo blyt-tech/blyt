@@ -1376,12 +1376,16 @@ if(EMCC)
     endif()
 
     message(STATUS "Building ${_WNAME} WASM runtime (${_w})…")
+    # BLYT_WASM_OUT_DIR makes the emcmake tree emit .html/.js/.wasm directly
+    # into the SDK share dir, so later incremental `cmake --build ${_WDIR}`
+    # invocations update the SDK in place (no copy step to go stale).
     execute_process(
       COMMAND
         emcmake ${CMAKE_COMMAND} -B "${_WDIR}" -S
         "${BLYT_SOURCE_DIR}/frontends/wasm" "-DBLYT_GUEST_LIB_DIR=${_WLIBS}"
         "-DBLYT_VERSION=${BLYT_VERSION}" "-DBLYT_WASM_NAME=${_WNAME}"
-        "-DBLYT_DAP=${_WDBG}" "-DBLYT_GDB=${_WDBG}" -G Ninja
+        "-DBLYT_WASM_OUT_DIR=${_WDEST}" "-DBLYT_DAP=${_WDBG}"
+        "-DBLYT_GDB=${_WDBG}" -G Ninja
       RESULT_VARIABLE R
       OUTPUT_QUIET)
     if(NOT R EQUAL 0)
@@ -1392,11 +1396,6 @@ if(EMCC)
       if(NOT R EQUAL 0)
         message(WARNING "${_WNAME} WASM: build failed — skipping")
       else()
-        foreach(_ext js wasm html)
-          if(EXISTS "${_WDIR}/${_WNAME}.${_ext}")
-            file(COPY "${_WDIR}/${_WNAME}.${_ext}" DESTINATION "${_WDEST}")
-          endif()
-        endforeach()
         message(STATUS "${_WNAME} WASM assembled at ${_WDEST}")
       endif()
     endif()

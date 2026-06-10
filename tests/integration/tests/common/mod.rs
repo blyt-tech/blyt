@@ -421,8 +421,8 @@ pub fn require_wasm() {
     assert!(
         find_wasm_dir().join("blytplay.js").exists(),
         "WASM runtime not built — install emscripten and run \
-         `cmake --build build --target sdk` (or \
-         `emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm`)"
+         `cmake --build build --target sdk` (incremental rebuild: \
+         `cmake --build build/build-wasm`)"
     );
 }
 
@@ -432,7 +432,8 @@ pub fn require_wasm_debug() {
     assert!(
         find_wasm_debug_dir().join("blytdebug.js").exists(),
         "debug WASM runtime not built — run `cmake --build build --target sdk` \
-         (builds share/wasm-debug/blytdebug.* with BLYT_DAP/BLYT_GDB)"
+         (builds share/wasm-debug/blytdebug.* with BLYT_DAP/BLYT_GDB; \
+         incremental rebuild: `cmake --build build/build-wasm-debug`)"
     );
 }
 
@@ -638,14 +639,10 @@ pub fn test_session_api() -> PathBuf {
     build_dir().join("test_session_api")
 }
 
-/// Locate the WASM runtime directory.
-///
-/// Prefers a direct emcmake build output; falls back to the SDK's share/wasm/.
+/// Locate the WASM runtime directory (SDK layout).  The emcmake trees at
+/// build/build-wasm[-debug] emit their artifacts directly here via
+/// BLYT_WASM_OUT_DIR, so this is always the authoritative copy.
 pub fn find_wasm_dir() -> PathBuf {
-    let direct = repo_root().join("build-wasm");
-    if direct.join("blytplay.js").exists() {
-        return direct;
-    }
     build_dir().join("sdk/share/wasm")
 }
 
@@ -653,10 +650,6 @@ pub fn find_wasm_dir() -> PathBuf {
 /// The release blytplay has DAP/GDB compiled out (ADR-0129), so the WASM DAP/GDB
 /// tests must use this variant.
 pub fn find_wasm_debug_dir() -> PathBuf {
-    let direct = repo_root().join("build-wasm-debug");
-    if direct.join("blytdebug.js").exists() {
-        return direct;
-    }
     build_dir().join("sdk/share/wasm-debug")
 }
 

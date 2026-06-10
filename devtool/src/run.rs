@@ -539,8 +539,9 @@ mod tests {
  *
  * Resolution order:
  *   1. $BLYT_WASM_DIR            — explicit override
- *   2. <sdk>/share/wasm/         — SDK layout (blyt_sdk.cmake Step 7)
- *   3. <repo>/build-wasm/        — manual emcmake cmake invocation
+ *   2. <sdk>/share/wasm/         — installed SDK layout (blyt_sdk.cmake Step 7)
+ *   3. <repo>/build/sdk/share/wasm/ — dev layout (devtool run from the repo;
+ *      the emcmake trees emit directly here via BLYT_WASM_OUT_DIR)
  * ------------------------------------------------------------------------- */
 
 /// Locate the release WASM runtime dir (used by `blyt build wasm` packaging).
@@ -549,14 +550,18 @@ pub(crate) fn find_wasm_dir() -> Result<PathBuf, RunError> {
 }
 
 /// Locate the WASM runtime dir for the given build variant (ADR-0129):
-///   release → $BLYT_WASM_DIR       → <sdk>/share/wasm       → build-wasm
-///   debug   → $BLYT_WASM_DEBUG_DIR → <sdk>/share/wasm-debug → build-wasm-debug
+///   release → $BLYT_WASM_DIR       → <sdk>/share/wasm       → build/sdk/share/wasm
+///   debug   → $BLYT_WASM_DEBUG_DIR → <sdk>/share/wasm-debug → build/sdk/share/wasm-debug
 fn find_wasm_dir_for(mode: Mode) -> Result<PathBuf, RunError> {
     let name = mode.wasm_name();
     let js = format!("{name}.js");
     let (env_var, share_sub, dev_sub) = match mode {
-        Mode::Release => ("BLYT_WASM_DIR", "wasm", "build-wasm"),
-        Mode::Debug => ("BLYT_WASM_DEBUG_DIR", "wasm-debug", "build-wasm-debug"),
+        Mode::Release => ("BLYT_WASM_DIR", "wasm", "build/sdk/share/wasm"),
+        Mode::Debug => (
+            "BLYT_WASM_DEBUG_DIR",
+            "wasm-debug",
+            "build/sdk/share/wasm-debug",
+        ),
     };
 
     if let Ok(d) = std::env::var(env_var) {

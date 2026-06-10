@@ -10,9 +10,9 @@ use tempfile::TempDir;
 /// WASM DAP gate test: set a breakpoint in a Lua cart running inside blytplay.js,
 /// verify the stopped event, inspect locals, step over, and continue to completion.
 ///
-/// Requires the WASM runtime to have been built with BLYT_DAP=ON:
-///   emcmake cmake -B build-wasm -S frontends/wasm -DBLYT_DAP=ON
-///   cmake --build build-wasm
+/// Requires the debug WASM runtime (BLYT_DAP=ON) to have been built:
+///   cmake --build build --target sdk   (requires emcc)
+/// (incremental rebuild: cmake --build build/build-wasm-debug)
 ///
 /// Silently asserts on missing WASM runtime or Lua SDK.
 #[test]

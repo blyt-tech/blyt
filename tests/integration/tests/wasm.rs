@@ -13,8 +13,8 @@ use tempfile::TempDir;
 /// golden file used by testcard_frame0_matches_golden.
 ///
 /// Requires the WASM runtime to have been built:
-///   emcmake cmake -B build-wasm -S frontends/wasm && cmake --build build-wasm
-/// (or cmake --build build --target sdk when emcc is present).
+///   cmake --build build --target sdk   (requires emcc)
+/// (incremental rebuild: cmake --build build/build-wasm).
 ///
 /// Silently skipped when blytplay.js is not found.
 #[test]

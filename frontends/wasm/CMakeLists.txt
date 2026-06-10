@@ -2,15 +2,18 @@ cmake_minimum_required(VERSION 3.25)
 project(blytplay C)
 
 # -------------------------------------------------------------------------
-# Guard: this project must be configured with Emscripten. Usage: emcmake cmake
-# -B build-wasm -S frontends/wasm cmake --build build-wasm
+# Guard: this project must be configured with Emscripten.  Normally configured
+# by the SDK build (cmake --build build --target sdk) at build/build-wasm and
+# build/build-wasm-debug; rebuild incrementally with cmake --build <that dir>.
 # -------------------------------------------------------------------------
 if(NOT EMSCRIPTEN)
   message(
     FATAL_ERROR
-      "blytplay (WASM) must be built with Emscripten.\n" "Configure with:\n"
-      "  emcmake cmake -B build-wasm -S frontends/wasm\n"
-      "  cmake --build build-wasm")
+      "blytplay (WASM) must be built with Emscripten.\n"
+      "Build via the SDK target (configures this tree automatically):\n"
+      "  cmake --build build --target sdk\n"
+      "or configure manually with:\n"
+      "  emcmake cmake -B <dir> -S frontends/wasm")
 endif()
 
 set(CMAKE_C_STANDARD 11)
@@ -328,8 +331,18 @@ add_executable(
 set(BLYT_WASM_NAME
     "blytplay"
     CACHE STRING "Output base name for the WASM player (.html/.js/.wasm)")
-set_target_properties(blytplay PROPERTIES OUTPUT_NAME "${BLYT_WASM_NAME}"
-                                          SUFFIX ".html")
+
+# Where the final .html/.js/.wasm land.  The SDK build (blyt_sdk.cmake Step 7)
+# points this at sdk/share/wasm[-debug] so incremental rebuilds of this tree
+# write straight into the SDK layout — there is no copy step to go stale.
+set(BLYT_WASM_OUT_DIR
+    "${CMAKE_BINARY_DIR}"
+    CACHE PATH "Output directory for the WASM player artifacts")
+set_target_properties(
+  blytplay
+  PROPERTIES OUTPUT_NAME "${BLYT_WASM_NAME}"
+             SUFFIX ".html"
+             RUNTIME_OUTPUT_DIRECTORY "${BLYT_WASM_OUT_DIR}")
 
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)
@@ -438,9 +451,12 @@ target_link_options(
 # Summary
 # -------------------------------------------------------------------------
 message(STATUS "blytplay (WASM) configured")
-message(STATUS "  Output:    ${CMAKE_BINARY_DIR}/blytplay.js + blytplay.wasm")
-message(STATUS "  WASM dir:  ${CMAKE_BINARY_DIR}")
 message(
   STATUS
-    "  Run cart:  blyt run <cart.blyt>  (or set BLYT_WASM_DIR=${CMAKE_BINARY_DIR})"
+    "  Output:    ${BLYT_WASM_OUT_DIR}/${BLYT_WASM_NAME}.js + ${BLYT_WASM_NAME}.wasm"
+)
+message(STATUS "  WASM dir:  ${BLYT_WASM_OUT_DIR}")
+message(
+  STATUS
+    "  Run cart:  blyt run <cart.blyt>  (or set BLYT_WASM_DIR=${BLYT_WASM_OUT_DIR})"
 )
