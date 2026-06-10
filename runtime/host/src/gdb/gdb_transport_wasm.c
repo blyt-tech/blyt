@@ -21,6 +21,7 @@
 
 #include <emscripten.h>
 
+#include "blyt_trace.h"
 #include "gdb_stub.h"
 
 #define MAX_PKT 4096
@@ -77,6 +78,18 @@ EM_JS(int, wgdb_is_connected_js, (void), {
 
 /* clang-format on */
 
+/* Trace WebSocket connect/disconnect transitions.  There is no connection
+ * callback into C, so the transition is detected wherever the connection
+ * state is polled (recv_pkt and fc_gdb_transport_wasm_is_connected). */
+static void wgdb_trace_conn(void) {
+    static int was_connected;
+    int now = wgdb_is_connected_js();
+    if (now != was_connected) {
+        blyt_tracef(BLYT_TRACE_GDB, now ? "client connected" : "client disconnected");
+        was_connected = now;
+    }
+}
+
 /* ── GDB RSP framing ──────────────────────────────────────────────────────── */
 
 static int wgdb_send_pkt(const char *payload) {
@@ -116,6 +129,7 @@ static int wgdb_extract_payload(const char *frame, char *buf, size_t cap) {
 }
 
 static int wgdb_recv_pkt(char *buf, size_t cap) {
+    wgdb_trace_conn();
     /* Drain ack-only frames and find a real packet. */
     while (wgdb_queue_length() > 0) {
         char *frame = wgdb_dequeue_frame();
@@ -185,5 +199,6 @@ void fc_gdb_transport_wasm_shutdown(void) {
 }
 
 int fc_gdb_transport_wasm_is_connected(void) {
+    wgdb_trace_conn();
     return wgdb_is_connected_js();
 }

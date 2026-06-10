@@ -89,6 +89,131 @@ static unsigned int build_save_path(char *dst, unsigned int cap, const char *sav
     return i;
 }
 
+/* ── BLYT_TRACE api channel (native path) ────────────────────────────────
+ *
+ * Mirrors the host trace module's line format ("[blyt:api] <msg>") minus the
+ * frame/time counters — runtime/host trace code cannot run inside the
+ * seccomp'd ILP32 cart process.  getenv() comes from ld-blyt.so.1; all
+ * formatting is hand-rolled (no snprintf in this library) and emission is a
+ * raw SYS_write to fd 2, both already used in this file and present in the
+ * restricted seccomp allowlist.  f32 values are printed as raw hex bits.
+ */
+
+static void blyt32_trace_write(const char *buf, unsigned int len) {
+    register long a0 __asm__("a0") = 2; /* STDERR_FILENO */
+    register const char *a1 __asm__("a1") = buf;
+    register long a2 __asm__("a2") = (long)len;
+    register long a7 __asm__("a7") = 64; /* SYS_write */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+}
+
+/* 1 when BLYT_TRACE contains the "api" (or "all") channel token. */
+static int blyt32_trace_api_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 0;
+        const char *p = getenv("BLYT_TRACE");
+        while (p && *p) {
+            if (((p[0] == 'a' && p[1] == 'p' && p[2] == 'i') ||
+                 (p[0] == 'a' && p[1] == 'l' && p[2] == 'l')) &&
+                (p[3] == '\0' || p[3] == ',')) {
+                cached = 1;
+                break;
+            }
+            while (*p && *p != ',')
+                p++;
+            if (*p)
+                p++;
+        }
+    }
+    return cached;
+}
+
+static char *blyt32_trace_app_str(char *p, char *end, const char *s) {
+    while (*s && p + 1 < end)
+        *p++ = *s++;
+    return p;
+}
+
+static char *blyt32_trace_app_dec(char *p, char *end, long v) {
+    char num[16];
+    int ni = 0;
+    unsigned long u = (v < 0) ? (unsigned long)-v : (unsigned long)v;
+    if (v < 0 && p + 1 < end)
+        *p++ = '-';
+    do {
+        num[ni++] = (char)('0' + (int)(u % 10u));
+        u /= 10u;
+    } while (u && ni < (int)sizeof(num));
+    for (int j = ni - 1; j >= 0 && p + 1 < end; j--)
+        *p++ = num[j];
+    return p;
+}
+
+static char *blyt32_trace_app_hex(char *p, char *end, uint32_t v) {
+    p = blyt32_trace_app_str(p, end, "0x");
+    int started = 0;
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        unsigned int nyb = (v >> shift) & 0xFu;
+        if (!nyb && !started && shift)
+            continue;
+        started = 1;
+        if (p + 1 < end)
+            *p++ = "0123456789abcdef"[nyb];
+    }
+    return p;
+}
+
+static void blyt32_trace_emit(char *buf, char *p, char *end) {
+    if (p + 1 < end)
+        *p++ = '\n';
+    blyt32_trace_write(buf, (unsigned int)(p - buf));
+}
+
+/* One line per typed buffer get/set: "[blyt:api] <name>(buf=…, slot=…,
+ * field=…[, v=…])[ -> …]".  f32 bits are printed as hex. */
+static void blyt32_trace_buf_op(const char *name, uint32_t b, int32_t s, uint32_t f, uint32_t bits,
+                                int is_set, int is_f32) {
+    if (!blyt32_trace_api_enabled())
+        return;
+    char buf[160];
+    char *end = buf + sizeof(buf);
+    char *p = blyt32_trace_app_str(buf, end, "[blyt:api] ");
+    p = blyt32_trace_app_str(p, end, name);
+    p = blyt32_trace_app_str(p, end, "(buf=");
+    p = blyt32_trace_app_dec(p, end, (long)b);
+    p = blyt32_trace_app_str(p, end, ", slot=");
+    p = blyt32_trace_app_dec(p, end, (long)s);
+    p = blyt32_trace_app_str(p, end, ", field=");
+    p = blyt32_trace_app_dec(p, end, (long)(f & 0xFFFFu));
+    p = blyt32_trace_app_str(p, end, is_set ? ", v=" : ") -> ");
+    if (is_f32)
+        p = blyt32_trace_app_hex(p, end, bits);
+    else
+        p = blyt32_trace_app_dec(p, end, (long)(int32_t)bits);
+    if (is_set)
+        p = blyt32_trace_app_str(p, end, ")");
+    blyt32_trace_emit(buf, p, end);
+}
+
+/* Simple "<name>(arg) [-> ret]" line for the non-buffer APIs. */
+static void blyt32_trace_call(const char *name, long arg, int has_ret, long ret) {
+    if (!blyt32_trace_api_enabled())
+        return;
+    char buf[128];
+    char *end = buf + sizeof(buf);
+    char *p = blyt32_trace_app_str(buf, end, "[blyt:api] ");
+    p = blyt32_trace_app_str(p, end, name);
+    p = blyt32_trace_app_str(p, end, "(");
+    p = blyt32_trace_app_dec(p, end, arg);
+    p = blyt32_trace_app_str(p, end, ")");
+    if (has_ret) {
+        p = blyt32_trace_app_str(p, end, " -> ");
+        p = blyt32_trace_app_dec(p, end, ret);
+    }
+    blyt32_trace_emit(buf, p, end);
+}
+
 /* ── Raw I/O helpers (loop until all bytes transferred) ─────────────────── */
 
 static int write_all(int fd, const void *buf, unsigned int len) {
@@ -230,6 +355,10 @@ void blyt_frame_done(void) {
      * The memory clobber prevents the compiler from reordering FP operations
      * across this boundary. */
     __asm__ volatile("csrw fcsr, zero" ::: "memory");
+    if (blyt32_trace_api_enabled()) {
+        static const char msg[] = "[blyt:api] frame_done()\n";
+        blyt32_trace_write(msg, sizeof(msg) - 1);
+    }
 }
 
 /* blyt_exit — clean process exit after cart main loop.
@@ -242,6 +371,7 @@ void blyt_frame_done(void) {
  * in _blyt_entry and avoid generating a dead-code epilogue.
  */
 __attribute__((noreturn)) void blyt_exit(int code) {
+    blyt32_trace_call("exit", (long)code, 0, 0);
     blyt_rs_exit_group(code);
 }
 
@@ -249,6 +379,18 @@ __attribute__((noreturn)) void blyt_exit(int code) {
  * write(2) is NR 64, in the restricted allowlist. */
 void blyt_console_debug(const char *s) {
     unsigned int len = blyt32_native_strlen(s);
+    if (blyt32_trace_api_enabled()) {
+        char tbuf[300];
+        char *tend = tbuf + sizeof(tbuf);
+        char *tp = blyt32_trace_app_str(tbuf, tend, "[blyt:api] console_debug(\"");
+        unsigned int tl = len;
+        while (tl > 0 && (s[tl - 1] == '\n' || s[tl - 1] == '\r'))
+            tl--;
+        for (unsigned int ti = 0; ti < tl && tp + 1 < tend; ti++)
+            *tp++ = s[ti];
+        tp = blyt32_trace_app_str(tp, tend, "\")");
+        blyt32_trace_emit(tbuf, tp, tend);
+    }
     register long a0 __asm__("a0") = 2; /* STDERR_FILENO */
     register const char *a1 __asm__("a1") = s;
     register long a2 __asm__("a2") = len;
@@ -269,6 +411,7 @@ float blyt_buffer_get_f32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     if (!ref_ok(bi, s, fi))
         return 0.0f;
     uint32_t bits = s_soa[bi][s][fi];
+    blyt32_trace_buf_op("buf_get_f32", b, s, f, bits, 0, 1);
     float v;
     blyt32_native_memcpy(&v, &bits, 4);
     return v;
@@ -279,6 +422,7 @@ void blyt_buffer_set_f32(blyt_buffer_h b, int32_t s, blyt_field_h f, float v) {
         return;
     uint32_t bits;
     blyt32_native_memcpy(&bits, &v, 4);
+    blyt32_trace_buf_op("buf_set_f32", b, s, f, bits, 1, 1);
     s_soa[bi][s][fi] = canon_f32(bits);
 }
 
@@ -286,12 +430,15 @@ int32_t blyt_buffer_get_i32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0;
-    return (int32_t)s_soa[bi][s][fi];
+    uint32_t bits = s_soa[bi][s][fi];
+    blyt32_trace_buf_op("buf_get_i32", b, s, f, bits, 0, 0);
+    return (int32_t)bits;
 }
 void blyt_buffer_set_i32(blyt_buffer_h b, int32_t s, blyt_field_h f, int32_t v) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return;
+    blyt32_trace_buf_op("buf_set_i32", b, s, f, (uint32_t)v, 1, 0);
     s_soa[bi][s][fi] = (uint32_t)v;
 }
 
@@ -299,12 +446,15 @@ uint32_t blyt_buffer_get_u32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0u;
-    return s_soa[bi][s][fi];
+    uint32_t bits = s_soa[bi][s][fi];
+    blyt32_trace_buf_op("buf_get_u32", b, s, f, bits, 0, 0);
+    return bits;
 }
 void blyt_buffer_set_u32(blyt_buffer_h b, int32_t s, blyt_field_h f, uint32_t v) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return;
+    blyt32_trace_buf_op("buf_set_u32", b, s, f, v, 1, 0);
     s_soa[bi][s][fi] = v;
 }
 
@@ -312,12 +462,15 @@ int16_t blyt_buffer_get_i16(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0;
-    return (int16_t)(s_soa[bi][s][fi] & 0xFFFFu);
+    int16_t v16 = (int16_t)(s_soa[bi][s][fi] & 0xFFFFu);
+    blyt32_trace_buf_op("buf_get_i16", b, s, f, (uint32_t)(int32_t)v16, 0, 0);
+    return v16;
 }
 void blyt_buffer_set_i16(blyt_buffer_h b, int32_t s, blyt_field_h f, int16_t v) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return;
+    blyt32_trace_buf_op("buf_set_i16", b, s, f, (uint32_t)(int32_t)v, 1, 0);
     s_soa[bi][s][fi] = (uint32_t)(uint16_t)v;
 }
 
@@ -325,12 +478,15 @@ uint16_t blyt_buffer_get_u16(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0u;
-    return (uint16_t)(s_soa[bi][s][fi] & 0xFFFFu);
+    uint16_t v16 = (uint16_t)(s_soa[bi][s][fi] & 0xFFFFu);
+    blyt32_trace_buf_op("buf_get_u16", b, s, f, (uint32_t)v16, 0, 0);
+    return v16;
 }
 void blyt_buffer_set_u16(blyt_buffer_h b, int32_t s, blyt_field_h f, uint16_t v) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return;
+    blyt32_trace_buf_op("buf_set_u16", b, s, f, (uint32_t)v, 1, 0);
     s_soa[bi][s][fi] = (uint32_t)v;
 }
 
@@ -338,12 +494,15 @@ int8_t blyt_buffer_get_i8(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0;
-    return (int8_t)(s_soa[bi][s][fi] & 0xFFu);
+    int8_t v8 = (int8_t)(s_soa[bi][s][fi] & 0xFFu);
+    blyt32_trace_buf_op("buf_get_i8", b, s, f, (uint32_t)(int32_t)v8, 0, 0);
+    return v8;
 }
 void blyt_buffer_set_i8(blyt_buffer_h b, int32_t s, blyt_field_h f, int8_t v) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return;
+    blyt32_trace_buf_op("buf_set_i8", b, s, f, (uint32_t)(int32_t)v, 1, 0);
     s_soa[bi][s][fi] = (uint32_t)(uint8_t)v;
 }
 
@@ -351,12 +510,15 @@ uint8_t blyt_buffer_get_u8(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0u;
-    return (uint8_t)(s_soa[bi][s][fi] & 0xFFu);
+    uint8_t v8 = (uint8_t)(s_soa[bi][s][fi] & 0xFFu);
+    blyt32_trace_buf_op("buf_get_u8", b, s, f, (uint32_t)v8, 0, 0);
+    return v8;
 }
 void blyt_buffer_set_u8(blyt_buffer_h b, int32_t s, blyt_field_h f, uint8_t v) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return;
+    blyt32_trace_buf_op("buf_set_u8", b, s, f, (uint32_t)v, 1, 0);
     s_soa[bi][s][fi] = (uint32_t)v;
 }
 
@@ -364,12 +526,15 @@ bool blyt_buffer_get_bool(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return false;
-    return s_soa[bi][s][fi] != 0u;
+    bool vb = s_soa[bi][s][fi] != 0u;
+    blyt32_trace_buf_op("buf_get_bool", b, s, f, vb ? 1u : 0u, 0, 0);
+    return vb;
 }
 void blyt_buffer_set_bool(blyt_buffer_h b, int32_t s, blyt_field_h f, bool v) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return;
+    blyt32_trace_buf_op("buf_set_bool", b, s, f, v ? 1u : 0u, 1, 0);
     s_soa[bi][s][fi] = v ? 1u : 0u;
 }
 
@@ -384,9 +549,11 @@ blyt_result_t blyt_buffer_alloc_slot(blyt_buffer_h b, int32_t *out_slot) {
         if (!(s_slot_bits[bi][byte] & (uint8_t)(1u << bit))) {
             s_slot_bits[bi][byte] |= (uint8_t)(1u << bit);
             *out_slot = i;
+            blyt32_trace_call("buf_alloc_slot", (long)b, 1, (long)i);
             return BLYT_OK;
         }
     }
+    blyt32_trace_call("buf_alloc_slot", (long)b, 1, -1);
     return BLYT_ERR_BUFFER_FULL;
 }
 
@@ -394,6 +561,7 @@ blyt_result_t blyt_buffer_free_slot(blyt_buffer_h b, int32_t s) {
     uint32_t bi = b - 1u;
     if (bi >= NATIVE_MAX_BUF || s < 0 || (uint32_t)s >= NATIVE_MAX_SLOTS)
         return BLYT_ERR_INVALID_ARG;
+    blyt32_trace_call("buf_free_slot", (long)s, 0, 0);
     s_slot_bits[bi][(uint32_t)s / 8u] &= (uint8_t)~(1u << ((uint32_t)s % 8u));
     return BLYT_OK;
 }
@@ -457,6 +625,7 @@ blyt_result_t blyt_save_write(uint32_t slot) {
 
     blyt_rs_fsync(fd);
     blyt_rs_close(fd);
+    blyt32_trace_call("save_write", (long)slot, 1, 0);
     return BLYT_OK;
 }
 
@@ -498,6 +667,7 @@ blyt_result_t blyt_save_read(uint32_t slot) {
     }
 
     blyt_rs_close(fd);
+    blyt32_trace_call("save_read", (long)slot, 1, 0);
 
     /* Notify the cart that state was loaded. */
     blyt_load_info_t info;

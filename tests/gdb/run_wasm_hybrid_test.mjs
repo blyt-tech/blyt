@@ -23,6 +23,10 @@
 
 'use strict';
 
+/* Debug-driver default: every failure's captured stderr should already carry
+ * a protocol/lifecycle trace.  'api' stays opt-in (high volume). */
+if (!process.env.BLYT_TRACE) process.env.BLYT_TRACE = 'gdb,dap,lifecycle,frame';
+
 import { createServer as createHttpServer } from 'http';
 import { createServer as createTcpServer }  from 'net';
 import { createHash }    from 'crypto';
@@ -262,6 +266,13 @@ function loadWasmRuntime(wasmDir, cartPath, wsPort) {
         const cartData = readFileSync(cartPath);
 
         globalThis.__blyt_cart_data = new Uint8Array(cartData);
+        // module_pre.js copies __blyt_env_vars into the Emscripten ENV (preRun),
+        // so the C-side getenv("BLYT_TRACE") sees the same channels as native legs.
+        if (process.env.BLYT_TRACE) {
+            globalThis.__blyt_env_vars = Object.assign(globalThis.__blyt_env_vars || {}, {
+                BLYT_TRACE: process.env.BLYT_TRACE,
+            });
+        }
         globalThis.__blyt_dap_port  = wsPort;
         globalThis.__blyt_gdb_port  = wsPort;
 

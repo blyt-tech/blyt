@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "blyt_runtime.h"
+#include "blyt_trace.h"
 #include "cart_load.h"
 #include "ecall.h"
 #include "save.h"
@@ -253,6 +254,14 @@ struct blyt_session {
     /* blyt_is_quit_requested() from libblytcommon.so: called by the WASM
      * frontend after each lifecycle trampoline to propagate blyt_quit(). */
     uint32_t fn_is_quit_requested;
+
+    /* BLYT_TRACE bookkeeping: open frame ("start" emitted, "end" pending),
+     * per-session frame counter for blyt_trace_frame_mark, and the guest
+     * address of the in-flight host-initiated fn call (0 = none) so the
+     * lifecycle "ret <name>" line can name the function that returned. */
+    bool trace_frame_open;
+    uint32_t trace_frame_no;
+    uint32_t trace_fn_addr;
 };
 
 #ifdef BLYT_GDB
@@ -528,8 +537,129 @@ static bool bridge_abs_index(lua_State *EX, int32_t idx, int *out) {
     return false;
 }
 
+static const char *bridge_op_name(uint32_t op) {
+    switch (op) {
+    case BLYT_LUA_OP_GETTOP:
+        return "GETTOP";
+    case BLYT_LUA_OP_SETTOP:
+        return "SETTOP";
+    case BLYT_LUA_OP_PUSHVALUE:
+        return "PUSHVALUE";
+    case BLYT_LUA_OP_TYPE:
+        return "TYPE";
+    case BLYT_LUA_OP_PUSHNIL:
+        return "PUSHNIL";
+    case BLYT_LUA_OP_PUSHBOOLEAN:
+        return "PUSHBOOLEAN";
+    case BLYT_LUA_OP_PUSHINTEGER:
+        return "PUSHINTEGER";
+    case BLYT_LUA_OP_PUSHNUMBER:
+        return "PUSHNUMBER";
+    case BLYT_LUA_OP_PUSHLSTRING:
+        return "PUSHLSTRING";
+    case BLYT_LUA_OP_TOINTEGERX:
+        return "TOINTEGERX";
+    case BLYT_LUA_OP_TONUMBERX:
+        return "TONUMBERX";
+    case BLYT_LUA_OP_TOBOOLEAN:
+        return "TOBOOLEAN";
+    case BLYT_LUA_OP_TOLSTRING:
+        return "TOLSTRING";
+    case BLYT_LUA_OP_CREATETABLE:
+        return "CREATETABLE";
+    case BLYT_LUA_OP_GETFIELD:
+        return "GETFIELD";
+    case BLYT_LUA_OP_SETFIELD:
+        return "SETFIELD";
+    case BLYT_LUA_OP_GETI:
+        return "GETI";
+    case BLYT_LUA_OP_SETI:
+        return "SETI";
+    case BLYT_LUA_OP_RAWLEN:
+        return "RAWLEN";
+    case BLYT_LUA_OP_NEXT:
+        return "NEXT";
+    case BLYT_LUA_OP_GETGLOBAL:
+        return "GETGLOBAL";
+    case BLYT_LUA_OP_SETGLOBAL:
+        return "SETGLOBAL";
+    case BLYT_LUA_OP_ERROR:
+        return "ERROR";
+    case BLYT_LUA_OP_ERRMSG:
+        return "ERRMSG";
+    default:
+        return "?";
+    }
+}
+
+/* One typed api-channel line per bridge op, formatted with the args that
+ * matter for that op (per-API "most useful thing" policy). */
+static void bridge_trace_op(uint32_t opcode, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t st,
+                            uint32_t val, uint32_t aux) {
+    if (!blyt_trace_enabled(BLYT_TRACE_API))
+        return;
+    char args[64];
+    switch (opcode) {
+    case BLYT_LUA_OP_GETTOP:
+    case BLYT_LUA_OP_PUSHNIL:
+    case BLYT_LUA_OP_ERROR:
+        args[0] = '\0';
+        break;
+    case BLYT_LUA_OP_SETTOP:
+    case BLYT_LUA_OP_PUSHVALUE:
+    case BLYT_LUA_OP_TYPE:
+    case BLYT_LUA_OP_TOINTEGERX:
+    case BLYT_LUA_OP_TONUMBERX:
+    case BLYT_LUA_OP_TOBOOLEAN:
+    case BLYT_LUA_OP_RAWLEN:
+    case BLYT_LUA_OP_NEXT:
+        snprintf(args, sizeof args, "idx=%d", (int32_t)a2);
+        break;
+    case BLYT_LUA_OP_PUSHBOOLEAN:
+        snprintf(args, sizeof args, "b=%u", a2 ? 1u : 0u);
+        break;
+    case BLYT_LUA_OP_PUSHINTEGER:
+        snprintf(args, sizeof args, "n=%d", (int32_t)a2);
+        break;
+    case BLYT_LUA_OP_PUSHNUMBER: {
+        float f;
+        memcpy(&f, &a2, 4);
+        snprintf(args, sizeof args, "n=%g", (double)f);
+        break;
+    }
+    case BLYT_LUA_OP_PUSHLSTRING:
+        snprintf(args, sizeof args, "len=%u", a3);
+        break;
+    case BLYT_LUA_OP_TOLSTRING:
+        snprintf(args, sizeof args, "idx=%d, cap=%u", (int32_t)a2, a4);
+        break;
+    case BLYT_LUA_OP_CREATETABLE:
+        snprintf(args, sizeof args, "narr=%d, nrec=%d", (int32_t)a2, (int32_t)a3);
+        break;
+    case BLYT_LUA_OP_GETFIELD:
+    case BLYT_LUA_OP_SETFIELD:
+        snprintf(args, sizeof args, "idx=%d, klen=%u", (int32_t)a2, a4);
+        break;
+    case BLYT_LUA_OP_GETI:
+    case BLYT_LUA_OP_SETI:
+        snprintf(args, sizeof args, "idx=%d, i=%d", (int32_t)a2, (int32_t)a3);
+        break;
+    case BLYT_LUA_OP_GETGLOBAL:
+    case BLYT_LUA_OP_SETGLOBAL:
+    case BLYT_LUA_OP_ERRMSG:
+        snprintf(args, sizeof args, "len=%u", a3);
+        break;
+    default:
+        snprintf(args, sizeof args, "a2=0x%x, a3=0x%x, a4=0x%x", a2, a3, a4);
+        break;
+    }
+    blyt_tracef(BLYT_TRACE_API, "lua_op %s(%s) -> st=%u val=0x%x aux=%u", bridge_op_name(opcode),
+                args, st, val, aux);
+}
+
 /* Raise: leave `err` (already on top of EX) as the pending error, halt. */
 static void bridge_fail(riscv_t *rv) {
+    blyt_tracef(BLYT_TRACE_API, "lua_op %s -> error raised", bridge_op_name(g_bridge_opctx.opcode));
     g_run_ctx->lua_bridge_error = true;
     rv_halt(rv); /* PC NOT advanced: the guest stub never resumes */
 }
@@ -925,11 +1055,13 @@ static void bridge_lua_op(riscv_t *rv) {
     }
 
     default:
+        blyt_tracef(BLYT_TRACE_API, "lua_op unknown opcode %u (trap)", opcode);
         g_run_ctx->ecall_trapped = true;
         rv_halt(rv);
         return;
     }
 
+    bridge_trace_op(opcode, a2, a3, a4, st, val, aux);
     rv_set_reg(rv, rv_reg_a0, st);
     rv_set_reg(rv, rv_reg_a1, val);
     rv_set_reg(rv, rv_reg_a2, aux);
@@ -941,12 +1073,81 @@ static void bridge_lua_op(riscv_t *rv) {
  * ECALL handler (ADR-0085: a0=ptr, a1=len, a7=ecall_number)
  * ------------------------------------------------------------------------- */
 
+static const char *buf_op_name(uint32_t op) {
+    switch (op) {
+    case BUF_OP_GET_F32:
+        return "buf_get_f32";
+    case BUF_OP_SET_F32:
+        return "buf_set_f32";
+    case BUF_OP_GET_I32:
+        return "buf_get_i32";
+    case BUF_OP_SET_I32:
+        return "buf_set_i32";
+    case BUF_OP_GET_U32:
+        return "buf_get_u32";
+    case BUF_OP_SET_U32:
+        return "buf_set_u32";
+    case BUF_OP_GET_I16:
+        return "buf_get_i16";
+    case BUF_OP_SET_I16:
+        return "buf_set_i16";
+    case BUF_OP_GET_U16:
+        return "buf_get_u16";
+    case BUF_OP_SET_U16:
+        return "buf_set_u16";
+    case BUF_OP_GET_I8:
+        return "buf_get_i8";
+    case BUF_OP_SET_I8:
+        return "buf_set_i8";
+    case BUF_OP_GET_U8:
+        return "buf_get_u8";
+    case BUF_OP_SET_U8:
+        return "buf_set_u8";
+    case BUF_OP_GET_BOOL:
+        return "buf_get_bool";
+    case BUF_OP_SET_BOOL:
+        return "buf_set_bool";
+    case BUF_OP_ALLOC_SLOT:
+        return "buf_alloc_slot";
+    case BUF_OP_FREE_SLOT:
+        return "buf_free_slot";
+    default:
+        return "buf_op?";
+    }
+}
+
+/* Typed value formatting for buf get/set traces: f32 as a float, u32
+ * unsigned, everything narrower sign-/zero-extended as the int it is. */
+static void buf_op_trace(uint32_t op, uint32_t buf_id, int32_t slot, uint32_t field,
+                         uint32_t bits) {
+    if (!blyt_trace_enabled(BLYT_TRACE_API))
+        return;
+    int is_set = (op & 1u) == 0 && op <= BUF_OP_SET_BOOL;
+    char vstr[32];
+    if (op == BUF_OP_GET_F32 || op == BUF_OP_SET_F32) {
+        float f;
+        memcpy(&f, &bits, 4);
+        snprintf(vstr, sizeof vstr, "%g", (double)f);
+    } else if (op == BUF_OP_GET_U32 || op == BUF_OP_SET_U32) {
+        snprintf(vstr, sizeof vstr, "%u", bits);
+    } else {
+        snprintf(vstr, sizeof vstr, "%d", (int32_t)bits);
+    }
+    if (is_set)
+        blyt_tracef(BLYT_TRACE_API, "%s(buf=%u, slot=%d, field=%u, v=%s)", buf_op_name(op), buf_id,
+                    slot, field, vstr);
+    else
+        blyt_tracef(BLYT_TRACE_API, "%s(buf=%u, slot=%d, field=%u) -> %s", buf_op_name(op), buf_id,
+                    slot, field, vstr);
+}
+
 static void blyt_ecall_handler(riscv_t *rv) {
     uint32_t num = rv_get_reg(rv, rv_reg_a7);
 
     switch (num) {
     case BLYT_ECALL_EXIT: {
         uint32_t code = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "exit(code=%u)", code);
         rv_halt(rv);
         if (code != 0 && g_run_ctx)
             g_run_ctx->ecall_aborted = true;
@@ -972,6 +1173,13 @@ static void blyt_ecall_handler(riscv_t *rv) {
         }
         buf[i] = '\0';
 
+        if (blyt_trace_enabled(BLYT_TRACE_API)) {
+            uint32_t tl = i;
+            while (tl > 0 && (buf[tl - 1] == '\n' || buf[tl - 1] == '\r'))
+                tl--;
+            blyt_tracef(BLYT_TRACE_API, "console_debug(\"%.*s\")", (int)tl, buf);
+        }
+
         if (g_run_ctx && g_run_ctx->log_fn)
             g_run_ctx->log_fn(buf);
 
@@ -980,6 +1188,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
     }
 
     case BLYT_ECALL_FRAME_DONE: {
+        blyt_tracef(BLYT_TRACE_API, "frame_done()");
         rv->PC += 4;
         /* Enforce FP determinism (ADR-0007): frm must be RNE (0) at every
          * frame boundary.  A non-zero frm means cart/library code called
@@ -1033,6 +1242,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
 
             /* Probe call from blyt_dap_active(): src=0 or line<0 */
             if (src_vaddr == 0 || line < 0) {
+                blyt_tracef(BLYT_TRACE_API, "dap_hook(probe) -> 1");
                 rv_set_reg(rv, rv_reg_a0, 1);
                 rv->PC += 4;
                 return;
@@ -1054,6 +1264,8 @@ static void blyt_ecall_handler(riscv_t *rv) {
             src_buf[ri] = '\0';
 
             int cmd = fc_dap_check_hook_line(src_buf, line, depth);
+            blyt_tracef(BLYT_TRACE_API, "dap_hook(%s:%d, depth=%d) -> %d", src_buf, line, depth,
+                        cmd);
             rv_set_reg(rv, rv_reg_a0, (uint32_t)cmd);
         }
 #else
@@ -1087,6 +1299,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
                 json[i] = (char)c;
             }
             json[i] = '\0';
+            blyt_tracef(BLYT_TRACE_API, "dap_send(len=%u)", i);
             fc_dap_host_send(json, i);
             free(json);
         }
@@ -1117,6 +1330,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
             }
             free(buf);
         }
+        blyt_tracef(BLYT_TRACE_API, "dap_recv -> len=%d", len);
         rv_set_reg(rv, rv_reg_a0, (uint32_t)len);
         rv->PC += 4;
         return;
@@ -1146,6 +1360,8 @@ static void blyt_ecall_handler(riscv_t *rv) {
         }
         msg_buf[mi] = '\0';
         int r6 = fc_dap_on_exception(msg_buf, is_uncaught);
+        blyt_tracef(BLYT_TRACE_API, "dap_exception(\"%s\", uncaught=%d) -> %d", msg_buf,
+                    is_uncaught, r6);
         rv_set_reg(rv, rv_reg_a0, (uint32_t)r6);
         rv->PC += 4;
         return;
@@ -1163,6 +1379,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
             buf7_len = 255u;
         char cond_buf[256];
         int clen = fc_dap_get_condition(cond_buf, (size_t)buf7_len);
+        blyt_tracef(BLYT_TRACE_API, "dap_get_condition -> len=%d", clen);
         if (clen > 0) {
             vm_attr_t *attr7 = PRIV(rv);
             memory_t *mem7 = attr7->mem;
@@ -1181,6 +1398,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
         }
         int result8 = (int)rv_get_reg(rv, rv_reg_a0);
         int r8 = fc_dap_on_condition_result(result8);
+        blyt_tracef(BLYT_TRACE_API, "dap_condition_result(%d) -> %d", result8, r8);
         rv_set_reg(rv, rv_reg_a0, (uint32_t)r8);
         rv->PC += 4;
         return;
@@ -1198,6 +1416,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
         /* Guest function called via blyt_session_begin_fn_call() returned.
          * a0 holds the return value (set by the C function's ret instruction).
          * Signal the host; blyt_session_fn_return_value() will read a0. */
+        blyt_tracef(BLYT_TRACE_API, "host_fn_return(a0=0x%x)", rv_get_reg(rv, rv_reg_a0));
         rv->PC += 4;
         if (g_run_ctx)
             g_run_ctx->fn_return_done = true;
@@ -1231,6 +1450,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
         case BUF_OP_GET_BOOL: {
             uint32_t bits = 0;
             blyt_state_get(sc, buf_id, slot, field, &bits);
+            buf_op_trace(op, buf_id, slot, field, bits);
             rv_set_reg(rv, rv_reg_a0, bits);
             break;
         }
@@ -1244,6 +1464,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
         case BUF_OP_SET_BOOL: {
             /* type_tag = (op / 2) - 1: SET_F32=2→0 (f32=6), etc.
              * We rely on the field declaration's type_tag in blyt_state_set. */
+            buf_op_trace(op, buf_id, slot, field, value_bits);
             blyt_state_set(sc, buf_id, slot, field, value_bits, 0);
             rv_set_reg(rv, rv_reg_a0, 0);
             break;
@@ -1253,6 +1474,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
             uint32_t out_vaddr = (uint32_t)slot; /* slot register holds the ptr */
             int32_t new_slot = -1;
             int r = blyt_state_alloc_slot(sc, buf_id, &new_slot);
+            blyt_tracef(BLYT_TRACE_API, "buf_alloc_slot(buf=%u) -> slot=%d", buf_id, new_slot);
             /* Write result back to guest memory */
             if (out_vaddr) {
                 vm_attr_t *attr = PRIV(rv);
@@ -1265,10 +1487,13 @@ static void blyt_ecall_handler(riscv_t *rv) {
         }
         case BUF_OP_FREE_SLOT: {
             int r = blyt_state_free_slot(sc, buf_id, slot);
+            blyt_tracef(BLYT_TRACE_API, "buf_free_slot(buf=%u, slot=%d) -> %d", buf_id, slot, r);
             rv_set_reg(rv, rv_reg_a0, r == 0 ? 0 : (uint32_t)-1);
             break;
         }
         default:
+            blyt_tracef(BLYT_TRACE_API, "buf_op?(op=%u, buf=%u, slot=%d, field=%u) -> -1", op,
+                        buf_id, slot, field);
             rv_set_reg(rv, rv_reg_a0, (uint32_t)-1);
             break;
         }
@@ -1284,6 +1509,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
             r = blyt_save_write(g_run_ctx->state_ctx, g_run_ctx->save_dir, g_run_ctx->cart_name,
                                 slot_n);
         }
+        blyt_tracef(BLYT_TRACE_API, "save_write(slot=%u) -> %d", slot_n, r);
         rv_set_reg(rv, rv_reg_a0, r == 0 ? 0u : 3u); /* BLYT_ERR_IO=3 */
         rv->PC += 4;
         return;
@@ -1299,6 +1525,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
         }
         /* r==0 → BLYT_OK=0, r==-1 → BLYT_ERR_IO=3, r==-2 → BLYT_ERR_SCHEMA_MISMATCH=5 */
         uint32_t result = (r == 0) ? 0u : (r == -2) ? 5u : 3u;
+        blyt_tracef(BLYT_TRACE_API, "save_read(slot=%u) -> %u", slot_n, result);
         rv_set_reg(rv, rv_reg_a0, result);
         rv->PC += 4;
         return;
@@ -1306,12 +1533,17 @@ static void blyt_ecall_handler(riscv_t *rv) {
 
     case 93: /* SYS_exit (Linux NR 93) — blyt_exit on emulated path */
     case 94: /* SYS_exit_group (Linux NR 94) — blyt_exit on emulated path */
+        blyt_tracef(BLYT_TRACE_API, "sys_exit%s(code=%u)", num == 94 ? "_group" : "",
+                    rv_get_reg(rv, rv_reg_a0));
         rv_halt(rv);
         if (rv_get_reg(rv, rv_reg_a0) != 0 && g_run_ctx)
             g_run_ctx->ecall_aborted = true;
         return;
 
     default:
+        /* Safety net: unknown ECALLs get a generic hex dump before trapping. */
+        blyt_tracef(BLYT_TRACE_API, "unknown ecall a7=%u a0=0x%x a1=0x%x (trap)", num,
+                    rv_get_reg(rv, rv_reg_a0), rv_get_reg(rv, rv_reg_a1));
         rv_halt(rv);
         if (g_run_ctx)
             g_run_ctx->ecall_trapped = true;
@@ -2139,10 +2371,61 @@ static void blyt_bridge_error_unwind(blyt_session_t *session) {
 }
 #endif
 
+/* Map a guest address back to the cart lifecycle callback it belongs to.
+ * Returns NULL for addresses that are not cached lifecycle entry points
+ * (e.g. Lua-export wrappers called via begin_fn_call). */
+static const char *session_fn_name(const blyt_session_t *s, uint32_t addr) {
+    if (addr == 0)
+        return NULL;
+    if (addr == s->fn_init)
+        return "init";
+    if (addr == s->fn_on_save_state)
+        return "on_save_state";
+    if (addr == s->fn_on_load_state)
+        return "on_load_state";
+    if (addr == s->fn_on_new_state)
+        return "on_new_state";
+    if (addr == s->fn_update)
+        return "update";
+    if (addr == s->fn_draw)
+        return "draw";
+    if (addr == s->fn_on_quit)
+        return "on_quit";
+    if (addr == s->fn_cleanup)
+        return "cleanup";
+    if (addr == s->fn_is_quit_requested)
+        return "is_quit_requested";
+    return NULL;
+}
+
+/* Emit the lifecycle "ret <name> a0=…" line for the in-flight host fn call. */
+static void trace_fn_return(blyt_session_t *session) {
+    if (session->trace_fn_addr == 0)
+        return;
+    if (blyt_trace_enabled(BLYT_TRACE_LIFECYCLE)) {
+        const char *nm = session_fn_name(session, session->trace_fn_addr);
+        uint32_t a0 = rv_get_reg(session->rv, rv_reg_a0);
+        if (nm)
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret %s a0=0x%x", nm, a0);
+        else
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret fn@0x%x a0=0x%x", session->trace_fn_addr, a0);
+    }
+    session->trace_fn_addr = 0;
+}
+
 blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     g_run_ctx = &session->ctx;
     session->ctx.frame_done = false;
     session->ctx.fn_return_done = false;
+
+    /* BLYT_TRACE frame channel: open a frame unless this run_frame call is
+     * driving a host-initiated fn call (begin_fn_call) or resuming a frame
+     * already open (e.g. re-entry while GDB-paused). */
+    if (session->trace_fn_addr == 0 && !session->trace_frame_open &&
+        blyt_trace_enabled(BLYT_TRACE_FRAME)) {
+        blyt_tracef(BLYT_TRACE_FRAME, "start");
+        session->trace_frame_open = true;
+    }
     /* Clear any halt set by the previous BLYT_ECALL_FRAME_DONE so the while
      * loop below can execute the new frame.  A halt from blyt_exit/abort would
      * have caused the caller to stop resubmitting frames entirely. */
@@ -2358,6 +2641,11 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
         if (session->ctx.frame_done) {
             if (!session->cart_has_drawn)
                 blyt_testcard_draw(session->frame_count++, session->pixels);
+            if (session->trace_frame_open) {
+                blyt_tracef(BLYT_TRACE_FRAME, "end");
+                session->trace_frame_open = false;
+            }
+            blyt_trace_frame_mark(++session->trace_frame_no);
             g_run_ctx = NULL;
             return BLYT_RUN_FRAME_DONE;
         }
@@ -2365,12 +2653,14 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
 #ifdef BLYT_LUA
             session->ctx.lua_bridge_active = false;
 #endif
+            trace_fn_return(session);
             g_run_ctx = NULL;
             return BLYT_RUN_FN_DONE;
         }
 #ifdef BLYT_LUA
         if (session->ctx.lua_bridge_error) {
             blyt_bridge_error_unwind(session);
+            session->trace_fn_addr = 0;
             g_run_ctx = NULL;
             return BLYT_RUN_FN_ERROR;
         }
@@ -2381,12 +2671,14 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
 #ifdef BLYT_LUA
         session->ctx.lua_bridge_active = false;
 #endif
+        trace_fn_return(session);
         g_run_ctx = NULL;
         return BLYT_RUN_FN_DONE;
     }
 #ifdef BLYT_LUA
     if (session->ctx.lua_bridge_error) {
         blyt_bridge_error_unwind(session);
+        session->trace_fn_addr = 0;
         g_run_ctx = NULL;
         return BLYT_RUN_FN_ERROR;
     }
@@ -2423,6 +2715,14 @@ int blyt_session_begin_fn_call(blyt_session_t *s, uint32_t fn_addr, int nargs,
                                const uint32_t args[]) {
     if (nargs > 4)
         nargs = 4;
+    if (blyt_trace_enabled(BLYT_TRACE_LIFECYCLE)) {
+        const char *nm = session_fn_name(s, fn_addr);
+        if (nm)
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "call %s", nm);
+        else
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "call fn@0x%x", fn_addr);
+    }
+    s->trace_fn_addr = fn_addr;
     s->rv->PC = fn_addr;
     rv_set_reg(s->rv, rv_reg_ra, BLYT_TRAMPOLINE_FN_RETURN_ADDR);
     for (int i = 0; i < nargs; i++)

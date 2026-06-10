@@ -261,6 +261,18 @@ async function run() {
         );
     }
 
+    /* 7b. source — VS Code fetches content for sources it cannot open by
+     * path (e.g. the relative paths Lua chunk names produce).
+     * sourceReference 0 means "the file lives on disk at source.path": the
+     * adapter must answer success with no content so the client keeps the
+     * user's editor buffer instead of replacing it with an error message or
+     * an empty payload. */
+    const src = await request('source', {
+        source:          { path: SOURCE_PATH, sourceReference: 0 },
+        sourceReference: 0,
+    });
+    assert(!src.content, 'source(ref=0): success with no content payload');
+
     /* 8. scopes */
     const topFrameId = stack.stackFrames?.[0]?.id ?? 0;
     const scopes = await request('scopes', { frameId: topFrameId });

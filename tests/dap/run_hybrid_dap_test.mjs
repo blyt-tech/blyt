@@ -21,6 +21,10 @@
 
 'use strict';
 
+/* Debug-driver default: every failure's captured stderr should already carry
+ * a protocol/lifecycle trace.  'api' stays opt-in (high volume). */
+if (!process.env.BLYT_TRACE) process.env.BLYT_TRACE = 'gdb,dap,lifecycle,frame';
+
 import { execFile, spawn }  from 'child_process';
 import { createConnection } from 'net';
 import { fileURLToPath }    from 'url';

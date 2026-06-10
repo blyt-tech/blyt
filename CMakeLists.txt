@@ -279,7 +279,7 @@ add_library(
   libblyt STATIC
   runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
   runtime/host/src/libblyt/state_buffer.c runtime/host/src/libblyt/save.c
-  runtime/host/src/libblyt/testcard.c)
+  runtime/host/src/libblyt/testcard.c runtime/host/src/libblyt/trace.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
 # same static library is usable in both executables and shared objects.
@@ -375,7 +375,7 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     libblyt_debug STATIC
     runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
     runtime/host/src/libblyt/state_buffer.c runtime/host/src/libblyt/save.c
-    runtime/host/src/libblyt/testcard.c)
+    runtime/host/src/libblyt/testcard.c runtime/host/src/libblyt/trace.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
   target_include_directories(
@@ -712,8 +712,9 @@ add_test(NAME test_cart_run COMMAND test_cart_run)
 # can be injected cleanly.  Gated on BLYT_GDB so it is only built when GDB
 # support is compiled in.
 if(BLYT_GDB)
-  add_executable(test_gdb_stub tests/unit/test_gdb_stub.c
-                               runtime/host/src/gdb/gdb_stub.c)
+  add_executable(
+    test_gdb_stub tests/unit/test_gdb_stub.c runtime/host/src/gdb/gdb_stub.c
+                  runtime/host/src/libblyt/trace.c)
   target_include_directories(test_gdb_stub PRIVATE runtime/host/src/gdb
                                                    runtime/host/include)
   # BLYT_GDB enables stub code; BLYT_GDB_TEST exposes fc_gdb_stub_test_reset().

@@ -27,6 +27,11 @@
           "type": "string",
           "default": "",
           "description": "Path to the blyt SDK directory (contains bin/blyt, bin/blytplay, bin/blyt-clang, etc.). Also settable via the BLYT_SDK_DIR environment variable."
+        },
+        "blyt.traceChannels": {
+          "type": "string",
+          "default": "gdb,dap,lifecycle,frame",
+          "description": "BLYT_TRACE channels passed (via --trace) to debug sessions: comma list of gdb,dap,lifecycle,api,frame, or \"all\". Empty disables tracing."
         }
       }
     },

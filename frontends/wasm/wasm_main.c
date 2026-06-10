@@ -33,6 +33,7 @@
 #include <string.h>
 
 #include "blyt_runtime.h"
+#include "blyt_trace.h"
 
 #ifdef BLYT_LUA
 #include "save.h"
@@ -712,10 +713,13 @@ static int wasm_lua_save_write(lua_State *L) {
     uint32_t slot = (uint32_t)luaL_checkinteger(L, 1);
     /* Ask cart to flush transient state into buffers before persisting. */
     lua_getglobal(L, "on_save_state");
-    if (lua_isfunction(L, -1))
+    if (lua_isfunction(L, -1)) {
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_save_state");
         lua_pcall(L, 0, 0, 0);
-    else
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_save_state");
+    } else {
         lua_pop(L, 1);
+    }
     int r = -1;
     blyt_state_ctx_t *ctx = active_state_ctx();
     if (ctx)
@@ -734,12 +738,14 @@ static int wasm_lua_save_read(lua_State *L) {
     if (r == BLYT_RUN_OK) {
         lua_getglobal(L, "on_load_state");
         if (lua_isfunction(L, -1)) {
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_load_state");
             lua_newtable(L);
             lua_pushinteger(L, 0); /* reason=BLYT_LOAD_EXPLICIT */
             lua_setfield(L, -2, "reason");
             lua_pushinteger(L, 0);
             lua_setfield(L, -2, "saved_cart_version");
             lua_pcall(L, 1, 0, 0);
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_load_state");
         } else {
             lua_pop(L, 1);
         }
@@ -942,10 +948,13 @@ static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
 static void wasm_lua_reset_cycle(void) {
     /* Step 1: flush live state to buffers */
     lua_getglobal(g_lua, "on_save_state");
-    if (lua_isfunction(g_lua, -1))
+    if (lua_isfunction(g_lua, -1)) {
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_save_state");
         lua_pcall(g_lua, 0, 0, 0);
-    else
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_save_state");
+    } else {
         lua_pop(g_lua, 1);
+    }
 
     /* Step 2: snapshot state buffers */
     blyt_state_snapshot_t *snap = NULL;
@@ -1081,10 +1090,13 @@ static void wasm_lua_reset_cycle(void) {
 
     /* Step 12: call init() from C (no coroutine needed for this reset call) */
     lua_getglobal(g_lua, "init");
-    if (lua_isfunction(g_lua, -1))
+    if (lua_isfunction(g_lua, -1)) {
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call init");
         lua_pcall(g_lua, 0, 0, 0);
-    else
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret init");
+    } else {
         lua_pop(g_lua, 1);
+    }
 
     /* Step 13: restore state buffers from snapshot */
     if (snap) {
@@ -1095,12 +1107,14 @@ static void wasm_lua_reset_cycle(void) {
     /* Step 14: notify cart that state was restored (reason=BLYT_LOAD_HOT_RELOAD=3) */
     lua_getglobal(g_lua, "on_load_state");
     if (lua_isfunction(g_lua, -1)) {
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_load_state");
         lua_newtable(g_lua);
         lua_pushinteger(g_lua, 3);
         lua_setfield(g_lua, -2, "reason");
         lua_pushinteger(g_lua, 0);
         lua_setfield(g_lua, -2, "saved_cart_version");
         lua_pcall(g_lua, 1, 0, 0);
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_load_state");
     } else {
         lua_pop(g_lua, 1);
     }
@@ -1261,6 +1275,15 @@ static void wasm_lua_loop(void) {
     }
 
     /* ---- RUNNING phase ---- */
+    /* BLYT_TRACE frame channel for the host-Lua fast path.  The open flag
+     * survives DAP/GDB pause round-trips so a resumed frame does not emit a
+     * second "start". */
+    static bool trace_frame_open;
+    static uint32_t trace_frame_no;
+    if (!trace_frame_open && blyt_trace_enabled(BLYT_TRACE_FRAME)) {
+        blyt_tracef(BLYT_TRACE_FRAME, "start");
+        trace_frame_open = true;
+    }
     g_lua_drawn = false;
     int nres = 0;
     int status = lua_resume(g_lua_co, g_lua, 0, &nres);
@@ -1300,6 +1323,12 @@ static void wasm_lua_loop(void) {
 
     if (!g_lua_drawn)
         render_testcard();
+
+    if (trace_frame_open) {
+        blyt_tracef(BLYT_TRACE_FRAME, "end");
+        trace_frame_open = false;
+    }
+    blyt_trace_frame_mark(++trace_frame_no);
 
     blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
 

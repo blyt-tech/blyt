@@ -41,6 +41,17 @@
       /* Relay ports injected by `blyt run --debug`.  0 when debugging is not active. */
       window.blyt_dap_port = {{BLYT_DAP_PORT}};
       window.blyt_gdb_port = {{BLYT_GDB_PORT}};
+      /* Trace channels injected by `blyt run/debug --trace` ("" when off).
+       * module_pre.js copies __blyt_env_vars into the Emscripten ENV before C
+       * startup, so the runtime's getenv("BLYT_TRACE") sees the channels.
+       * Lives in this script block on purpose: when the template is loaded
+       * without replacement, the port lines above are a syntax error and the
+       * whole block (including this) is inert. */
+      if ("{{BLYT_TRACE}}") {
+        globalThis.__blyt_env_vars = Object.assign(globalThis.__blyt_env_vars || {}, {
+          BLYT_TRACE: "{{BLYT_TRACE}}",
+        });
+      }
     </script>
     <script>
       /* Pre-load the cart into the Emscripten virtual filesystem before

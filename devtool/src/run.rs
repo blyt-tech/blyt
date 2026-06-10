@@ -61,16 +61,30 @@ impl Mode {
 }
 
 /// Serve a release cart in the browser (no debugger).
-pub fn run(cart_path: &Path) -> Result<(), RunError> {
-    serve_cart(cart_path, Mode::Release)
+pub fn run(cart_path: &Path, trace: Option<&str>) -> Result<(), RunError> {
+    serve_cart(cart_path, Mode::Release, trace)
 }
 
 /// Serve a debug cart with the DAP/GDB debug runtime.
-pub fn debug(cart_path: &Path) -> Result<(), RunError> {
-    serve_cart(cart_path, Mode::Debug)
+pub fn debug(cart_path: &Path, trace: Option<&str>) -> Result<(), RunError> {
+    serve_cart(cart_path, Mode::Debug, trace)
 }
 
-fn serve_cart(cart_path: &Path, mode: Mode) -> Result<(), RunError> {
+/// Resolve the BLYT_TRACE channel list for the served runtime: the --trace
+/// flag wins, then the BLYT_TRACE environment variable.  Sanitised to the
+/// channel-list alphabet so the value is safe to splice into the shell.html
+/// script template.
+fn resolve_trace(flag: Option<&str>) -> String {
+    let raw = flag
+        .map(str::to_owned)
+        .or_else(|| std::env::var("BLYT_TRACE").ok())
+        .unwrap_or_default();
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == ',' || *c == '_')
+        .collect()
+}
+
+fn serve_cart(cart_path: &Path, mode: Mode, trace: Option<&str>) -> Result<(), RunError> {
     let cart_path = cart_path
         .canonicalize()
         .map_err(|e| err(format!("cannot open cart '{}': {}", cart_path.display(), e)))?;
@@ -120,9 +134,14 @@ fn serve_cart(cart_path: &Path, mode: Mode) -> Result<(), RunError> {
         (0, 0)
     };
 
+    let trace = resolve_trace(trace);
+
     println!("blyt run: serving on http://127.0.0.1:{port}/");
     println!("  Cart:     {}", cart_path.display());
     println!("  WASM dir: {}", wasm_dir.display());
+    if !trace.is_empty() {
+        println!("  Trace:    {trace} (BLYT_TRACE — browser console / stderr)");
+    }
     println!();
     println!("Open http://127.0.0.1:{port}/ in your browser.");
     println!("Press Ctrl+C to stop.");
@@ -138,6 +157,7 @@ fn serve_cart(cart_path: &Path, mode: Mode) -> Result<(), RunError> {
         Arc::new(wasm_dir),
         Arc::new(cart_path),
         Arc::new(name.to_string()),
+        Arc::new(trace),
         dap_ws_port,
         gdb_ws_port,
     )
@@ -394,6 +414,18 @@ fn read_cl(r: &mut impl BufRead) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn resolve_trace_prefers_flag_and_sanitises() {
+        assert_eq!(resolve_trace(Some("api,frame")), "api,frame");
+        // Characters outside the channel-list alphabet are stripped so the
+        // value is safe to splice into the shell.html script template.
+        assert_eq!(
+            resolve_trace(Some("api\"</script><script>,frame")),
+            "apiscriptscript,frame"
+        );
+        assert_eq!(resolve_trace(Some("")), "");
+    }
 
     #[test]
     fn cl_codec_roundtrip() {
@@ -772,6 +804,7 @@ fn serve(
     wasm_dir: Arc<PathBuf>,
     cart_path: Arc<PathBuf>,
     wasm_name: Arc<String>,
+    trace: Arc<String>,
     dap_port: u16,
     gdb_port: u16,
 ) -> Result<(), RunError> {
@@ -783,9 +816,10 @@ fn serve(
         let wasm_dir = Arc::clone(&wasm_dir);
         let cart_path = Arc::clone(&cart_path);
         let wasm_name = Arc::clone(&wasm_name);
+        let trace = Arc::clone(&trace);
         std::thread::spawn(move || {
             handle_connection(
-                stream, &wasm_dir, &cart_path, &wasm_name, dap_port, gdb_port,
+                stream, &wasm_dir, &cart_path, &wasm_name, &trace, dap_port, gdb_port,
             );
         });
     }
@@ -797,6 +831,7 @@ fn handle_connection(
     wasm_dir: &Path,
     cart_path: &Path,
     wasm_name: &str,
+    trace: &str,
     dap_port: u16,
     gdb_port: u16,
 ) {
@@ -839,11 +874,13 @@ fn handle_connection(
     match fs::read(&file_path) {
         Ok(data) => {
             if inject_dap {
-                // Replace {{BLYT_DAP_PORT}} and {{BLYT_GDB_PORT}} with actual relay ports.
+                // Replace {{BLYT_DAP_PORT}}/{{BLYT_GDB_PORT}} with the relay
+                // ports and {{BLYT_TRACE}} with the trace channel list ("" off).
                 let html = String::from_utf8_lossy(&data);
                 let patched = html
                     .replace("{{BLYT_DAP_PORT}}", &dap_port.to_string())
-                    .replace("{{BLYT_GDB_PORT}}", &gdb_port.to_string());
+                    .replace("{{BLYT_GDB_PORT}}", &gdb_port.to_string())
+                    .replace("{{BLYT_TRACE}}", trace);
                 respond(&mut stream, 200, content_type, patched.as_bytes());
             } else {
                 respond(&mut stream, 200, content_type, &data);

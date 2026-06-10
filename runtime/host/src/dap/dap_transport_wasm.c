@@ -32,6 +32,7 @@
 #include "lstate.h" /* TStatus, L->status — needed to temp-clear yield flag during eval pcall */
 #include "lua.h"
 
+#include "blyt_trace.h"
 #include "dap_server.h"
 #include "master_hook.h"
 
@@ -182,7 +183,19 @@ EM_JS(void, wdap_ws_send_js, (const char *json_ptr), {
 
 /* clang-format on */
 
+/* Trace WebSocket connect/disconnect transitions.  There is no connection
+ * callback into C, so the transition is detected where state is polled. */
+static void wdap_trace_conn(void) {
+    static int was_connected;
+    int now = wdap_is_connected_js();
+    if (now != was_connected) {
+        blyt_tracef(BLYT_TRACE_DAP, now ? "client connected" : "client disconnected");
+        was_connected = now;
+    }
+}
+
 static void send_json(const char *json) {
+    blyt_tracef(BLYT_TRACE_DAP, "send %s", json);
     wdap_ws_send_js(json);
 }
 
@@ -732,6 +745,7 @@ static void handle_set_exception_breakpoints(int seq, const char *args) {
 /* ── Dispatcher ────────────────────────────────────────────────────────────── */
 
 static void dispatch(const char *msg) {
+    blyt_tracef(BLYT_TRACE_DAP, "recv %s", msg);
     int seq = json_get_int(msg, "seq", 0);
     char cmd[64];
     if (!json_get_string(msg, "command", cmd, sizeof cmd))
@@ -800,6 +814,7 @@ EM_JS(char *, wdap_dequeue_json, (void), {
 
 /* Drain the message queue and dispatch each JSON message. */
 static void drain_queue(void) {
+    wdap_trace_conn();
     while (wdap_queue_length() > 0) {
         char *json = wdap_dequeue_json();
         if (!json)

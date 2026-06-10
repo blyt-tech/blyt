@@ -144,6 +144,7 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index, unsig
 
 static int g_dap_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static int g_gdb_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
+static const char *g_trace = NULL; /* --trace: BLYT_TRACE channel list */
 static int g_quit_after = -1; /* -1 = disabled; >=0 = exit after N frames */
 static bool g_reset_every_frame =
     false; /* --reset-every-frame: run a save/clear/restore cycle after each frame */
@@ -237,6 +238,10 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
                 g_gdb_port = 0;
         } else if (strcmp(argv[i], "--quit-after") == 0 && i + 1 < argc) {
             g_quit_after = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--trace") == 0 && i + 1 < argc) {
+            g_trace = argv[++i];
+        } else if (strncmp(argv[i], "--trace=", 8) == 0) {
+            g_trace = argv[i] + 8;
         } else if (strcmp(argv[i], "--reset-every-frame") == 0) {
             g_reset_every_frame = true;
         } else if (argv[i][0] != '-') {
@@ -259,6 +264,11 @@ int main(int argc, char *argv[]) {
 
     bool debug_mode = (g_dap_port >= 0 || g_gdb_port >= 0);
     maybe_setenv_lib_dir(debug_mode);
+
+    /* --trace is just the flag form of the BLYT_TRACE env var (same pattern
+     * as --debug → BLYT_DAP_PORT); set it before retro_init(). */
+    if (g_trace)
+        setenv("BLYT_TRACE", g_trace, 1);
 
 #ifdef BLYT_DAP
     if (g_dap_port >= 0) {

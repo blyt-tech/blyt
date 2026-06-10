@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "blyt_trace.h"
 #include "dap_server.h"
 
 /* Step modes (must match dap_step_mode_t in master_hook.h). */
@@ -194,6 +195,8 @@ static int write_all(int fd, const char *p, size_t n) {
 static void send_msg(const char *json) {
     if (g_dap.client_fd < 0)
         return;
+    /* Covers responses, events, and guest-built JSON via fc_dap_host_send. */
+    blyt_tracef(BLYT_TRACE_DAP, "send %s", json);
     char hdr[64];
     int hn = snprintf(hdr, sizeof hdr, "Content-Length: %zu\r\n\r\n", strlen(json));
     pthread_mutex_lock(&g_dap.mu);
@@ -521,6 +524,19 @@ static void handle_restart(int seq, const char *args) {
     send_event("initialized", "{}");
 }
 
+static void handle_source(int seq, const char *args) {
+    int ref = json_get_int(args, "sourceReference", -1);
+    if (ref == 0) {
+        /* sourceReference=0 means the file lives on disk at source.path.
+         * Return success with no content so VS Code continues with navigation
+         * but does NOT replace the editor buffer with an empty payload (or,
+         * worse, with the failure message of an unhandled request). */
+        send_response(seq, "source", 1, "{}");
+    } else {
+        send_response(seq, "source", 0, "source not available");
+    }
+}
+
 static void handle_loaded_sources(int seq, const char *args) {
     (void)args;
     static char body[MAX_MSG];
@@ -551,6 +567,7 @@ static void handle_set_exception_breakpoints(int seq, const char *args) {
 /* ── Dispatcher ────────────────────────────────────────────────────────────── */
 
 static void dispatch(const char *msg) {
+    blyt_tracef(BLYT_TRACE_DAP, "recv %s", msg);
     int seq = json_get_int(msg, "seq", 0);
     char cmd[64];
     if (!json_get_string(msg, "command", cmd, sizeof cmd))
@@ -606,6 +623,8 @@ static void dispatch(const char *msg) {
         handle_disconnect(seq, msg);
     else if (strcmp(cmd, "terminate") == 0)
         handle_disconnect(seq, msg);
+    else if (strcmp(cmd, "source") == 0)
+        handle_source(seq, msg);
     else if (strcmp(cmd, "loadedSources") == 0)
         handle_loaded_sources(seq, msg);
     else
@@ -664,12 +683,14 @@ static void *dap_thread_main(void *arg) {
         g_dap.client_fd = fd;
         g_dap.n_sources = 0;
         pthread_mutex_unlock(&g_dap.mu);
+        blyt_tracef(BLYT_TRACE_DAP, "client connected");
         while (g_dap.running) {
             int n = read_msg(fd, buf, sizeof buf);
             if (n <= 0)
                 break;
             dispatch(buf);
         }
+        blyt_tracef(BLYT_TRACE_DAP, "client disconnected");
         pthread_mutex_lock(&g_dap.mu);
         close(fd);
         g_dap.client_fd = -1;
