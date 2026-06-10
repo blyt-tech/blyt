@@ -85,8 +85,11 @@ macro(blyt_set_variant _var)
   endif()
 endmacro()
 
-# Declare one guest .so as a ninja rule.  ARGS = clang args after RV32_BASE
-# (must include -o <out>); release variants get a strip pass appended.
+# Declare one guest .so as a single compile+link ninja rule.  ARGS = clang args
+# after RV32_BASE (must include -o <out>); release variants get a strip pass
+# appended.  Used for trivial single-source / non-file-source libs; the
+# multi-source libs go through blyt_guest_so_objs below so each TU is its own
+# cacheable, parallel, depfile-tracked rule.
 function(blyt_guest_so out strip comment)
   cmake_parse_arguments(G "" "" "ARGS;DEPENDS" ${ARGN})
   set(_link COMMAND "${BLYT_RV32_CLANG}" ${RV32_BASE} ${G_ARGS})
@@ -107,24 +110,121 @@ function(blyt_guest_so out strip comment)
     VERBATIM)
 endfunction()
 
+# ── Per-object compilation ───────────────────────────────────────────────────
+#
+# Compile-phase subset of RV32_BASE: only flags that affect codegen of a -c
+# compile.  Link-only flags (-shared, -nostdlib, -Wl,--shared, -fuse-ld) are
+# excluded; -fsemantic-interposition stays (codegen flag, see RV32_BASE).
+set(RV32_COMPILE_BASE
+    --target=riscv32-linux-gnu
+    -march=rv32imafc
+    -mabi=ilp32f
+    -fPIC
+    -fsemantic-interposition
+    -I
+    "${CMAKE_SOURCE_DIR}/runtime/guest/include")
+
+set(GUEST_OBJ_ROOT "${CMAKE_BINARY_DIR}/guest-obj")
+
+# ccache launcher for the per-object compiles (cmake/blyt_ccache.cmake); empty
+# list when ccache is absent.
+set(GUEST_CC_LAUNCHER)
+if(BLYT_CCACHE_PROGRAM)
+  set(GUEST_CC_LAUNCHER "${BLYT_CCACHE_PROGRAM}")
+endif()
+
+# Compile SRCS to one object per source under guest-obj/<objns>/, returning the
+# object list (source order preserved — lld's first-wins symbol semantics and
+# the ADR-0129 interposition layering depend on it) in <outvar>. Pre-built .o
+# entries in SRCS pass through in place.  Each compile is its own ninja rule
+# with a depfile, so header edits recompile exactly the affected objects, ninja
+# parallelises within a library, and ccache caches every TU. BASE overrides the
+# compile base flags (default RV32_COMPILE_BASE).
+function(blyt_guest_objects outvar objns)
+  cmake_parse_arguments(O "" "" "SRCS;CFLAGS;BASE" ${ARGN})
+  if(NOT O_BASE)
+    set(O_BASE ${RV32_COMPILE_BASE})
+  endif()
+  set(_objs)
+  foreach(_src ${O_SRCS})
+    if(_src MATCHES "\\.o$")
+      list(APPEND _objs "${_src}")
+      continue()
+    endif()
+    file(RELATIVE_PATH _rel "${CMAKE_SOURCE_DIR}" "${_src}")
+    set(_obj "${GUEST_OBJ_ROOT}/${objns}/${_rel}.o")
+    get_filename_component(_objdir "${_obj}" DIRECTORY)
+    file(MAKE_DIRECTORY "${_objdir}")
+    add_custom_command(
+      OUTPUT "${_obj}"
+      COMMAND ${GUEST_CC_LAUNCHER} "${BLYT_RV32_CLANG}" ${O_BASE} ${O_CFLAGS}
+              -MD -MF "${_obj}.d" -c "${_src}" -o "${_obj}"
+      DEPENDS "${_src}"
+      DEPFILE "${_obj}.d"
+      COMMENT "CC(rv32) ${objns}/${_rel}"
+      VERBATIM)
+    list(APPEND _objs "${_obj}")
+  endforeach()
+  set(${outvar}
+      "${_objs}"
+      PARENT_SCOPE)
+endfunction()
+
+# Declare one guest .so from per-object compiles + a link step.  The link
+# command must stay byte-for-byte equivalent to the old single-command form:
+# same RV32_BASE, LINK_ARGS in the old argument order (soname, version scripts,
+# --no-as-needed/--as-needed bracketed .so inputs), then -o and the objects in
+# source order.  OBJNS namespaces the object dir (include the variant so
+# release/debug objects never collide).  LINK_DEPENDS lists link inputs
+# (.so/.sym) — kept off the compile rules so relinking a dependency does not
+# recompile this library's objects.
+function(blyt_guest_so_objs out strip comment)
+  cmake_parse_arguments(G "" "OBJNS" "SRCS;CFLAGS;LINK_ARGS;LINK_DEPENDS"
+                        ${ARGN})
+  blyt_guest_objects(_objs "${G_OBJNS}" SRCS ${G_SRCS} CFLAGS ${G_CFLAGS})
+  set(_link
+      COMMAND
+      "${BLYT_RV32_CLANG}"
+      ${RV32_BASE}
+      -Wno-unused-command-line-argument
+      ${G_LINK_ARGS}
+      -o
+      "${out}"
+      ${_objs})
+  if(strip AND BLYT_RV32_OBJCOPY)
+    list(
+      APPEND
+      _link
+      COMMAND
+      "${BLYT_RV32_OBJCOPY}"
+      --strip-debug
+      --strip-unneeded
+      "${out}")
+  endif()
+  add_custom_command(
+    OUTPUT "${out}" ${_link}
+    DEPENDS ${_objs} ${G_LINK_DEPENDS}
+    COMMENT "${comment}"
+    VERBATIM)
+endfunction()
+
 # ── libblytcommon.so — variant-portable blyt.h ECALL stubs ──────────────────
 set(LIBBLYTCOMMON_SRC
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c")
 foreach(_var release debug)
   blyt_set_variant(${_var})
-  blyt_guest_so(
+  blyt_guest_so_objs(
     "${_VDIR}/libblytcommon.so"
     ${_VSTRIP}
-    "Cross-compiling libblytcommon.so (${_var})"
-    ARGS
+    "Linking libblytcommon.so (${_var})"
+    OBJNS
+    libblytcommon-${_var}
+    SRCS
+    "${LIBBLYTCOMMON_SRC}"
+    CFLAGS
     ${_VOPT}
-    -Wl,-soname,libblytcommon.so
-    -o
-    "${_VDIR}/libblytcommon.so"
-    "${LIBBLYTCOMMON_SRC}"
-    DEPENDS
-    "${LIBBLYTCOMMON_SRC}"
-    "${BLYT_H}")
+    LINK_ARGS
+    -Wl,-soname,libblytcommon.so)
 endforeach()
 set(LIBBLYTCOMMON_OUT "${SDK_LIB}/libblytcommon.so")
 
@@ -265,21 +365,20 @@ set(LIBBLYTC_CFLAGS
 
 foreach(_var release debug)
   blyt_set_variant(${_var})
-  blyt_guest_so(
+  blyt_guest_so_objs(
     "${_VDIR}/libblytc.so"
     ${_VSTRIP}
-    "Cross-compiling libblytc.so (${_var}, musl subset)"
-    ARGS
+    "Linking libblytc.so (${_var}, musl subset)"
+    OBJNS
+    libblytc-${_var}
+    SRCS
+    ${LIBBLYTC_SRCS}
+    CFLAGS
     ${LIBBLYTC_INCLUDES}
     ${LIBBLYTC_CFLAGS}
     ${_VOPT}
-    -Wl,-soname,libblytc.so
-    -o
-    "${_VDIR}/libblytc.so"
-    ${LIBBLYTC_SRCS}
-    DEPENDS
-    ${LIBBLYTC_SRCS}
-    "${LIBBLYTC_ALLTYPES_H}")
+    LINK_ARGS
+    -Wl,-soname,libblytc.so)
 endforeach()
 set(LIBBLYTC_OUT "${SDK_LIB}/libblytc.so")
 
@@ -371,40 +470,32 @@ endif()
 # hardware trusted-exec path where ld.so resolves against it directly.
 foreach(_var release debug)
   blyt_set_variant(${_var})
-  blyt_guest_so(
+  blyt_guest_so_objs(
     "${_VDIR}/libblyt32.so"
     ${_VSTRIP}
-    "Cross-compiling libblyt32.so (${_var})"
-    ARGS
+    "Linking libblyt32.so (${_var})"
+    OBJNS
+    libblyt32-${_var}
+    SRCS
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
+    ${LIBBLYTC_SRCS}
+    ${SF_ALL}
+    ${SF_RISCV}
+    ${SF_MWORD}
+    ${SF_BUILTINS}
+    CFLAGS
     ${LIBBLYTC_INCLUDES}
     ${LIBBLYTC_CFLAGS}
     ${SF_INCLUDES}
     ${SF_DEFINES}
     ${_VOPT}
+    LINK_ARGS
     -Wl,-soname,libblyt32.so
     -Wl,--no-as-needed
     "${_VDIR}/libblytc.so"
     -Wl,--as-needed
-    -o
-    "${_VDIR}/libblyt32.so"
-    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
-    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
-    ${LIBBLYTC_SRCS}
-    ${SF_ALL}
-    ${SF_RISCV}
-    ${SF_MWORD}
-    ${SF_BUILTINS}
-    DEPENDS
-    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
-    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
-    ${LIBBLYTC_SRCS}
-    ${SF_ALL}
-    ${SF_RISCV}
-    ${SF_MWORD}
-    ${SF_BUILTINS}
-    "${BLYT_H}"
-    "${BLYT32_H}"
-    "${LIBBLYTC_ALLTYPES_H}"
+    LINK_DEPENDS
     "${_VDIR}/libblytc.so")
 endforeach()
 set(LIBBLYT32_OUT "${SDK_LIB}/libblyt32.so")
@@ -461,11 +552,15 @@ else()
 
   # libblytcommonlua.so — standalone sandboxed Lua VM (tooling use; carts get
   # the VM via libblyt32lua.so below).
-  blyt_guest_so(
+  blyt_guest_so_objs(
     "${SDK_LIB}/libblytcommonlua.so"
     FALSE
-    "Cross-compiling libblytcommonlua.so"
-    ARGS
+    "Linking libblytcommonlua.so"
+    OBJNS
+    libblytcommonlua
+    SRCS
+    ${LUA_GUEST_SRCS}
+    CFLAGS
     ${LUA_MUSL_INCLUDES}
     ${LIBBLYTC_CFLAGS}
     -DLUA_32BITS=1
@@ -473,13 +568,8 @@ else()
     ${LUA_SEED_DEF}
     -I
     "${LUA_DIR}"
-    -Wl,-soname,libblytcommonlua.so
-    -o
-    "${SDK_LIB}/libblytcommonlua.so"
-    ${LUA_GUEST_SRCS}
-    DEPENDS
-    ${LUA_GUEST_SRCS}
-    "${LIBBLYTC_ALLTYPES_H}")
+    LINK_ARGS
+    -Wl,-soname,libblytcommonlua.so)
   list(APPEND _guest_lib_outputs "${SDK_LIB}/libblytcommonlua.so")
 
   # libblyt32lua.so — Lua VM embedded directly (exports lua_*/luaL_* in .dynsym)
@@ -499,11 +589,24 @@ else()
       set(_VLUA_DAP_FLAGS "")
       set(_VLUA_DAP_SRCS "")
     endif()
-    blyt_guest_so(
+    blyt_guest_so_objs(
       "${_VDIR}/libblyt32lua.so"
       ${_VSTRIP}
-      "Cross-compiling libblyt32lua.so (${_var})"
-      ARGS
+      "Linking libblyt32lua.so (${_var})"
+      OBJNS
+      libblyt32lua-${_var}
+      SRCS
+      ${LUA_GUEST_SRCS}
+      "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
+      "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S"
+      ${SF_ALL}
+      ${SF_RISCV}
+      ${SF_MWORD}
+      "${LUA32_DIR}/softfloat_builtins.c"
+      "${LUA32_DIR}/lua_runtime_stubs.c"
+      "${LUA32_DIR}/blyt32lua.c"
+      ${_VLUA_DAP_SRCS}
+      CFLAGS
       ${LUA_MUSL_INCLUDES}
       ${LIBBLYTC_CFLAGS}
       ${_VOPT}
@@ -515,33 +618,13 @@ else()
       "${LUA_DIR}"
       ${SF_INCLUDES}
       ${SF_DEFINES}
+      LINK_ARGS
       -Wl,-soname,libblyt32lua.so
       "-Wl,--version-script,${LUA32_SYM}"
       -Wl,--as-needed
       "${_VDIR}/libblyt32.so"
-      -o
-      "${_VDIR}/libblyt32lua.so"
-      ${LUA_GUEST_SRCS}
-      "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
-      "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S"
-      ${SF_ALL}
-      ${SF_RISCV}
-      ${SF_MWORD}
-      "${LUA32_DIR}/softfloat_builtins.c"
-      "${LUA32_DIR}/lua_runtime_stubs.c"
-      "${LUA32_DIR}/blyt32lua.c"
-      ${_VLUA_DAP_SRCS}
-      DEPENDS
-      ${LUA_GUEST_SRCS}
-      ${SF_ALL}
-      ${SF_RISCV}
-      ${SF_MWORD}
-      "${LUA32_DIR}/softfloat_builtins.c"
-      "${LUA32_DIR}/lua_runtime_stubs.c"
-      "${LUA32_DIR}/blyt32lua.c"
-      ${_VLUA_DAP_SRCS}
+      LINK_DEPENDS
       "${LUA32_SYM}"
-      "${BLYT_LUA_INTERNAL_H}"
       "${_VDIR}/libblyt32.so")
     list(APPEND _guest_lib_outputs "${_VDIR}/libblyt32lua.so")
   endforeach()
@@ -556,25 +639,25 @@ else()
   )
   foreach(_var release debug)
     blyt_set_variant(${_var})
-    blyt_guest_so(
+    blyt_guest_so_objs(
       "${_VDIR}/libblyt32lua-bridge.so"
       ${_VSTRIP}
-      "Cross-compiling libblyt32lua-bridge.so (${_var})"
-      ARGS
+      "Linking libblyt32lua-bridge.so (${_var})"
+      OBJNS
+      libblyt32lua-bridge-${_var}
+      SRCS
+      "${LUA_BRIDGE_SRC}"
+      CFLAGS
       ${LIBBLYTC_CFLAGS}
       ${_VOPT}
+      LINK_ARGS
       -Wl,-soname,libblyt32lua.so
       "-Wl,--version-script,${LUA32_SYM}"
       -Wl,--no-as-needed
       "${_VDIR}/libblyt32.so"
       -Wl,--as-needed
-      -o
-      "${_VDIR}/libblyt32lua-bridge.so"
-      "${LUA_BRIDGE_SRC}"
-      DEPENDS
-      "${LUA_BRIDGE_SRC}"
+      LINK_DEPENDS
       "${LUA32_SYM}"
-      "${BLYT_LUA_INTERNAL_H}"
       "${_VDIR}/libblyt32.so")
     list(APPEND _guest_lib_outputs "${_VDIR}/libblyt32lua-bridge.so")
   endforeach()
@@ -745,13 +828,28 @@ if(BLYT_BUILD_NATIVE)
         -nostdlib
         -no-pie
         "-fuse-ld=${BLYT_RV32_LLD}")
+    # Per-object compile base for the partial link: _RV32_PARTIAL's codegen
+    # subset — deliberately NO -fsemantic-interposition (the old single command
+    # never had it) and no guest-include -I.
+    set(_RV32_PARTIAL_COMPILE --target=riscv32-linux-gnu -march=rv32imafc
+                              -mabi=ilp32f -fPIC)
+    blyt_guest_objects(
+      _libblytc_native_objs
+      libblytc-native-partial
+      BASE
+      ${_RV32_PARTIAL_COMPILE}
+      SRCS
+      ${_LIBBLYTC_NATIVE_SRCS}
+      CFLAGS
+      ${LIBBLYTC_INCLUDES}
+      ${LIBBLYTC_CFLAGS}
+      -O2)
     add_custom_command(
       OUTPUT "${_LIBBLYTC_NATIVE_OBJ}"
       COMMAND
-        "${BLYT_RV32_CLANG}" ${_RV32_PARTIAL} ${LIBBLYTC_INCLUDES}
-        ${LIBBLYTC_CFLAGS} -O2 "-Wl,-r" -o "${_LIBBLYTC_NATIVE_OBJ}"
-        ${_LIBBLYTC_NATIVE_SRCS}
-      DEPENDS ${_LIBBLYTC_NATIVE_SRCS} "${LIBBLYTC_ALLTYPES_H}"
+        "${BLYT_RV32_CLANG}" ${_RV32_PARTIAL} -Wno-unused-command-line-argument
+        "-Wl,-r" -o "${_LIBBLYTC_NATIVE_OBJ}" ${_libblytc_native_objs}
+      DEPENDS ${_libblytc_native_objs}
       COMMENT "Partial-linking libblytc_native.o"
       VERBATIM)
 
@@ -771,32 +869,13 @@ if(BLYT_BUILD_NATIVE)
       -o
       "${_LIBC_STUB}")
 
-    blyt_guest_so(
+    blyt_guest_so_objs(
       "${SDK_LIB_NATIVE}/libblyt32lua.so"
       TRUE
-      "Cross-compiling libblyt32lua.so (native)"
-      ARGS
-      ${LUA_MUSL_INCLUDES}
-      ${LIBBLYTC_CFLAGS}
-      -O2
-      -DLUA_32BITS=1
-      -DLUA_USE_LONGJMP=1
-      ${LUA_SEED_DEF}
-      -I
-      "${LUA_DIR}"
-      ${SF_INCLUDES}
-      ${SF_DEFINES}
-      -Wl,-soname,libblyt32lua.so
-      "-Wl,--version-script,${LUA32_SYM}"
-      -Wl,-z,now
-      # --no-as-needed forces DT_NEEDED: libc.so even though the stub exports
-      # nothing; the is_self path adds ldso to the symbol chain.
-      -Wl,--no-as-needed
-      "${_LIBC_STUB}"
-      -Wl,--as-needed
-      "${SDK_LIB_NATIVE}/libblyt32.so"
-      -o
-      "${SDK_LIB_NATIVE}/libblyt32lua.so"
+      "Linking libblyt32lua.so (native)"
+      OBJNS
+      libblyt32lua-native
+      SRCS
       ${LUA_GUEST_SRCS}
       "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
       "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S"
@@ -808,16 +887,29 @@ if(BLYT_BUILD_NATIVE)
       "${LUA32_DIR}/lua_native_malloc.c"
       "${LUA32_DIR}/lua_native_stubs.c"
       "${LUA32_DIR}/blyt32lua.c"
-      DEPENDS
-      ${LUA_GUEST_SRCS}
-      ${SF_ALL}
-      ${SF_RISCV}
-      ${SF_MWORD}
-      "${LUA32_DIR}/softfloat_builtins.c"
+      CFLAGS
+      ${LUA_MUSL_INCLUDES}
+      ${LIBBLYTC_CFLAGS}
+      -O2
+      -DLUA_32BITS=1
+      -DLUA_USE_LONGJMP=1
+      ${LUA_SEED_DEF}
+      -I
+      "${LUA_DIR}"
+      ${SF_INCLUDES}
+      ${SF_DEFINES}
+      LINK_ARGS
+      -Wl,-soname,libblyt32lua.so
+      "-Wl,--version-script,${LUA32_SYM}"
+      -Wl,-z,now
+      # --no-as-needed forces DT_NEEDED: libc.so even though the stub exports
+      # nothing; the is_self path adds ldso to the symbol chain.
+      -Wl,--no-as-needed
+      "${_LIBC_STUB}"
+      -Wl,--as-needed
+      "${SDK_LIB_NATIVE}/libblyt32.so"
+      LINK_DEPENDS
       "${_LIBBLYTC_NATIVE_OBJ}"
-      "${LUA32_DIR}/lua_native_malloc.c"
-      "${LUA32_DIR}/lua_native_stubs.c"
-      "${LUA32_DIR}/blyt32lua.c"
       "${LUA32_SYM}"
       "${_LIBC_STUB}"
       "${SDK_LIB_NATIVE}/libblyt32.so")
