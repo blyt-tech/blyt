@@ -86,6 +86,47 @@ static int jget_str(const char *buf, const char *key, char *out, size_t n) {
     return 1;
 }
 
+/* ── BLYT_TRACE dap channel (native path) ─────────────────────────────────
+ *
+ * Self-contained mirror of the host trace module's dap channel: the host
+ * trace code cannot run inside the ILP32 cart process, so the env check and
+ * emission live here.  Lines use the host format minus frame/time counters
+ * and go straight to fd 2 via a raw SYS_write (seccomp-allowlisted) —
+ * deliberately not blyt_console_debug, whose own api-channel trace line
+ * would echo every dap line a second time. */
+static void mh_trace(const char *dir, const char *msg) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = 0;
+        const char *p = getenv("BLYT_TRACE");
+        while (p && *p) {
+            if (((p[0] == 'd' && p[1] == 'a' && p[2] == 'p') ||
+                 (p[0] == 'a' && p[1] == 'l' && p[2] == 'l')) &&
+                (p[3] == '\0' || p[3] == ',')) {
+                enabled = 1;
+                break;
+            }
+            while (*p && *p != ',')
+                p++;
+            if (*p)
+                p++;
+        }
+    }
+    if (!enabled)
+        return;
+    static char line[1024];
+    int n = snprintf(line, sizeof line, "[blyt:dap] %s %.900s\n", dir, msg);
+    if (n <= 0)
+        return;
+    if ((size_t)n >= sizeof line)
+        n = (int)sizeof(line) - 1;
+    register long a0 __asm__("a0") = 2; /* STDERR_FILENO */
+    register const char *a1 __asm__("a1") = line;
+    register long a2 __asm__("a2") = n;
+    register long a7 __asm__("a7") = 64; /* SYS_write */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+}
+
 /* ── Response helpers ─────────────────────────────────────────────────────── */
 
 static int g_seq = 1000;
@@ -102,6 +143,7 @@ static void send_resp(int req_seq, const char *cmd, int ok, const char *body) {
                  "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,"
                  "\"command\":\"%s\",\"success\":false,\"message\":\"%s\"}",
                  g_seq++, req_seq, cmd, body ? body : "");
+    mh_trace("send", g_out);
     fc_dap_host_send(g_out, strlen(g_out));
 }
 
@@ -295,6 +337,7 @@ void fc_dap_pause_loop(lua_State *L, lua_Debug *ar) {
             break;
 
         recv_buf[len] = '\0';
+        mh_trace("recv", recv_buf);
         int seq = jget_int(recv_buf, "seq", 0);
         char cmd[64] = {0};
         jget_str(recv_buf, "command", cmd, sizeof cmd);

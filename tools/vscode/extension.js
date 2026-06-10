@@ -335,6 +335,9 @@ function startNativeDebug(cartPath, cwd, output, isLua) {
         const proc = cp.spawn(blytdebug, [flag, '0', cartPath], {
             cwd,
             stdio: ['ignore', 'pipe', 'pipe'],
+            /* Manual debug sessions always carry the protocol/lifecycle trace
+             * in the output channel ('api' stays opt-in — high volume). */
+            env: { ...process.env, BLYT_TRACE: process.env.BLYT_TRACE || 'gdb,dap,lifecycle,frame' },
         });
 
         let buf = '', resolved = false;
@@ -389,6 +392,8 @@ function startHybridNativeDebug(cartPath, cwd, output) {
         const proc = cp.spawn(blytdebug, ['--debug', '0', '--gdb', '0', cartPath], {
             cwd,
             stdio: ['ignore', 'pipe', 'pipe'],
+            /* Same default trace channels as startNativeDebug. */
+            env: { ...process.env, BLYT_TRACE: process.env.BLYT_TRACE || 'gdb,dap,lifecycle,frame' },
         });
 
         let buf = '', dapPort = 0, gdbPort = 0, resolved = false;

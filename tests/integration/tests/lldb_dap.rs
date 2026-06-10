@@ -41,6 +41,7 @@ fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::pat
     // can extract the GDB port, then keep it alive for the lldb-dap session.
     let mut blytplay_proc = std::process::Command::new(blytdebug())
         .args(["--gdb", "0", "--headless", cart.to_str().unwrap()])
+        .env("BLYT_TRACE", "gdb,dap,lifecycle,frame")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -51,10 +52,22 @@ fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::pat
     let stdout = blytplay_proc.stdout.take().unwrap();
     let mut stderr = blytplay_proc.stderr.take().unwrap();
 
-    // Drain stderr in a background thread so it doesn't block the process.
-    std::thread::spawn(move || {
-        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-    });
+    // Capture stderr (carries the BLYT_TRACE protocol trace) in a background
+    // thread so it doesn't block the process; printed on failure below.
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let stderr_buf = stderr_buf.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stderr_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+    }
 
     // Read stdout until the port announcement or EOF.
     let stdout_reader = BufReader::new(stdout);
@@ -104,7 +117,14 @@ fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::pat
 
     let _ = blytplay_proc.kill();
 
-    result.success();
+    if let Err(e) = result.try_success() {
+        let captured = stderr_buf.lock().unwrap();
+        eprintln!(
+            "--- blytdebug stderr (BLYT_TRACE) ---\n{}",
+            String::from_utf8_lossy(&captured)
+        );
+        panic!("{e}");
+    }
 }
 
 /* ── Tests ───────────────────────────────────────────────────────────────── */

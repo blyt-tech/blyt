@@ -16,6 +16,7 @@
 #include <pthread.h>
 #endif
 
+#include "blyt_trace.h"
 #include "gdb_stub.h"
 
 #define MAX_PACKET (1 << 16)
@@ -108,6 +109,7 @@ static int hex_decode(const char *src, uint8_t *dst, size_t cap) {
 static void send_response(const char *payload) {
     if (!g_gdb.transport || !g_gdb.transport->send_pkt)
         return;
+    blyt_tracef(BLYT_TRACE_GDB, "send %s", payload);
     GDB_LOCK();
     g_gdb.transport->send_pkt(payload);
     GDB_UNLOCK();
@@ -380,6 +382,12 @@ static int handle_vCont(const char *args, char *out, size_t cap) {
 static void handle_packet(const char *pkt) {
     static char out[MAX_PACKET];
     out[0] = '\0';
+
+    /* Inbound trace at the stub level covers the TCP and WASM transports. */
+    if (pkt[0] == '\x03' && pkt[1] == '\0')
+        blyt_tracef(BLYT_TRACE_GDB, "recv ^C (interrupt)");
+    else
+        blyt_tracef(BLYT_TRACE_GDB, "recv %s", pkt);
 
     if (strncmp(pkt, "qSupported", 10) == 0) {
         handle_qSupported(out, sizeof out);

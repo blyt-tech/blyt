@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "blyt_trace.h"
 #include "gdb_stub.h"
 
 #define MAX_PACKET (1 << 16)
@@ -133,6 +134,7 @@ static void *tcp_thread(void *arg) {
             continue;
         }
         g_tcp.client_fd = fd;
+        blyt_tracef(BLYT_TRACE_GDB, "client connected");
         fc_gdb_stub_set_has_client(1);
         /* Drive packet loop: read from socket, process via stub. */
         while (g_tcp.running) {
@@ -142,6 +144,7 @@ static void *tcp_thread(void *arg) {
             fc_gdb_stub_process_pkt(pkt);
         }
         g_tcp.client_fd = -1;
+        blyt_tracef(BLYT_TRACE_GDB, "client disconnected");
         fc_gdb_stub_set_has_client(0);
         close(fd);
     }

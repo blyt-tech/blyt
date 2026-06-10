@@ -14,6 +14,13 @@
  *   1–49     lifecycle (console_debug, frame_done, …)
  *   100–199  graphics
  *   …
+ *
+ * BLYT_TRACE convention: every ECALL case in blyt_ecall_handler() (and every
+ * bridge sub-op in bridge_lua_op()) emits one typed blyt_tracef(BLYT_TRACE_API,
+ * …) line using the cart-facing public name and the most useful formatting for
+ * that API (ints as ints, slots as slots, strings dereferenced).  When adding
+ * a new ECALL number here, add its trace line in the handler too — only the
+ * default/unknown path falls back to a generic hex dump.
  */
 #define BLYT_ECALL_EXIT 0 /* halt emulation; a0=exit code (0=clean, 1=abort) */
 #define BLYT_ECALL_CONSOLE_DEBUG 1 /* blyt_console_debug: a0=ptr, a1=len */

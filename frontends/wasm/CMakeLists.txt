@@ -315,6 +315,7 @@ add_executable(
   "${BLYT_ROOT}/runtime/host/src/libblyt/state_buffer.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/save.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c"
+  "${BLYT_ROOT}/runtime/host/src/libblyt/trace.c"
   ${BLYT_LUA_SOURCES}
   ${BLYT_DAP_SOURCES}
   ${BLYT_GDB_SOURCES})
