@@ -2,9 +2,9 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytdebug, build_cart, build_debug_cart, build_debug_lua_cart, find_symbol_addr,
+    CartProject, blytdebug, build_cart, build_debug_cart, build_debug_lua_cart,
     find_wasm_debug_dir, repo_root, require_gdb, require_lua_sdk, require_rust_riscv_target,
-    require_sdk, require_wasm_debug,
+    require_sdk, require_symbol_addr, require_wasm_debug,
 };
 use tempfile::TempDir;
 
@@ -66,21 +66,7 @@ fn sdl_gdb_breakpoint_step() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let addr = find_symbol_addr(&cart, "blyt_cart_init");
-    if addr.is_none() {
-        // readelf not available or symbol stripped — fall back to handshake only.
-        let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
-        Command::new("node")
-            .args([
-                orchestrator.to_str().unwrap(),
-                blytdebug().to_str().unwrap(),
-                cart.to_str().unwrap(),
-            ])
-            .assert()
-            .success();
-        return;
-    }
-    let addr = addr.unwrap();
+    let addr = require_symbol_addr(&cart, "blyt_cart_init");
 
     let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
     Command::new("node")
@@ -128,8 +114,7 @@ fn sdl_gdb_rust_cart() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    // Find the function address; fall back to plain handshake if readelf is absent.
-    let addr = find_symbol_addr(&cart, "blyt_cart_init");
+    let addr = require_symbol_addr(&cart, "blyt_cart_init");
     let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
     let mut cmd = Command::new("node");
     cmd.args([
@@ -137,9 +122,7 @@ fn sdl_gdb_rust_cart() {
         blytdebug().to_str().unwrap(),
         cart.to_str().unwrap(),
     ]);
-    if let Some(a) = addr {
-        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
-    }
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"));
     cmd.assert().success();
 }
 
@@ -174,7 +157,7 @@ fn wasm_gdb_rust_cart() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let addr = find_symbol_addr(&cart, "blyt_cart_init");
+    let addr = require_symbol_addr(&cart, "blyt_cart_init");
     let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
     let mut cmd = Command::new("node");
     cmd.args([
@@ -182,9 +165,7 @@ fn wasm_gdb_rust_cart() {
         find_wasm_debug_dir().to_str().unwrap(),
         cart.to_str().unwrap(),
     ]);
-    if let Some(a) = addr {
-        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
-    }
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"));
     cmd.assert().success();
 }
 
@@ -243,7 +224,7 @@ fn wasm_gdb_breakpoint_step() {
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let addr = find_symbol_addr(&cart, "blyt_cart_init");
+    let addr = require_symbol_addr(&cart, "blyt_cart_init");
     let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
     let mut cmd = Command::new("node");
     cmd.args([
@@ -251,9 +232,7 @@ fn wasm_gdb_breakpoint_step() {
         find_wasm_debug_dir().to_str().unwrap(),
         cart.to_str().unwrap(),
     ]);
-    if let Some(a) = addr {
-        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
-    }
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"));
     cmd.assert().success();
 }
 
@@ -320,7 +299,7 @@ function draw()   end\n";
 
     // Look up blyt_native_work in the cart ELF symbol table.  With --debug
     // the symbol is in .symtab even though it is statically linked in.
-    let addr = find_symbol_addr(&cart, "blyt_native_work");
+    let addr = require_symbol_addr(&cart, "blyt_native_work");
 
     let orchestrator = repo_root().join("tests/gdb/run_sdl_hybrid_test.mjs");
     let mut cmd = Command::new("node");
@@ -330,9 +309,7 @@ function draw()   end\n";
         cart.to_str().unwrap(),
     ]);
 
-    if let Some(a) = addr {
-        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
-    }
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"));
 
     cmd.assert().success();
 }
@@ -382,7 +359,7 @@ function draw()   end\n";
     let cart = build_debug_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let addr = find_symbol_addr(&cart, "blyt_native_work");
+    let addr = require_symbol_addr(&cart, "blyt_native_work");
     let wasm_dir = find_wasm_debug_dir();
     let orchestrator = repo_root().join("tests/gdb/run_wasm_hybrid_test.mjs");
 
@@ -393,15 +370,7 @@ function draw()   end\n";
         cart.to_str().unwrap(),
     ]);
 
-    // Missing prerequisites are test failures, not silent skips: without the
-    // break address the orchestrator skips the entire GDB native-breakpoint
-    // section and the test passes vacuously (this hid a real Linux-only
-    // regression on macOS, which has no GNU readelf).
-    let a = addr.expect(
-        "blyt_native_work symbol not found in cart — \
-         install readelf or llvm-readelf (brew install llvm)",
-    );
-    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"));
 
     cmd.timeout(std::time::Duration::from_secs(60))
         .assert()
@@ -423,8 +392,8 @@ fn wasm_c_cart_gdb_memory_read() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let bp_addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
-    let mem_addr = find_symbol_addr(&cart, "g_counter");
+    let bp_addr = require_symbol_addr(&cart, "blyt_debug_bp_target");
+    let mem_addr = require_symbol_addr(&cart, "g_counter");
     let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
     let mut cmd = Command::new("node");
     cmd.args([
@@ -432,10 +401,8 @@ fn wasm_c_cart_gdb_memory_read() {
         find_wasm_debug_dir().to_str().unwrap(),
         cart.to_str().unwrap(),
     ]);
-    if let (Some(bp), Some(mem)) = (bp_addr, mem_addr) {
-        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{bp:x}"));
-        cmd.env("BLYT_GDB_MEM_ADDR", format!("{mem:x}"));
-    }
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{bp_addr:x}"));
+    cmd.env("BLYT_GDB_MEM_ADDR", format!("{mem_addr:x}"));
     cmd.assert().success();
 }
 
@@ -452,36 +419,23 @@ fn wasm_c_cart_gdb_multi_breakpoints() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let addr1 = find_symbol_addr(&cart, "blyt_debug_bp_target");
-    let addr2 = find_symbol_addr(&cart, "blyt_debug_bp2");
-    let addr3 = find_symbol_addr(&cart, "blyt_debug_bp3");
+    let addr1 = require_symbol_addr(&cart, "blyt_debug_bp_target");
+    let addr2 = require_symbol_addr(&cart, "blyt_debug_bp2");
+    let addr3 = require_symbol_addr(&cart, "blyt_debug_bp3");
 
-    match (addr1, addr2, addr3) {
-        (Some(a1), Some(a2), Some(a3)) => {
-            let orchestrator = repo_root().join("tests/gdb/run_wasm_multi_bp_test.mjs");
-            Command::new("node")
-                .args([
-                    orchestrator.to_str().unwrap(),
-                    find_wasm_debug_dir().to_str().unwrap(),
-                    cart.to_str().unwrap(),
-                ])
-                .env("BLYT_GDB_BP_ADDRS", format!("{a1:x},{a2:x},{a3:x}"))
-                .assert()
-                .success();
-        }
-        _ => {
-            // readelf not available — fall back to basic handshake.
-            let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
-            Command::new("node")
-                .args([
-                    orchestrator.to_str().unwrap(),
-                    find_wasm_debug_dir().to_str().unwrap(),
-                    cart.to_str().unwrap(),
-                ])
-                .assert()
-                .success();
-        }
-    }
+    let orchestrator = repo_root().join("tests/gdb/run_wasm_multi_bp_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            find_wasm_debug_dir().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env(
+            "BLYT_GDB_BP_ADDRS",
+            format!("{addr1:x},{addr2:x},{addr3:x}"),
+        )
+        .assert()
+        .success();
 }
 
 /// WASM GDB: detach after a breakpoint stop — cart continues to completion.
@@ -497,7 +451,7 @@ fn wasm_c_cart_gdb_detach() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let addr = require_symbol_addr(&cart, "blyt_debug_bp_target");
     let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
     let mut cmd = Command::new("node");
     cmd.args([
@@ -506,9 +460,7 @@ fn wasm_c_cart_gdb_detach() {
         cart.to_str().unwrap(),
     ])
     .env("BLYT_GDB_DETACH", "1");
-    if let Some(a) = addr {
-        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
-    }
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"));
     cmd.assert().success();
 }
 
@@ -652,12 +604,7 @@ fn wasm_c_cart_gdb_register_write() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists());
 
-    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
-    if addr.is_none() {
-        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
-        return;
-    }
-    let break_addr = format!("{:x}", addr.unwrap());
+    let break_addr = format!("{:x}", require_symbol_addr(&cart, "blyt_debug_bp_target"));
 
     let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
     Command::new("node")
@@ -684,12 +631,7 @@ fn wasm_c_cart_gdb_thread_stop_info() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists());
 
-    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
-    if addr.is_none() {
-        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
-        return;
-    }
-    let break_addr = format!("{:x}", addr.unwrap());
+    let break_addr = format!("{:x}", require_symbol_addr(&cart, "blyt_debug_bp_target"));
 
     let orchestrator = repo_root().join("tests/gdb/run_gdb_test.mjs");
     Command::new("node")
@@ -747,21 +689,8 @@ fn sdl_c_cart_gdb_memory_read() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let bp_addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
-    let mem_addr = find_symbol_addr(&cart, "g_counter");
-    if bp_addr.is_none() || mem_addr.is_none() {
-        // readelf not available — fall back to basic handshake.
-        let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
-        Command::new("node")
-            .args([
-                orchestrator.to_str().unwrap(),
-                blytdebug().to_str().unwrap(),
-                cart.to_str().unwrap(),
-            ])
-            .assert()
-            .success();
-        return;
-    }
+    let bp_addr = require_symbol_addr(&cart, "blyt_debug_bp_target");
+    let mem_addr = require_symbol_addr(&cart, "g_counter");
 
     let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
     Command::new("node")
@@ -770,8 +699,8 @@ fn sdl_c_cart_gdb_memory_read() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_GDB_BREAK_ADDR", format!("{:x}", bp_addr.unwrap()))
-        .env("BLYT_GDB_MEM_ADDR", format!("{:x}", mem_addr.unwrap()))
+        .env("BLYT_GDB_BREAK_ADDR", format!("{bp_addr:x}"))
+        .env("BLYT_GDB_MEM_ADDR", format!("{mem_addr:x}"))
         .assert()
         .success();
 }
@@ -794,36 +723,23 @@ fn sdl_c_cart_gdb_multi_breakpoints() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let addr1 = find_symbol_addr(&cart, "blyt_debug_bp_target");
-    let addr2 = find_symbol_addr(&cart, "blyt_debug_bp2");
-    let addr3 = find_symbol_addr(&cart, "blyt_debug_bp3");
+    let addr1 = require_symbol_addr(&cart, "blyt_debug_bp_target");
+    let addr2 = require_symbol_addr(&cart, "blyt_debug_bp2");
+    let addr3 = require_symbol_addr(&cart, "blyt_debug_bp3");
 
-    match (addr1, addr2, addr3) {
-        (Some(a1), Some(a2), Some(a3)) => {
-            let orchestrator = repo_root().join("tests/gdb/run_sdl_multi_bp_test.mjs");
-            Command::new("node")
-                .args([
-                    orchestrator.to_str().unwrap(),
-                    blytdebug().to_str().unwrap(),
-                    cart.to_str().unwrap(),
-                ])
-                .env("BLYT_GDB_BP_ADDRS", format!("{a1:x},{a2:x},{a3:x}"))
-                .assert()
-                .success();
-        }
-        _ => {
-            // readelf not available — fall back to basic handshake.
-            let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
-            Command::new("node")
-                .args([
-                    orchestrator.to_str().unwrap(),
-                    blytdebug().to_str().unwrap(),
-                    cart.to_str().unwrap(),
-                ])
-                .assert()
-                .success();
-        }
-    }
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_multi_bp_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env(
+            "BLYT_GDB_BP_ADDRS",
+            format!("{addr1:x},{addr2:x},{addr3:x}"),
+        )
+        .assert()
+        .success();
 }
 
 /// SDL2 GDB: detach after a breakpoint stop — cart continues to completion.
@@ -844,7 +760,7 @@ fn sdl_c_cart_gdb_detach() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
+    let addr = require_symbol_addr(&cart, "blyt_debug_bp_target");
     let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
     let mut cmd = Command::new("node");
     cmd.args([
@@ -853,9 +769,7 @@ fn sdl_c_cart_gdb_detach() {
         cart.to_str().unwrap(),
     ])
     .env("BLYT_GDB_DETACH", "1");
-    if let Some(a) = addr {
-        cmd.env("BLYT_GDB_BREAK_ADDR", format!("{a:x}"));
-    }
+    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"));
     cmd.assert().success();
 }
 
@@ -1075,12 +989,7 @@ fn sdl_c_cart_gdb_register_write() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists());
 
-    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
-    if addr.is_none() {
-        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
-        return;
-    }
-    let break_addr = format!("{:x}", addr.unwrap());
+    let break_addr = format!("{:x}", require_symbol_addr(&cart, "blyt_debug_bp_target"));
 
     let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
     Command::new("node")
@@ -1112,12 +1021,7 @@ fn sdl_c_cart_gdb_thread_stop_info() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists());
 
-    let addr = find_symbol_addr(&cart, "blyt_debug_bp_target");
-    if addr.is_none() {
-        println!("skipping: blyt_debug_bp_target not found (readelf unavailable)");
-        return;
-    }
-    let break_addr = format!("{:x}", addr.unwrap());
+    let break_addr = format!("{:x}", require_symbol_addr(&cart, "blyt_debug_bp_target"));
 
     let orchestrator = repo_root().join("tests/gdb/run_sdl_gdb_test.mjs");
     Command::new("node")
