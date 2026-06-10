@@ -824,6 +824,19 @@ pub fn require_lldb_dap() {
 /// Find the virtual address of a symbol in a cart ELF using `readelf -s`.
 ///
 /// Returns `None` if `readelf` is not available or the symbol is not found.
+/// find_symbol_addr or panic.  Missing symbol lookup must be a test failure,
+/// not a silent skip or a degraded handshake-only fallback: vacuous passes on
+/// macOS (which lacks GNU readelf) hid a Linux-only GDB regression (65d8341).
+pub fn require_symbol_addr(cart: &std::path::Path, symbol: &str) -> u64 {
+    find_symbol_addr(cart, symbol).unwrap_or_else(|| {
+        panic!(
+            "symbol {symbol} not found in {} — install readelf or llvm-readelf \
+             (brew install llvm); symbol lookup must not be skipped",
+            cart.display()
+        )
+    })
+}
+
 pub fn find_symbol_addr(cart: &std::path::Path, symbol: &str) -> Option<u64> {
     // GNU readelf on Linux; llvm-readelf elsewhere (macOS has no readelf —
     // falling through silently here used to skip the GDB native-breakpoint

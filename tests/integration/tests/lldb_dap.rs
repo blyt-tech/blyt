@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytdebug, build_debug_cart, find_symbol_addr, lldb_dap_bin, repo_root,
-    require_gdb, require_lldb_dap, require_sdk,
+    CartProject, blytdebug, build_debug_cart, lldb_dap_bin, repo_root, require_gdb,
+    require_lldb_dap, require_sdk, require_symbol_addr,
 };
 use std::time::Duration;
 use tempfile::TempDir;
@@ -150,12 +150,9 @@ fn sdl_native_lldb_dap_source_breakpoint() {
     assert!(cart.exists());
 
     // Verify DWARF is present by checking we can find the test function.
-    let addr = find_symbol_addr(&cart, "blyt_lldb_test_fn");
-    if addr.is_none() {
-        // DWARF not available — skip source-level test.
-        println!("skipping: blyt_lldb_test_fn symbol not found (readelf unavailable)");
-        return;
-    }
+    // Asserts symbol lookup works (DWARF/symtab present); the value itself
+    // is not needed — lldb-dap sets the breakpoint by source line.
+    require_symbol_addr(&cart, "blyt_lldb_test_fn");
 
     run_lldb_dap_test("source-breakpoint", &project, &cart);
 }
@@ -178,11 +175,9 @@ fn sdl_native_lldb_dap_auto_start() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists());
 
-    let addr = find_symbol_addr(&cart, "blyt_lldb_test_fn");
-    if addr.is_none() {
-        println!("skipping: blyt_lldb_test_fn not found (readelf unavailable)");
-        return;
-    }
+    // Asserts symbol lookup works (DWARF/symtab present); the value itself
+    // is not needed — lldb-dap sets the breakpoint by source line.
+    require_symbol_addr(&cart, "blyt_lldb_test_fn");
 
     run_lldb_dap_test("auto-start", &project, &cart);
 }
@@ -205,11 +200,9 @@ fn sdl_native_lldb_dap_stack_trace() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists());
 
-    let addr = find_symbol_addr(&cart, "blyt_lldb_test_fn");
-    if addr.is_none() {
-        println!("skipping: blyt_lldb_test_fn not found");
-        return;
-    }
+    // Asserts symbol lookup works (DWARF/symtab present); the value itself
+    // is not needed — lldb-dap sets the breakpoint by source line.
+    require_symbol_addr(&cart, "blyt_lldb_test_fn");
 
     run_lldb_dap_test("stack-trace", &project, &cart);
 }
@@ -233,11 +226,9 @@ fn sdl_native_lldb_dap_variables() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists());
 
-    let addr = find_symbol_addr(&cart, "blyt_lldb_test_fn");
-    if addr.is_none() {
-        println!("skipping: blyt_lldb_test_fn not found");
-        return;
-    }
+    // Asserts symbol lookup works (DWARF/symtab present); the value itself
+    // is not needed — lldb-dap sets the breakpoint by source line.
+    require_symbol_addr(&cart, "blyt_lldb_test_fn");
 
     run_lldb_dap_test("variables", &project, &cart);
 }
@@ -261,11 +252,9 @@ fn sdl_native_lldb_dap_source_map() {
     let cart = build_debug_cart(&project);
     assert!(cart.exists());
 
-    let addr = find_symbol_addr(&cart, "blyt_lldb_test_fn");
-    if addr.is_none() {
-        println!("skipping: blyt_lldb_test_fn not found");
-        return;
-    }
+    // Asserts symbol lookup works (DWARF/symtab present); the value itself
+    // is not needed — lldb-dap sets the breakpoint by source line.
+    require_symbol_addr(&cart, "blyt_lldb_test_fn");
 
     run_lldb_dap_test("source-map", &project, &cart);
 }
