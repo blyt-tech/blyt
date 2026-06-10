@@ -83,6 +83,16 @@ function sdkDir() {
         || process.env.BLYT_SDK_DIR || '').trim();
 }
 
+/* BLYT_TRACE channels for debug sessions, passed as a --trace parameter to
+ * blytdebug / `blyt debug` so failures always carry a protocol/lifecycle
+ * trace ('api' stays opt-in — high volume).  Empty disables tracing. */
+function traceChannels() {
+    return vscode.workspace
+        .getConfiguration('blyt')
+        .get('traceChannels', 'gdb,dap,lifecycle,frame')
+        .trim();
+}
+
 /* Returns the path to the blyt binary, or null (silently) if the SDK is not
  * configured.  Use this for background / auto-setup paths. */
 function findBlytSilent() {
@@ -226,8 +236,13 @@ function buildCart(cwd, output, debug = false) {
 function startBlytRun(cartPath, cwd, output) {
     const blyt = findBlyt();
     if (!blyt) return Promise.reject(new Error('blyt SDK not configured'));
+    const args = ['debug', cartPath];
+    const trace = traceChannels();
+    /* Trace lands in the BROWSER dev console for this flow: the WASM runtime's
+     * stderr goes to printErr in the page, not to this process. */
+    if (trace) args.push(`--trace=${trace}`);
     return new Promise((resolve, reject) => {
-        const proc = cp.spawn(blyt, ['debug', cartPath], {
+        const proc = cp.spawn(blyt, args, {
             cwd,
             stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -331,13 +346,13 @@ function startNativeDebug(cartPath, cwd, output, isLua) {
     const blytdebug = findSdkBin('blytdebug');
     if (!blytdebug) return Promise.reject(new Error('blytdebug not found in SDK'));
     const flag = isLua ? '--debug' : '--gdb';
+    const args = [flag, '0', cartPath];
+    const trace = traceChannels();
+    if (trace) args.unshift(`--trace=${trace}`);
     return new Promise((resolve, reject) => {
-        const proc = cp.spawn(blytdebug, [flag, '0', cartPath], {
+        const proc = cp.spawn(blytdebug, args, {
             cwd,
             stdio: ['ignore', 'pipe', 'pipe'],
-            /* Manual debug sessions always carry the protocol/lifecycle trace
-             * in the output channel ('api' stays opt-in — high volume). */
-            env: { ...process.env, BLYT_TRACE: process.env.BLYT_TRACE || 'gdb,dap,lifecycle,frame' },
         });
 
         let buf = '', resolved = false;
@@ -388,12 +403,13 @@ function startNativeDebug(cartPath, cwd, output, isLua) {
 function startHybridNativeDebug(cartPath, cwd, output) {
     const blytdebug = findSdkBin('blytdebug');
     if (!blytdebug) return Promise.reject(new Error('blytdebug not found in SDK'));
+    const hybridArgs = ['--debug', '0', '--gdb', '0', cartPath];
+    const hybridTrace = traceChannels();
+    if (hybridTrace) hybridArgs.unshift(`--trace=${hybridTrace}`);
     return new Promise((resolve, reject) => {
-        const proc = cp.spawn(blytdebug, ['--debug', '0', '--gdb', '0', cartPath], {
+        const proc = cp.spawn(blytdebug, hybridArgs, {
             cwd,
             stdio: ['ignore', 'pipe', 'pipe'],
-            /* Same default trace channels as startNativeDebug. */
-            env: { ...process.env, BLYT_TRACE: process.env.BLYT_TRACE || 'gdb,dap,lifecycle,frame' },
         });
 
         let buf = '', dapPort = 0, gdbPort = 0, resolved = false;

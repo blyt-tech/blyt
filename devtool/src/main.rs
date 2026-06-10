@@ -26,12 +26,22 @@ enum Commands {
     Run {
         /// Path to the .blyt cart file to run
         cart: PathBuf,
+
+        /// Trace channels for the served runtime (comma list of
+        /// gdb,dap,lifecycle,api,frame — or "all"); falls back to BLYT_TRACE
+        #[arg(long, value_name = "CHANNELS")]
+        trace: Option<String>,
     },
 
     /// Serve a debug .dbg.blyt cart with the DAP/GDB debug runtime (ADR-0129)
     Debug {
         /// Path to the debug .dbg.blyt cart file to debug
         cart: PathBuf,
+
+        /// Trace channels for the served runtime (comma list of
+        /// gdb,dap,lifecycle,api,frame — or "all"); falls back to BLYT_TRACE
+        #[arg(long, value_name = "CHANNELS")]
+        trace: Option<String>,
     },
 
     /// Configure IDE and tooling integration for a cart project
@@ -150,9 +160,13 @@ fn main() {
                 .map_err(|e| e.to_string())
         }
 
-        Commands::Run { cart } => run::run(&cart).map_err(|e| e.to_string()),
+        Commands::Run { cart, trace } => {
+            run::run(&cart, trace.as_deref()).map_err(|e| e.to_string())
+        }
 
-        Commands::Debug { cart } => run::debug(&cart).map_err(|e| e.to_string()),
+        Commands::Debug { cart, trace } => {
+            run::debug(&cart, trace.as_deref()).map_err(|e| e.to_string())
+        }
 
         Commands::Setup {
             sub: SetupSubcommand::Vscode { project_dir, force },

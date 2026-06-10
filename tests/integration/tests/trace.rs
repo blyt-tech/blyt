@@ -246,6 +246,67 @@ fn trace_api_frame_channels_wasm() {
     assert_api_frame_trace(&stderr, "wasm");
 }
 
+/* ── blyt debug (browser flow) ───────────────────────────────────────────── */
+
+/// `blyt debug --trace=<list>` injects the channel list into the served
+/// shell page ({{BLYT_TRACE}} → __blyt_env_vars → Emscripten ENV), so the
+/// browser runtime traces without any env var on the devtool process.
+#[test]
+fn trace_param_injected_into_served_page() {
+    use std::io::{Read as _, Write as _};
+    require_sdk();
+    common::require_wasm_debug();
+
+    // Reuse the debug hello cart built by `blyt build --debug` (Lua carts are
+    // debuggable as-is, so build one here from the trace cart project).
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("trace_cart");
+    CartProject::new()
+        .config(TRACE_CONFIG)
+        .c(TRACE_TEST_C)
+        .write(&project);
+    let cart = common::build_debug_cart(&project);
+
+    let blyt = common::sdk_dir().join("bin/blyt");
+    let mut serve = std::process::Command::new(&blyt)
+        .args(["debug", "--trace=api,frame", cart.to_str().unwrap()])
+        .env_remove("BLYT_TRACE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("blyt debug spawn");
+
+    // Parse "serving on http://127.0.0.1:PORT/" from stdout.
+    let mut stdout = serve.stdout.take().unwrap();
+    let mut banner = String::new();
+    let port = loop {
+        let mut chunk = [0u8; 1024];
+        let n = stdout.read(&mut chunk).expect("read blyt debug stdout");
+        assert!(n > 0, "blyt debug exited before announcing a port");
+        banner.push_str(&String::from_utf8_lossy(&chunk[..n]));
+        if let Some(idx) = banner.find("http://127.0.0.1:") {
+            let rest = &banner[idx + "http://127.0.0.1:".len()..];
+            if let Some(end) = rest.find('/') {
+                break rest[..end].parse::<u16>().expect("port parse");
+            }
+        }
+    };
+
+    // Plain HTTP GET of the served page.
+    let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    conn.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut page = String::new();
+    conn.read_to_string(&mut page).unwrap();
+    let _ = serve.kill();
+
+    assert!(
+        page.contains("BLYT_TRACE: \"api,frame\""),
+        "expected injected trace channels in served page, got:\n{}",
+        &page[..page.len().min(2000)]
+    );
+}
+
 /* ── libretro leg ────────────────────────────────────────────────────────── */
 
 /// The libretro core (with its embedded guest libs) honours BLYT_TRACE from
