@@ -524,6 +524,19 @@ static void handle_restart(int seq, const char *args) {
     send_event("initialized", "{}");
 }
 
+static void handle_source(int seq, const char *args) {
+    int ref = json_get_int(args, "sourceReference", -1);
+    if (ref == 0) {
+        /* sourceReference=0 means the file lives on disk at source.path.
+         * Return success with no content so VS Code continues with navigation
+         * but does NOT replace the editor buffer with an empty payload (or,
+         * worse, with the failure message of an unhandled request). */
+        send_response(seq, "source", 1, "{}");
+    } else {
+        send_response(seq, "source", 0, "source not available");
+    }
+}
+
 static void handle_loaded_sources(int seq, const char *args) {
     (void)args;
     static char body[MAX_MSG];
@@ -610,6 +623,8 @@ static void dispatch(const char *msg) {
         handle_disconnect(seq, msg);
     else if (strcmp(cmd, "terminate") == 0)
         handle_disconnect(seq, msg);
+    else if (strcmp(cmd, "source") == 0)
+        handle_source(seq, msg);
     else if (strcmp(cmd, "loadedSources") == 0)
         handle_loaded_sources(seq, msg);
     else
