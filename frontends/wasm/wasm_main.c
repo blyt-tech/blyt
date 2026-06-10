@@ -815,27 +815,25 @@ static void wasm_register_s_proxy(lua_State *L) {
 
         APPENDF("local _b%u_rmt={}\n", buf_id);
 
-        /* __index */
+        /* __index: _buf.get_T(buf_id, slot, field_idx) */
         APPENDF("_b%u_rmt.__index=function(t,k)\nlocal s=rawget(t,1)\n", buf_id);
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
-            uint32_t field_h = (buf_id << 16) | (fi + 1);
             uint8_t tag = bc->field_types[fi];
             const char *tname = (tag < 8) ? type_names[tag] : "i32";
-            APPENDF("%s k==\"%s\" then return _buf.get_%s(%u,s)\n",
+            APPENDF("%s k==\"%s\" then return _buf.get_%s(%u,s,%u)\n",
                     fi == 0 ? "if" : "elseif",
-                    bc->field_names[fi], tname, field_h);
+                    bc->field_names[fi], tname, buf_id, fi + 1);
         }
         APPEND("end\nend\n");
 
-        /* __newindex */
+        /* __newindex: _buf.set_T(buf_id, slot, field_idx, value) */
         APPENDF("_b%u_rmt.__newindex=function(t,k,v)\nlocal s=rawget(t,1)\n", buf_id);
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
-            uint32_t field_h = (buf_id << 16) | (fi + 1);
             uint8_t tag = bc->field_types[fi];
             const char *tname = (tag < 8) ? type_names[tag] : "i32";
-            APPENDF("%s k==\"%s\" then _buf.set_%s(%u,s,v)\n",
+            APPENDF("%s k==\"%s\" then _buf.set_%s(%u,s,%u,v)\n",
                     fi == 0 ? "if" : "elseif",
-                    bc->field_names[fi], tname, field_h);
+                    bc->field_names[fi], tname, buf_id, fi + 1);
         }
         APPEND("end\nend\n");
 

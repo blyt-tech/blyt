@@ -1510,6 +1510,45 @@ function draw() end
     run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "score=42");
 }
 
+/// S proxy global works in the WASM pure-Lua path.  wasm_register_s_proxy()
+/// generates the S table with integer constants and proxy metatables so carts
+/// can use S.GAME, S.game[slot].score, etc. without the rv32emu.
+#[test]
+fn wasm_lua_cart_s_proxy() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_lua_s_proxy");
+
+    CartProject::new()
+        .config(CART_CONFIG)
+        .lua(
+            r#"
+local slot = -1
+
+function init()
+    slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].score = 77
+end
+
+function update()
+    local v = S.game[slot].score
+    blyt.debug.print("score=" .. tostring(v))
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm(&cart, "score=77");
+}
+
 // ── WASM reset-every-frame ─────────────────────────────────────────────────
 
 /// A C cart that stores its frame counter in a state buffer survives the
