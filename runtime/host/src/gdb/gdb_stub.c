@@ -37,6 +37,12 @@ typedef struct {
     int halted;
     /* -1 = no action yet, 0 = continue, 1 = single-step, 2 = exit. */
     int pending_action;
+    /* 1 while in the initial startup/connect halt (no client interaction
+     * yet).  Breakpoint, step, and interrupt halts set this to 0 so
+     * fc_gdb_stub_continue_initial_halt() never clears a real halt: both
+     * kinds park the stub at halted=1/pending_action=-1, so pending_action
+     * alone cannot distinguish them. */
+    int initial_halt;
     /* Set to 1 when the transport is initialised; cleared after the first
      * vCont;c so we can simulate an entry-point stop and let VS Code enable
      * all debug controls before the user explicitly continues. */
@@ -44,9 +50,10 @@ typedef struct {
 } gdb_state_t;
 
 #ifdef BLYT_GDB_TCP
-static gdb_state_t g_gdb = {.mu = PTHREAD_MUTEX_INITIALIZER, .pending_action = -1};
+static gdb_state_t g_gdb = {
+    .mu = PTHREAD_MUTEX_INITIALIZER, .pending_action = -1, .initial_halt = 1};
 #else
-static gdb_state_t g_gdb = {.pending_action = -1};
+static gdb_state_t g_gdb = {.pending_action = -1, .initial_halt = 1};
 #endif
 
 /* ── mutex helpers (no-op on WASM — single-threaded) ─────────────────────── */
@@ -357,12 +364,14 @@ static int handle_vCont(const char *args, char *out, size_t cap) {
         g_gdb.entry_stop_pending = 0;
         g_gdb.halted = 1;
         g_gdb.pending_action = -1;
+        g_gdb.initial_halt = 0;
         GDB_UNLOCK();
         send_stop_with_regs();
         return 1; /* deferred — response already sent via send_stop_with_regs */
     }
     g_gdb.pending_action = action;
     g_gdb.halted = 0;
+    g_gdb.initial_halt = 0;
     GDB_UNLOCK();
     /* No immediate response — T05 comes from fc_gdb_stub_notify_stopped. */
     return 1;
@@ -517,6 +526,7 @@ static void handle_packet(const char *pkt) {
         GDB_LOCK();
         g_gdb.halted = 1;
         g_gdb.pending_action = -1;
+        g_gdb.initial_halt = 0;
         GDB_UNLOCK();
         send_response("T02thread:01;");
         return; /* response already sent; skip final send_response() */
@@ -558,6 +568,7 @@ void fc_gdb_stub_set_transport(const fc_gdb_transport_t *t) {
      * letting on_ebreak advance PC past the first breakpoint to addr+4. */
     g_gdb.halted = 1;
     g_gdb.pending_action = -1;
+    g_gdb.initial_halt = 1;
 }
 
 void fc_gdb_stub_set_layout(const fc_gdb_layout_t *layout) {
@@ -580,6 +591,7 @@ void fc_gdb_stub_notify_stopped(void) {
     GDB_LOCK();
     g_gdb.halted = 1;
     g_gdb.pending_action = -1;
+    g_gdb.initial_halt = 0;
     GDB_UNLOCK();
     send_stop_with_regs();
 }
@@ -633,6 +645,7 @@ void fc_gdb_stub_set_has_client(int val) {
         g_gdb.has_client = 1;
         g_gdb.halted = 1;
         g_gdb.pending_action = -1;
+        g_gdb.initial_halt = 1;
         GDB_UNLOCK();
     }
 }
@@ -647,14 +660,16 @@ int fc_gdb_stub_is_halted(void) {
 /* In hybrid (DAP+GDB) mode the Lua DAP session has already received its
  * breakpoints before the frame loop starts.  Clear the initial halt so the
  * cart can run without waiting for a vCont;c from lldb-dap.  Only clears
- * if still in the initial-connection state (pending_action == -1); a real
- * breakpoint or interrupt that set halted=1 with pending_action >= 0 is
- * left alone. */
+ * only while still in the initial startup/connect halt (initial_halt set).
+ * Breakpoint, step, and interrupt halts clear initial_halt when they fire,
+ * so they are never released here — pending_action cannot distinguish them
+ * (every halt parks at pending_action == -1). */
 void fc_gdb_stub_continue_initial_halt(void) {
     GDB_LOCK();
-    if (g_gdb.halted && g_gdb.pending_action < 0) {
+    if (g_gdb.halted && g_gdb.pending_action < 0 && g_gdb.initial_halt) {
         g_gdb.pending_action = 0;
         g_gdb.halted = 0;
+        g_gdb.initial_halt = 0;
     }
     GDB_UNLOCK();
 }
@@ -664,6 +679,7 @@ void fc_gdb_stub_continue_initial_halt(void) {
 void fc_gdb_stub_test_reset(void) {
     memset(&g_gdb, 0, sizeof g_gdb);
     g_gdb.pending_action = -1;
+    g_gdb.initial_halt = 1;
 }
 #endif
 
