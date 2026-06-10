@@ -752,9 +752,7 @@ static int wasm_lua_save_read(lua_State *L) {
  * that the packer generates as native C in __blyt_lua_glue.c, but uses
  * blyt.buf.get_T/set_T instead of ECALL stubs so it runs without rv32emu. */
 static void wasm_register_s_proxy(lua_State *L) {
-    static const char *type_names[] = {
-        "i8", "u8", "i16", "u16", "i32", "u32", "f32", "bool"
-    };
+    static const char *type_names[] = {"i8", "u8", "i16", "u16", "i32", "u32", "f32", "bool"};
 
     blyt_state_ctx_t *ctx = g_lua_state_ctx;
     if (!ctx || ctx->n_buffers == 0)
@@ -770,14 +768,21 @@ static void wasm_register_s_proxy(lua_State *L) {
         return;
     size_t pos = 0;
 
-#define APPEND(s) do { \
-    size_t _n = strlen(s); \
-    if (pos + _n + 1 <= cap) { memcpy(buf + pos, s, _n); pos += _n; buf[pos] = '\0'; } \
-} while (0)
-#define APPENDF(...) do { \
-    int _n = snprintf(buf + pos, cap - pos, __VA_ARGS__); \
-    if (_n > 0 && (size_t)_n < cap - pos) pos += (size_t)_n; \
-} while (0)
+#define APPEND(s)                                                                                  \
+    do {                                                                                           \
+        size_t _n = strlen(s);                                                                     \
+        if (pos + _n + 1 <= cap) {                                                                 \
+            memcpy(buf + pos, s, _n);                                                              \
+            pos += _n;                                                                             \
+            buf[pos] = '\0';                                                                       \
+        }                                                                                          \
+    } while (0)
+#define APPENDF(...)                                                                               \
+    do {                                                                                           \
+        int _n = snprintf(buf + pos, cap - pos, __VA_ARGS__);                                      \
+        if (_n > 0 && (size_t)_n < cap - pos)                                                      \
+            pos += (size_t)_n;                                                                     \
+    } while (0)
 
     APPEND("do\nlocal _buf=blyt.buf\nS={}\n");
 
@@ -820,8 +825,7 @@ static void wasm_register_s_proxy(lua_State *L) {
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             uint8_t tag = bc->field_types[fi];
             const char *tname = (tag < 8) ? type_names[tag] : "i32";
-            APPENDF("%s k==\"%s\" then return _buf.get_%s(%u,s,%u)\n",
-                    fi == 0 ? "if" : "elseif",
+            APPENDF("%s k==\"%s\" then return _buf.get_%s(%u,s,%u)\n", fi == 0 ? "if" : "elseif",
                     bc->field_names[fi], tname, buf_id, fi + 1);
         }
         APPEND("end\nend\n");
@@ -831,8 +835,7 @@ static void wasm_register_s_proxy(lua_State *L) {
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             uint8_t tag = bc->field_types[fi];
             const char *tname = (tag < 8) ? type_names[tag] : "i32";
-            APPENDF("%s k==\"%s\" then _buf.set_%s(%u,s,%u,v)\n",
-                    fi == 0 ? "if" : "elseif",
+            APPENDF("%s k==\"%s\" then _buf.set_%s(%u,s,%u,v)\n", fi == 0 ? "if" : "elseif",
                     bc->field_names[fi], tname, buf_id, fi + 1);
         }
         APPEND("end\nend\n");
@@ -843,7 +846,8 @@ static void wasm_register_s_proxy(lua_State *L) {
                 bc->count > 0 ? bc->count - 1 : 0, buf_id, buf_id);
 
         /* Buffer proxy assigned to S.<name> */
-        APPENDF("S.%s=setmetatable({},{__index=function(t,k) if k==\"count\" then return %u end return _b%u_rows[k] end})\n",
+        APPENDF("S.%s=setmetatable({},{__index=function(t,k) if k==\"count\" then return %u end "
+                "return _b%u_rows[k] end})\n",
                 bc->name, bc->count, buf_id);
     }
 
@@ -853,12 +857,10 @@ static void wasm_register_s_proxy(lua_State *L) {
 #undef APPENDF
 
     if (luaL_loadbuffer(L, buf, pos, "@s_proxy") != LUA_OK) {
-        fprintf(stderr, "[blyt] wasm_register_s_proxy load error: %s\n",
-                lua_tostring(L, -1));
+        fprintf(stderr, "[blyt] wasm_register_s_proxy load error: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     } else if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-        fprintf(stderr, "[blyt] wasm_register_s_proxy eval error: %s\n",
-                lua_tostring(L, -1));
+        fprintf(stderr, "[blyt] wasm_register_s_proxy eval error: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     }
 

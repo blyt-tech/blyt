@@ -51,35 +51,6 @@ jobs:
           version: latest
           actions-cache-folder: emsdk-cache
 
-      - name: Check formatting
-        run: |
-          clang-format --dry-run --Werror \
-            runtime/host/src/libblyt/*.h runtime/host/src/libblyt/*.c \
-            runtime/host/src/dap/*.h runtime/host/src/dap/*.c \
-            runtime/host/src/gdb/*.h runtime/host/src/gdb/*.c \
-            runtime/host/include/*.h \
-            runtime/guest/src/libblytcommon/*.c \
-            runtime/guest/src/libblyt32/*.c \
-            runtime/guest/src/libblyt32lua/*.c \
-            runtime/guest/src/libblytc/blytc_arena.c \
-            runtime/guest/src/libblytc/blytc_stubs.c \
-            runtime/guest/include/*.h \
-            runtime/tools/blyt-luac.c \
-            tests/unit/*.c \
-            tests/tools/*.c \
-            examples/hello-c/src/game/c/*.c \
-            frontends/player/main.c \
-            frontends/libretro/blyt_libretro.c \
-            frontends/wasm/wasm_main.c \
-            frontends/native/launcher.c \
-            frontends/native/seccomp_allowlist.h \
-            frontends/native/src/libblyt32/blyt32.c \
-            frontends/native/src/libblyt32/seccomp_restricted.h \
-            runtime/host/src/libblyt/testcard.c
-          cmake-format --check CMakeLists.txt frontends/wasm/CMakeLists.txt
-          yamllint .github/workflows/ci.yml
-          cargo fmt --check --all
-
       - name: Init submodules
         run: |
           git submodule update --init --depth 1 \
@@ -105,6 +76,12 @@ jobs:
 
       - name: Configure
         run: cmake -B build -G Ninja
+
+      # The lint target is the single source of truth for the format checks
+      # (clang-format, cmake-format, yamllint, cargo fmt). It needs a
+      # configured build tree, hence runs after Configure.
+      - name: Lint
+        run: cmake --build build --target lint
 
       - name: Build
         # Builds both player variants: blytplay (release) and blytdebug (debug,

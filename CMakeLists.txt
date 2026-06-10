@@ -1306,31 +1306,27 @@ add_custom_target(
   VERBATIM)
 
 # ── lint ──────────────────────────────────────────────────────────────────────
-# Mirrors the "Check formatting" step in .github/workflows/ci.yml exactly. Run
-# before every commit: cmake --build build --target lint
+# Single source of truth for the format checks: CI's "Lint" step runs this
+# target after configuring. Run before every commit: cmake --build build
+# --target lint
+#
+# All first-party C sources are globbed recursively; generated cart build output
+# (examples/*/build/) and vendored trees are excluded. The list is fixed at
+# configure time — re-run cmake to pick up newly added files (CI always
+# configures fresh, so it never sees a stale list).
 
 file(
-  GLOB
+  GLOB_RECURSE
   _LINT_C_FILES
-  "${CMAKE_SOURCE_DIR}/runtime/host/src/libblyt/*.h"
-  "${CMAKE_SOURCE_DIR}/runtime/host/src/libblyt/*.c"
-  "${CMAKE_SOURCE_DIR}/runtime/host/src/gdb/*.h"
-  "${CMAKE_SOURCE_DIR}/runtime/host/src/gdb/*.c"
-  "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/*.c"
-  "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/*.c"
-  "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_arena.c"
-  "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c"
-  "${CMAKE_SOURCE_DIR}/runtime/guest/include/*.h"
-  "${CMAKE_SOURCE_DIR}/runtime/host/include/*.h"
-  "${CMAKE_SOURCE_DIR}/tests/unit/*.c"
-  "${CMAKE_SOURCE_DIR}/tests/tools/*.c"
-  "${CMAKE_SOURCE_DIR}/examples/hello-c/src/game/c/*.c"
-  "${CMAKE_SOURCE_DIR}/frontends/player/main.c"
-  "${CMAKE_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
-  "${CMAKE_SOURCE_DIR}/frontends/wasm/wasm_main.c"
-  "${CMAKE_SOURCE_DIR}/frontends/native/launcher.c"
-  "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c"
-  "${CMAKE_SOURCE_DIR}/runtime/host/src/libblyt/testcard.c")
+  "${CMAKE_SOURCE_DIR}/runtime/*.c"
+  "${CMAKE_SOURCE_DIR}/runtime/*.h"
+  "${CMAKE_SOURCE_DIR}/frontends/*.c"
+  "${CMAKE_SOURCE_DIR}/frontends/*.h"
+  "${CMAKE_SOURCE_DIR}/tests/*.c"
+  "${CMAKE_SOURCE_DIR}/tests/*.h"
+  "${CMAKE_SOURCE_DIR}/examples/*.c"
+  "${CMAKE_SOURCE_DIR}/examples/*.h")
+list(FILTER _LINT_C_FILES EXCLUDE REGEX "/(build|node_modules|target)/")
 
 add_custom_target(
   lint
