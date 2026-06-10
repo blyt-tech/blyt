@@ -947,6 +947,11 @@ function(blyt_add_player target runtime_lib)
     ${target} PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
                       "${CMAKE_SOURCE_DIR}/runtime/host/include")
   target_compile_definitions(${target} PRIVATE BLYT_VERSION="${BLYT_VERSION}")
+  # Players emit directly into the SDK layout: BLYT_LIB_DIR auto-inference
+  # resolves <binary>/../lib[/debug], and tests run the sdk/bin copies — so
+  # building anywhere else just creates a stale duplicate.
+  set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                             "${CMAKE_BINARY_DIR}/sdk/bin")
 endfunction()
 
 if(SDL2_OK)
@@ -1230,9 +1235,9 @@ add_custom_target(
   COMMENT "Assembling blyt SDK in build/sdk/"
   VERBATIM)
 
-# The sdk script copies blytplay and blytdebug from the build directory. Declare
-# them as dependencies so `cmake --build build --target sdk` rebuilds the
-# binaries before assembling the SDK.
+# blytplay and blytdebug build directly into sdk/bin (RUNTIME_OUTPUT_DIRECTORY).
+# Declare them as dependencies so `cmake --build build --target sdk` rebuilds
+# the binaries before assembling the SDK.
 foreach(_sdk_bin blytplay blytdebug)
   if(TARGET ${_sdk_bin})
     add_dependencies(sdk ${_sdk_bin})

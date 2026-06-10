@@ -1237,17 +1237,13 @@ if(FOUND_LLDB_DAP)
   file(CREATE_LINK "${FOUND_LLDB_DAP}" "${SDK_BIN}/blyt-lldb-dap" SYMBOLIC)
 endif()
 # -------------------------------------------------------------------------
-# Step 5: blytplay (if built)
+# Step 5: blytplay / blytdebug
+#
+# Nothing to do: the main cmake build emits both players directly into
+# sdk/bin/ (RUNTIME_OUTPUT_DIRECTORY), so a plain `cmake --build build`
+# keeps them fresh — no copy step to go stale.  ADR-0129: blytdebug is
+# SDK-only — never embedded in / shipped with the production runtime.
 # -------------------------------------------------------------------------
-
-if(EXISTS "${BLYT_BINARY_DIR}/blytplay")
-  file(COPY "${BLYT_BINARY_DIR}/blytplay" DESTINATION "${SDK_BIN}")
-endif()
-# ADR-0129: ship the debug player (blytdebug) in the SDK too.  It is SDK-only —
-# never embedded in / shipped with the production runtime.
-if(EXISTS "${BLYT_BINARY_DIR}/blytdebug")
-  file(COPY "${BLYT_BINARY_DIR}/blytdebug" DESTINATION "${SDK_BIN}")
-endif()
 
 # -------------------------------------------------------------------------
 # Step 6: blyt_libretro.so — host-side libretro core
