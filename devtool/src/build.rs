@@ -1533,6 +1533,43 @@ fn cart_rustflags(extra: &str) -> String {
     format!("-C relocation-model=pic -C panic=abort{extra}")
 }
 
+/// sccache wrapper for cart rustc invocations, when available.
+///
+/// The expensive part of a cart build is `-Z build-std` recompiling
+/// core/alloc as PIC, which otherwise happens once per cart per checkout.
+/// Those units' inputs are machine-global (rust-src under ~/.rustup, fixed
+/// RUSTFLAGS), so sccache replays them across carts, checkouts, and git
+/// worktrees even though every cart keeps its own private cargo target dir.
+///
+/// A shared `--target-dir` was tried instead and is unsound: cargo's unit
+/// hash collides for same name+version packages at different paths, so a
+/// second cart silently reuses the first cart's compiled artifact without
+/// ever reading the second cart's sources.
+///
+/// An explicit `RUSTC_WRAPPER` in the environment wins (cargo inherits it);
+/// `BLYT_SCCACHE=<path>` overrides discovery; `BLYT_SCCACHE=off` disables.
+fn cart_sccache() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static SCCACHE: OnceLock<Option<String>> = OnceLock::new();
+    SCCACHE
+        .get_or_init(|| {
+            if std::env::var_os("RUSTC_WRAPPER").is_some() {
+                return None; // cargo inherits the caller's wrapper
+            }
+            match std::env::var("BLYT_SCCACHE") {
+                Ok(v) if v == "off" => None,
+                Ok(v) if !v.is_empty() => Some(v),
+                _ => Command::new("sccache")
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|_| "sccache".to_string()),
+            }
+        })
+        .as_deref()
+}
+
 /// Configure a `cargo build --release` command for a RISC-V cart Rust crate.
 ///
 /// Pins the nightly toolchain and passes `-Z build-std=core,alloc` so the
@@ -1556,6 +1593,9 @@ fn cargo_cart_cmd(cargo: &str, manifest: &Path, target_dir: &Path) -> Command {
         .arg(manifest)
         .arg("--target-dir")
         .arg(target_dir);
+    if let Some(wrapper) = cart_sccache() {
+        cmd.env("RUSTC_WRAPPER", wrapper);
+    }
     cmd
 }
 
