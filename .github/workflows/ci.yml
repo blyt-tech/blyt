@@ -11,6 +11,11 @@ jobs:
     name: Linux x86-64
     runs-on: ubuntu-latest
 
+    env:
+      # Back sccache (cart build-std compiles, via the devtool's
+      # RUSTC_WRAPPER) with the GitHub Actions cache.
+      SCCACHE_GHA_ENABLED: "true"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +55,26 @@ jobs:
         with:
           version: latest
           actions-cache-folder: emsdk-cache
+
+      # Compiler caches, persisted in the GitHub Actions cache. ccache is
+      # picked up automatically at CMake configure time
+      # (cmake/blyt_ccache.cmake) and covers the host build, both libc++
+      # trees, both WASM trees, and the riscv64 cross build. sccache is
+      # picked up by the blyt devtool (RUSTC_WRAPPER) for cart rustc
+      # invocations, so the -Z build-std core/alloc recompile is cached
+      # across the example carts and across runs. rust-cache covers the
+      # host cargo workspace (registry + target/).
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-clang22
+          max-size: 1.5G
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Init submodules
         run: |
