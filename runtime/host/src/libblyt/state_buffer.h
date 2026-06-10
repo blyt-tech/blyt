@@ -39,6 +39,8 @@ typedef struct {
     uint64_t schema_hash;
     /* Buffer name (pointer into FlatBuffer data owned by blyt_cart mmap). */
     const char *name;
+    /* Field names in declaration order (pointers into FlatBuffer data). */
+    const char *field_names[BLYT_MAX_FIELDS];
 } blyt_buffer_ctx_t;
 
 typedef struct blyt_state_ctx {

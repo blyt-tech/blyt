@@ -112,6 +112,7 @@ int blyt_state_ctx_init(const blyt_cart_t *cart, blyt_state_ctx_t *ctx) {
             }
             uint8_t tag = blyt_FieldDecl_type_tag(fdecl);
             bc->field_types[fi] = tag;
+            bc->field_names[fi] = blyt_FieldDecl_name(fdecl);
 
             size_t elem_size = field_sizeof(tag);
             size_t total = (size_t)bc->count * elem_size;

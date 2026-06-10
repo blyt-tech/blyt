@@ -24,10 +24,12 @@
  *   and installs the master Lua hook so VS Code can set breakpoints and step.
  */
 
+#include <ctype.h>
 #include <emscripten.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "blyt_runtime.h"
@@ -745,6 +747,126 @@ static int wasm_lua_save_read(lua_State *L) {
     return 1;
 }
 
+/* Build and eval a Lua chunk that creates the S proxy global for pure Lua
+ * carts with state buffers.  Mirrors the register_cart_state_S() function
+ * that the packer generates as native C in __blyt_lua_glue.c, but uses
+ * blyt.buf.get_T/set_T instead of ECALL stubs so it runs without rv32emu. */
+static void wasm_register_s_proxy(lua_State *L) {
+    static const char *type_names[] = {
+        "i8", "u8", "i16", "u16", "i32", "u32", "f32", "bool"
+    };
+
+    blyt_state_ctx_t *ctx = g_lua_state_ctx;
+    if (!ctx || ctx->n_buffers == 0)
+        return;
+
+    /* Estimate buffer size: ~4 KB base + ~600 bytes per buffer + ~150 bytes per field */
+    size_t cap = 4096 + ctx->n_buffers * 600;
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++)
+        cap += ctx->buffers[bi].n_fields * 150;
+
+    char *buf = malloc(cap);
+    if (!buf)
+        return;
+    size_t pos = 0;
+
+#define APPEND(s) do { \
+    size_t _n = strlen(s); \
+    if (pos + _n + 1 <= cap) { memcpy(buf + pos, s, _n); pos += _n; buf[pos] = '\0'; } \
+} while (0)
+#define APPENDF(...) do { \
+    int _n = snprintf(buf + pos, cap - pos, __VA_ARGS__); \
+    if (_n > 0 && (size_t)_n < cap - pos) pos += (size_t)_n; \
+} while (0)
+
+    APPEND("do\nlocal _buf=blyt.buf\nS={}\n");
+
+    /* Integer constants: S.BUFNAME = buf_id, S.BUFNAME_FIELDNAME = field_h */
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++) {
+        blyt_buffer_ctx_t *bc = &ctx->buffers[bi];
+        uint32_t buf_id = bc->buf_id;
+
+        /* S.GLOBALS = 1 */
+        APPENDF("S.");
+        for (const char *p = bc->name; *p; p++)
+            buf[pos++] = (char)toupper((unsigned char)*p);
+        buf[pos] = '\0';
+        APPENDF("=%u\n", buf_id);
+
+        /* S.GLOBALS_FRAME = 0x00010001 */
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            uint32_t field_h = (buf_id << 16) | (fi + 1);
+            APPENDF("S.");
+            for (const char *p = bc->name; *p; p++)
+                buf[pos++] = (char)toupper((unsigned char)*p);
+            buf[pos++] = '_';
+            buf[pos] = '\0';
+            for (const char *p = bc->field_names[fi]; *p; p++)
+                buf[pos++] = (char)toupper((unsigned char)*p);
+            buf[pos] = '\0';
+            APPENDF("=%u\n", field_h);
+        }
+    }
+
+    /* Proxy tables: one per buffer */
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++) {
+        blyt_buffer_ctx_t *bc = &ctx->buffers[bi];
+        uint32_t buf_id = bc->buf_id;
+
+        APPENDF("local _b%u_rmt={}\n", buf_id);
+
+        /* __index */
+        APPENDF("_b%u_rmt.__index=function(t,k)\nlocal s=rawget(t,1)\n", buf_id);
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            uint32_t field_h = (buf_id << 16) | (fi + 1);
+            uint8_t tag = bc->field_types[fi];
+            const char *tname = (tag < 8) ? type_names[tag] : "i32";
+            APPENDF("%s k==\"%s\" then return _buf.get_%s(%u,s)\n",
+                    fi == 0 ? "if" : "elseif",
+                    bc->field_names[fi], tname, field_h);
+        }
+        APPEND("end\nend\n");
+
+        /* __newindex */
+        APPENDF("_b%u_rmt.__newindex=function(t,k,v)\nlocal s=rawget(t,1)\n", buf_id);
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            uint32_t field_h = (buf_id << 16) | (fi + 1);
+            uint8_t tag = bc->field_types[fi];
+            const char *tname = (tag < 8) ? type_names[tag] : "i32";
+            APPENDF("%s k==\"%s\" then _buf.set_%s(%u,s,v)\n",
+                    fi == 0 ? "if" : "elseif",
+                    bc->field_names[fi], tname, field_h);
+        }
+        APPEND("end\nend\n");
+
+        /* Pre-create row tables */
+        APPENDF("local _b%u_rows={}\n", buf_id);
+        APPENDF("for i=0,%u do local r={i};setmetatable(r,_b%u_rmt);_b%u_rows[i]=r end\n",
+                bc->count > 0 ? bc->count - 1 : 0, buf_id, buf_id);
+
+        /* Buffer proxy assigned to S.<name> */
+        APPENDF("S.%s=setmetatable({},{__index=function(t,k) if k==\"count\" then return %u end return _b%u_rows[k] end})\n",
+                bc->name, bc->count, buf_id);
+    }
+
+    APPEND("end\n");
+
+#undef APPEND
+#undef APPENDF
+
+    if (luaL_loadbuffer(L, buf, pos, "@s_proxy") != LUA_OK) {
+        fprintf(stderr, "[blyt] wasm_register_s_proxy load error: %s\n",
+                lua_tostring(L, -1));
+        lua_pop(L, 1);
+    } else if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        fprintf(stderr, "[blyt] wasm_register_s_proxy eval error: %s\n",
+                lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+
+    free(buf);
+}
+
 /* Register blyt.buf.* and blyt.save_write/read into the active Lua state.
  * Must be called after the blyt and blyt32 globals are created. */
 static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
@@ -896,6 +1018,7 @@ static void wasm_lua_reset_cycle(void) {
     /* Step 8: re-register state API */
     if (active_state_ctx())
         wasm_register_state_api(g_lua, g_session);
+    wasm_register_s_proxy(g_lua);
 
     /* Step 9: re-run .cart.lua section */
     if (luaL_loadbuffer(g_lua, (const char *)g_lua_bytecode, g_lua_bytecode_size, "@cart") !=
@@ -1293,6 +1416,7 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         /* Register state buffer + save/load API for any cart with state. */
         if (active_state_ctx())
             wasm_register_state_api(g_lua, g_session);
+        wasm_register_s_proxy(g_lua);
     }
 
     /* Load and execute the bytecode chunk (defines init/update/draw globals). */
