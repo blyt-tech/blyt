@@ -232,11 +232,22 @@ fn cart_is_debuggable(cart_path: &Path) -> Result<bool, RunError> {
  * Returns the actual bound ports (may differ from requested if 0 is passed).
  * ------------------------------------------------------------------------- */
 
+/// Bind a relay listener on the preferred port, falling back to an
+/// OS-assigned one.  The preferred ports (HTTP port +1..+4) sit in the same
+/// ephemeral range the OS hands to every concurrent bind(:0)/connect, so
+/// collisions are routine under load (this killed `blyt debug` on busy CI
+/// runners).  Falling back is always safe: every consumer — the banner, the
+/// {{BLYT_*_PORT}} page injection, the VS Code extension regexes, the test
+/// drivers — reads the actual bound port, never the +N arithmetic.
+fn bind_relay(preferred: u16, what: &str) -> TcpListener {
+    TcpListener::bind(("127.0.0.1", preferred))
+        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
+        .unwrap_or_else(|e| panic!("{what}: bind failed: {e}"))
+}
+
 fn start_dap_relay(ws_port: u16, tcp_port: u16) -> (u16, u16) {
-    let ws_listener = TcpListener::bind(format!("127.0.0.1:{ws_port}"))
-        .expect("DAP relay: WebSocket bind failed");
-    let tcp_listener =
-        TcpListener::bind(format!("127.0.0.1:{tcp_port}")).expect("DAP relay: TCP bind failed");
+    let ws_listener = bind_relay(ws_port, "DAP relay (WebSocket)");
+    let tcp_listener = bind_relay(tcp_port, "DAP relay (TCP)");
 
     let actual_ws = ws_listener
         .local_addr()
@@ -641,10 +652,8 @@ fn find_wasm_dir_for(mode: Mode) -> Result<PathBuf, RunError> {
  * ------------------------------------------------------------------------- */
 
 fn start_gdb_relay(ws_port: u16, tcp_port: u16) -> (u16, u16) {
-    let ws_listener = TcpListener::bind(format!("127.0.0.1:{ws_port}"))
-        .expect("GDB relay: WebSocket bind failed");
-    let tcp_listener =
-        TcpListener::bind(format!("127.0.0.1:{tcp_port}")).expect("GDB relay: TCP bind failed");
+    let ws_listener = bind_relay(ws_port, "GDB relay (WebSocket)");
+    let tcp_listener = bind_relay(tcp_port, "GDB relay (TCP)");
 
     let actual_ws = ws_listener
         .local_addr()

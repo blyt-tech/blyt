@@ -272,7 +272,7 @@ fn trace_param_injected_into_served_page() {
         .args(["debug", "--trace=api,frame", cart.to_str().unwrap()])
         .env_remove("BLYT_TRACE")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("blyt debug spawn");
 
@@ -282,7 +282,15 @@ fn trace_param_injected_into_served_page() {
     let port = loop {
         let mut chunk = [0u8; 1024];
         let n = stdout.read(&mut chunk).expect("read blyt debug stdout");
-        assert!(n > 0, "blyt debug exited before announcing a port");
+        if n == 0 {
+            // The process died before serving — surface its stderr (panic
+            // messages, error reports) instead of hiding the cause.
+            let mut stderr_out = String::new();
+            if let Some(mut e) = serve.stderr.take() {
+                e.read_to_string(&mut stderr_out).ok();
+            }
+            panic!("blyt debug exited before announcing a port; stderr:\n{stderr_out}");
+        }
         banner.push_str(&String::from_utf8_lossy(&chunk[..n]));
         if let Some(idx) = banner.find("http://127.0.0.1:") {
             let rest = &banner[idx + "http://127.0.0.1:".len()..];
