@@ -634,6 +634,46 @@ pub fn run_cart_wasm_with_env(cart: &std::path::Path, extra_env: &[(&str, &str)]
     );
 }
 
+/// Run a cart through the embedded libretro core (test_libretro_core dlopens
+/// blyt_libretro.so); assert `expected` appears in the output.  This is the
+/// third leg of the native/wasm test pairs: it exercises the core's EMBEDDED
+/// guest lib blobs, which are a separate artifact from the sdk/lib files the
+/// blytplay path loads.  Cart debug output arrives via the libretro log
+/// callback, which the driver writes to stderr.
+pub fn run_cart_libretro(cart: &std::path::Path, expected: &str) {
+    run_cart_libretro_with_flags(cart, &[], expected)
+}
+
+/// Run a cart through the embedded libretro core with driver flags (e.g.
+/// `--reset-every-frame` to drive retro_reset_every_frame_cycle() after
+/// every frame — the same save-state stress cycle as blytplay
+/// --reset-every-frame); assert `expected` appears in the output.
+pub fn run_cart_libretro_with_flags(cart: &std::path::Path, flags: &[&str], expected: &str) {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    for f in flags {
+        cmd.arg(f);
+    }
+    cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
+    let output = cmd.assert().success().get_output().stderr.clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in libretro core output, got: {}",
+        expected,
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// Run a cart through the embedded libretro core; assert the driver exits
+/// with a non-zero status (load failure or runtime error).
+pub fn run_cart_libretro_expect_fail(cart: &std::path::Path) {
+    use assert_cmd::Command;
+    Command::new(test_libretro_core())
+        .args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()])
+        .assert()
+        .failure();
+}
+
 /// Path to the test_session_api binary produced by the CMake build.
 pub fn test_session_api() -> PathBuf {
     build_dir().join("test_session_api")

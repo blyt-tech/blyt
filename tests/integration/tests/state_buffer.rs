@@ -1,9 +1,10 @@
 mod common;
 
 use common::{
-    CartProject, build_cart, build_lua_cart, require_cpp_sdk, require_lua_sdk,
-    require_rust_riscv_target, require_sdk, require_wasm, run_cart_native_with_env,
-    run_cart_native_with_flags, run_cart_wasm, run_cart_wasm_with_env,
+    CartProject, build_cart, build_lua_cart, require_cpp_sdk, require_libretro_core,
+    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, run_cart_libretro,
+    run_cart_libretro_with_flags, run_cart_native_with_env, run_cart_native_with_flags,
+    run_cart_wasm, run_cart_wasm_with_env,
 };
 use tempfile::TempDir;
 
@@ -1655,4 +1656,181 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
     run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], "frame=3");
+}
+
+// ── Embedded libretro core legs ─────────────────────────────────────────────
+//
+// Third leg of the native/wasm pairs above: the same functionality through
+// test_libretro_core, which dlopens blyt_libretro.so with its EMBEDDED guest
+// lib blobs.  The reset-every-frame pairs map onto the core's own snapshot
+// mechanism: --reset-every-frame retro_serialize + retro_unserialize
+// after every frame (the rewind/netplay path), driving the same
+// on_save_state / on_load_state cart hooks.
+
+/// blyt_cart_on_new_state lifecycle hook fires through the embedded core.
+#[test]
+fn libretro_lua_cart_lifecycle_on_new_state() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_lua_lifecycle_new");
+
+    CartProject::new()
+        .lua(
+            r#"
+function on_new_state()
+    blyt.debug.print("new_state_called")
+end
+
+function init()   end
+function update() blyt.quit() end
+function draw()   end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_libretro(&cart, "new_state_called");
+}
+
+/// S proxy (S.game[slot].score) works through the embedded core — exercises
+/// the packer-generated native S glue inside the embedded libblyt32lua.so.
+#[test]
+fn libretro_lua_cart_s_proxy() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_lua_s_proxy");
+
+    CartProject::new()
+        .config(CART_CONFIG)
+        .lua(
+            r#"
+local slot = -1
+
+function init()
+    slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].score = 77
+end
+
+function update()
+    local v = S.game[slot].score
+    blyt.debug.print("score=" .. tostring(v))
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_libretro(&cart, "score=77");
+}
+
+/// A C cart that stores its frame counter in a state buffer survives the
+/// reset-every-frame cycle driven through the embedded core.
+#[test]
+fn libretro_c_cart_reset_every_frame() {
+    require_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_c_rt");
+
+    CartProject::new()
+        .config(GLOBALS_CONFIG)
+        .c(r#"
+#include "blyt.h"
+#include "cart_state.h"
+#include <stdio.h>
+
+static int32_t s_frame = 0;
+
+void blyt_cart_on_new_state(void) {}
+
+void blyt_cart_on_save_state(void) {
+    blyt_buffer_set_i32(S_GLOBALS, 0, S_GLOBALS_FRAME, s_frame);
+}
+
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    (void)info;
+    s_frame = blyt_buffer_get_i32(S_GLOBALS, 0, S_GLOBALS_FRAME);
+}
+
+void blyt_cart_init(void) {
+    int32_t slot = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &slot);
+}
+
+void blyt_cart_update(void) {
+    s_frame++;
+    if (s_frame == 3) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "frame=%d", s_frame);
+        blyt_console_debug(buf);
+        blyt_quit();
+    }
+}
+
+void blyt_cart_draw(void) {}
+"#)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], "frame=3");
+}
+
+/// A Lua cart that stores its frame counter in a state buffer survives the
+/// reset-every-frame cycle driven through the embedded core.
+#[test]
+fn libretro_lua_cart_reset_every_frame() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("libretro_lua_rt");
+
+    CartProject::new()
+        .config(GLOBALS_CONFIG)
+        .lua(
+            r#"
+local frame = 0
+
+function on_save_state()
+    S.globals[0].frame = frame
+end
+
+function on_load_state(info)
+    frame = S.globals[0].frame
+end
+
+function init()
+    blyt.buf.alloc_slot(S.GLOBALS)
+end
+
+function update()
+    frame = frame + 1
+    if frame == 3 then
+        blyt.debug.print("frame=" .. tostring(frame))
+        blyt.quit()
+    end
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], "frame=3");
 }

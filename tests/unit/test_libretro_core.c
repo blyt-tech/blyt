@@ -3,11 +3,18 @@
  * Minimal libretro runner for e2e integration tests.
  *
  * Usage:
- *   test_libretro_core <blyt_libretro.so> <cart.blyt>
+ *   test_libretro_core [--reset-every-frame] <blyt_libretro.so> <cart.blyt>
  *
  * Loads blyt_libretro.so via dlopen, wires up stub callbacks, and calls
  * retro_run in a loop until blyt_libretro_is_done() returns true or
  * MAX_FRAMES have elapsed.
+ *
+ * --reset-every-frame: after every retro_run, drive the core's
+ * retro_reset_every_frame_cycle() — the same save-state stress cycle
+ * blytplay's --reset-every-frame flag and the WASM runtime's
+ * BLYT_RESET_EVERY_FRAME use (on_save_state → snapshot → zero BSS → init →
+ * restore → on_load_state).  Carts that keep their state in tracked buffers
+ * must behave identically under this cycle.
  *
  * Exit:
  *   0  — cart called blyt_quit() / blyt_exit(0) cleanly
@@ -76,14 +83,23 @@ static int16_t input_state(unsigned p, unsigned d, unsigned i, unsigned id) {
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: test_libretro_core <blyt_libretro.so> <cart.blyt>\n");
+    bool reset_every_frame = false;
+    int argi = 1;
+    if (argi < argc && strcmp(argv[argi], "--reset-every-frame") == 0) {
+        reset_every_frame = true;
+        argi++;
+    }
+    if (argc - argi < 2) {
+        fprintf(stderr, "usage: test_libretro_core [--reset-every-frame] "
+                        "<blyt_libretro.so> <cart.blyt>\n");
         return 1;
     }
+    const char *core_path = argv[argi];
+    const char *cart_path = argv[argi + 1];
 
-    void *lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    void *lib = dlopen(core_path, RTLD_NOW | RTLD_LOCAL);
     if (!lib) {
-        fprintf(stderr, "dlopen(%s): %s\n", argv[1], dlerror());
+        fprintf(stderr, "dlopen(%s): %s\n", core_path, dlerror());
         return 1;
     }
 
@@ -117,6 +133,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* retro_reset_every_frame_cycle: blyt-private save-state stress hook,
+     * same cycle as blytplay --reset-every-frame (ADR-0045/0110). */
+    void (*p_reset_cycle)(void) = NULL;
+    if (reset_every_frame) {
+        p_reset_cycle = (void (*)(void))dlsym(lib, "retro_reset_every_frame_cycle");
+        if (!p_reset_cycle) {
+            fprintf(stderr, "dlsym(retro_reset_every_frame_cycle): %s\n", dlerror());
+            dlclose(lib);
+            return 1;
+        }
+    }
+
     p_retro_set_environment(env_cb);
     p_retro_set_video_refresh(video_refresh);
     p_retro_set_audio_sample(audio_sample);
@@ -125,7 +153,7 @@ int main(int argc, char *argv[]) {
     p_retro_set_input_state(input_state);
     p_retro_init();
 
-    struct retro_game_info game = {argv[2], NULL, 0, NULL};
+    struct retro_game_info game = {cart_path, NULL, 0, NULL};
     if (!p_retro_load_game(&game)) {
         fprintf(stderr, "retro_load_game failed\n");
         p_retro_deinit();
@@ -140,6 +168,8 @@ int main(int argc, char *argv[]) {
             rc = 0;
             break;
         }
+        if (p_reset_cycle)
+            p_reset_cycle();
     }
 
     if (rc != 0)

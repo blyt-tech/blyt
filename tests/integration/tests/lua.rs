@@ -2,9 +2,10 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_lua_sdk,
-    require_rust_riscv_target, require_sdk, require_wasm, run_cart_native,
-    run_cart_native_expect_fail, run_cart_wasm, sdk_dir,
+    CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_libretro_core,
+    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, run_cart_libretro,
+    run_cart_libretro_expect_fail, run_cart_native, run_cart_native_expect_fail, run_cart_wasm,
+    sdk_dir,
 };
 use tempfile::TempDir;
 
@@ -1115,4 +1116,256 @@ fn lua_per_callback_mix_wasm() {
     let cart = build_lua_per_callback_mix_cart(tmp.path());
     run_cart_wasm(&cart, "lua-init");
     run_cart_wasm(&cart, "native-update");
+}
+
+// -------------------------------------------------------------------------
+// Embedded libretro core legs
+//
+// Third leg of the native/wasm pairs above: the same carts run through
+// test_libretro_core, which dlopens blyt_libretro.so.  The core carries its
+// own EMBEDDED copies of the guest libs (bin2c blobs) — a separate artifact
+// from the sdk/lib files blytplay loads via BLYT_LIB_DIR — so functionality
+// proven on the player and WASM paths must be re-proven here.
+// -------------------------------------------------------------------------
+
+#[test]
+fn lua_cart_debug_output_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_hello_libretro");
+    CartProject::new()
+        .lua(
+            r#"
+function init()
+    blyt32.debug.print("hello from lua")
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    run_cart_libretro(&cart, "hello from lua");
+}
+
+#[test]
+fn lua_cart_calls_c_lib_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_lib_module_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+c ok");
+}
+
+#[test]
+fn lua_cart_calls_rust_lib_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_lib_module_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+rust ok");
+}
+
+#[test]
+fn lua_cart_calls_cpp_lib_libretro() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_cpp_lib_module_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+cpp ok");
+}
+
+#[test]
+fn lua_cart_calls_c_raw_string_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_raw_string_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+c raw ok");
+}
+
+#[test]
+fn lua_cart_calls_rust_raw_string_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_raw_string_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+rust raw ok");
+}
+
+#[test]
+fn c_lib_drives_lua_vm_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_c_increment_cart(tmp.path());
+    run_cart_libretro(&cart, "c-drives-lua ok");
+}
+
+#[test]
+fn lua_cart_with_c_game_code_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_game_module_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+c-game ok");
+}
+
+#[test]
+fn lua_cart_with_cpp_game_code_libretro() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_cpp_game_module_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+cpp-game ok");
+}
+
+#[test]
+fn lua_rust_hybrid_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_hybrid_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+rust ok");
+}
+
+#[test]
+fn lua_c_hybrid_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_hybrid_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+c ok");
+}
+
+#[test]
+fn lua_c_rust_exports_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_rust_exports_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+c+rust exports ok");
+}
+
+#[test]
+fn lua_rust_c_chain_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_c_chain_cart(tmp.path());
+    run_cart_libretro(&cart, "lua->rust->c ok");
+}
+
+#[test]
+fn lua_cpp_hybrid_libretro() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_cpp_hybrid_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+cpp ok");
+}
+
+#[test]
+fn lua_c_lib_export_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_lib_export_cart(tmp.path());
+    run_cart_libretro(&cart, "lua+c-lib ok");
+}
+
+#[test]
+fn lua_module_export_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_module_export_cart(tmp.path());
+    run_cart_libretro(&cart, "module export ok");
+}
+
+#[test]
+fn lua_rust_module_export_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_module_export_cart(tmp.path());
+    run_cart_libretro(&cart, "rust module export ok");
+}
+
+#[test]
+fn lua_cart_c_native_lifecycle_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_native_lifecycle_cart(tmp.path());
+    run_cart_libretro(&cart, "c native lifecycle ok");
+}
+
+#[test]
+fn lua_cart_rust_native_lifecycle_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_rust_native_lifecycle_cart(tmp.path());
+    run_cart_libretro(&cart, "rust native lifecycle ok");
+}
+
+#[test]
+fn lua_native_lifecycle_conflict_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_overrides_native_lifecycle_cart(tmp.path());
+    // Conflict detected in blyt_session_create → retro_load_game fails →
+    // the driver exits non-zero.
+    run_cart_libretro_expect_fail(&cart);
+}
+
+#[test]
+fn lua_per_callback_mix_libretro() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_per_callback_mix_cart(tmp.path());
+    // No conflict: Lua owns init, native owns update.
+    run_cart_libretro(&cart, "lua-init");
+    run_cart_libretro(&cart, "native-update");
 }
