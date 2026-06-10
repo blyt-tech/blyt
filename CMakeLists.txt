@@ -229,482 +229,18 @@ target_include_directories(libblytemu PUBLIC ${RV32EMU_DIR})
 target_link_libraries(libblytemu PRIVATE libsoftfloat)
 
 # -------------------------------------------------------------------------
-# Guest-side RV32IMAFC shared libraries
+# Guest-side RV32IMAFC shared libraries → build/sdk/lib
 #
-# libblytcommon.so — variant-portable shared API (blyt.h); ECALL stubs for all
-# functions declared in blyt.h. libblytc.so — runtime-provided C library
-# (ADR-0120): trimmed musl subset (malloc, string, math, printf, fmemopen).
-# Requires third_party/musl. libblyt32.so — Blyt32 variant library; DT_NEEDED:
-# libblytcommon.so, libblytc.so.  Carts link against this and get the C library
-# transitively.
-#
-# Requires clang with riscv32 target support and lld.
+# Toolchain discovery runs at configure time (cmake/blyt_rv32_toolchain.cmake);
+# every guest library (release, debug, and native variants, the Lua libs, and
+# blyt-luac) is a ninja rule emitting directly into the SDK layout
+# (cmake/blyt_guest_libs.cmake), so a plain `cmake --build build` keeps them
+# fresh — the sdk script compiles nothing RV32 itself.  The module exports
+# LIBBLYTCOMMON_OUT / LIBBLYTC_OUT / LIBBLYT32_OUT / LIBBLYT32LUA_OUT (release
+# paths) for the libretro embed below.
 # -------------------------------------------------------------------------
-find_program(CLANG_RV32 clang)
-find_program(LLD_FOUND ld.lld)
-if(CLANG_RV32 AND LLD_FOUND)
-  # Verify that this clang can actually target riscv32 (Apple clang cannot).
-  execute_process(
-    COMMAND ${CLANG_RV32} --target=riscv32 -march=rv32imafc -mabi=ilp32f -x c -E
-            - -o /dev/null
-    INPUT_FILE /dev/null
-    RESULT_VARIABLE CLANG_RV32_OK
-    ERROR_QUIET OUTPUT_QUIET)
-endif()
-if(CLANG_RV32
-   AND LLD_FOUND
-   AND CLANG_RV32_OK EQUAL 0)
-  set(RV32_FLAGS
-      --target=riscv32
-      -march=rv32imafc
-      -mabi=ilp32f
-      # Release optimisation (ADR-0129): the host build produces release guest
-      # libs (embedded into blyt_libretro); determinism flags live in the
-      # per-lib CFLAGS so -O2 does not change numeric results (ADR-0007).
-      -O2
-      # The emulated↔native split overrides libblytcommon's ECALL stubs (e.g.
-      # blyt_frame_done) via symbol preemption. -O2 defaults to
-      # -fno-semantic-interposition, which binds libblytcommon's *intra-module*
-      # calls (blyt_main → blyt_frame_done) directly to its own stub, bypassing
-      # the native override and ecall'ing on the native path. Keep
-      # interposition.
-      -fsemantic-interposition
-      -shared
-      # -Wl,--shared explicitly tells lld to produce ET_DYN; clang may inject
-      # -Bstatic for bare-metal riscv targets which overrides -shared otherwise.
-      -Wl,--shared
-      -fPIC
-      -nostdlib
-      -fuse-ld=lld)
-  set(RV32_INCLUDE -I "${CMAKE_SOURCE_DIR}/runtime/guest/include")
-  set(BLYT_H "${CMAKE_SOURCE_DIR}/runtime/guest/include/blyt.h")
-
-  # libblytcommon.so — variant-portable blyt.h ECALL stubs
-  set(LIBBLYTCOMMON_SRC
-      "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c")
-  set(LIBBLYTCOMMON_OUT "${CMAKE_BINARY_DIR}/libblytcommon.so")
-  add_custom_command(
-    OUTPUT "${LIBBLYTCOMMON_OUT}"
-    COMMAND "${CLANG_RV32}" ${RV32_FLAGS} -Wl,-soname,libblytcommon.so
-            ${RV32_INCLUDE} -o "${LIBBLYTCOMMON_OUT}" "${LIBBLYTCOMMON_SRC}"
-    DEPENDS "${LIBBLYTCOMMON_SRC}" "${BLYT_H}"
-    COMMENT "Cross-compiling libblytcommon.so (RV32IMAFC)"
-    VERBATIM)
-
-  # ---- libblytc.so — runtime-provided C library (ADR-0120) ----
-  #
-  # Built from a curated subset of musl 1.2 sources (third_party/musl) plus our
-  # own arena allocator and internal stubs.  Requires the musl submodule.
-  set(MUSL_DIR "${CMAKE_SOURCE_DIR}/third_party/musl")
-  set(LIBBLYTC_BITS_DIR "${CMAKE_BINARY_DIR}/libblytc/bits")
-  set(LIBBLYTC_ALLTYPES_H "${LIBBLYTC_BITS_DIR}/alltypes.h")
-  set(LIBBLYTC_OUT "${CMAKE_BINARY_DIR}/libblytc.so")
-
-  if(EXISTS "${MUSL_DIR}/include/stdio.h")
-    # Generate bits/alltypes.h from the musl arch + generic templates. Set up
-    # bits/ directory: copy all arch/riscv32/bits/*.h, then generate the two
-    # that need processing.  Runs at configure time.
-    file(MAKE_DIRECTORY "${LIBBLYTC_BITS_DIR}")
-    file(GLOB _BITS_HDRS "${MUSL_DIR}/arch/riscv32/bits/*.h")
-    foreach(_H ${_BITS_HDRS})
-      file(COPY "${_H}" DESTINATION "${LIBBLYTC_BITS_DIR}")
-    endforeach()
-
-    execute_process(
-      COMMAND sh -c "cat '${MUSL_DIR}/arch/riscv32/bits/alltypes.h.in' \
-              '${MUSL_DIR}/include/alltypes.h.in' \
-         | sed -f '${MUSL_DIR}/tools/mkalltypes.sed'"
-      OUTPUT_FILE "${LIBBLYTC_ALLTYPES_H}"
-      RESULT_VARIABLE ALLTYPES_RESULT
-      ERROR_QUIET)
-
-    if(NOT ALLTYPES_RESULT EQUAL 0)
-      message(
-        WARNING "libblytc.so: failed to generate bits/alltypes.h — skipping")
-      set(MUSL_DIR "")
-    endif()
-
-    # Generate bits/syscall.h: copy .in then append SYS_xxx alias for each
-    # __NR_xxx (matching musl's Makefile rule).
-    if(MUSL_DIR)
-      execute_process(
-        COMMAND
-          sh -c "cp '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
-              '${LIBBLYTC_BITS_DIR}/syscall.h' \
-           && sed -n -e 's/__NR_/SYS_/p' \
-               '${MUSL_DIR}/arch/riscv32/bits/syscall.h.in' \
-               >> '${LIBBLYTC_BITS_DIR}/syscall.h'"
-        RESULT_VARIABLE SYSCALL_RESULT
-        ERROR_QUIET)
-      if(NOT SYSCALL_RESULT EQUAL 0)
-        message(WARNING "libblytc.so: failed to generate bits/syscall.h")
-        set(MUSL_DIR "")
-      endif()
-    endif()
-  else()
-    message(STATUS "libblytc.so: third_party/musl not initialised — skipping \
-(run: git submodule update --init third_party/musl)")
-    set(MUSL_DIR "")
-  endif()
-
-  if(MUSL_DIR)
-    # musl source subsets — generic C only (no arch-specific subdirectories).
-    file(GLOB LIBBLYTC_STRING_SRCS "${MUSL_DIR}/src/string/*.c")
-    # strsignal calls __lctrans_cur (locale translation); exclude it.
-    list(REMOVE_ITEM LIBBLYTC_STRING_SRCS "${MUSL_DIR}/src/string/strsignal.c")
-    file(GLOB LIBBLYTC_MATH_SRCS "${MUSL_DIR}/src/math/*.c")
-    file(GLOB LIBBLYTC_CTYPE_SRCS "${MUSL_DIR}/src/ctype/*.c")
-
-    set(LIBBLYTC_STDLIB_SRCS
-        "${MUSL_DIR}/src/stdlib/strtol.c"
-        "${MUSL_DIR}/src/stdlib/strtod.c"
-        "${MUSL_DIR}/src/stdlib/qsort.c"
-        "${MUSL_DIR}/src/stdlib/qsort_nr.c"
-        "${MUSL_DIR}/src/stdlib/abs.c"
-        "${MUSL_DIR}/src/stdlib/atoi.c"
-        "${MUSL_DIR}/src/stdlib/atol.c"
-        "${MUSL_DIR}/src/stdlib/atof.c")
-
-    # floatscan / intscan / shgetc are internal helpers for strtod / strtol.
-    set(LIBBLYTC_INTERNAL_SRCS
-        "${MUSL_DIR}/src/internal/floatscan.c"
-        "${MUSL_DIR}/src/internal/intscan.c"
-        "${MUSL_DIR}/src/internal/shgetc.c")
-
-    # stdio subset: vsnprintf / snprintf / vfprintf / fmemopen + minimal FILE
-    # infrastructure.  Excludes anything that issues real syscalls (fopen,
-    # fread, fwrite via fd, etc.).
-    set(LIBBLYTC_STDIO_SRCS
-        "${MUSL_DIR}/src/stdio/vsnprintf.c"
-        "${MUSL_DIR}/src/stdio/snprintf.c"
-        "${MUSL_DIR}/src/stdio/vfprintf.c"
-        "${MUSL_DIR}/src/stdio/fwrite.c"
-        "${MUSL_DIR}/src/stdio/fmemopen.c"
-        "${MUSL_DIR}/src/stdio/__overflow.c"
-        "${MUSL_DIR}/src/stdio/__towrite.c"
-        "${MUSL_DIR}/src/stdio/__toread.c"
-        "${MUSL_DIR}/src/stdio/__uflow.c"
-        "${MUSL_DIR}/src/stdio/__fmodeflags.c")
-
-    set(LIBBLYTC_OWN_SRCS
-        "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_arena.c"
-        "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c")
-
-    set(LIBBLYTC_SRCS
-        ${LIBBLYTC_STRING_SRCS}
-        ${LIBBLYTC_MATH_SRCS}
-        ${LIBBLYTC_CTYPE_SRCS}
-        ${LIBBLYTC_STDLIB_SRCS}
-        ${LIBBLYTC_INTERNAL_SRCS}
-        ${LIBBLYTC_STDIO_SRCS}
-        ${LIBBLYTC_OWN_SRCS})
-
-    # Include paths for musl internal compilation. LIBBLYTC_BITS_DIR provides
-    # the generated bits/alltypes.h.
-    set(LIBBLYTC_INCLUDES
-        -I
-        "${MUSL_DIR}/src/include" # defines `hidden` and other internal macros
-        -I
-        "${MUSL_DIR}/include"
-        -I
-        "${MUSL_DIR}/arch/riscv32"
-        -I
-        "${MUSL_DIR}/arch/generic"
-        -I
-        "${MUSL_DIR}/src/internal"
-        -I
-        "${CMAKE_BINARY_DIR}/libblytc") # bits/alltypes.h lives here
-
-    # Determinism and musl-compatibility compile flags.
-    set(LIBBLYTC_CFLAGS
-        -ffp-contract=off
-        -fno-fast-math
-        -fno-strict-aliasing
-        -Wno-unused-parameter
-        -Wno-sign-compare
-        -Wno-implicit-fallthrough
-        -Wno-unused-variable
-        -Wno-deprecated-non-prototype)
-
-    add_custom_command(
-      OUTPUT "${LIBBLYTC_OUT}"
-      COMMAND
-        "${CLANG_RV32}" ${RV32_FLAGS} ${LIBBLYTC_INCLUDES} ${LIBBLYTC_CFLAGS}
-        -Wl,-soname,libblytc.so -o "${LIBBLYTC_OUT}" ${LIBBLYTC_SRCS}
-      DEPENDS ${LIBBLYTC_SRCS} "${LIBBLYTC_ALLTYPES_H}"
-      COMMENT "Cross-compiling libblytc.so (RV32IMAFC, musl subset)"
-      VERBATIM)
-
-    message(STATUS "libblytc.so: will be built (musl at ${MUSL_DIR})")
-
-    # ---- libblyt32lua.so (Lua VM + SoftFloat + runtime stubs) ----
-    #
-    # Provides the symbols that libblytc.so omits: strerror, soft-float double
-    # ops (__muldf3 etc.), setjmp/longjmp, and the Lua VM itself. Embedded into
-    # blyt_libretro.so alongside the other guest libs so the core is
-    # self-contained (no BLYT_LIB_DIR required at runtime).
-    set(LIBBLYT32LUA_OUT "")
-    set(_LUA_DIR "${CMAKE_SOURCE_DIR}/third_party/lua")
-    set(_SF_SRC "${CMAKE_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
-    if(EXISTS "${_LUA_DIR}/lvm.c" AND EXISTS "${_SF_SRC}/s_addMagsF64.c")
-      set(LIBBLYT32LUA_OUT "${CMAKE_BINARY_DIR}/libblyt32lua.so")
-
-      set(_SF_PLATFORM_DIR "${CMAKE_BINARY_DIR}/softfloat-rv32")
-      file(MAKE_DIRECTORY "${_SF_PLATFORM_DIR}")
-      file(WRITE "${_SF_PLATFORM_DIR}/platform.h" "#define THREAD_LOCAL\n")
-
-      file(GLOB _SF_ALL "${_SF_SRC}/*.c")
-      foreach(
-        _EXCL_PAT
-        "${_SF_SRC}/extF80*"
-        "${_SF_SRC}/*M_*"
-        "${_SF_SRC}/*M.*"
-        "${_SF_SRC}/bf16*"
-        "${_SF_SRC}/f16*"
-        "${_SF_SRC}/f32_to_extF80*"
-        "${_SF_SRC}/f64_to_extF80*"
-        "${_SF_SRC}/f128_to_extF80*")
-        file(GLOB _EXCL_LIST "${_EXCL_PAT}")
-        list(REMOVE_ITEM _SF_ALL ${_EXCL_LIST})
-      endforeach()
-      file(
-        GLOB
-        _SF_RISCV
-        "${_SF_SRC}/RISCV/s_propagateNaNF16UI.c"
-        "${_SF_SRC}/RISCV/s_propagateNaNF32UI.c"
-        "${_SF_SRC}/RISCV/s_propagateNaNF64UI.c"
-        "${_SF_SRC}/RISCV/s_propagateNaNF128UI.c"
-        "${_SF_SRC}/RISCV/s_propagateNaNExtF80UI.c"
-        "${_SF_SRC}/RISCV/s_f16UIToCommonNaN.c"
-        "${_SF_SRC}/RISCV/s_f32UIToCommonNaN.c"
-        "${_SF_SRC}/RISCV/s_f64UIToCommonNaN.c"
-        "${_SF_SRC}/RISCV/s_f128UIToCommonNaN.c"
-        "${_SF_SRC}/RISCV/s_extF80UIToCommonNaN.c"
-        "${_SF_SRC}/RISCV/s_commonNaNToF16UI.c"
-        "${_SF_SRC}/RISCV/s_commonNaNToF32UI.c"
-        "${_SF_SRC}/RISCV/s_commonNaNToF64UI.c"
-        "${_SF_SRC}/RISCV/s_commonNaNToF128UI.c"
-        "${_SF_SRC}/RISCV/s_commonNaNToExtF80UI.c"
-        "${_SF_SRC}/RISCV/softfloat_raiseFlags.c")
-      set(_SF_MWORD
-          "${_SF_SRC}/s_add256M.c" "${_SF_SRC}/s_sub256M.c"
-          "${_SF_SRC}/s_mul128To256M.c" "${_SF_SRC}/s_shiftRightJam256M.c")
-
-      file(GLOB _LUA_SRCS "${_LUA_DIR}/*.c")
-      foreach(
-        _EXCL
-        "${_LUA_DIR}/lua.c"
-        "${_LUA_DIR}/luac.c"
-        "${_LUA_DIR}/onelua.c"
-        "${_LUA_DIR}/liolib.c"
-        "${_LUA_DIR}/loslib.c"
-        "${_LUA_DIR}/loadlib.c"
-        "${_LUA_DIR}/ldblib.c"
-        "${_LUA_DIR}/lutf8lib.c")
-        list(REMOVE_ITEM _LUA_SRCS "${_EXCL}")
-      endforeach()
-
-      # Public musl headers — avoids the `#define weak __attribute__((weak))` in
-      # musl's src/include/ that clashes with Lua's GCObject *weak field.
-      set(_LUA_MUSL_INC
-          -I
-          "${MUSL_DIR}/include"
-          -I
-          "${MUSL_DIR}/arch/riscv32"
-          -I
-          "${MUSL_DIR}/arch/generic"
-          -I
-          "${LIBBLYTC_BITS_DIR}/..")
-
-      set(_LUA32_SRCS
-          ${_LUA_SRCS}
-          "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
-          "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S"
-          ${_SF_ALL}
-          ${_SF_RISCV}
-          ${_SF_MWORD}
-          "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/softfloat_builtins.c"
-          "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/lua_runtime_stubs.c"
-          "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/blyt32lua.c"
-          "${CMAKE_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"
-          "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/master_hook_ecall.c"
-      )
-
-      add_custom_command(
-        OUTPUT "${LIBBLYT32LUA_OUT}"
-        COMMAND
-          "${CLANG_RV32}" ${RV32_FLAGS} ${RV32_INCLUDE} ${_LUA_MUSL_INC}
-          ${LIBBLYTC_CFLAGS} -DLUA_32BITS=1 -DLUA_USE_LONGJMP=1
-          "-Dluai_makeseed()=0x424C5954u" -DBLYT_DAP=1 -I "${_LUA_DIR}" -I
-          "${_SF_SRC}/include" -I "${_SF_SRC}/RISCV" -I "${_SF_PLATFORM_DIR}" -I
-          "${CMAKE_SOURCE_DIR}/runtime/host/src/dap" -DSOFTFLOAT_FAST_INT64=1
-          -DSOFTFLOAT_ROUND_ODD=1 -Wl,-soname,libblyt32lua.so -Wl,--as-needed
-          "${LIBBLYT32_OUT}" -o "${LIBBLYT32LUA_OUT}" ${_LUA32_SRCS}
-        DEPENDS "${LIBBLYT32_OUT}" ${_LUA32_SRCS}
-        COMMENT "Cross-compiling libblyt32lua.so (RV32IMAFC, Lua + SoftFloat)"
-        VERBATIM)
-
-      message(STATUS "libblyt32lua.so: will be built (Lua + SoftFloat)")
-    else()
-      message(STATUS "libblyt32lua.so: skipping \
-(third_party/lua or rv32emu/softfloat not initialised)")
-    endif()
-  endif()
-
-  # libblyt32.so — Blyt32 variant. DT_NEEDED: libblytcommon.so, libblytc.so (the
-  # latter via --no-as-needed so the entry is added even though libblyt32.so's
-  # own code doesn't reference libblytc symbols directly).
-  set(LIBBLYT32_SRC "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c")
-  set(LIBBLYT32_OUT "${CMAKE_BINARY_DIR}/libblyt32.so")
-
-  if(MUSL_DIR)
-    # Full build: DT_NEEDED for both libblytcommon.so and libblytc.so. Use full
-    # paths to avoid lld defaulting to -Bstatic on bare-metal targets.
-    set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}"
-                       "${LIBBLYTC_OUT}")
-    set(LIBBLYT32_LINK -Wl,-Bdynamic "${LIBBLYTCOMMON_OUT}" -Wl,--no-as-needed
-                       "${LIBBLYTC_OUT}" -Wl,--as-needed)
-  else()
-    # musl unavailable: build without libblytc.so dependency.
-    set(LIBBLYT32_DEPS "${LIBBLYT32_SRC}" "${BLYT_H}" "${LIBBLYTCOMMON_OUT}")
-    set(LIBBLYT32_LINK -Wl,-Bdynamic "${LIBBLYTCOMMON_OUT}")
-  endif()
-
-  add_custom_command(
-    OUTPUT "${LIBBLYT32_OUT}"
-    COMMAND
-      "${CLANG_RV32}" ${RV32_FLAGS} -Wl,-soname,libblyt32.so ${RV32_INCLUDE}
-      ${LIBBLYT32_LINK} -o "${LIBBLYT32_OUT}" "${LIBBLYT32_SRC}"
-    DEPENDS ${LIBBLYT32_DEPS}
-    COMMENT "Cross-compiling libblyt32.so (RV32IMAFC)"
-    VERBATIM)
-
-  if(MUSL_DIR)
-    set(_libblyt32_all_deps "${LIBBLYT32_OUT}" "${LIBBLYTCOMMON_OUT}"
-                            "${LIBBLYTC_OUT}")
-    if(LIBBLYT32LUA_OUT)
-      list(APPEND _libblyt32_all_deps "${LIBBLYT32LUA_OUT}")
-    endif()
-    add_custom_target(libblyt32_so ALL DEPENDS ${_libblyt32_all_deps})
-    message(
-      STATUS "libblytcommon.so + libblytc.so + libblyt32.so: will be built \
-(${CLANG_RV32})")
-  else()
-    add_custom_target(libblyt32_so ALL DEPENDS "${LIBBLYT32_OUT}"
-                                               "${LIBBLYTCOMMON_OUT}")
-    message(
-      STATUS "libblytcommon.so + libblyt32.so: will be built (${CLANG_RV32})")
-  endif()
-
-  # -------------------------------------------------------------------------
-  # Native-path libblyt32.so (frontends/native/src/libblyt32/)
-  #
-  # Real API implementations for trusted native exec on RISC-V:
-  # blyt_console_debug → write(2,...), seccomp constructor, and future API
-  # functions. Placed in build/native/ alongside libblytcommon.so + libblytc.so
-  # so the launcher can use a single LD_LIBRARY_PATH=build/native.
-  #
-  # Only exercised by the native RISC-V QEMU gate (native_qemu.rs).  Gated by
-  # BLYT_BUILD_NATIVE so environments that don't run that gate (e.g. the Linux
-  # Docker test image, which skips it) can avoid the work.
-  # -------------------------------------------------------------------------
-  option(BLYT_BUILD_NATIVE
-         "Build the native trusted-exec libblyt32.so (RISC-V QEMU gate)" ON)
-  if(BLYT_BUILD_NATIVE)
-    set(LIBBLYT32_NATIVE_SRC
-        "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c")
-    set(LIBBLYT32_NATIVE_INC
-        "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32")
-    set(LIBBLYT32_NATIVE_OUT "${CMAKE_BINARY_DIR}/native/libblyt32.so")
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/native")
-
-    # ld-blyt.so.1 stub: empty shared lib with SONAME=ld-blyt.so.1. Used only at
-    # link time so lld emits DT_NEEDED: ld-blyt.so.1 in libblytc.so.  Never
-    # staged to QEMU; the real /lib/ld-blyt.so.1 (system musl) is loaded by the
-    # kernel as the ELF interpreter.
-    set(LD_BLYT_STUB_SRC
-        "${CMAKE_SOURCE_DIR}/frontends/native/src/libblytc/ld_blyt_stub.c")
-    set(LD_BLYT_STUB_OUT "${CMAKE_BINARY_DIR}/native/ld-blyt.so.1.stub")
-    add_custom_command(
-      OUTPUT "${LD_BLYT_STUB_OUT}"
-      COMMAND "${CLANG_RV32}" ${RV32_FLAGS} -shared -Wl,-soname,ld-blyt.so.1 -o
-              "${LD_BLYT_STUB_OUT}" "${LD_BLYT_STUB_SRC}"
-      DEPENDS "${LD_BLYT_STUB_SRC}"
-      COMMENT "Cross-compiling ld-blyt.so.1 stub (build-time only)"
-      VERBATIM)
-
-    # Native libblytc.so: thin wrapper whose only job is to carry DT_NEEDED:
-    # ld-blyt.so.1 so carts and libblyt32.so can resolve stdlib symbols (malloc,
-    # getenv, snprintf, …) from the system musl interpreter at runtime on QEMU.
-    set(LIBBLYTC_NATIVE_SRC
-        "${CMAKE_SOURCE_DIR}/frontends/native/src/libblytc/libblytc_native.c")
-    set(LIBBLYTC_NATIVE_OUT "${CMAKE_BINARY_DIR}/native/libblytc.so")
-    add_custom_command(
-      OUTPUT "${LIBBLYTC_NATIVE_OUT}"
-      COMMAND
-        "${CLANG_RV32}" ${RV32_FLAGS} -shared -Wl,-soname,libblytc.so
-        -Wl,-Bdynamic -Wl,--no-as-needed "${LD_BLYT_STUB_OUT}" -Wl,--as-needed
-        -o "${LIBBLYTC_NATIVE_OUT}" "${LIBBLYTC_NATIVE_SRC}"
-      DEPENDS "${LIBBLYTC_NATIVE_SRC}" "${LD_BLYT_STUB_OUT}"
-      COMMENT
-        "Cross-compiling libblytc.so (RV32IMAFC, native, DT_NEEDED: ld-blyt.so.1)"
-      VERBATIM)
-
-    set(LIBBLYT32_NATIVE_DEPS
-        "${LIBBLYT32_NATIVE_SRC}"
-        "${LIBBLYT32_NATIVE_INC}/seccomp_restricted.h" "${BLYT_H}"
-        "${LIBBLYTCOMMON_OUT}" "${LIBBLYTC_NATIVE_OUT}")
-
-    # Native link: --no-as-needed forces both libblytcommon.so and libblytc.so
-    # into DT_NEEDED.  libblytc.so chains to ld-blyt.so.1 (system musl), making
-    # malloc/getenv/snprintf/... available to libblyt32.so and to native carts
-    # at runtime on QEMU.
-    set(LIBBLYT32_NATIVE_LINK
-        -Wl,-Bdynamic -Wl,--no-as-needed "${LIBBLYTCOMMON_OUT}"
-        "${LIBBLYTC_NATIVE_OUT}" -Wl,--as-needed)
-
-    add_custom_command(
-      OUTPUT "${LIBBLYT32_NATIVE_OUT}"
-      COMMAND
-        # Keep -O0: blyt32.c uses hand-rolled string helpers prefixed
-        # blyt32_native_* so the compiler won't recognize them as stdlib
-        # functions; -O0 avoids any loop-idiom rewrites into libcalls.
-        # -fno-builtin removed: stdlib is now available via the DT_NEEDED chain
-        # libblyt32.so → libblytc.so → ld-blyt.so.1 (system musl).
-        "${CLANG_RV32}" ${RV32_FLAGS} -O0 -Wl,-soname,libblyt32.so
-        ${RV32_INCLUDE} -I "${LIBBLYT32_NATIVE_INC}" ${LIBBLYT32_NATIVE_LINK} -o
-        "${LIBBLYT32_NATIVE_OUT}" "${LIBBLYT32_NATIVE_SRC}"
-      DEPENDS ${LIBBLYT32_NATIVE_DEPS}
-      COMMENT "Cross-compiling libblyt32.so (RV32IMAFC, native build)"
-      VERBATIM)
-
-    # Stage libblytcommon.so and libblytc.so alongside native libblyt32.so.
-    # libblytc.so on the native path is the thin wrapper that DT_NEEDs
-    # ld-blyt.so.1; it does NOT conflict with the musl interpreter because it
-    # exports no libc symbols of its own — it only carries the DT_NEEDED.
-    add_custom_command(
-      OUTPUT "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
-      COMMAND "${CMAKE_COMMAND}" -E copy "${LIBBLYTCOMMON_OUT}"
-              "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
-      DEPENDS "${LIBBLYTCOMMON_OUT}"
-      COMMENT "Staging libblytcommon.so to native/"
-      VERBATIM)
-
-    add_custom_target(
-      libblyt32_native_so ALL
-      DEPENDS "${LIBBLYT32_NATIVE_OUT}"
-              "${CMAKE_BINARY_DIR}/native/libblytcommon.so"
-              "${LIBBLYTC_NATIVE_OUT}")
-    message(STATUS "libblyt32.so (native build): will be built → build/native/")
-  else()
-    message(
-      STATUS "libblyt32.so (native build): skipped (BLYT_BUILD_NATIVE=OFF)")
-  endif()
-
-else()
-  message(STATUS "libblytcommon.so + libblyt32.so + libblytc.so: skipping \
-(need clang riscv32 + ld.lld)")
-endif()
+include(cmake/blyt_rv32_toolchain.cmake)
+include(cmake/blyt_guest_libs.cmake)
 
 # -------------------------------------------------------------------------
 # Host runtime libraries (stubs for future expansion; only libblyt is real)
@@ -1012,7 +548,7 @@ if(LIBBLYTC_OUT)
   endif()
   target_compile_definitions(blyt_libretro PRIVATE ${_blyt_libretro_defs})
   set_target_properties(blyt_libretro PROPERTIES PREFIX "" SUFFIX ".so")
-  add_dependencies(blyt_libretro libblyt32_so)
+  add_dependencies(blyt_libretro guest_libs)
   message(STATUS "blyt_libretro: will be built")
 else()
   add_library(blyt_libretro INTERFACE)
@@ -1215,9 +751,11 @@ endif()
 #
 # cmake --build build --target sdk
 #
-# Downloads a pre-built LLVM toolchain if no riscv32-capable clang is found,
-# builds libblytcommon.so + libblyt32.so (RV32IMAFC), copies the devtool and
-# headers, and assembles a self-contained SDK under build/sdk/.
+# The guest libraries, players, and blyt-luac are built by the main ninja graph
+# directly into sdk/ (see cmake/blyt_guest_libs.cmake); the script adds the
+# parts that change rarely: libc++, headers, the devtool, toolchain symlinks,
+# and the WASM runtimes.  The RV32 toolchain discovered at configure time is
+# passed through so the script and the ninja rules always agree.
 #
 # After building, carts can be built with: build/sdk/bin/blyt build
 # <project-dir>
@@ -1228,6 +766,10 @@ add_custom_target(
     ${CMAKE_COMMAND} -DBLYT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
     -DBLYT_BINARY_DIR=${CMAKE_BINARY_DIR} -DBLYT_VERSION=${BLYT_VERSION}
     -DBLYT_BUILD_NATIVE=${BLYT_BUILD_NATIVE}
+    -DBLYT_RV32_CLANG=${BLYT_RV32_CLANG}
+    -DBLYT_RV32_CLANGPP=${BLYT_RV32_CLANGPP} -DBLYT_RV32_LLD=${BLYT_RV32_LLD}
+    -DBLYT_RV32_OBJCOPY=${BLYT_RV32_OBJCOPY} -DBLYT_RV32_AR=${BLYT_RV32_AR}
+    -DBLYT_RV32_LLDB_DAP=${BLYT_RV32_LLDB_DAP}
     -DCMAKE_HOST_SYSTEM_NAME=${CMAKE_HOST_SYSTEM_NAME}
     -DCMAKE_HOST_SYSTEM_PROCESSOR=${CMAKE_HOST_SYSTEM_PROCESSOR} -P
     ${CMAKE_SOURCE_DIR}/cmake/blyt_sdk.cmake
@@ -1235,12 +777,12 @@ add_custom_target(
   COMMENT "Assembling blyt SDK in build/sdk/"
   VERBATIM)
 
-# blytplay and blytdebug build directly into sdk/bin (RUNTIME_OUTPUT_DIRECTORY).
-# Declare them as dependencies so `cmake --build build --target sdk` rebuilds
-# the binaries before assembling the SDK.
-foreach(_sdk_bin blytplay blytdebug)
-  if(TARGET ${_sdk_bin})
-    add_dependencies(sdk ${_sdk_bin})
+# The players, guest libraries, and native libs all build directly into sdk/ via
+# the ninja graph.  Declare them as dependencies so `cmake --build build
+# --target sdk` refreshes them before assembling the rest of the SDK.
+foreach(_sdk_dep blytplay blytdebug guest_libs libblyt32_native_so)
+  if(TARGET ${_sdk_dep})
+    add_dependencies(sdk ${_sdk_dep})
   endif()
 endforeach()
 

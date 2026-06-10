@@ -68,12 +68,6 @@ set(BLYT_GUEST_LIB_DIR
     CACHE PATH
           "Directory containing libblytcommon.so, libblytc.so, libblyt32.so")
 
-# Fall back to build/ (cmake main build without the sdk target)
-if(NOT EXISTS "${BLYT_GUEST_LIB_DIR}/libblytcommon.so"
-   AND EXISTS "${BLYT_ROOT}/build/libblytcommon.so")
-  set(BLYT_GUEST_LIB_DIR "${BLYT_ROOT}/build")
-endif()
-
 foreach(_LIB libblytcommon.so libblytc.so libblyt32.so)
   if(NOT EXISTS "${BLYT_GUEST_LIB_DIR}/${_LIB}")
     message(

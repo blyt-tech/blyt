@@ -11,7 +11,7 @@
 /// Silently skipped if images or qemu-system-riscv64 are not present.
 mod common;
 
-use common::{CartProject, build_dir, has_luac, repo_root, sdk_dir, write_c_cart_project};
+use common::{CartProject, has_luac, repo_root, sdk_dir, write_c_cart_project};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -248,10 +248,11 @@ fn native_riscv_qemu_gate() {
         return;
     }
 
-    let native_dir = build_dir().join("native");
+    let native_dir = sdk_dir().join("lib/native");
     assert!(
         native_dir.join("libblyt32.so").exists(),
-        "native/libblyt32.so not found — run: cmake --build build --target libblyt32_native_so"
+        "sdk/lib/native/libblyt32.so not found — \
+         run: cmake --build build --target libblyt32_native_so"
     );
     assert!(
         sdk_dir().join("bin/blyt-clang").exists(),
