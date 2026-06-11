@@ -8,3 +8,10 @@ retries = 0
 # behind interleaved progress lines; re-print every failure's full output at
 # the end of the run as well.
 failure-output = "immediate-final"
+
+# The QEMU gate boots a full system over SSH (~25-35s, the longest single
+# test). Schedule it first so it overlaps the other suites instead of
+# extending the run when it lands at the tail of the queue.
+[[profile.default.overrides]]
+filter = 'test(native_riscv_qemu_gate)'
+priority = 100
