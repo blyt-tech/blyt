@@ -77,14 +77,20 @@ function nextEvent(name) {
         const check = (e) => {
             if (e.event === name) {
                 clearTimeout(timer);
-                const idx = waiters.indexOf(check);
-                if (idx >= 0) waiters.splice(idx, 1);
+                const widx = waiters.indexOf(check);
+                if (widx >= 0) waiters.splice(widx, 1);
+                /* Consume the event so a later nextEvent() for the same name
+                 * waits for a fresh one instead of resolving with this stale
+                 * entry (e.g. the restart flow must observe the *second*
+                 * "stopped", not instantly re-consume the first). */
+                const qidx = eventQueue.indexOf(e);
+                if (qidx >= 0) eventQueue.splice(qidx, 1);
                 resolve(e);
                 return true;
             }
             return false;
         };
-        /* Check already-buffered events first. */
+        /* Check already-buffered (unconsumed) events first. */
         for (const e of eventQueue) {
             if (check(e)) return;
         }

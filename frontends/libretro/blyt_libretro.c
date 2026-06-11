@@ -248,6 +248,8 @@ RETRO_API void retro_unload_game(void) {
 RETRO_API void retro_reset(void) {
     blyt_session_destroy(g_session);
     g_session = g_cart ? blyt_session_create(g_cart, libretro_log) : NULL;
+    if (!g_session && g_log_cb)
+        g_log_cb(RETRO_LOG_ERROR, "blyt: reset failed to recreate the cart session\n");
     g_cart_done = false;
     g_run_err = BLYT_RUN_OK;
 }

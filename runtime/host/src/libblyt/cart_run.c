@@ -2292,6 +2292,8 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
 
     s->rv = rv_create(&s->attr);
     if (!s->rv) {
+        if (log_fn)
+            log_fn("session create: rv_create failed (guest VM allocation)");
         free(s);
         return NULL;
     }
@@ -2301,6 +2303,8 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
 
     blyt_cart_run_err_t load_err = dynlink(s, cart);
     if (load_err != BLYT_RUN_OK) {
+        if (log_fn)
+            log_fn("session create: guest dynamic link failed");
         rv_delete(s->rv);
         free(s);
         return NULL;
