@@ -936,6 +936,11 @@ if(_BLYT_DOCKER)
       /usr/bin/env docker run --platform linux/${BLYT_LINUX_ARCH} --rm -v
       "${CMAKE_SOURCE_DIR}:/repo:ro" -v
       blyt-linux-build-${BLYT_LINUX_ARCH}:/build
+      # Compiler caches live in their own volume so wiping the build volume (the
+      # usual reset) keeps them; ccache/sccache are picked up automatically by
+      # the configure step and the devtool.
+      -v blyt-compiler-cache-${BLYT_LINUX_ARCH}:/ccache -e
+      CCACHE_DIR=/ccache/ccache -e SCCACHE_DIR=/ccache/sccache
       # The native RISC-V QEMU gate is host-independent and would run nested
       # under Rosetta here; skip it in the Docker image (runs natively + in CI).
       -e BLYT_SKIP_QEMU_GATE=1 blyt-testing-${BLYT_LINUX_ARCH} bash -c
