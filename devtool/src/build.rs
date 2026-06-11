@@ -142,7 +142,6 @@ fn cart_layouts_bytes(cfg: &CartConfig) -> Vec<u8> {
  * ------------------------------------------------------------------------- */
 
 struct CartStateFiles {
-    c_header: PathBuf,      /* build/blyt/c/cart_state.h */
     rust_module: PathBuf,   /* build/blyt/rust/cart_state.rs */
     layouts_bin: PathBuf,   /* build/cart.layouts.bin */
     c_include_dir: PathBuf, /* build/blyt/c/ */
@@ -451,7 +450,6 @@ fn generate_cart_state(
     }
 
     Ok(CartStateFiles {
-        c_header: c_path,
         rust_module: rs_path,
         layouts_bin,
         c_include_dir: c_dir,
@@ -824,7 +822,6 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     let lib_include_paths: Vec<PathBuf> =
         built_libs.iter().map(|l| l.include_path.clone()).collect();
     let mut lib_archives: Vec<PathBuf> = built_libs.into_iter().map(|l| l.archive).collect();
-    let lib_include_refs: Vec<&Path> = lib_include_paths.iter().map(PathBuf::as_path).collect();
 
     // Lua carts may have standalone Rust libs in src/lib/ (Cargo.toml present).
     // Build each independently; the resulting archives are appended to lib_archives
