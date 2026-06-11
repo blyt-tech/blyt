@@ -1,34 +1,39 @@
 local greeting = require("greeting")
-local slot = -1
-local frame = 0
+-- frame is deliberately plain Lua state (not a state buffer) to demonstrate
+-- serialising static state in on_save_state/on_load_state.
+local frame
 
 function init()
-    blyt.buf.alloc_slot(S.GLOBALS)
-    slot = blyt.buf.alloc_slot(S.PLAYER)
+    frame = 0
 end
 
 function on_new_state()
-    S.player[slot].x = 160
-    S.player[slot].y = 120
+    blyt.buf.alloc_slot(S.GLOBALS)
+    local slot = blyt.buf.alloc_slot(S.CHARACTER)
+    S.globals[0].player_id = slot
+    S.character[slot].x = 160
+    S.character[slot].y = 120
     greeting.log("init player pos: 160, 120")
 end
 
 function update()
     frame = frame + 1
     if frame % 10 == 0 then
-        local x = (S.player[slot].x + 1) % 320
-        local y = (S.player[slot].y + 1) % 240
-        S.player[slot].x = x
-        S.player[slot].y = y
+        local slot = S.globals[0].player_id
+        local x = (S.character[slot].x + 1) % 320
+        local y = (S.character[slot].y + 1) % 240
+        S.character[slot].x = x
+        S.character[slot].y = y
         greeting.log("update frame " .. frame .. " player pos: " .. x .. ", " .. y)
     end
 end
 
 function draw()
     if frame % 10 == 0 then
+        local slot = S.globals[0].player_id
         greeting.log("draw frame " .. frame ..
-                     " player pos: " .. S.player[slot].x ..
-                     ", " .. S.player[slot].y)
+                     " player pos: " .. S.character[slot].x ..
+                     ", " .. S.character[slot].y)
     end
 end
 
@@ -38,5 +43,4 @@ end
 
 function on_load_state(info)
     frame = S.globals[0].frame
-    slot = 0
 end

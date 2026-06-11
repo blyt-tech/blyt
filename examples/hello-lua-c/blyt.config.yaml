@@ -2,7 +2,8 @@ records:
   Globals:
     fields:
       - { name: frame, type: i32 }
-  Player:
+      - { name: player_id, type: i32 }
+  Character:
     fields:
       - { name: x, type: i32 }
       - { name: y, type: i32 }
@@ -10,6 +11,6 @@ state_buffers:
   globals:
     record: Globals
     count: 1
-  player:
-    record: Player
+  character:
+    record: Character
     count: 1

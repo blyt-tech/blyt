@@ -31,21 +31,22 @@ impl<T: Copy> BlytCell<T> {
     }
 }
 
+/// S_FRAME is deliberately plain static state (not a state buffer) to
+/// demonstrate serialising static state in on_save_state/on_load_state.
 static S_FRAME: BlytCell<u32> = BlytCell::new(0);
-static S_SLOT: BlytCell<i32> = BlytCell::new(-1);
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_init() {
-    alloc_slot(S_GLOBALS);
-    let slot = alloc_slot(S_PLAYER);
-    S_SLOT.set(slot);
+    S_FRAME.set(0);
 }
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_on_new_state() {
-    let slot = S_SLOT.get();
-    set_i32(S_PLAYER, slot, S_PLAYER_X, 160);
-    set_i32(S_PLAYER, slot, S_PLAYER_Y, 120);
+    alloc_slot(S_GLOBALS);
+    let slot = alloc_slot(S_CHARACTER);
+    set_i32(S_GLOBALS, 0, S_GLOBALS_PLAYER_ID, slot);
+    set_i32(S_CHARACTER, slot, S_CHARACTER_X, 160);
+    set_i32(S_CHARACTER, slot, S_CHARACTER_Y, 120);
     blyt::console_debug("init player pos: 160, 120");
 }
 
@@ -54,11 +55,11 @@ pub extern "C" fn blyt_cart_update() {
     let frame = S_FRAME.get() + 1;
     S_FRAME.set(frame);
     if frame % 10 == 0 {
-        let slot = S_SLOT.get();
-        let x = (get_i32(S_PLAYER, slot, S_PLAYER_X) + 1) % 320;
-        let y = (get_i32(S_PLAYER, slot, S_PLAYER_Y) + 1) % 240;
-        set_i32(S_PLAYER, slot, S_PLAYER_X, x);
-        set_i32(S_PLAYER, slot, S_PLAYER_Y, y);
+        let slot = get_i32(S_GLOBALS, 0, S_GLOBALS_PLAYER_ID);
+        let x = (get_i32(S_CHARACTER, slot, S_CHARACTER_X) + 1) % 320;
+        let y = (get_i32(S_CHARACTER, slot, S_CHARACTER_Y) + 1) % 240;
+        set_i32(S_CHARACTER, slot, S_CHARACTER_X, x);
+        set_i32(S_CHARACTER, slot, S_CHARACTER_Y, y);
         blyt::console_debug(&format!("update frame {} player pos: {}, {}", frame, x, y));
     }
 }
@@ -67,9 +68,9 @@ pub extern "C" fn blyt_cart_update() {
 pub extern "C" fn blyt_cart_draw() {
     let frame = S_FRAME.get();
     if frame % 10 == 0 {
-        let slot = S_SLOT.get();
-        let x = get_i32(S_PLAYER, slot, S_PLAYER_X);
-        let y = get_i32(S_PLAYER, slot, S_PLAYER_Y);
+        let slot = get_i32(S_GLOBALS, 0, S_GLOBALS_PLAYER_ID);
+        let x = get_i32(S_CHARACTER, slot, S_CHARACTER_X);
+        let y = get_i32(S_CHARACTER, slot, S_CHARACTER_Y);
         blyt::console_debug(&format!("draw frame {} player pos: {}, {}", frame, x, y));
     }
 }
@@ -82,5 +83,4 @@ pub extern "C" fn blyt_cart_on_save_state() {
 #[no_mangle]
 pub extern "C" fn blyt_cart_on_load_state(_reason: u32, _saved_version: u32, _buffers: u32) {
     S_FRAME.set(get_i32(S_GLOBALS, 0, S_GLOBALS_FRAME) as u32);
-    S_SLOT.set(0);
 }
