@@ -316,9 +316,16 @@ add_executable(
   "${BLYT_ROOT}/runtime/host/src/libblyt/save.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/trace.c"
+  "${BLYT_ROOT}/runtime/host/src/libblyt/version.c"
   ${BLYT_LUA_SOURCES}
   ${BLYT_DAP_SOURCES}
   ${BLYT_GDB_SOURCES})
+
+# BLYT_VERSION carries a per-run timestamp in CI dev builds; scope it to the one
+# tiny TU that uses it so everything else stays compiler-cacheable.
+set_source_files_properties(
+  "${BLYT_ROOT}/runtime/host/src/libblyt/version.c"
+  PROPERTIES COMPILE_DEFINITIONS BLYT_VERSION="${BLYT_VERSION}")
 
 # Produce <name>.html + <name>.js + <name>.wasm.  ADR-0129: the SDK builds this
 # twice — release as "blytplay" (DAP/GDB off, release libs) and debug as

@@ -36,6 +36,9 @@ typedef enum blyt_cart_err {
     BLYT_CART_ERR_BAD_IMPORT = 21, /* imported symbol not on allowlist */
     BLYT_CART_ERR_MISSING_ENTRY = 22, /* required cart entry point absent */
     BLYT_CART_ERR_BAD_LAYOUTS = 23, /* .cart.layouts FlatBuffers parse error */
+    BLYT_CART_ERR_BAD_ID = 24, /* .cart.info id missing or invalid */
+    BLYT_CART_ERR_BAD_TITLE = 25, /* .cart.info title missing or invalid */
+    BLYT_CART_ERR_BAD_VERSION = 26, /* .cart.info version missing or invalid */
 } blyt_cart_err_t;
 
 typedef struct blyt_cart blyt_cart_t;
@@ -70,6 +73,19 @@ uint32_t blyt_cart_lua_lifecycle_mask(const blyt_cart_t *cart);
 
 /* Return non-zero if the cart has a .cart.layouts section. */
 int blyt_cart_has_layouts(const blyt_cart_t *cart);
+
+/*
+ * Cart identity from the .cart.info manifest, validated at load time:
+ * id (machine identifier: save directory name), title (human-readable),
+ * version (cart semver string).  All non-NULL on a successfully opened cart;
+ * valid while the cart is open.
+ */
+const char *blyt_cart_id(const blyt_cart_t *cart);
+const char *blyt_cart_title(const blyt_cart_t *cart);
+const char *blyt_cart_version(const blyt_cart_t *cart);
+
+/* Runtime version string (from version.txt, baked in at build time). */
+const char *blyt_runtime_version(void);
 
 /* Return a static human-readable string for a blyt_cart_err_t value. */
 const char *blyt_cart_err_str(blyt_cart_err_t err);

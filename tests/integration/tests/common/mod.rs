@@ -228,11 +228,13 @@ impl CartProject {
         // Ensure the project root exists before writing any files into it.
         fs::create_dir_all(dir).unwrap();
 
-        // blyt.info.yaml — mandatory for all blyt cart projects.
+        // blyt.info.yaml — mandatory for all blyt cart projects.  The title
+        // contains a space on purpose (it is not filename-constrained) and
+        // `version:` is omitted to exercise the 0.0.1-dev default.
         let project_name = dir.file_name().unwrap_or_default().to_string_lossy();
         fs::write(
             dir.join("blyt.info.yaml"),
-            format!("name: {project_name}\n"),
+            format!("id: {project_name}\ntitle: {project_name} Title\n"),
         )
         .unwrap();
 

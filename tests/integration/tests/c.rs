@@ -39,7 +39,7 @@ fn build_empty_c_project_fails_with_error() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("empty");
     fs::create_dir_all(project.join("src/game/c")).unwrap();
-    fs::write(project.join("blyt.info.yaml"), "name: empty\n").unwrap();
+    fs::write(project.join("blyt.info.yaml"), "id: empty\ntitle: Empty\n").unwrap();
     fs::write(project.join("blyt.build.yaml"), "language: c\n").unwrap();
 
     Command::new(blyt_bin())

@@ -127,7 +127,7 @@ RETRO_API void retro_deinit(void) {
 RETRO_API void retro_get_system_info(struct retro_system_info *info) {
     memset(info, 0, sizeof(*info));
     info->library_name = "blyt";
-    info->library_version = BLYT_VERSION;
+    info->library_version = blyt_runtime_version();
     info->valid_extensions = "blyt";
     info->need_fullpath = true;
     info->block_extract = false;
@@ -163,6 +163,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
         g_cart = NULL;
         return false;
     }
+
+    fprintf(stderr, "Blyt %s - %s (%s %s)\n", blyt_runtime_version(), blyt_cart_title(g_cart),
+            blyt_cart_id(g_cart), blyt_cart_version(g_cart));
 
     g_session = blyt_session_create(g_cart, libretro_log);
     if (!g_session) {

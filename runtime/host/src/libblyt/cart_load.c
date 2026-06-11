@@ -439,6 +439,38 @@ static const void *check_preamble(const void *sect_data, size_t sect_size, const
     return p + SECT_PREAMBLE_SIZE;
 }
 
+/* Cart id rules — mirror the devtool's cart_id_valid (devtool/src/build.rs;
+ * keep in sync): 1-63 bytes, [a-z0-9_-], first char alphanumeric.  The id
+ * names the save-file subdirectory, so the 63-byte cap fits cart_name[64]
+ * in cart_run.c. */
+static int cart_id_valid(const char *id) {
+    if (!id || !id[0])
+        return 0;
+    size_t len = strlen(id);
+    if (len > 63)
+        return 0;
+    if (!((id[0] >= 'a' && id[0] <= 'z') || (id[0] >= '0' && id[0] <= '9')))
+        return 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = id[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+/* title/version rules: non-empty, no control characters (the devtool
+ * additionally enforces semver on version). */
+static int cart_text_valid(const char *s) {
+    if (!s || !s[0])
+        return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f)
+            return 0;
+    }
+    return 1;
+}
+
 /* -------------------------------------------------------------------------
  * blyt_cart_open
  * ------------------------------------------------------------------------- */
@@ -469,6 +501,11 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
 
     size_t map_size = (size_t)st.st_size;
     blyt_cart_err_t err;
+    /* .cart.info identity (read below; owned until success).  Declared before
+     * the first `goto fail` so the fail path can free them unconditionally. */
+    char *cart_id = NULL;
+    char *cart_title = NULL;
+    char *cart_version = NULL;
 
     /* -----------------------------------------------------------------------
      * ELF identity checks (ADR-0024)
@@ -866,8 +903,15 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         uint16_t api_major = (verify_result == flatcc_verify_ok && info)
                                  ? blyt_CartInfo_api_version_major(info)
                                  : BLYT_API_VERSION_MAJOR + 1;
-        if (verify_result == flatcc_verify_ok && info)
+        if (verify_result == flatcc_verify_ok && info) {
             cart_is_debug = blyt_CartInfo_debug(info) ? 1 : 0;
+            const char *id = blyt_CartInfo_id(info);
+            const char *title = blyt_CartInfo_title(info);
+            const char *version = blyt_CartInfo_version(info);
+            cart_id = id ? strdup(id) : NULL;
+            cart_title = title ? strdup(title) : NULL;
+            cart_version = version ? strdup(version) : NULL;
+        }
         free(fb_aligned);
 
         if (verify_result != flatcc_verify_ok) {
@@ -880,6 +924,18 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         }
         if (api_major != BLYT_API_VERSION_MAJOR) {
             err = BLYT_CART_ERR_API_VERSION;
+            goto fail;
+        }
+        if (!cart_id_valid(cart_id)) {
+            err = BLYT_CART_ERR_BAD_ID;
+            goto fail;
+        }
+        if (!cart_text_valid(cart_title)) {
+            err = BLYT_CART_ERR_BAD_TITLE;
+            goto fail;
+        }
+        if (!cart_text_valid(cart_version)) {
+            err = BLYT_CART_ERR_BAD_VERSION;
             goto fail;
         }
     }
@@ -998,6 +1054,9 @@ success: {
     cart->map_size = map_size;
     cart->is_debug = cart_is_debug;
     cart->has_dwarf = has_dwarf;
+    cart->id = cart_id; /* ownership transferred; validated non-NULL above */
+    cart->title = cart_title;
+    cart->version = cart_version;
     cart->path = strdup(path);
     if (!cart->path) {
         free(cart);
@@ -1009,6 +1068,9 @@ success: {
 }
 
 fail:
+    free(cart_id);
+    free(cart_title);
+    free(cart_version);
     munmap(map, map_size);
     close(fd);
     return err;
@@ -1177,7 +1239,22 @@ void blyt_cart_close(blyt_cart_t *cart) {
     munmap(cart->map, cart->map_size);
     close(cart->fd);
     free(cart->path);
+    free(cart->id);
+    free(cart->title);
+    free(cart->version);
     free(cart);
+}
+
+const char *blyt_cart_id(const blyt_cart_t *cart) {
+    return cart ? cart->id : NULL;
+}
+
+const char *blyt_cart_title(const blyt_cart_t *cart) {
+    return cart ? cart->title : NULL;
+}
+
+const char *blyt_cart_version(const blyt_cart_t *cart) {
+    return cart ? cart->version : NULL;
 }
 
 const char *blyt_cart_err_str(blyt_cart_err_t err) {
@@ -1230,6 +1307,13 @@ const char *blyt_cart_err_str(blyt_cart_err_t err) {
         return "required cart entry point missing (blyt_cart_init/update/draw)";
     case BLYT_CART_ERR_BAD_LAYOUTS:
         return ".cart.layouts FlatBuffers parse error";
+    case BLYT_CART_ERR_BAD_ID:
+        return ".cart.info: cart id missing or invalid (1-63 chars [a-z0-9_-], "
+               "alphanumeric first; rebuild with current blyt)";
+    case BLYT_CART_ERR_BAD_TITLE:
+        return ".cart.info: cart title missing or invalid (rebuild with current blyt)";
+    case BLYT_CART_ERR_BAD_VERSION:
+        return ".cart.info: cart version missing or invalid (rebuild with current blyt)";
     }
     return "unknown error";
 }

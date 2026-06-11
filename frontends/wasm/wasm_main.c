@@ -1434,13 +1434,9 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
             const char *save_dir = getenv("BLYT_SAVE_DIR");
             if (save_dir)
                 g_lua_save_dir = strdup(save_dir);
-            const char *base = strrchr("/cart.blyt", '/');
-            base = base ? base + 1 : "/cart.blyt";
-            strncpy(g_lua_cart_name, base, sizeof(g_lua_cart_name) - 1);
-            g_lua_cart_name[sizeof(g_lua_cart_name) - 1] = '\0';
-            char *dot = strrchr(g_lua_cart_name, '.');
-            if (dot)
-                *dot = '\0';
+            /* The manifest id names the save subdirectory (validated at load
+             * time: ≤63 bytes, so it always fits g_lua_cart_name[64]). */
+            snprintf(g_lua_cart_name, sizeof(g_lua_cart_name), "%s", blyt_cart_id(g_cart));
         }
         /* Register state buffer + save/load API for any cart with state. */
         if (active_state_ctx())
@@ -1622,6 +1618,9 @@ int main(void) {
         blyt_js_error(blyt_cart_err_str(cerr));
         return 1;
     }
+
+    fprintf(stderr, "Blyt %s - %s (%s %s)\n", blyt_runtime_version(), blyt_cart_title(g_cart),
+            blyt_cart_id(g_cart), blyt_cart_version(g_cart));
 
 #ifdef BLYT_LUA
     /* Lua-direct path: if the cart has a .cart.lua section, run it directly

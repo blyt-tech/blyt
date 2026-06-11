@@ -30,12 +30,20 @@ static void blob_free(Blob *b) {
     b->size = 0;
 }
 
-static Blob build_cart_info(uint16_t api_major, uint16_t api_minor) {
+/* id/title/version: NULL omits the field (load must reject the cart). */
+static Blob build_cart_info(uint16_t api_major, uint16_t api_minor, const char *id,
+                            const char *title, const char *version) {
     flatcc_builder_t B;
     flatcc_builder_init(&B);
     blyt_CartInfo_start_as_root(&B);
     blyt_CartInfo_api_version_major_add(&B, api_major);
     blyt_CartInfo_api_version_minor_add(&B, api_minor);
+    if (id)
+        blyt_CartInfo_id_create_str(&B, id);
+    if (title)
+        blyt_CartInfo_title_create_str(&B, title);
+    if (version)
+        blyt_CartInfo_version_create_str(&B, version);
     blyt_CartInfo_end_as_root(&B);
     size_t size;
     void *raw = flatcc_builder_finalize_buffer(&B, &size);
@@ -45,6 +53,10 @@ static Blob build_cart_info(uint16_t api_major, uint16_t api_minor) {
     free(raw);
     return b;
 }
+
+#define TEST_CART_ID "testcart"
+#define TEST_CART_TITLE "Test Cart"
+#define TEST_CART_VERSION "0.0.1-dev"
 
 static Blob build_cart_config(void) {
     flatcc_builder_t B;
@@ -222,7 +234,7 @@ static Blob build_valid_elf(const CartSections *sects) {
 }
 
 static Blob default_valid_elf(void) {
-    Blob ci_fb = build_cart_info(0, 0);
+    Blob ci_fb = build_cart_info(0, 0, TEST_CART_ID, TEST_CART_TITLE, TEST_CART_VERSION);
     Blob cc_fb = build_cart_config();
     Blob ci = add_preamble(&ci_fb, CART_INFO_TAG);
     Blob cc = add_preamble(&cc_fb, CART_CONFIG_TAG);
@@ -389,7 +401,7 @@ static void mut_bad_ci_preamble(Blob *b) {
 }
 /* build_elf_bad_api_version: valid ELF but api_version_major = 9 */
 static Blob build_elf_bad_api_version(void) {
-    Blob ci_fb = build_cart_info(9, 0);
+    Blob ci_fb = build_cart_info(9, 0, TEST_CART_ID, TEST_CART_TITLE, TEST_CART_VERSION);
     Blob cc_fb = build_cart_config();
     Blob ci = add_preamble(&ci_fb, CART_INFO_TAG);
     Blob cc = add_preamble(&cc_fb, CART_CONFIG_TAG);
@@ -413,7 +425,7 @@ static Blob build_elf_bad_needed(void) {
     static const char DYNSTR[] = "\0libforbidden.so";
     size_t dynstr_sz = sizeof(DYNSTR) - 1;
 
-    Blob ci_fb = build_cart_info(0, 0);
+    Blob ci_fb = build_cart_info(0, 0, TEST_CART_ID, TEST_CART_TITLE, TEST_CART_VERSION);
     Blob ci = add_preamble(&ci_fb, CART_INFO_TAG);
 
     Elf32_Dyn dyn[] = {
@@ -520,7 +532,7 @@ static Blob build_elf_bad_import(void) {
     static const char SYMSTR[] = "\0forbidden_fn";
     size_t symstr_sz = sizeof(SYMSTR) - 1;
 
-    Blob ci_fb = build_cart_info(0, 0);
+    Blob ci_fb = build_cart_info(0, 0, TEST_CART_ID, TEST_CART_TITLE, TEST_CART_VERSION);
     Blob ci = add_preamble(&ci_fb, CART_INFO_TAG);
 
     /* Two symbol entries: [0] STB_LOCAL null, [1] STB_GLOBAL SHN_UNDEF */
@@ -614,6 +626,53 @@ static Blob build_elf_bad_import(void) {
 }
 
 /* -------------------------------------------------------------------------
+ * Cart identity (.cart.info id/title/version) validation
+ * ------------------------------------------------------------------------- */
+
+static Blob build_elf_with_identity(const char *id, const char *title, const char *version) {
+    Blob ci_fb = build_cart_info(0, 0, id, title, version);
+    Blob cc_fb = build_cart_config();
+    Blob ci = add_preamble(&ci_fb, CART_INFO_TAG);
+    Blob cc = add_preamble(&cc_fb, CART_CONFIG_TAG);
+    CartSections s = {ci, cc};
+    Blob elf = build_valid_elf(&s);
+    blob_free(&ci);
+    blob_free(&cc);
+    blob_free(&ci_fb);
+    blob_free(&cc_fb);
+    return elf;
+}
+
+static void check_identity(const char *name, const char *id, const char *title, const char *version,
+                           blyt_cart_err_t expected) {
+    Blob elf = build_elf_with_identity(id, title, version);
+    char *path = write_temp(&elf);
+    check(name, path, expected);
+    unlink(path);
+    free(path);
+    blob_free(&elf);
+}
+
+static void check_identity_accessors(void) {
+    Blob elf = build_elf_with_identity(TEST_CART_ID, TEST_CART_TITLE, TEST_CART_VERSION);
+    char *path = write_temp(&elf);
+    blyt_cart_t *cart = NULL;
+    blyt_cart_err_t err = blyt_cart_open(path, &cart);
+    if (err != BLYT_CART_OK || !cart || strcmp(blyt_cart_id(cart), TEST_CART_ID) != 0 ||
+        strcmp(blyt_cart_title(cart), TEST_CART_TITLE) != 0 ||
+        strcmp(blyt_cart_version(cart), TEST_CART_VERSION) != 0) {
+        fprintf(stderr, "FAIL identity accessors round-trip\n");
+        failures++;
+    } else {
+        printf("PASS identity accessors round-trip\n");
+    }
+    blyt_cart_close(cart);
+    unlink(path);
+    free(path);
+    blob_free(&elf);
+}
+
+/* -------------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------------- */
 
@@ -653,6 +712,37 @@ int main(void) {
         unlink(path);
         free(path);
         blob_free(&elf);
+    }
+
+    /* Cart identity (id/title/version) */
+    {
+        static const char id63[] =
+            "a23456789012345678901234567890123456789012345678901234567890123";
+        static const char id64[] =
+            "a234567890123456789012345678901234567890123456789012345678901234";
+        check_identity("id missing", NULL, TEST_CART_TITLE, TEST_CART_VERSION,
+                       BLYT_CART_ERR_BAD_ID);
+        check_identity("id empty", "", TEST_CART_TITLE, TEST_CART_VERSION, BLYT_CART_ERR_BAD_ID);
+        check_identity("id uppercase", "Hello", TEST_CART_TITLE, TEST_CART_VERSION,
+                       BLYT_CART_ERR_BAD_ID);
+        check_identity("id with space", "hello world", TEST_CART_TITLE, TEST_CART_VERSION,
+                       BLYT_CART_ERR_BAD_ID);
+        check_identity("id leading dash", "-hello", TEST_CART_TITLE, TEST_CART_VERSION,
+                       BLYT_CART_ERR_BAD_ID);
+        check_identity("id 64 bytes", id64, TEST_CART_TITLE, TEST_CART_VERSION,
+                       BLYT_CART_ERR_BAD_ID);
+        check_identity("id 63 bytes ok", id63, TEST_CART_TITLE, TEST_CART_VERSION, BLYT_CART_OK);
+        check_identity("id single char ok", "a", TEST_CART_TITLE, TEST_CART_VERSION, BLYT_CART_OK);
+        check_identity("title missing", TEST_CART_ID, NULL, TEST_CART_VERSION,
+                       BLYT_CART_ERR_BAD_TITLE);
+        check_identity("title empty", TEST_CART_ID, "", TEST_CART_VERSION, BLYT_CART_ERR_BAD_TITLE);
+        check_identity("title with newline", TEST_CART_ID, "Hello\nWorld", TEST_CART_VERSION,
+                       BLYT_CART_ERR_BAD_TITLE);
+        check_identity("version missing", TEST_CART_ID, TEST_CART_TITLE, NULL,
+                       BLYT_CART_ERR_BAD_VERSION);
+        check_identity("version empty", TEST_CART_ID, TEST_CART_TITLE, "",
+                       BLYT_CART_ERR_BAD_VERSION);
+        check_identity_accessors();
     }
 
     /* DT_NEEDED */
