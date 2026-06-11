@@ -89,6 +89,13 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # nextest runs the workspace's test binaries in parallel (cargo test
+      # executes them serially); the integration suites are dominated by
+      # waiting on spawned players/drivers, so cross-suite parallelism is a
+      # large win. Prebuilt binary install (~2s).
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Init submodules
         run: |
           git submodule update --init --depth 1 \
@@ -185,7 +192,7 @@ jobs:
           BLYT_BUILD_DIR: ${{ github.workspace }}/build
         run: |
           cargo build -p blyt
-          cargo test --workspace
+          cargo nextest run --workspace
 
       # Build every example cart with the assembled SDK to validate that the
       # examples stay buildable. Runs last so it gates on a working SDK. The
