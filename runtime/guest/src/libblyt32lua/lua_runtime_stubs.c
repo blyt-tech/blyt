@@ -18,8 +18,8 @@
  * linit.c references luaopen_io/os/debug/package/utf8 which are excluded
  * from libblytcommonlua.so.  Stub openers return 0 (register nothing).
  *
- * NOT defined here (already in LIBBLYTC_SRCS / musl/src/string/*.c):
- *   strpbrk, strspn — musl/src/string/*.c
+ * NOT defined here (already in LIBBLYTC_SRCS / the musl string sources):
+ *   strpbrk, strspn — musl src/string
  *   fwrite           — musl/src/stdio/fwrite.c
  */
 
@@ -52,7 +52,7 @@ int strcoll(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-const char *strerror(int e) {
+char *strerror(int e) {
     (void)e;
     return "error";
 }
@@ -74,7 +74,16 @@ blyt_time_t time(blyt_time_t *t) {
  * stdin/stdout/stderr are non-NULL so NULL-checks in Lua pass, but the
  * underlying fd operations are no-ops.  fprintf routes to blyt_console_debug
  * so Lua's panic handler produces a visible error rather than silently dying.
+ *
+ * The signatures use void * in place of FILE * (no <stdio.h> here).  All
+ * object pointers share one representation and calling convention on the
+ * single RV32 ilp32f target, so callers built against the real prototypes
+ * interoperate deterministically; silence clang's builtin-signature lints.
  * ------------------------------------------------------------------------- */
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wincompatible-library-redeclaration"
+#pragma clang diagnostic ignored "-Wbuiltin-requires-header"
 
 /* blyt_console_debug is in libblyt32.so; weak so this file links standalone */
 void blyt_console_debug(const char *s) __attribute__((weak));
@@ -148,6 +157,8 @@ int fputc(int c, void *f) {
     (void)f;
     return c;
 }
+
+#pragma clang diagnostic pop
 
 /* -------------------------------------------------------------------------
  * Excluded Lua standard library openers

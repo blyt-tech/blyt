@@ -62,7 +62,7 @@ extern int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap);
 #define ST_RETRY 1
 #define ST_NIL 2
 
-/* One bridge ECALL.  Returns status (a0); *val/*aux receive a1/a2. */
+/* One bridge ECALL.  Returns status (a0); *val and *aux receive a1/a2. */
 static uint32_t bridge_op(uint32_t opcode, lua_State *L, uint32_t b2, uint32_t b3, uint32_t b4,
                           uint32_t *val, uint32_t *aux) {
     register uint32_t a0 __asm__("a0") = opcode;
