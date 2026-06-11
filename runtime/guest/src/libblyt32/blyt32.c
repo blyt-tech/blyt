@@ -39,6 +39,8 @@
 #define BUF_OP_SET_BOOL 16
 #define BUF_OP_ALLOC_SLOT 17
 #define BUF_OP_FREE_SLOT 18
+#define BUF_OP_REF 19
+#define BUF_OP_REF_VALID 20
 
 /* -------------------------------------------------------------------------
  * Internal helpers
@@ -156,6 +158,27 @@ blyt_result_t blyt_buffer_free_slot(blyt_buffer_h buf, int32_t slot) {
     register long a7 __asm__("a7") = ECALL_BUF_OP;
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
     return (blyt_result_t)a0;
+}
+
+/* Packed entity refs (ADR-0096).  blyt_buffer_ref_slot is a static inline in
+ * blyt.h — pure bit math, no ECALL needed. */
+
+blyt_entity_ref_t blyt_buffer_ref(blyt_buffer_h buf, int32_t slot) {
+    register long a0 __asm__("a0") = BUF_OP_REF;
+    register long a1 __asm__("a1") = (long)(buf);
+    register long a2 __asm__("a2") = (long)(slot);
+    register long a7 __asm__("a7") = ECALL_BUF_OP;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return (blyt_entity_ref_t)a0;
+}
+
+bool blyt_buffer_ref_valid(blyt_buffer_h buf, blyt_entity_ref_t ref) {
+    register long a0 __asm__("a0") = BUF_OP_REF_VALID;
+    register long a1 __asm__("a1") = (long)(buf);
+    register long a2 __asm__("a2") = (long)(ref);
+    register long a7 __asm__("a7") = ECALL_BUF_OP;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return a0 != 0;
 }
 
 /* -------------------------------------------------------------------------

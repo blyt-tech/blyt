@@ -7,6 +7,11 @@ pub type BlytFieldH = u32;
 pub const BLYT_FIELD_NONE: BlytFieldH = 0;
 pub const BLYT_INVALID_SLOT: i32 = -1;
 
+/// Packed entity ref (ADR-0096): generation in the high 16 bits, slot index
+/// in the low 16 bits. Generations start at 1, so a valid ref is never 0.
+pub type BlytEntityRef = u32;
+pub const BLYT_ENTITY_REF_NONE: BlytEntityRef = 0;
+
 extern "C" {
     fn blyt_buffer_get_f32(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> f32;
     fn blyt_buffer_set_f32(buf: BlytBufferH, slot: i32, field: BlytFieldH, v: f32);
@@ -26,6 +31,8 @@ extern "C" {
     fn blyt_buffer_set_bool(buf: BlytBufferH, slot: i32, field: BlytFieldH, v: bool);
     fn blyt_buffer_alloc_slot(buf: BlytBufferH, out_slot: *mut i32) -> u32;
     fn blyt_buffer_free_slot(buf: BlytBufferH, slot: i32) -> u32;
+    fn blyt_buffer_ref(buf: BlytBufferH, slot: i32) -> u32;
+    fn blyt_buffer_ref_valid(buf: BlytBufferH, r: u32) -> bool;
 }
 
 pub fn get_f32(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> f32 {
@@ -86,6 +93,26 @@ pub fn alloc_slot(buf: BlytBufferH) -> i32 {
 
 pub fn free_slot(buf: BlytBufferH, slot: i32) {
     unsafe { blyt_buffer_free_slot(buf, slot) };
+}
+
+/// Packed entity ref for an allocated slot (ADR-0096); BLYT_ENTITY_REF_NONE
+/// if the slot is unallocated or out of range. Store refs in `ref:` manifest
+/// fields (u32 on the wire) — they serialize with the buffer, and a freed
+/// slot's ref is detectably stale via [`ref_valid`].
+pub fn entity_ref(buf: BlytBufferH, slot: i32) -> BlytEntityRef {
+    unsafe { blyt_buffer_ref(buf, slot) }
+}
+
+/// True iff `r` still names the same entity (slot allocated and generation
+/// unchanged since the ref was taken).
+pub fn ref_valid(buf: BlytBufferH, r: BlytEntityRef) -> bool {
+    unsafe { blyt_buffer_ref_valid(buf, r) }
+}
+
+/// Slot index carried by a ref — pure bit math, only meaningful when the
+/// ref is valid (`ref_slot(BLYT_ENTITY_REF_NONE) == 0`).
+pub const fn ref_slot(r: BlytEntityRef) -> i32 {
+    (r & 0xFFFF) as i32
 }
 
 /* Suppress unused import warning for c_void in cfg(feature="...") paths */

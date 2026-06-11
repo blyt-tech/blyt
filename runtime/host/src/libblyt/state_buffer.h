@@ -35,6 +35,10 @@ typedef struct {
     void *field_data[BLYT_MAX_FIELDS];
     /* Active-slot bitset: bit i set ↔ slot i is allocated. */
     uint8_t slot_bitset[BLYT_MAX_SLOTS / 8];
+    /* Per-slot generation counters (ADR-0096): start at 1 (0 is reserved so
+     * BLYT_ENTITY_REF_NONE == 0 never collides with a valid ref to slot 0),
+     * incremented on successful free_slot, wrapping 65535 -> 1. */
+    uint16_t slot_gens[BLYT_MAX_SLOTS];
     /* Schema hash from .cart.layouts (used by save/load). */
     uint64_t schema_hash;
     /* Buffer name (pointer into FlatBuffer data owned by blyt_cart mmap). */
@@ -76,6 +80,14 @@ int blyt_state_set(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_
 
 int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t *out_slot);
 int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot);
+
+/* Packed entity refs (ADR-0096): generation in the high 16 bits, slot in the
+ * low 16 bits; 0 is the null/invalid sentinel.
+ * blyt_state_ref returns the packed ref for an allocated slot, 0 otherwise.
+ * blyt_state_ref_valid returns 1 iff ref is non-zero, the slot is allocated,
+ * and the stored generation matches the slot's current generation. */
+uint32_t blyt_state_ref(const blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot);
+int blyt_state_ref_valid(const blyt_state_ctx_t *ctx, uint32_t buf_id, uint32_t ref);
 
 /* -------------------------------------------------------------------------
  * State snapshot (for --reset-every-frame cycle / hot-reload save-restore)

@@ -123,6 +123,11 @@ int blyt_state_ctx_init(const blyt_cart_t *cart, blyt_state_ctx_t *ctx) {
             }
         }
 
+        /* Generation counters start at 1: 0 is reserved so a packed ref to
+         * slot 0 (gen<<16 | slot) can never equal BLYT_ENTITY_REF_NONE. */
+        for (uint32_t s = 0; s < BLYT_MAX_SLOTS; s++)
+            bc->slot_gens[s] = 1;
+
         ctx->n_buffers++;
     }
 
@@ -241,6 +246,7 @@ struct blyt_state_snapshot {
         uint8_t field_types[BLYT_MAX_FIELDS];
         void *field_data[BLYT_MAX_FIELDS];
         uint8_t slot_bitset[BLYT_MAX_SLOTS / 8];
+        uint16_t slot_gens[BLYT_MAX_SLOTS];
     } buffers[BLYT_MAX_BUFFERS];
 };
 
@@ -255,6 +261,7 @@ blyt_state_snapshot_t *blyt_state_ctx_snapshot(const blyt_state_ctx_t *ctx) {
         snap->buffers[bi].n_fields = bc->n_fields;
         memcpy(snap->buffers[bi].field_types, bc->field_types, sizeof(bc->field_types));
         memcpy(snap->buffers[bi].slot_bitset, bc->slot_bitset, sizeof(bc->slot_bitset));
+        memcpy(snap->buffers[bi].slot_gens, bc->slot_gens, sizeof(bc->slot_gens));
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             size_t sz = (size_t)bc->count * field_sizeof(bc->field_types[fi]);
             snap->buffers[bi].field_data[fi] = malloc(sz);
@@ -277,6 +284,7 @@ void blyt_state_ctx_restore_snapshot(blyt_state_ctx_t *ctx, const blyt_state_sna
         if (snap->buffers[bi].n_fields != bc->n_fields || snap->buffers[bi].count != bc->count)
             continue;
         memcpy(bc->slot_bitset, sb_slot, sizeof(bc->slot_bitset));
+        memcpy(bc->slot_gens, snap->buffers[bi].slot_gens, sizeof(bc->slot_gens));
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             if (!snap->buffers[bi].field_data[fi] || !bc->field_data[fi])
                 continue;
@@ -300,6 +308,9 @@ void blyt_state_ctx_zero_data(blyt_state_ctx_t *ctx) {
     for (uint32_t bi = 0; bi < ctx->n_buffers; bi++) {
         blyt_buffer_ctx_t *bc = &ctx->buffers[bi];
         memset(bc->slot_bitset, 0, sizeof(bc->slot_bitset));
+        /* Fresh-boot state for generation counters is 1, not 0 (see header). */
+        for (uint32_t s = 0; s < BLYT_MAX_SLOTS; s++)
+            bc->slot_gens[s] = 1;
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             if (!bc->field_data[fi])
                 continue;
@@ -326,5 +337,32 @@ int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot) {
         uint8_t *ptr = (uint8_t *)bc->field_data[fi] + (size_t)slot * elem;
         memset(ptr, 0, elem);
     }
+
+    /* Stale-ref detection (ADR-0096): bump the generation on successful free
+     * only, wrapping 65535 -> 1 (0 is reserved as the invalid sentinel). */
+    bc->slot_gens[slot] = (uint16_t)(bc->slot_gens[slot] == 0xFFFFu ? 1 : bc->slot_gens[slot] + 1);
     return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Packed entity refs (ADR-0096): gen:16 | slot:16, 0 = invalid sentinel
+ * ------------------------------------------------------------------------- */
+
+uint32_t blyt_state_ref(const blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot) {
+    blyt_buffer_ctx_t *bc = find_buffer((blyt_state_ctx_t *)ctx, buf_id);
+    if (!bc || !slot_is_allocated(bc, slot))
+        return 0;
+    return ((uint32_t)bc->slot_gens[slot] << 16) | (uint32_t)slot;
+}
+
+int blyt_state_ref_valid(const blyt_state_ctx_t *ctx, uint32_t buf_id, uint32_t ref) {
+    if (ref == 0)
+        return 0;
+    blyt_buffer_ctx_t *bc = find_buffer((blyt_state_ctx_t *)ctx, buf_id);
+    if (!bc)
+        return 0;
+    int32_t slot = (int32_t)(ref & 0xFFFFu);
+    if (!slot_is_allocated(bc, slot))
+        return 0;
+    return bc->slot_gens[slot] == (uint16_t)(ref >> 16);
 }

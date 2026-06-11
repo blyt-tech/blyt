@@ -1111,6 +1111,10 @@ static const char *buf_op_name(uint32_t op) {
         return "buf_alloc_slot";
     case BUF_OP_FREE_SLOT:
         return "buf_free_slot";
+    case BUF_OP_REF:
+        return "buf_ref";
+    case BUF_OP_REF_VALID:
+        return "buf_ref_valid";
     default:
         return "buf_op?";
     }
@@ -1425,10 +1429,16 @@ static void blyt_ecall_handler(riscv_t *rv) {
     }
 
     case BLYT_ECALL_BUF_OP: {
-        /* State buffer typed get/set + slot management (ADR-0009, ADR-0057, ADR-0058).
+        /* State buffer typed get/set + slot management (ADR-0009, ADR-0057,
+         * ADR-0058, ADR-0096).
          * a0=sub-opcode, a1=buf_h (1-based), a2=slot, a3=field_h, a4=value_bits */
         if (!g_run_ctx || !g_run_ctx->state_ctx) {
-            rv_set_reg(rv, rv_reg_a0, (uint32_t)-1);
+            /* REF/REF_VALID must report "no ref" / "invalid" here: the legacy
+             * -1 would read back as a valid-looking packed ref / true. */
+            uint32_t no_ctx_op = rv_get_reg(rv, rv_reg_a0);
+            uint32_t no_ctx_ret =
+                (no_ctx_op == BUF_OP_REF || no_ctx_op == BUF_OP_REF_VALID) ? 0 : (uint32_t)-1;
+            rv_set_reg(rv, rv_reg_a0, no_ctx_ret);
             rv->PC += 4;
             return;
         }
@@ -1489,6 +1499,20 @@ static void blyt_ecall_handler(riscv_t *rv) {
             int r = blyt_state_free_slot(sc, buf_id, slot);
             blyt_tracef(BLYT_TRACE_API, "buf_free_slot(buf=%u, slot=%d) -> %d", buf_id, slot, r);
             rv_set_reg(rv, rv_reg_a0, r == 0 ? 0 : (uint32_t)-1);
+            break;
+        }
+        case BUF_OP_REF: {
+            uint32_t ref = blyt_state_ref(sc, buf_id, slot);
+            blyt_tracef(BLYT_TRACE_API, "buf_ref(buf=%u, slot=%d) -> 0x%08x", buf_id, slot, ref);
+            rv_set_reg(rv, rv_reg_a0, ref);
+            break;
+        }
+        case BUF_OP_REF_VALID: {
+            /* a2 carries the packed ref, not a slot index. */
+            uint32_t ref = (uint32_t)slot;
+            int v = blyt_state_ref_valid(sc, buf_id, ref);
+            blyt_tracef(BLYT_TRACE_API, "buf_ref_valid(buf=%u, ref=0x%08x) -> %d", buf_id, ref, v);
+            rv_set_reg(rv, rv_reg_a0, (uint32_t)v);
             break;
         }
         default:

@@ -43,8 +43,14 @@ pub struct RecordDecl {
 #[serde(deny_unknown_fields)]
 pub struct FieldDecl {
     pub name: String,
-    #[serde(rename = "type")]
-    pub type_name: String,
+    /// Primitive type name or another record name for inline embedding.
+    /// Exactly one of `type` / `ref` must be present.
+    #[serde(rename = "type", default)]
+    pub type_name: Option<String>,
+    /// Cross-buffer reference (ADR-0009 amendment, ADR-0096): names a state
+    /// buffer; the field stores a packed blyt_entity_ref_t (u32 on the wire).
+    #[serde(rename = "ref", default)]
+    pub ref_target: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -137,6 +143,10 @@ pub struct FlatField {
     pub type_tag: u8,
     /// 1-based index within this record's flattened field list
     pub index: u32,
+    /// For `ref:` fields, the target state buffer name. The wire type is
+    /// plain u32 (TYPE_U32); ref-ness exists only for validation, codegen
+    /// annotations, and the schema hash.
+    pub ref_target: Option<String>,
 }
 
 /// Flatten all fields of a record, resolving inline embedding.
@@ -160,21 +170,44 @@ pub fn flatten_record<'a>(
 
     let mut flat = Vec::new();
     for field in &rec.fields {
-        if let Some(tag) = parse_type_tag(&field.type_name) {
-            flat.push(FlatField {
-                flat_name: field.name.clone(),
-                type_tag: tag,
-                index: 0, // filled in below
-            });
-        } else {
-            // Inline embedding: field.type_name names another record
-            let sub = flatten_record(&field.type_name, records, visiting)?;
-            for sub_field in sub {
+        match (&field.type_name, &field.ref_target) {
+            (Some(_), Some(_)) | (None, None) => {
+                visiting.pop();
+                return Err(format!(
+                    "blyt.config.yaml: record {record_name:?} field {:?}: declare exactly one \
+                     of 'type:' or 'ref:'",
+                    field.name
+                ));
+            }
+            (None, Some(target)) => {
+                // Cross-buffer reference: packed blyt_entity_ref_t, u32 on the wire.
                 flat.push(FlatField {
-                    flat_name: format!("{}_{}", field.name, sub_field.flat_name),
-                    type_tag: sub_field.type_tag,
-                    index: 0,
+                    flat_name: field.name.clone(),
+                    type_tag: TYPE_U32,
+                    index: 0, // filled in below
+                    ref_target: Some(target.clone()),
                 });
+            }
+            (Some(type_name), None) => {
+                if let Some(tag) = parse_type_tag(type_name) {
+                    flat.push(FlatField {
+                        flat_name: field.name.clone(),
+                        type_tag: tag,
+                        index: 0,
+                        ref_target: None,
+                    });
+                } else {
+                    // Inline embedding: type_name names another record
+                    let sub = flatten_record(type_name, records, visiting)?;
+                    for sub_field in sub {
+                        flat.push(FlatField {
+                            flat_name: format!("{}_{}", field.name, sub_field.flat_name),
+                            type_tag: sub_field.type_tag,
+                            index: 0,
+                            ref_target: sub_field.ref_target,
+                        });
+                    }
+                }
             }
         }
     }
@@ -200,7 +233,17 @@ pub fn compute_schema_hash(cfg: &CartConfig) -> u64 {
     for (name, rec) in &cfg.records {
         let _ = write!(text, "record:{name}");
         for f in &rec.fields {
-            let _ = write!(text, ",{}:{}", f.name, f.type_name);
+            // ref fields hash as "name:ref<target>" so a ref<character>
+            // field is a schema change relative to a plain u32 field.
+            match (&f.type_name, &f.ref_target) {
+                (Some(t), _) => {
+                    let _ = write!(text, ",{}:{}", f.name, t);
+                }
+                (None, Some(target)) => {
+                    let _ = write!(text, ",{}:ref<{target}>", f.name);
+                }
+                (None, None) => {}
+            }
         }
         text.push(';');
     }
@@ -246,11 +289,98 @@ pub fn read_cart_config(project_dir: &Path) -> Result<CartConfig, String> {
         }
     }
 
-    // Validate all field type names (detect cycles + unknown types)
+    // Validate all field type names (detect cycles + unknown types), and
+    // that every ref: field targets a declared state buffer (ADR-0096).
     for (rec_name, _) in &cfg.records {
         let mut visiting = Vec::new();
-        flatten_record(rec_name, &cfg.records, &mut visiting).map_err(|e| e)?;
+        let flat = flatten_record(rec_name, &cfg.records, &mut visiting)?;
+        for f in &flat {
+            if let Some(target) = &f.ref_target {
+                if !cfg.state_buffers.contains_key(target) {
+                    return Err(format!(
+                        "blyt.config.yaml: record {rec_name:?} field {:?}: ref target buffer \
+                         {target:?} not declared in state_buffers",
+                        f.flat_name
+                    ));
+                }
+            }
+        }
     }
 
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> Result<CartConfig, String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("blyt.config.yaml"), yaml).unwrap();
+        read_cart_config(dir.path())
+    }
+
+    const REF_CONFIG: &str = "\
+records:
+  Globals:
+    fields:
+      - { name: frame, type: i32 }
+      - { name: player, ref: character }
+  Character:
+    fields:
+      - { name: x, type: i32 }
+state_buffers:
+  globals:
+    record: Globals
+    count: 1
+  character:
+    record: Character
+    count: 1
+";
+
+    #[test]
+    fn ref_field_parses_as_u32_with_target() {
+        let cfg = parse(REF_CONFIG).unwrap();
+        let mut visiting = Vec::new();
+        let flat = flatten_record("Globals", &cfg.records, &mut visiting).unwrap();
+        let player = flat.iter().find(|f| f.flat_name == "player").unwrap();
+        assert_eq!(player.type_tag, TYPE_U32);
+        assert_eq!(player.ref_target.as_deref(), Some("character"));
+        let frame = flat.iter().find(|f| f.flat_name == "frame").unwrap();
+        assert_eq!(frame.ref_target, None);
+    }
+
+    #[test]
+    fn ref_field_unknown_target_buffer_rejected() {
+        let err = parse(&REF_CONFIG.replace("ref: character", "ref: nonexistent"))
+            .err()
+            .expect("config should be rejected");
+        assert!(err.contains("ref target buffer"), "{err}");
+        assert!(err.contains("nonexistent"), "{err}");
+    }
+
+    #[test]
+    fn field_with_both_type_and_ref_rejected() {
+        let err = parse(&REF_CONFIG.replace("ref: character", "ref: character, type: u32"))
+            .err()
+            .expect("config should be rejected");
+        assert!(err.contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn field_with_neither_type_nor_ref_rejected() {
+        let err = parse(&REF_CONFIG.replace("ref: character", ""))
+            .err()
+            .expect("config should be rejected");
+        // serde produces a YAML error or our validation fires, depending on
+        // how the empty mapping entry parses; either way the config fails.
+        assert!(!err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn schema_hash_distinguishes_ref_from_u32() {
+        let ref_cfg = parse(REF_CONFIG).unwrap();
+        let u32_cfg = parse(&REF_CONFIG.replace("ref: character", "type: u32")).unwrap();
+        assert_ne!(compute_schema_hash(&ref_cfg), compute_schema_hash(&u32_cfg));
+    }
 }

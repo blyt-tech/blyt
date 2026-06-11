@@ -208,6 +208,22 @@ static int lua_buf_free_slot(lua_State *L) {
     blyt_buffer_free_slot((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2));
     return 0;
 }
+/* Packed entity refs (ADR-0096) */
+static int lua_buf_ref(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)blyt_buffer_ref((uint32_t)luaL_checkinteger(L, 1),
+                                                    (int32_t)luaL_checkinteger(L, 2)));
+    return 1;
+}
+static int lua_buf_ref_valid(lua_State *L) {
+    lua_pushboolean(L, blyt_buffer_ref_valid((uint32_t)luaL_checkinteger(L, 1),
+                                             (uint32_t)luaL_checkinteger(L, 2)));
+    return 1;
+}
+static int lua_buf_ref_slot(lua_State *L) {
+    /* Pure bit math — no ECALL (mirrors the static inline in blyt.h). */
+    lua_pushinteger(L, (lua_Integer)((uint32_t)luaL_checkinteger(L, 1) & 0xFFFFu));
+    return 1;
+}
 
 static void register_blyt32(lua_State *L) {
     /* --- shared: blyt.debug subtable --- */
@@ -251,6 +267,9 @@ static void register_blyt32(lua_State *L) {
         {"set_bool", lua_buf_set_bool},
         {"alloc_slot", lua_buf_alloc_slot},
         {"free_slot", lua_buf_free_slot},
+        {"ref", lua_buf_ref},
+        {"ref_valid", lua_buf_ref_valid},
+        {"ref_slot", lua_buf_ref_slot},
         {NULL, NULL},
     };
     for (int i = 0; buf_fns[i].name; i++) {

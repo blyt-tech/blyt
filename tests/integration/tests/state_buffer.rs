@@ -1834,3 +1834,594 @@ function draw() end
     assert!(cart.exists(), "cart not found at {}", cart.display());
     run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], "frame=3");
 }
+
+// ── Packed entity refs (ADR-0096): generation counters + ref/ref_valid ─────
+
+/// Two buffers; Globals carries a `ref:` field into entity (also exercises
+/// the devtool's ref: schema support end to end on every leg).
+const ENTITY_REF_CONFIG: &str = "\
+records:
+  Globals:
+    fields:
+      - { name: frame,  type: i32 }
+      - { name: target, ref: entity }
+  Entity:
+    fields:
+      - { name: hp, type: i32 }
+state_buffers:
+  globals:
+    record: Globals
+    count: 1
+  entity:
+    record: Entity
+    count: 4
+";
+
+/// alloc → ref packs (gen=1)<<16|slot; valid; ref_slot round-trips; free →
+/// stale; realloc of the same slot → old ref still stale (gen=2), new valid.
+const C_REF_LIFECYCLE: &str = r#"
+#include "blyt.h"
+#include "cart_state.h"
+
+void blyt_cart_init(void) {}
+
+void blyt_cart_update(void) {
+    int ok = 1;
+    int32_t g = -1, a = -1, b = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &g);
+    blyt_buffer_alloc_slot(S_ENTITY, &a);
+    blyt_entity_ref_t r = blyt_buffer_ref(S_ENTITY, a);
+    ok &= (r == ((1u << 16) | (uint32_t)a));
+    ok &= blyt_buffer_ref_valid(S_ENTITY, r);
+    ok &= (blyt_buffer_ref_slot(r) == a);
+    blyt_buffer_free_slot(S_ENTITY, a);
+    ok &= !blyt_buffer_ref_valid(S_ENTITY, r);
+    blyt_buffer_alloc_slot(S_ENTITY, &b);
+    ok &= (b == a);                           /* same slot reused */
+    ok &= !blyt_buffer_ref_valid(S_ENTITY, r); /* old ref stays stale */
+    blyt_entity_ref_t r2 = blyt_buffer_ref(S_ENTITY, b);
+    ok &= (r2 == ((2u << 16) | (uint32_t)b));
+    ok &= blyt_buffer_ref_valid(S_ENTITY, r2);
+    blyt_console_debug(ok ? "ref_ok" : "ref_bad");
+    blyt_quit();
+}
+
+void blyt_cart_draw(void) {}
+"#;
+
+const RUST_REF_LIFECYCLE: &str = r#"#![no_std]
+include!(env!("BLYT_CART_STATE_RS"));
+
+use blyt::buffer::{alloc_slot, entity_ref, free_slot, ref_slot, ref_valid};
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    let mut ok = true;
+    let _g = alloc_slot(S_GLOBALS);
+    let a = alloc_slot(S_ENTITY);
+    let r = entity_ref(S_ENTITY, a);
+    ok &= r == (1u32 << 16) | a as u32;
+    ok &= ref_valid(S_ENTITY, r);
+    ok &= ref_slot(r) == a;
+    free_slot(S_ENTITY, a);
+    ok &= !ref_valid(S_ENTITY, r);
+    let b = alloc_slot(S_ENTITY);
+    ok &= b == a;
+    ok &= !ref_valid(S_ENTITY, r);
+    let r2 = entity_ref(S_ENTITY, b);
+    ok &= r2 == (2u32 << 16) | b as u32;
+    ok &= ref_valid(S_ENTITY, r2);
+    blyt::console_debug(if ok { "ref_ok" } else { "ref_bad" });
+    blyt::quit();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#;
+
+const LUA_REF_LIFECYCLE: &str = r#"
+function init() end
+
+function update()
+    blyt.buf.alloc_slot(S.GLOBALS)
+    local a = blyt.buf.alloc_slot(S.ENTITY)
+    local r = blyt.buf.ref(S.ENTITY, a)
+    local ok = (r == ((1 << 16) | a))
+    ok = ok and blyt.buf.ref_valid(S.ENTITY, r)
+    ok = ok and (blyt.buf.ref_slot(r) == a)
+    blyt.buf.free_slot(S.ENTITY, a)
+    ok = ok and not blyt.buf.ref_valid(S.ENTITY, r)
+    local b = blyt.buf.alloc_slot(S.ENTITY)
+    ok = ok and (b == a)
+    ok = ok and not blyt.buf.ref_valid(S.ENTITY, r)
+    local r2 = blyt.buf.ref(S.ENTITY, b)
+    ok = ok and (r2 == ((2 << 16) | b))
+    ok = ok and blyt.buf.ref_valid(S.ENTITY, r2)
+    blyt.debug.print(ok and "ref_ok" or "ref_bad")
+    blyt.quit()
+end
+
+function draw() end
+"#;
+
+#[test]
+fn c_cart_entity_ref_lifecycle() {
+    require_sdk();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_c");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_native_with_flags(&cart, &[], "ref_ok");
+}
+
+#[test]
+fn wasm_c_cart_entity_ref_lifecycle() {
+    require_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_c_wasm");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_wasm(&cart, "ref_ok");
+}
+
+#[test]
+fn libretro_c_cart_entity_ref_lifecycle() {
+    require_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_c_lr");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_libretro(&cart, "ref_ok");
+}
+
+#[test]
+fn rust_cart_entity_ref_lifecycle() {
+    require_sdk();
+    require_rust_riscv_target();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_rust");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .rust(RUST_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_native_with_flags(&cart, &[], "ref_ok");
+}
+
+#[test]
+fn wasm_rust_cart_entity_ref_lifecycle() {
+    require_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_rust_wasm");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .rust(RUST_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_wasm(&cart, "ref_ok");
+}
+
+#[test]
+fn libretro_rust_cart_entity_ref_lifecycle() {
+    require_sdk();
+    require_rust_riscv_target();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_rust_lr");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .rust(RUST_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_libretro(&cart, "ref_ok");
+}
+
+#[test]
+fn lua_cart_entity_ref_lifecycle() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_lua");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .lua(LUA_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    run_cart_native_with_flags(&cart, &[], "ref_ok");
+}
+
+/// The WASM leg of the Lua lifecycle specifically covers the host-Lua
+/// fast-path closures in wasm_main.c (distinct code from blyt32lua.c).
+#[test]
+fn wasm_lua_cart_entity_ref_lifecycle() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_lua_wasm");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .lua(LUA_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    run_cart_wasm(&cart, "ref_ok");
+}
+
+#[test]
+fn libretro_lua_cart_entity_ref_lifecycle() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_lua_lr");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .lua(LUA_REF_LIFECYCLE)
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    run_cart_libretro(&cart, "ref_ok");
+}
+
+/// Edge cases: refs to unallocated/out-of-range slots and bad buffer handles
+/// are NONE; NONE is never valid; a ref is only valid against a buffer where
+/// its slot is actually allocated; slot 0's first ref is exactly 0x00010000.
+const C_REF_EDGE: &str = r#"
+#include "blyt.h"
+#include "cart_state.h"
+
+void blyt_cart_init(void) {}
+
+void blyt_cart_update(void) {
+    int ok = 1;
+    /* nothing allocated yet */
+    ok &= (blyt_buffer_ref(S_ENTITY, 0) == BLYT_ENTITY_REF_NONE);
+    ok &= (blyt_buffer_ref(S_ENTITY, 99) == BLYT_ENTITY_REF_NONE);
+    ok &= (blyt_buffer_ref(S_ENTITY, -1) == BLYT_ENTITY_REF_NONE);
+    ok &= (blyt_buffer_ref(0, 0) == BLYT_ENTITY_REF_NONE);
+    ok &= (blyt_buffer_ref(99, 0) == BLYT_ENTITY_REF_NONE);
+    ok &= !blyt_buffer_ref_valid(S_ENTITY, BLYT_ENTITY_REF_NONE);
+
+    int32_t g = -1, e0 = -1, e1 = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &g);
+    blyt_buffer_alloc_slot(S_ENTITY, &e0);
+    blyt_buffer_alloc_slot(S_ENTITY, &e1);
+    ok &= (e0 == 0 && e1 == 1);
+    /* slot 0, first generation: exact packed value */
+    ok &= (blyt_buffer_ref(S_ENTITY, e0) == 0x00010000u);
+    /* a ref to entity slot 1 is not valid against globals (count 1) */
+    blyt_entity_ref_t r1 = blyt_buffer_ref(S_ENTITY, e1);
+    ok &= blyt_buffer_ref_valid(S_ENTITY, r1);
+    ok &= !blyt_buffer_ref_valid(S_GLOBALS, r1);
+    ok &= !blyt_buffer_ref_valid(99, r1);
+
+    blyt_console_debug(ok ? "edge_ok" : "edge_bad");
+    blyt_quit();
+}
+
+void blyt_cart_draw(void) {}
+"#;
+
+#[test]
+fn c_cart_entity_ref_edge_cases() {
+    require_sdk();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_edge_c");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_EDGE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_native_with_flags(&cart, &[], "edge_ok");
+}
+
+#[test]
+fn wasm_c_cart_entity_ref_edge_cases() {
+    require_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_edge_wasm");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_EDGE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_wasm(&cart, "edge_ok");
+}
+
+#[test]
+fn libretro_c_cart_entity_ref_edge_cases() {
+    require_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_edge_lr");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_EDGE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_libretro(&cart, "edge_ok");
+}
+
+/// 65535 free/realloc cycles wrap the generation 65535 -> 1 (never 0): the
+/// final ref equals the very first one and is still a valid, non-NONE ref.
+#[test]
+fn c_cart_entity_ref_gen_wrap() {
+    require_sdk();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_wrap_c");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(r#"
+#include "blyt.h"
+#include "cart_state.h"
+
+void blyt_cart_init(void) {}
+
+void blyt_cart_update(void) {
+    int32_t s = -1;
+    blyt_buffer_alloc_slot(S_ENTITY, &s);
+    blyt_entity_ref_t first = blyt_buffer_ref(S_ENTITY, s); /* gen 1 */
+    int ok = (first == 0x00010000u);
+    for (uint32_t i = 0; i < 65535u; i++) {
+        blyt_buffer_free_slot(S_ENTITY, s);
+        blyt_buffer_alloc_slot(S_ENTITY, &s);
+    }
+    /* gen sequence 1 -> 2 -> ... -> 65535 -> 1 after 65535 frees */
+    blyt_entity_ref_t wrapped = blyt_buffer_ref(S_ENTITY, s);
+    ok &= (wrapped == first);
+    ok &= (wrapped != BLYT_ENTITY_REF_NONE);
+    ok &= blyt_buffer_ref_valid(S_ENTITY, wrapped);
+    blyt_console_debug(ok ? "wrap_ok" : "wrap_bad");
+    blyt_quit();
+}
+
+void blyt_cart_draw(void) {}
+"#)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_native_with_flags(&cart, &[], "wrap_ok");
+}
+
+/// Generations are serialized in save states: a ref taken before save_write
+/// goes stale when its slot is freed, and becomes valid again after
+/// save_read restores the generation counters and slot bitset.
+const C_REF_SAVE: &str = r#"
+#include "blyt.h"
+#include "cart_state.h"
+
+void blyt_cart_init(void) {
+    int32_t g = -1, e = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &g);
+    blyt_buffer_alloc_slot(S_ENTITY, &e);
+    blyt_buffer_free_slot(S_ENTITY, e);
+    blyt_buffer_alloc_slot(S_ENTITY, &e); /* gen 2 */
+    blyt_buffer_set_u32(S_GLOBALS, 0, S_GLOBALS_TARGET, blyt_buffer_ref(S_ENTITY, e));
+    blyt_save_write(0);
+    blyt_buffer_free_slot(S_ENTITY, e); /* gen 3; target now stale */
+}
+
+void blyt_cart_update(void) {
+    blyt_entity_ref_t target = blyt_buffer_get_u32(S_GLOBALS, 0, S_GLOBALS_TARGET);
+    int ok = !blyt_buffer_ref_valid(S_ENTITY, target);
+    blyt_save_read(0);
+    target = blyt_buffer_get_u32(S_GLOBALS, 0, S_GLOBALS_TARGET);
+    ok &= blyt_buffer_ref_valid(S_ENTITY, target);
+    ok &= (target == ((2u << 16) | 0u));
+    blyt_console_debug(ok ? "save_ref_ok" : "save_ref_bad");
+    blyt_quit();
+}
+
+void blyt_cart_draw(void) {}
+"#;
+
+const LUA_REF_SAVE: &str = r#"
+function init()
+    blyt.buf.alloc_slot(S.GLOBALS)
+    local e = blyt.buf.alloc_slot(S.ENTITY)
+    blyt.buf.free_slot(S.ENTITY, e)
+    e = blyt.buf.alloc_slot(S.ENTITY) -- gen 2
+    S.globals[0].target = blyt.buf.ref(S.ENTITY, e)
+    blyt.save_write(0)
+    blyt.buf.free_slot(S.ENTITY, e) -- gen 3; target now stale
+end
+
+function update()
+    local target = S.globals[0].target
+    local ok = not blyt.buf.ref_valid(S.ENTITY, target)
+    blyt.save_read(0)
+    target = S.globals[0].target
+    ok = ok and blyt.buf.ref_valid(S.ENTITY, target)
+    ok = ok and (target == ((2 << 16) | 0))
+    blyt.debug.print(ok and "save_ref_ok" or "save_ref_bad")
+    blyt.quit()
+end
+
+function draw() end
+"#;
+
+#[test]
+fn c_cart_ref_save_roundtrip() {
+    require_sdk();
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_save_c");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_SAVE)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_native_with_env(
+        &cart,
+        &[("BLYT_SAVE_DIR", save_dir.path().to_str().unwrap())],
+        "save_ref_ok",
+    );
+}
+
+#[test]
+fn lua_cart_ref_save_roundtrip() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_save_lua");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .lua(LUA_REF_SAVE)
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    run_cart_native_with_env(
+        &cart,
+        &[("BLYT_SAVE_DIR", save_dir.path().to_str().unwrap())],
+        "save_ref_ok",
+    );
+}
+
+/// Exercises blyt.save_write/save_read + ref restore on the WASM host-Lua
+/// fast path (wasm_main.c's save closures over the shared state_buffer.c).
+#[test]
+fn wasm_lua_cart_ref_save_roundtrip() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_save_lua_wasm");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .lua(LUA_REF_SAVE)
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "save_ref_ok");
+}
+
+/// Generation counters are tracked state: a ref taken in on_new_state (with
+/// a deliberate free/realloc so its generation is 2, not the fresh-boot 1)
+/// must survive the per-frame snapshot/zero/init/restore cycle. If the cycle
+/// dropped generations, the restored ref would read as stale.
+const C_REF_RESET: &str = r#"
+#include "blyt.h"
+#include "cart_state.h"
+
+void blyt_cart_init(void) {}
+
+void blyt_cart_on_new_state(void) {
+    int32_t g = -1, e = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &g);
+    blyt_buffer_alloc_slot(S_ENTITY, &e);
+    blyt_buffer_free_slot(S_ENTITY, e);
+    blyt_buffer_alloc_slot(S_ENTITY, &e); /* gen 2 */
+    blyt_buffer_set_u32(S_GLOBALS, 0, S_GLOBALS_TARGET, blyt_buffer_ref(S_ENTITY, e));
+}
+
+void blyt_cart_update(void) {
+    int32_t frame = blyt_buffer_get_i32(S_GLOBALS, 0, S_GLOBALS_FRAME) + 1;
+    blyt_buffer_set_i32(S_GLOBALS, 0, S_GLOBALS_FRAME, frame);
+    if (frame == 3) {
+        blyt_entity_ref_t target = blyt_buffer_get_u32(S_GLOBALS, 0, S_GLOBALS_TARGET);
+        int ok = blyt_buffer_ref_valid(S_ENTITY, target);
+        ok &= (target == ((2u << 16) | 0u));
+        blyt_console_debug(ok ? "reset_ref_ok" : "reset_ref_bad");
+        blyt_quit();
+    }
+}
+
+void blyt_cart_draw(void) {}
+"#;
+
+#[test]
+fn c_cart_entity_ref_reset_every_frame() {
+    require_sdk();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_reset_c");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_RESET)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_native_with_flags(&cart, &["--reset-every-frame"], "reset_ref_ok");
+}
+
+#[test]
+fn wasm_c_cart_entity_ref_reset_every_frame() {
+    require_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_reset_wasm");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_RESET)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], "reset_ref_ok");
+}
+
+#[test]
+fn libretro_c_cart_entity_ref_reset_every_frame() {
+    require_sdk();
+    require_libretro_core();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_reset_lr");
+    CartProject::new()
+        .config(ENTITY_REF_CONFIG)
+        .c(C_REF_RESET)
+        .write(&project);
+    let cart = build_cart(&project);
+    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], "reset_ref_ok");
+}
+
+/// A `ref:` field whose target buffer is not declared fails `blyt build`
+/// with a pointed error message.
+#[test]
+fn ref_field_unknown_buffer_fails_build() {
+    require_sdk();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("ref_bad_target");
+    CartProject::new()
+        .config(
+            "\
+records:
+  Globals:
+    fields:
+      - { name: target, ref: nonexistent }
+state_buffers:
+  globals:
+    record: Globals
+    count: 1
+",
+        )
+        .c(r#"
+#include "blyt.h"
+void blyt_cart_init(void) {}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#)
+        .write(&project);
+
+    let sdk = common::sdk_dir();
+    let out = std::process::Command::new(common::blyt_bin())
+        .args(["build", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .output()
+        .expect("failed to spawn blyt build");
+    assert!(!out.status.success(), "build unexpectedly succeeded");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ref target buffer") && stderr.contains("nonexistent"),
+        "unexpected error output: {stderr}"
+    );
+}

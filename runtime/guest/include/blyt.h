@@ -68,6 +68,31 @@ blyt_result_t blyt_buffer_alloc_slot(blyt_buffer_h buf, int32_t *out_slot);
 blyt_result_t blyt_buffer_free_slot(blyt_buffer_h buf, int32_t slot);
 
 /* -------------------------------------------------------------------------
+ * Packed entity refs (ADR-0096)
+ *
+ * A blyt_entity_ref_t stores a slot's generation counter in the high 16 bits
+ * and the slot index in the low 16 bits; BLYT_ENTITY_REF_NONE (0) is the
+ * null/invalid sentinel.  Generations start at 1 and are bumped when a slot
+ * is freed, so a ref taken before free_slot is detectably stale after the
+ * slot is reused.  Refs are plain u32 values: store them in u32 state-buffer
+ * fields (manifest `ref:` fields) and they serialize with the buffer.
+ *
+ * blyt_buffer_ref returns the ref for an allocated slot, NONE otherwise.
+ * blyt_buffer_ref_valid checks that ref still names the same entity.
+ * blyt_buffer_ref_slot extracts the slot index; only meaningful when the
+ * ref is valid (ref_slot(NONE) == 0).
+ * ------------------------------------------------------------------------- */
+typedef uint32_t blyt_entity_ref_t;
+#define BLYT_ENTITY_REF_NONE ((blyt_entity_ref_t)0)
+
+blyt_entity_ref_t blyt_buffer_ref(blyt_buffer_h buf, int32_t slot);
+bool blyt_buffer_ref_valid(blyt_buffer_h buf, blyt_entity_ref_t ref);
+
+static inline int32_t blyt_buffer_ref_slot(blyt_entity_ref_t ref) {
+    return (int32_t)(ref & 0xFFFFu);
+}
+
+/* -------------------------------------------------------------------------
  * Save/load (ADR-0087, ADR-0125)
  * ------------------------------------------------------------------------- */
 blyt_result_t blyt_save_write(uint32_t slot);

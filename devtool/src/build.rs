@@ -248,11 +248,21 @@ fn generate_cart_state(
             let rs_type = type_tag_rust_type(f.type_tag);
             let _suffix = type_tag_buf_get_suffix(f.type_tag);
 
+            /* ref: fields are u32 on the wire; annotate the generated
+             * constant with the target buffer (ADR-0096). */
+            let (c_note, rs_note) = match &f.ref_target {
+                Some(target) => (
+                    format!("blyt_entity_ref_t -> buffer \"{target}\""),
+                    format!("entity ref -> buffer \"{target}\""),
+                ),
+                None => (c_type.to_string(), rs_type.to_string()),
+            };
+
             c_out.push_str(&format!(
-                "#define {c_field} ((blyt_field_h)0x{field_h:08X}u) /* {c_type} */\n"
+                "#define {c_field} ((blyt_field_h)0x{field_h:08X}u) /* {c_note} */\n"
             ));
             rs_out.push_str(&format!(
-                "#[allow(dead_code)] pub const {c_field}: BlytFieldH = 0x{field_h:08X}; /* {rs_type} */\n"
+                "#[allow(dead_code)] pub const {c_field}: BlytFieldH = 0x{field_h:08X}; /* {rs_note} */\n"
             ));
             lua_c_fn.push_str(&format!(
                 "    lua_pushinteger(L, 0x{field_h:08X}); lua_setfield(L, -2, \"{lua_key}\");\n"
