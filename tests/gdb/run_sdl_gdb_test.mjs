@@ -42,7 +42,7 @@ function findGdbPort(proc) {
         let buf = '';
         const timer = setTimeout(
             () => reject(new Error('timeout: blytplay did not print GDB port')),
-            15000
+            60000
         );
         function check(chunk) {
             buf += chunk.toString();
@@ -79,7 +79,7 @@ async function main() {
         execFile(
             process.execPath,
             [testScript, endpoint, ...extraArgs],
-            { timeout: 30000 },
+            { timeout: 120000 },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);

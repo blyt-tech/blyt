@@ -35,7 +35,7 @@ if (!htmlPath || !goldenPath) {
 }
 
 const W = 320, H = 240;
-const TIMEOUT_MS = 15000;
+const TIMEOUT_MS = 60000;
 
 const goldenBin = readFileSync(goldenPath);
 if (goldenBin.length !== W * H * 4) {

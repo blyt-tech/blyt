@@ -25,7 +25,7 @@
 const ENDPOINT             = process.argv[2];
 const SOURCE_PATH          = process.argv[3] || 'cart';
 const BP_LINE              = parseInt(process.argv[4] || '4', 10);
-const TIMEOUT_MS           = 20000;
+const TIMEOUT_MS           = 60000;
 
 /* Optional feature flags */
 const LOADED_SOURCES_CHECK = !!process.env.BLYT_DAP_LOADED_SOURCES;

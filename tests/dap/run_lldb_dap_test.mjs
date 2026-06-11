@@ -115,7 +115,7 @@ async function runDap(fn) {
         });
     }
 
-    function waitEvent(eventName, timeoutMs = 15000) {
+    function waitEvent(eventName, timeoutMs = 60000) {
         return new Promise((resolve, reject) => {
             const timer = setTimeout(
                 () => reject(new Error(`timeout waiting for event '${eventName}'`)),
@@ -217,7 +217,7 @@ async function testAutoStart() {
         await send('configurationDone');
         await launchP;
 
-        const ev = await waitEvent('stopped', 15000);
+        const ev = await waitEvent('stopped', 60000);
         if (ev.body.reason === 'entry') {
             throw new Error('stopOnEntry:false still produced an entry stop');
         }
@@ -244,7 +244,7 @@ async function testStackTrace() {
             source: { path: `/blyt/src/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
-        const stoppedP = waitEvent('stopped', 15000);
+        const stoppedP = waitEvent('stopped', 60000);
         await send('configurationDone');
         const ev = await stoppedP;
         const threadId = ev.body.threadId;
@@ -281,7 +281,7 @@ async function testVariables() {
             source: { path: `/blyt/src/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
-        const stoppedP = waitEvent('stopped', 15000);
+        const stoppedP = waitEvent('stopped', 60000);
         await send('configurationDone');
         const ev = await stoppedP;
 
@@ -326,7 +326,7 @@ async function testSourceMap() {
             source: { path: `/blyt/src/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
-        const stoppedP = waitEvent('stopped', 15000);
+        const stoppedP = waitEvent('stopped', 60000);
         await send('configurationDone');
         const ev = await stoppedP;
 

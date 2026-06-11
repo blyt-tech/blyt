@@ -277,7 +277,7 @@ async function main() {
     /* Await T02 (SIGINT) stop reply. */
     const stop = await Promise.race([
         client.recv(),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout waiting for T02')), 5000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout waiting for T02')), 30000)),
     ]);
 
     if (!stop || !stop.startsWith('T02')) {

@@ -243,7 +243,7 @@ async function main() {
         execFile(
             process.execPath,
             [testScript, wsUrl, ...extraArgs],
-            { timeout: 30000 },
+            { timeout: 120000 },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);

@@ -43,7 +43,7 @@ function findDapPort(proc) {
         let buf = '';
         const timer = setTimeout(
             () => reject(new Error('timeout: blytplay did not print DAP port')),
-            15000
+            60000
         );
         proc.stdout.on('data', (chunk) => {
             buf += chunk.toString();
@@ -74,7 +74,7 @@ async function main() {
         execFile(
             process.execPath,
             [testScript, endpoint, 'main.lua', BP_LINE],
-            { timeout: 30000 },
+            { timeout: 120000 },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);

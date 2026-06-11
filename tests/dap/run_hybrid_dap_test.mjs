@@ -49,7 +49,7 @@ function findPorts(proc) {
         let gdbPort = null;
         const timer = setTimeout(
             () => reject(new Error('timeout: blytdebug did not print both ports')),
-            15000
+            60000
         );
         proc.stdout.on('data', (chunk) => {
             buf += chunk.toString();

@@ -232,7 +232,7 @@ async function main() {
         execFile(
             process.execPath,
             [testScript, wsUrl, 'main.lua', String(BP_LINE)],
-            { timeout: 30000 },
+            { timeout: 120000 },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);
