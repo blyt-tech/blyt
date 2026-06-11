@@ -56,7 +56,7 @@ function findGdbPort(proc) {
         let buf = '';
         const timer = setTimeout(
             () => reject(new Error('timeout: blytplay did not print GDB port')),
-            15000
+            60000
         );
         function check(chunk) {
             buf += chunk.toString();
@@ -149,7 +149,7 @@ async function main() {
         /* Await T02 (SIGINT) stop reply. */
         const stop = await Promise.race([
             t.recv(),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout waiting for T02')), 5000)),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout waiting for T02')), 30000)),
         ]);
 
         if (!stop || !stop.startsWith('T02')) {

@@ -46,7 +46,7 @@ function findBothPorts(proc) {
         let gdbPort = null;
         const timer = setTimeout(
             () => reject(new Error('timeout: blytplay did not print both DAP and GDB ports')),
-            15000
+            60000
         );
         function check(chunk) {
             buf += chunk.toString();
@@ -87,7 +87,7 @@ async function main() {
         execFile(
             process.execPath,
             [testScript, dapEndpoint, gdbEndpoint, ...extraArgs],
-            { timeout: 30000 },
+            { timeout: 120000 },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);

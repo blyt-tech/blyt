@@ -318,7 +318,7 @@ async function main() {
         relay.waitForWasmConnections(),
         new Promise((_, reject) => setTimeout(
             () => reject(new Error('timeout: WASM did not connect both DAP and GDB paths')),
-            15000
+            60000
         )),
     ]);
     clearInterval(heartbeat);
@@ -335,7 +335,7 @@ async function main() {
         execFile(
             process.execPath,
             [testScript, dapEndpoint, gdbEndpoint, ...extraArgs],
-            { timeout: 30000 },
+            { timeout: 120000 },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);

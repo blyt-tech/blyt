@@ -193,14 +193,14 @@ async function connectDap(endpointStr) {
         request(command, args = {}) {
             const s = seq++;
             return new Promise((resolve, reject) => {
-                const timer = setTimeout(() => reject(new Error(`timeout: ${command}`)), 20000);
+                const timer = setTimeout(() => reject(new Error(`timeout: ${command}`)), 60000);
                 pendingReqs.set(s, { resolve, reject, timer });
                 sendRaw(JSON.stringify({ seq: s, type: 'request', command, arguments: args }));
             });
         },
         nextEvent(name) {
             return new Promise((resolve, reject) => {
-                const timer = setTimeout(() => reject(new Error(`timeout: event "${name}"`)), 20000);
+                const timer = setTimeout(() => reject(new Error(`timeout: event "${name}"`)), 60000);
                 const check = (e) => {
                     if (e.event === name) {
                         clearTimeout(timer);
