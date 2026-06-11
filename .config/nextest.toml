@@ -1,0 +1,10 @@
+# nextest configuration (local runs and CI).
+
+[profile.default]
+# Flakes and missing prerequisites must fail loudly — never auto-retry
+# (explicit: this is the repo's missing-prereqs-are-failures policy).
+retries = 0
+# With suites running in parallel, a failure printed mid-run can scroll away
+# behind interleaved progress lines; re-print every failure's full output at
+# the end of the run as well.
+failure-output = "immediate-final"
