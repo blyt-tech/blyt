@@ -122,8 +122,12 @@ else()
   )
 
   if(FOUND_LLD)
-    string(APPEND _LXX_C_FLAGS " -fuse-ld=${FOUND_LLD}")
-    string(APPEND _LXX_CXX_FLAGS " -fuse-ld=${FOUND_LLD}")
+    # -fuse-ld must sit in the compile flags so the nested configure's link
+    # checks use lld, but compile-only steps then warn it is unused.
+    string(APPEND _LXX_C_FLAGS
+           " -fuse-ld=${FOUND_LLD} -Wno-unused-command-line-argument")
+    string(APPEND _LXX_CXX_FLAGS
+           " -fuse-ld=${FOUND_LLD} -Wno-unused-command-line-argument")
   endif()
 
   # Configure
@@ -227,8 +231,11 @@ else()
       "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti ${_LXXD_SECTION_FLAGS} ${_LXXD_MUSL_FLAGS}"
   )
   if(FOUND_LLD)
-    string(APPEND _LXXD_C_FLAGS " -fuse-ld=${FOUND_LLD}")
-    string(APPEND _LXXD_CXX_FLAGS " -fuse-ld=${FOUND_LLD}")
+    # Same -fuse-ld / unused-argument trade-off as the release build above.
+    string(APPEND _LXXD_C_FLAGS
+           " -fuse-ld=${FOUND_LLD} -Wno-unused-command-line-argument")
+    string(APPEND _LXXD_CXX_FLAGS
+           " -fuse-ld=${FOUND_LLD} -Wno-unused-command-line-argument")
   endif()
 
   execute_process(

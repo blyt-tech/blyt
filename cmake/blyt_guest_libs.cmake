@@ -352,7 +352,9 @@ set(LIBBLYTC_INCLUDES
     -I
     "${LIBBLYTC_BITS_DIR}/..")
 
-# Determinism (ADR-0007) and musl-compatibility compile flags.
+# Determinism (ADR-0007) and musl-compatibility compile flags.  musl relies
+# on unparenthesised shift idioms (`x >> 64-d`, `1U<<*s-' '`) that are
+# range-guarded and well-defined; upstream builds itself with -w under clang.
 set(LIBBLYTC_CFLAGS
     -ffp-contract=off
     -fno-fast-math
@@ -361,7 +363,8 @@ set(LIBBLYTC_CFLAGS
     -Wno-sign-compare
     -Wno-implicit-fallthrough
     -Wno-unused-variable
-    -Wno-deprecated-non-prototype)
+    -Wno-deprecated-non-prototype
+    -Wno-shift-op-parentheses)
 
 foreach(_var release debug)
   blyt_set_variant(${_var})

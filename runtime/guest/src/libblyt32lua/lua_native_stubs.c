@@ -235,7 +235,16 @@ blyt_time_t time(blyt_time_t *t) {
  *
  * NOTE: snprintf is NOT stubbed here; it comes from musl snprintf.c compiled
  * into libblytc_native.o (see cmake/blyt_sdk.cmake native build section).
+ *
+ * The signatures use void * in place of FILE * (no <stdio.h> here).  All
+ * object pointers share one representation and calling convention on the
+ * single RV32 ilp32f target, so callers built against the real prototypes
+ * interoperate deterministically; silence clang's builtin-signature lints.
  * ========================================================================= */
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wincompatible-library-redeclaration"
+#pragma clang diagnostic ignored "-Wbuiltin-requires-header"
 
 void blyt_console_debug(const char *s) __attribute__((weak));
 
@@ -313,6 +322,8 @@ int fputc(int c, void *f) {
     (void)f;
     return c;
 }
+
+#pragma clang diagnostic pop
 
 /* =========================================================================
  * Excluded Lua standard-library openers
