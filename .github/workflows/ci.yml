@@ -96,6 +96,22 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
+      # Cache the submodule object stores keyed on the gitlink SHAs (the
+      # nested rv32emu/softfloat SHA is pinned by rv32emu's commit, so the
+      # third_party tree hash covers it). On a hit, the update --init below
+      # checks out from the cached objects with no network (~70s -> ~5s).
+      - name: Compute submodule cache key
+        id: subkey
+        run: |
+          echo "key=$(git ls-tree HEAD -- third_party \
+            | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache submodules
+        uses: actions/cache@v4
+        with:
+          path: .git/modules
+          key: submodules-${{ steps.subkey.outputs.key }}
+
       - name: Init submodules
         run: |
           git submodule update --init --depth 1 \
@@ -165,20 +181,14 @@ jobs:
           curl -fsSL "$QEMU_IMAGE_URL/id_ed25519"   -o /tmp/blyt-qemu/id_ed25519
           chmod 600 /tmp/blyt-qemu/id_ed25519
 
-      - name: Native RISC-V ILP32 gate
-        if: vars.BLYT_QEMU_IMAGE_URL != ''
-        timeout-minutes: 10
-        env:
-          BLYT_QEMU_KERNEL: /tmp/blyt-qemu/Image
-          BLYT_QEMU_ROOTFS: /tmp/blyt-qemu/rootfs.qcow2
-          BLYT_QEMU_SSH_KEY: /tmp/blyt-qemu/id_ed25519
-          BLYT_BUILD_DIR: ${{ github.workspace }}/build
-          BLYT_SDK_DIR: ${{ github.workspace }}/build/sdk
-          BLYT_OBJCOPY: llvm-objcopy
-        run: |
-          cargo test \
-            --manifest-path tests/integration/Cargo.toml \
-            -- native_riscv_qemu_gate --nocapture
+      # Cache the Playwright chromium download keyed on the pinned playwright
+      # version (lockfile); --with-deps still apt-installs the few system
+      # libs but skips the browser download on a hit.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('tests/wasm/package-lock.json') }}
 
       - name: Install Playwright
         run: |
@@ -186,10 +196,18 @@ jobs:
           npm install
           npx playwright install --with-deps chromium
 
+      # The QEMU native ILP32 gate runs inside this step as a regular test:
+      # nextest overlaps its ~30s QEMU boot with the other suites. The
+      # BLYT_QEMU_* env points at the files downloaded above — when
+      # BLYT_QEMU_IMAGE_URL is unset they don't exist and the gate skips,
+      # matching the old dedicated step's `if:` behaviour.
       - name: Rust tests (unit + integration)
         timeout-minutes: 20
         env:
           BLYT_BUILD_DIR: ${{ github.workspace }}/build
+          BLYT_QEMU_KERNEL: /tmp/blyt-qemu/Image
+          BLYT_QEMU_ROOTFS: /tmp/blyt-qemu/rootfs.qcow2
+          BLYT_QEMU_SSH_KEY: /tmp/blyt-qemu/id_ed25519
         run: |
           cargo build -p blyt
           cargo nextest run --workspace
