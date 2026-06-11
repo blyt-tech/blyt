@@ -40,8 +40,13 @@
 
 #include "seccomp_allowlist.h"
 
-#ifndef BLYT_VERSION
-#define BLYT_VERSION "dev"
+#ifdef BLYT_WITH_CART_VALIDATE
+/* Normal build: version string baked into libblyt.a (version.c). */
+#include "blyt_runtime.h"
+#define LAUNCHER_VERSION blyt_runtime_version()
+#else
+/* Standalone build without libblyt.a (e.g. natively inside the QEMU VM). */
+#define LAUNCHER_VERSION "dev"
 #endif
 
 /* ── Argument parsing ────────────────────────────────────────────────── */
@@ -81,7 +86,7 @@ static int parse_opts(int argc, char **argv, struct launcher_opts *o) {
         } else if (!strcmp(argv[i], "--no-validate")) {
             o->do_validate = 0;
         } else if (!strcmp(argv[i], "--version")) {
-            printf("blyt_native %s\n", BLYT_VERSION);
+            printf("blyt_native %s\n", LAUNCHER_VERSION);
             exit(0);
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
@@ -105,7 +110,6 @@ static int parse_opts(int argc, char **argv, struct launcher_opts *o) {
 
 #ifdef BLYT_WITH_CART_VALIDATE
 /* Full validation via blyt_cart_open (requires linking against libblyt.a). */
-#include "blyt_runtime.h"
 
 static int validate_cart(const char *path) {
     blyt_cart_t *cart = NULL;
@@ -114,6 +118,9 @@ static int validate_cart(const char *path) {
         fprintf(stderr, "blyt_native: %s: %s\n", path, blyt_cart_err_str(err));
         return -1;
     }
+    /* Startup line — before fork/seccomp install (no fprintf after that). */
+    fprintf(stderr, "Blyt %s - %s (%s %s)\n", blyt_runtime_version(), blyt_cart_title(cart),
+            blyt_cart_id(cart), blyt_cart_version(cart));
     blyt_cart_close(cart);
     return 0;
 }

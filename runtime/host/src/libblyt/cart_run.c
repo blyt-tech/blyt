@@ -2302,23 +2302,9 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     blyt_state_ctx_init(cart, &s->state_ctx);
     s->ctx.state_ctx = &s->state_ctx;
 
-    /* Derive cart name from path for save file subdirectory. */
-    {
-        const char *base = cart->path ? cart->path : "cart";
-        const char *slash = strrchr(base, '/');
-        if (slash)
-            base = slash + 1;
-        size_t n = strlen(base);
-        /* Strip .blyt or .dbg.blyt suffix */
-        if (n > 10 && strcmp(base + n - 10, ".dbg.blyt") == 0)
-            n -= 10;
-        else if (n > 5 && strcmp(base + n - 5, ".blyt") == 0)
-            n -= 5;
-        if (n >= sizeof(s->ctx.cart_name))
-            n = sizeof(s->ctx.cart_name) - 1;
-        memcpy(s->ctx.cart_name, base, n);
-        s->ctx.cart_name[n] = '\0';
-    }
+    /* The manifest id names the save file subdirectory (validated at load
+     * time: ≤63 bytes, so it always fits cart_name[64]). */
+    snprintf(s->ctx.cart_name, sizeof(s->ctx.cart_name), "%s", cart->id);
 
     /* Resolve save directory: BLYT_SAVE_DIR env var or ~/.local/share/blyt */
     {

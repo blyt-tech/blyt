@@ -73,7 +73,7 @@ struct BuildArgs {
     /// Path to the cart project directory (default: current directory)
     project_dir: Option<PathBuf>,
 
-    /// Output path (default: <project-dir-name>.blyt)
+    /// Output path (default: build/<id>.blyt, id from blyt.info.yaml)
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -99,7 +99,7 @@ enum BuildSubcommand {
         /// Path to the cart project directory (default: current directory)
         project_dir: Option<PathBuf>,
 
-        /// Output path for the .blyt cart (default: <project-dir-name>.blyt)
+        /// Output path for the .blyt cart (default: build/<id>.blyt, id from blyt.info.yaml)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },

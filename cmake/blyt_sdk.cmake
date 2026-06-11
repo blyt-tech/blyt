@@ -496,8 +496,7 @@ else()
 
   execute_process(
     COMMAND
-      "${HOST_CC}" ${LINK_FLAGS} -fPIC -o "${LIBRETRO_OUT}"
-      "-DBLYT_VERSION=\"${BLYT_VERSION}\"" ${_libretro_embed_defs}
+      "${HOST_CC}" ${LINK_FLAGS} -fPIC -o "${LIBRETRO_OUT}" ${_libretro_embed_defs}
       "${BLYT_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
       "${EMBEDDED_LIBS_C}" -I
       "${BLYT_SOURCE_DIR}/third_party/libretro-common/include" -I

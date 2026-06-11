@@ -6,10 +6,13 @@ namespace blyt;
 table CartInfo {
     api_version_major: uint16;  // checked against runtime range at load time
     api_version_minor: uint16;
-    title:             string;
+    title:             string;  // human-readable title; required, no control chars
     author:            string;
     console:           string;  // "blyt32", "blytty", etc.; defaults to "blyt32" if absent
     debug:             bool;     // true for `blyt build --debug` carts (DWARF, unstripped); ADR-0129
+    // Appended fields (FlatBuffers: never reorder the ones above).
+    id:                string;  // machine identifier: output filename, save dir; [a-z0-9_-], alnum first, 1-63 bytes
+    version:           string;  // cart version, semver; devtool defaults it to "0.0.1-dev"
 }
 
 root_type CartInfo;

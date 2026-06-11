@@ -1,1 +1,3 @@
-name: hello
+id: hello
+title: Hello (Lua)
+version: 0.1.0

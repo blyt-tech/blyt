@@ -21,20 +21,26 @@ use flatbuffers::FlatBufferBuilder;
  * flatcc-generated reader — the wire format is identical for both codegens.
  *
  * `debug` records whether this is a `blyt build --debug` cart (DWARF, unstripped).
- * api_version_major/minor stay 0/0 (validated at load); title/author/console are
- * left unset for now — wire them from blyt.info.yaml when that file grows fields.
+ * api_version_major/minor stay 0/0 (validated at load); id/title/version come
+ * from blyt.info.yaml (see read_cart_info); author/console are left unset for
+ * now — wire them from blyt.info.yaml when that file grows fields.
  * ------------------------------------------------------------------------- */
-fn cart_info_bytes(debug: bool) -> Vec<u8> {
+fn cart_info_bytes(debug: bool, info: &InfoFields) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
+    let id = fbb.create_string(&info.id);
+    let title = fbb.create_string(&info.title);
+    let version = fbb.create_string(&info.version);
     let info = CartInfo::create(
         &mut fbb,
         &CartInfoArgs {
             api_version_major: 0,
             api_version_minor: 0,
-            title: None,
+            title: Some(title),
             author: None,
             console: None,
             debug,
+            id: Some(id),
+            version: Some(version),
         },
     );
     fbb.finish(info, None);
@@ -669,10 +675,48 @@ fn read_cart_languages(project_dir: &Path) -> Result<BTreeSet<CartLanguage>, Bui
 }
 
 /* -------------------------------------------------------------------------
- * Public entry point
+ * blyt.info.yaml — cart identity manifest
+ *
+ * Required for every cart project:
+ *   id: hello            # machine identifier: output filename, save dir
+ *   title: Hello World   # human-readable title
+ *   version: 0.1.0       # optional, semver; defaults to 0.0.1-dev
+ *
+ * Validation rules mirror the runtime loader (cart_id_valid in
+ * runtime/host/src/libblyt/cart_load.c — keep in sync):
+ *   id:    1-63 bytes, [a-z0-9_-], first char alphanumeric
+ *   title: non-empty, no control characters
  * ------------------------------------------------------------------------- */
 
-pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<PathBuf, BuildError> {
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InfoManifest {
+    id: Option<String>,
+    title: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Debug)]
+struct InfoFields {
+    id: String,
+    title: String,
+    version: String,
+}
+
+fn cart_id_valid(id: &str) -> bool {
+    if id.is_empty() || id.len() > 63 {
+        return false;
+    }
+    let bytes = id.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+fn read_cart_info(project_dir: &Path) -> Result<InfoFields, BuildError> {
     let info_path = project_dir.join("blyt.info.yaml");
     if !info_path.exists() {
         return Err(err(format!(
@@ -681,6 +725,48 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             project_dir.display()
         )));
     }
+    let text = fs::read_to_string(&info_path)?;
+    let manifest: InfoManifest =
+        serde_yaml::from_str(&text).map_err(|e| err(format!("blyt.info.yaml: {e}")))?;
+    let id = manifest.id.ok_or_else(|| {
+        err("blyt.info.yaml: missing required field `id` — \
+             the machine identifier used for the output filename and save directory")
+    })?;
+    if !cart_id_valid(&id) {
+        return Err(err(format!(
+            "blyt.info.yaml: invalid `id` {id:?} — \
+             must be 1-63 characters from [a-z0-9_-], starting with a letter or digit"
+        )));
+    }
+    let title = manifest.title.ok_or_else(|| {
+        err("blyt.info.yaml: missing required field `title` — \
+             the human-readable title of the cart")
+    })?;
+    if title.is_empty() || title.chars().any(|c| c.is_control()) {
+        return Err(err(
+            "blyt.info.yaml: `title` must be non-empty and contain no control characters",
+        ));
+    }
+    let version = match manifest.version {
+        None => "0.0.1-dev".to_string(),
+        Some(v) => {
+            semver::Version::parse(&v).map_err(|e| {
+                err(format!(
+                    "blyt.info.yaml: `version` {v:?} is not a valid semver string: {e}"
+                ))
+            })?;
+            v
+        }
+    };
+    Ok(InfoFields { id, title, version })
+}
+
+/* -------------------------------------------------------------------------
+ * Public entry point
+ * ------------------------------------------------------------------------- */
+
+pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<PathBuf, BuildError> {
+    let cart_info = read_cart_info(project_dir)?;
 
     let clang = find_clang();
     let clangpp = find_clangpp();
@@ -860,7 +946,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     fs::write(&ld_script, ld_content)?;
 
     let cart_info_file = build_dir.join("cart.info.bin");
-    fs::write(&cart_info_file, cart_info_bytes(debug))?;
+    fs::write(&cart_info_file, cart_info_bytes(debug, &cart_info))?;
 
     /* Parse blyt.config.yaml and generate state buffer codegen artifacts. */
     let cart_config = crate::config::read_cart_config(project_dir).map_err(|e| err(e))?;
@@ -1117,7 +1203,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
 
     let output_path = output
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_output(project_dir, debug));
+        .unwrap_or_else(|| default_output(project_dir, &cart_info.id, debug));
 
     let lua_bytecode_path = if is_lua {
         Some(build_dir.join("bytecode.luac"))
@@ -1199,17 +1285,13 @@ pub fn build_single_lib(project_dir: &Path, lib_name: &str) -> Result<PathBuf, B
     Ok(built.archive)
 }
 
-fn default_output(project_dir: &Path, debug: bool) -> PathBuf {
-    let name = project_dir
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("cart");
+fn default_output(project_dir: &Path, id: &str, debug: bool) -> PathBuf {
     // ADR-0129: debug carts get a `.dbg.blyt` suffix so they never collide with
     // a release `.blyt` and so `blyt debug` / tooling can tell them apart.
     let file = if debug {
-        format!("{name}.dbg.blyt")
+        format!("{id}.dbg.blyt")
     } else {
-        format!("{name}.blyt")
+        format!("{id}.blyt")
     };
     project_dir.join("build").join(file)
 }
@@ -2234,6 +2316,14 @@ mod tests {
     use super::*;
     use crate::cart_info_generated::blyt::root_as_cart_info;
 
+    fn test_fields() -> InfoFields {
+        InfoFields {
+            id: "hello".to_string(),
+            title: "Hello World".to_string(),
+            version: "0.0.1-dev".to_string(),
+        }
+    }
+
     // The .cart.info writer (flatbuffers crate) and the runtime reader
     // (flatcc) share one wire format; this round-trips the writer against the
     // matching flatbuffers reader to lock the `debug` field (ADR-0129).
@@ -2247,20 +2337,79 @@ mod tests {
     #[test]
     fn cart_info_debug_flag_round_trips() {
         assert!(
-            read_debug(&cart_info_bytes(true)),
+            read_debug(&cart_info_bytes(true, &test_fields())),
             "debug cart -> debug=true"
         );
         assert!(
-            !read_debug(&cart_info_bytes(false)),
+            !read_debug(&cart_info_bytes(false, &test_fields())),
             "release cart -> debug=false"
         );
     }
 
     #[test]
     fn cart_info_preamble_is_well_formed() {
-        let b = cart_info_bytes(false);
+        let b = cart_info_bytes(false, &test_fields());
         assert_eq!(&b[0..4], b"CINF");
         assert_eq!(&b[4..6], &[0, 0], "format_major = 0");
         assert_eq!(&b[6..8], &[0, 0], "format_minor = 0");
+    }
+
+    #[test]
+    fn cart_info_id_title_version_round_trip() {
+        let b = cart_info_bytes(false, &test_fields());
+        let info = root_as_cart_info(&b[8..]).expect("valid CartInfo");
+        assert_eq!(info.id(), Some("hello"));
+        assert_eq!(info.title(), Some("Hello World"));
+        assert_eq!(info.version(), Some("0.0.1-dev"));
+    }
+
+    #[test]
+    fn cart_id_validation() {
+        for ok in ["a", "0", "hello", "hello-world_2", &"a".repeat(63)] {
+            assert!(cart_id_valid(ok), "{ok:?} should be valid");
+        }
+        for bad in [
+            "",
+            "Hello",
+            "hello world",
+            "-hello",
+            "_hello",
+            "héllo",
+            &"a".repeat(64),
+        ] {
+            assert!(!cart_id_valid(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn read_cart_info_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |text: &str| fs::write(dir.path().join("blyt.info.yaml"), text).unwrap();
+
+        write("id: hello\ntitle: Hello World\n");
+        let f = read_cart_info(dir.path()).unwrap();
+        assert_eq!(f.id, "hello");
+        assert_eq!(f.title, "Hello World");
+        assert_eq!(f.version, "0.0.1-dev", "version defaults when absent");
+
+        write("id: hello\ntitle: Hello\nversion: 1.2.3-rc.1\n");
+        assert_eq!(read_cart_info(dir.path()).unwrap().version, "1.2.3-rc.1");
+
+        let expect_err = |text: &str, needle: &str| {
+            write(text);
+            let e = read_cart_info(dir.path()).unwrap_err().to_string();
+            assert!(e.contains(needle), "error {e:?} should mention {needle:?}");
+        };
+        expect_err("title: Hello\n", "missing required field `id`");
+        expect_err("id: hello\n", "missing required field `title`");
+        expect_err("id: Hello\ntitle: Hello\n", "invalid `id`");
+        expect_err("id: hello\ntitle: \"a\\nb\"\n", "control characters");
+        expect_err("id: hello\ntitle: Hello\nversion: not-semver\n", "semver");
+        // The retired `name:` field is an unknown field like any other.
+        expect_err("name: hello\n", "unknown field");
+
+        fs::remove_file(dir.path().join("blyt.info.yaml")).unwrap();
+        let e = read_cart_info(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("blyt.info.yaml not found"));
     }
 }

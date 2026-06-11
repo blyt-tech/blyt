@@ -277,9 +277,13 @@ add_library(libblytc INTERFACE)
 
 add_library(
   libblyt STATIC
-  runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
-  runtime/host/src/libblyt/state_buffer.c runtime/host/src/libblyt/save.c
-  runtime/host/src/libblyt/testcard.c runtime/host/src/libblyt/trace.c)
+  runtime/host/src/libblyt/cart_load.c
+  runtime/host/src/libblyt/cart_run.c
+  runtime/host/src/libblyt/state_buffer.c
+  runtime/host/src/libblyt/save.c
+  runtime/host/src/libblyt/testcard.c
+  runtime/host/src/libblyt/trace.c
+  runtime/host/src/libblyt/version.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
 # same static library is usable in both executables and shared objects.
@@ -293,6 +297,13 @@ target_include_directories(
 # cart_run.c includes common.h explicitly; the -D flags ensure feature macros
 # expand correctly when rv32emu headers are pulled in from cart_run.c.
 target_compile_definitions(libblyt PRIVATE ${RV32EMU_FEATURE_DEFS})
+# BLYT_VERSION carries a per-run timestamp in CI dev builds; scope it to the one
+# tiny TU that uses it (blyt_runtime_version) so everything else stays
+# compiler-cacheable across runs.  Directory-scoped: covers libblyt and
+# libblyt_debug.
+set_source_files_properties(
+  runtime/host/src/libblyt/version.c PROPERTIES COMPILE_DEFINITIONS
+                                                BLYT_VERSION="${BLYT_VERSION}")
 target_link_libraries(
   libblyt
   PUBLIC flatccrt
@@ -373,9 +384,13 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
   set(BLYT_DEBUG_RUNTIME ON)
   add_library(
     libblyt_debug STATIC
-    runtime/host/src/libblyt/cart_load.c runtime/host/src/libblyt/cart_run.c
-    runtime/host/src/libblyt/state_buffer.c runtime/host/src/libblyt/save.c
-    runtime/host/src/libblyt/testcard.c runtime/host/src/libblyt/trace.c)
+    runtime/host/src/libblyt/cart_load.c
+    runtime/host/src/libblyt/cart_run.c
+    runtime/host/src/libblyt/state_buffer.c
+    runtime/host/src/libblyt/save.c
+    runtime/host/src/libblyt/testcard.c
+    runtime/host/src/libblyt/trace.c
+    runtime/host/src/libblyt/version.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
   target_include_directories(
@@ -550,12 +565,6 @@ if(LIBBLYTC_OUT)
     list(APPEND _blyt_libretro_defs BLYT_EMBED_LUA)
   endif()
   target_compile_definitions(blyt_libretro PRIVATE ${_blyt_libretro_defs})
-  # BLYT_VERSION carries a per-run timestamp in CI dev builds; scope it to the
-  # one TU that uses it so the (large, generated) embedded-libs TU stays
-  # compiler-cacheable across runs.
-  set_source_files_properties(
-    frontends/libretro/blyt_libretro.c
-    PROPERTIES COMPILE_DEFINITIONS BLYT_VERSION="${BLYT_VERSION}")
   set_target_properties(blyt_libretro PROPERTIES PREFIX "" SUFFIX ".so")
   add_dependencies(blyt_libretro guest_libs)
   message(STATUS "blyt_libretro: will be built")
@@ -575,8 +584,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES
   add_executable(blyt_native frontends/native/launcher.c)
   target_include_directories(blyt_native PRIVATE frontends/native
                                                  runtime/host/include)
-  target_compile_definitions(blyt_native PRIVATE BLYT_VERSION="${BLYT_VERSION}"
-                                                 BLYT_WITH_CART_VALIDATE)
+  target_compile_definitions(blyt_native PRIVATE BLYT_WITH_CART_VALIDATE)
   target_link_libraries(blyt_native PRIVATE libblyt)
   # Cross-compilation: link statically so the binary runs on any riscv64 Linux
   # regardless of which C library (glibc, musl, …) the target system uses.
