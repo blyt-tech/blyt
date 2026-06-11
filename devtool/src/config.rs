@@ -12,8 +12,12 @@ use std::path::Path;
 #[derive(serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct CartConfig {
-    /// Target frames per second (default: 60). Compiled into .cart.config.
+    /// Target frames per second (default: 60).
+    /// TODO: emit the .cart.config FlatBuffer section (schemas/cart_config.fbs)
+    /// so this reaches the host; until then the value is parsed but unused and
+    /// carts always run at the fixed 60 Hz timestep.
     #[serde(default = "default_fps")]
+    #[allow(dead_code)]
     pub fps: u8,
 
     /// Named record type declarations (flat POD structs).
