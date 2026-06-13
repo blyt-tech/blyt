@@ -1533,7 +1533,7 @@ fn generate_lua_data_c(bytecode_path: &Path, output_c: &Path) -> Result<(), Buil
  *   3. Ancestors of the running binary
  * ------------------------------------------------------------------------- */
 
-fn find_sdk_include() -> Result<PathBuf, BuildError> {
+pub(crate) fn find_sdk_include() -> Result<PathBuf, BuildError> {
     if let Ok(sdk) = std::env::var("BLYT_SDK_DIR") {
         let sdk = PathBuf::from(sdk);
         let via_include = sdk.join("include");
@@ -1645,7 +1645,7 @@ fn find_cargo() -> String {
  *   3. Walk up from sdk_include looking for sdk/rust/blyt/ in the repo tree
  * ------------------------------------------------------------------------- */
 
-fn find_rust_sdk(sdk_include: &Path) -> Result<PathBuf, BuildError> {
+pub(crate) fn find_rust_sdk(sdk_include: &Path) -> Result<PathBuf, BuildError> {
     if let Ok(p) = std::env::var("BLYT_RUST_SDK") {
         let p = PathBuf::from(p);
         if p.join("Cargo.toml").exists() {
@@ -2020,7 +2020,7 @@ fn discover_libraries(project_dir: &Path) -> Result<Vec<String>, BuildError> {
 /// Discover Rust libraries in `src/lib/`: any subdirectory with a `Cargo.toml`
 /// is treated as a Rust crate.  The directory name is used as the crate name
 /// for `--config` patch injection; the `Cargo.toml` [package] name must match.
-fn discover_rust_libs(project_dir: &Path) -> Result<Vec<(String, PathBuf)>, BuildError> {
+pub(crate) fn discover_rust_libs(project_dir: &Path) -> Result<Vec<(String, PathBuf)>, BuildError> {
     let lib_root = project_dir.join("src/lib");
     if !lib_root.exists() {
         return Ok(Vec::new());

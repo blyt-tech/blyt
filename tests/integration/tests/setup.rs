@@ -1,7 +1,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{CartProject, blyt_bin};
+use common::{CartProject, blyt_bin, sdk_dir};
 use std::fs;
 use tempfile::TempDir;
 
@@ -56,6 +56,36 @@ fn setup_vscode_lua_cart() {
     assert!(
         content.contains("\"type\": \"blyt\""),
         "launch.json missing blyt config:\n{content}"
+    );
+}
+
+/// `blyt setup vscode` on a Rust cart also writes a `.vscode/settings.json`
+/// telling rust-analyzer the `--config patch` that resolves the SDK `blyt`
+/// crate (issue #48 item 1a).  A non-Rust cart gets no settings.json.
+#[test]
+fn setup_vscode_rust_cart_writes_ra_config() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_cart");
+    CartProject::new()
+        .rust("#![no_std]\n#[no_mangle] pub extern \"C\" fn blyt_cart_init() {}\n#[no_mangle] pub extern \"C\" fn blyt_cart_update() {}\n#[no_mangle] pub extern \"C\" fn blyt_cart_draw() {}\n")
+        .write(&project);
+
+    Command::new(blyt_bin())
+        .args(["setup", "vscode", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", sdk_dir())
+        .assert()
+        .success();
+
+    let settings = project.join(".vscode/settings.json");
+    assert!(settings.exists(), "settings.json not written for rust cart");
+    let content = fs::read_to_string(&settings).unwrap();
+    assert!(
+        content.contains("rust-analyzer.cargo.extraArgs"),
+        "settings.json missing extraArgs:\n{content}"
+    );
+    assert!(
+        content.contains("patch.crates-io.blyt.path"),
+        "settings.json missing blyt patch:\n{content}"
     );
 }
 
