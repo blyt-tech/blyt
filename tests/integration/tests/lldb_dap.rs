@@ -3,7 +3,7 @@ mod common;
 use assert_cmd::Command;
 use common::{
     CartProject, blytdebug, build_debug_cart, lldb_dap_bin, repo_root, require_gdb,
-    require_lldb_dap, require_sdk, require_symbol_addr,
+    require_lldb_dap, require_rust_riscv_target, require_sdk, require_symbol_addr,
 };
 use std::time::Duration;
 use tempfile::TempDir;
@@ -35,6 +35,17 @@ const BREAK_LINE: u32 = 5;
 /* ── Helper: spawn blytplay with GDB, run an lldb-dap test script ────────── */
 
 fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::path::Path) {
+    run_lldb_dap_test_env(test_name, project, cart, &[]);
+}
+
+/// As `run_lldb_dap_test`, with extra environment for the Node driver (e.g.
+/// BLYT_SDK_BREAK_FILE/LINE for the sdk-source-breakpoint scenario).
+fn run_lldb_dap_test_env(
+    test_name: &str,
+    project: &std::path::Path,
+    cart: &std::path::Path,
+    extra_env: &[(&str, String)],
+) {
     let lldb_dap = lldb_dap_bin().expect("lldb-dap not found");
 
     // Spawn blytplay --gdb 0 --headless <cart> with piped stdout/stderr so we
@@ -112,6 +123,7 @@ fn run_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::pat
         ])
         .env("BLYT_GDB_BREAK_LINE", BREAK_LINE.to_string())
         .env("BLYT_SOURCE_FILE", "src/game/c/main.c")
+        .envs(extra_env.iter().map(|(k, v)| (*k, v.as_str())))
         .timeout(Duration::from_secs(30))
         .assert();
 
@@ -277,4 +289,55 @@ fn sdl_native_lldb_dap_source_map() {
     require_symbol_addr(&cart, "blyt_lldb_test_fn");
 
     run_lldb_dap_test("source-map", &project, &cart);
+}
+
+/// LLDB-DAP: a breakpoint *inside SDK-shipped source* binds and fires (#48 item 2).
+///
+/// Sets a breakpoint by the canonical `/blyt/sdk/rust/blyt/src/lib.rs:<line>`
+/// path — the statically-linked blyt SDK crate, whose DWARF travels in the cart
+/// — and verifies it binds (against the SDK DWARF) and fires (the cart calls
+/// `console_debug`).  Proves the shipped SDK source + the manifest source-map
+/// resolve end to end, not just the cart's own source.  The line is resolved
+/// from the shipped crate so it tracks edits and is HOME-independent.
+#[test]
+fn sdl_native_lldb_dap_sdk_source_breakpoint() {
+    require_sdk();
+    require_gdb();
+    require_lldb_dap();
+    require_rust_riscv_target();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_sdk_bp");
+    CartProject::new()
+        .rust(
+            "#![no_std]\n\
+             use blyt::*;\n\
+             #[no_mangle] pub extern \"C\" fn blyt_cart_init() { console_debug(\"sdk bp\"); }\n\
+             #[no_mangle] pub extern \"C\" fn blyt_cart_update() { quit(); }\n\
+             #[no_mangle] pub extern \"C\" fn blyt_cart_draw() {}\n",
+        )
+        .write(&project);
+    let cart = build_debug_cart(&project);
+
+    // Resolve console_debug's first body statement in the shipped SDK crate.
+    let lib_rs = repo_root().join("sdk/rust/blyt/src/lib.rs");
+    let src = std::fs::read_to_string(&lib_rs).expect("read SDK lib.rs");
+    let sig = src
+        .lines()
+        .position(|l| l.contains("pub fn console_debug(s: &str)"))
+        .expect("console_debug not found in SDK crate");
+    let break_line = sig + 2; // 1-based line of the first body statement
+
+    run_lldb_dap_test_env(
+        "sdk-source-breakpoint",
+        &project,
+        &cart,
+        &[
+            (
+                "BLYT_SDK_BREAK_FILE",
+                "/blyt/sdk/rust/blyt/src/lib.rs".to_string(),
+            ),
+            ("BLYT_SDK_BREAK_LINE", break_line.to_string()),
+        ],
+    );
 }
