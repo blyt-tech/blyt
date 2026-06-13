@@ -57,6 +57,13 @@ fn setup_vscode_lua_cart() {
         content.contains("\"type\": \"blyt\""),
         "launch.json missing blyt config:\n{content}"
     );
+
+    // A Lua cart also gets .luarc.json registering the generated LuaLS library.
+    let luarc = fs::read_to_string(project.join(".luarc.json")).expect(".luarc.json not written");
+    assert!(
+        luarc.contains("workspace.library") && luarc.contains("build/blyt/lua"),
+        ".luarc.json missing workspace.library:\n{luarc}"
+    );
 }
 
 /// `blyt setup vscode` on a Rust cart also writes a `.vscode/settings.json`
