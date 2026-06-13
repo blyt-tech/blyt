@@ -776,6 +776,14 @@ fn read_cart_info(project_dir: &Path) -> Result<InfoFields, BuildError> {
  * ------------------------------------------------------------------------- */
 
 pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<PathBuf, BuildError> {
+    // Canonicalise to an absolute path so the build is independent of how blyt
+    // was invoked (relative vs absolute project arg).  This is what makes the
+    // /blyt/cart prefix map and the source-map manifest deterministic: the
+    // compiler always sees absolute source paths under this root, the prefix map
+    // always matches, and the manifest's `local` is absolute (a debug client
+    // needs that).  Building the same cart from different invocations now yields
+    // identical paths in DWARF.
+    let project_dir = &fs::canonicalize(project_dir)?;
     let cart_info = read_cart_info(project_dir)?;
 
     let clang = find_clang();
@@ -785,6 +793,14 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
 
     let sdk_include = find_sdk_include()?;
     let lib_dir = find_lib_dir(&sdk_include)?;
+    // SDK root = parent of the include dir (build/sdk, $BLYT_SDK_DIR, …).  Used
+    // as the local side of the /blyt/sdk source-path remap: SDK headers compiled
+    // inline into the cart (libc++ templates, blyt.h static inlines) otherwise
+    // bake this absolute path into cart DWARF.
+    let sdk_root = sdk_include
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| sdk_include.clone());
 
     let languages = read_cart_languages(project_dir)?;
     let is_lua = languages.contains(&CartLanguage::Lua);
@@ -862,31 +878,66 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         }
     }
 
+    // Canonical source-path remapping (issue #46).  Every path embedded in a
+    // cart — DWARF, Rust panic Location strings, C __FILE__/assert — is rewritten
+    // from a machine-local absolute path to a /blyt/* canonical prefix, so carts
+    // are machine-independent and a debugger on any machine reverses the mapping
+    // via build/source-map.json.  Applied to BOTH variants: release has no DWARF
+    // but __FILE__ and panic-Location strings still embed paths, so the maps keep
+    // release carts free of the author's absolute paths (privacy + byte
+    // reproducibility).
+    let src_map = source_map_entries(project_dir, &sdk_root);
+
+    // C/C++ only ever embeds cart + SDK paths (its own sources and the SDK
+    // headers compiled inline); the rust-src / cargo entries never match a C
+    // path, so they are filtered out here to keep the command line tight.
+    let c_prefix_flags: Vec<String> = src_map
+        .iter()
+        .filter(|e| e.canonical == "/blyt/cart" || e.canonical == "/blyt/sdk")
+        .map(|e| format!("-ffile-prefix-map={}={}", e.local.display(), e.canonical))
+        .collect();
+
     // Per-variant optimisation/debug flags, computed once and passed to every
-    // compile_c/compile_cpp invocation for user source files (generated stubs
-    // like _blyt_entry.c are excluded).  Debug: -O0 -g + path remap for clean
-    // stepping.  Release: -O2 (ADR-0129).  Determinism flags (ADR-0007) live in
-    // compile_c/compile_cpp and apply to both variants, so -O2 must not drop them.
-    let opt_c_flags: Vec<String> = if debug {
-        vec![
-            "-g".to_string(),
-            "-O0".to_string(),
-            format!("-ffile-prefix-map={}=/blyt/src", project_dir.display()),
-        ]
-    } else {
-        vec!["-O2".to_string()]
+    // compile_c/compile_cpp invocation (incl. the generated stubs, so their
+    // frames carry line info too).  Debug: -O0 -g for clean stepping.  Release:
+    // -O2 (ADR-0129).  The prefix maps go in both.  Determinism flags (ADR-0007)
+    // live in compile_c/compile_cpp and apply to both variants, so -O2 must not
+    // drop them.
+    let opt_c_flags: Vec<String> = {
+        let mut f = if debug {
+            // Pin DW_AT_comp_dir to the canonical cart root so it does not leak
+            // the absolute build directory into DWARF (the source-file DW_AT_names
+            // are already absolute /blyt/cart paths via the prefix map, so comp_dir
+            // is otherwise cosmetic — but it must be deterministic for byte-identical
+            // debug carts across build directories).
+            vec![
+                "-g".to_string(),
+                "-O0".to_string(),
+                "-ffile-compilation-dir=/blyt/cart".to_string(),
+            ]
+        } else {
+            vec!["-O2".to_string()]
+        };
+        f.extend(c_prefix_flags);
+        f
     };
-    // -C opt-level=0 mirrors the C path's -O0 so cart Rust *and* the std crates
-    // rebuilt by build-std step cleanly line-by-line (no inlining / reordering /
-    // <optimized out> locals).  RUSTFLAGS are appended after cargo's release
-    // profile flags, so this opt-level wins over the profile's.
-    let debug_rust_flags: String = if debug {
-        format!(
-            " -g -C opt-level=0 --remap-path-prefix={}=/blyt/src",
-            project_dir.display()
-        )
+
+    // Rust remaps cover all four prefixes: build-std recompiles core/alloc from
+    // the local rust-src and registry deps resolve from the cargo cache, so those
+    // paths reach cart DWARF + panic Location strings too.  The cart + sdk remaps
+    // are project-specific and (as before this change) fragment the sccache
+    // build-std unit cache across carts — acceptable; the rust-src / cargo remaps
+    // are machine-constant and cache-neutral.  -C opt-level=0 mirrors the C path's
+    // -O0 (debug only) so cart Rust *and* build-std crates step line-by-line;
+    // RUSTFLAGS are appended after cargo's release profile flags so it wins.
+    let rust_remap_flags: String = src_map
+        .iter()
+        .map(|e| format!(" --remap-path-prefix={}={}", e.local.display(), e.canonical))
+        .collect();
+    let rust_extra_flags: String = if debug {
+        format!(" -g -C opt-level=0{rust_remap_flags}")
     } else {
-        String::new()
+        rust_remap_flags
     };
 
     // Build all libraries before game code.
@@ -928,7 +979,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             let lib_build_dir = project_dir.join("build/lib").join(&lib_name);
             fs::create_dir_all(&lib_build_dir)?;
             let status = cargo_cart_cmd(&cargo, &lib_path.join("Cargo.toml"), &lib_build_dir)
-                .env("RUSTFLAGS", cart_rustflags(&debug_rust_flags))
+                .env("RUSTFLAGS", cart_rustflags(&rust_extra_flags))
                 .status()
                 .map_err(|e| err(format!("failed to run cargo for Rust lib {lib_name}: {e}")))?;
             if !status.success() {
@@ -946,6 +997,11 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         project_dir.join("build/game/c")
     };
     fs::create_dir_all(&build_dir)?;
+
+    // Emit the source-map manifest (issue #46 §2) for debug clients.  Written
+    // for both variants — a release cart carries no DWARF but the manifest is
+    // cheap and lets tooling reason about either build uniformly.
+    write_source_map_manifest(&project_dir.join("build"), &src_map, project_dir)?;
 
     let ld_script = build_dir.join("blyt_cart.ld");
     let ld_content = if is_lua {
@@ -999,7 +1055,9 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     )?;
 
     // Generated stubs need no lib includes — they only call blyt_main/blyt_exit.
-    // No debug flags: these are auto-generated files, not user source.
+    // They get the per-variant flags (incl. -g + prefix maps in debug) so that
+    // stepping across the generated entry/glue carries line info, and their
+    // build-dir paths canonicalise to /blyt/cart/build/… like the rest.
     let mut obj_files = Vec::new();
     obj_files.push(compile_c(
         &clang,
@@ -1008,7 +1066,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         &sdk_include,
         &[],
         &[],
-        &[],
+        &opt_c_flags,
     )?);
     obj_files.push(compile_c(
         &clang,
@@ -1017,7 +1075,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         &sdk_include,
         &[],
         &[],
-        &[],
+        &opt_c_flags,
     )?);
 
     // Step 1: Lua bytecode — shared for all carts that include Lua.
@@ -1190,7 +1248,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             &rust_build_dir,
             &rust_sdk,
             &rust_libs,
-            &debug_rust_flags,
+            &rust_extra_flags,
             is_lua,
             cart_state_rs,
         )?;
@@ -1613,6 +1671,119 @@ fn rust_toolchain() -> String {
     std::env::var("BLYT_RUST_TOOLCHAIN").unwrap_or_else(|_| CART_RUST_TOOLCHAIN.to_string())
 }
 
+/* -------------------------------------------------------------------------
+ * Canonical source-path mapping (issue #46)
+ *
+ * Each entry maps a machine-local absolute directory to a canonical "/blyt/…"
+ * prefix that is embedded in cart debug info (DWARF, Rust panic Location, C
+ * __FILE__).  The same set drives the compiler prefix-map flags and the
+ * build/source-map.json manifest that debuggers reverse to find sources.
+ * ------------------------------------------------------------------------- */
+
+pub(crate) struct SourceMapEntry {
+    pub local: PathBuf,
+    pub canonical: &'static str,
+}
+
+/// Local user home, for deriving the default cargo cache location.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// The pinned cart toolchain's rust-src tree
+/// (`<sysroot>/lib/rustlib/src/rust`), whence build-std recompiles
+/// core/alloc.  Returns None if the sysroot can't be resolved, in which case
+/// the /blyt/rust remap is simply omitted (paths stay absolute, still debuggable
+/// locally).
+fn rust_src_dir() -> Option<PathBuf> {
+    let out = Command::new("rustc")
+        .env("RUSTUP_TOOLCHAIN", rust_toolchain())
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8(out.stdout).ok()?;
+    Some(PathBuf::from(sysroot.trim()).join("lib/rustlib/src/rust"))
+}
+
+/// The cargo registry source cache (`$CARGO_HOME/registry/src`, default
+/// `~/.cargo/registry/src`), whence crates.io dependency sources are compiled.
+fn cargo_registry_src() -> Option<PathBuf> {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".cargo")))?;
+    Some(cargo_home.join("registry/src"))
+}
+
+/// The canonical source-path mappings for a cart build, in a deterministic
+/// order.  The cart and SDK roots always map; the rust-src and cargo entries
+/// map when their local roots can be resolved.  None of these prefixes nest,
+/// so prefix-map ordering is immaterial.
+pub(crate) fn source_map_entries(project_dir: &Path, sdk_root: &Path) -> Vec<SourceMapEntry> {
+    let mut v = vec![
+        SourceMapEntry {
+            local: project_dir.to_path_buf(),
+            canonical: "/blyt/cart",
+        },
+        SourceMapEntry {
+            local: sdk_root.to_path_buf(),
+            canonical: "/blyt/sdk",
+        },
+    ];
+    if let Some(rust_src) = rust_src_dir() {
+        v.push(SourceMapEntry {
+            local: rust_src,
+            canonical: "/blyt/rust",
+        });
+    }
+    if let Some(reg) = cargo_registry_src() {
+        v.push(SourceMapEntry {
+            local: reg,
+            canonical: "/blyt/cargo",
+        });
+    }
+    v
+}
+
+/// Minimal JSON string escaping for a filesystem path (covers `"` and `\`,
+/// which suffice for POSIX paths; control chars are not expected here).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Write `<build_root>/source-map.json`: the authoritative list of
+/// {prefix, local} pairs a debug client reverses to resolve canonical cart
+/// paths back to local sources (issue #46 §2).  A legacy `/blyt/src → project`
+/// entry is appended so carts built before the /blyt/cart rename still resolve.
+fn write_source_map_manifest(
+    build_root: &Path,
+    entries: &[SourceMapEntry],
+    project_dir: &Path,
+) -> Result<(), BuildError> {
+    let mut pairs: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| (e.canonical.to_string(), e.local.display().to_string()))
+        .collect();
+    // Legacy alias: /blyt/src meant the project root before the /blyt/cart rename.
+    pairs.push(("/blyt/src".to_string(), project_dir.display().to_string()));
+
+    let mut json = String::from("[\n");
+    for (i, (prefix, local)) in pairs.iter().enumerate() {
+        json.push_str(&format!(
+            "  {{ \"prefix\": \"{}\", \"local\": \"{}\" }}",
+            json_escape(prefix),
+            json_escape(local)
+        ));
+        json.push_str(if i + 1 < pairs.len() { ",\n" } else { "\n" });
+    }
+    json.push_str("]\n");
+
+    fs::write(build_root.join("source-map.json"), json)?;
+    Ok(())
+}
+
 /// Build the RUSTFLAGS for a cart Rust build.
 ///
 /// `relocation-model=pic`: the cart ELF is ET_DYN (PIE), so every object —
@@ -1725,8 +1896,17 @@ fn build_rust_archive(
         let abs = std::fs::canonicalize(rs_path).unwrap_or_else(|_| rs_path.to_path_buf());
         cargo_cmd.env("BLYT_CART_STATE_RS", abs);
     }
+    // Pin the SDK crate's source to a canonical /blyt/sdk/rust/blyt path.  The
+    // crate is injected by --config from rust_sdk_path, which is normally under
+    // the SDK root (already covered by the /blyt/sdk remap) but can be elsewhere
+    // via $BLYT_RUST_SDK or the in-repo sdk/rust/blyt; this explicit remap makes
+    // its embedded DWARF path identical regardless of where it physically lives.
+    let rust_flags = format!(
+        "{extra_rustflags} --remap-path-prefix={}=/blyt/sdk/rust/blyt",
+        rust_sdk_path.display()
+    );
     let status = cargo_cmd
-        .env("RUSTFLAGS", cart_rustflags(extra_rustflags))
+        .env("RUSTFLAGS", cart_rustflags(&rust_flags))
         .status()
         .map_err(|e| err(format!("failed to run {cargo}: {e}")))?;
 

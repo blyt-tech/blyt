@@ -112,6 +112,53 @@ endfunction()
 
 # ── Per-object compilation ───────────────────────────────────────────────────
 #
+# Canonical source-path remapping for guest-lib DWARF (issue #46 §4).  Guest
+# objects compile with absolute source paths; without these maps clang emits
+# build-relative DW_AT_names against an absolute DW_AT_comp_dir, so the debug
+# libs only resolve on the machine that built them and their bytes vary by build
+# directory.  Each map rewrites a source tree to the /blyt/sdk/src/<component>
+# layout the SDK ships (§5).  -ffile-prefix-map also rewrites DW_AT_comp_dir, so
+# the build-dir map canonicalises comp_dir.  Applied to every guest TU; harmless
+# in the stripped release variant (and keeps its __FILE__ strings canonical).
+#
+# Two forms per source tree.  When ccache is the launcher its `base_dir`
+# rewrites absolute source paths to build-dir-relative before clang sees them
+# (for cross-checkout cache hits), so clang records e.g. "../runtime/guest/…"
+# and an absolute-only map would miss the file names — only comp_dir (clang's
+# getcwd, not a ccache-rewritten argument) matches the absolute build-dir map.
+# Without ccache, clang sees the absolute paths.  Emitting both the absolute and
+# the build-dir-relative form covers both; only one matches any given path, the
+# other is inert.  The relative form is computed against CMAKE_BINARY_DIR (the
+# compile CWD) so it is correct for any build-directory location. rv32emu's
+# softfloat sources are pulled into libblyt32lua via softfloat_builtins.c, so
+# they appear in guest DWARF and need mapping + shipping too (only its
+# src/softfloat subtree is referenced). The debug-only DAP master hook
+# (runtime/host/src/dap/master_hook.{c,h}) is compiled into the debug
+# libblyt32lua, so it appears in guest DWARF and is mapped + shipped under
+# /blyt/sdk/src/blyt-dap.
+file(RELATIVE_PATH _rel_guest "${CMAKE_BINARY_DIR}"
+     "${CMAKE_SOURCE_DIR}/runtime/guest")
+file(RELATIVE_PATH _rel_musl "${CMAKE_BINARY_DIR}"
+     "${CMAKE_SOURCE_DIR}/third_party/musl")
+file(RELATIVE_PATH _rel_lua "${CMAKE_BINARY_DIR}"
+     "${CMAKE_SOURCE_DIR}/third_party/lua")
+file(RELATIVE_PATH _rel_rv32 "${CMAKE_BINARY_DIR}"
+     "${CMAKE_SOURCE_DIR}/third_party/rv32emu")
+file(RELATIVE_PATH _rel_dap "${CMAKE_BINARY_DIR}"
+     "${CMAKE_SOURCE_DIR}/runtime/host/src/dap")
+set(RV32_PREFIX_MAP
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/guest=/blyt/sdk/src/blyt"
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/third_party/musl=/blyt/sdk/src/musl"
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/third_party/lua=/blyt/sdk/src/lua"
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/third_party/rv32emu=/blyt/sdk/src/rv32emu"
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/host/src/dap=/blyt/sdk/src/blyt-dap"
+    "-ffile-prefix-map=${_rel_guest}=/blyt/sdk/src/blyt"
+    "-ffile-prefix-map=${_rel_musl}=/blyt/sdk/src/musl"
+    "-ffile-prefix-map=${_rel_lua}=/blyt/sdk/src/lua"
+    "-ffile-prefix-map=${_rel_rv32}=/blyt/sdk/src/rv32emu"
+    "-ffile-prefix-map=${_rel_dap}=/blyt/sdk/src/blyt-dap"
+    "-ffile-prefix-map=${CMAKE_BINARY_DIR}=/blyt/sdk/build")
+
 # Compile-phase subset of RV32_BASE: only flags that affect codegen of a -c
 # compile.  Link-only flags (-shared, -nostdlib, -Wl,--shared, -fuse-ld) are
 # excluded; -fsemantic-interposition stays (codegen flag, see RV32_BASE).
@@ -121,6 +168,7 @@ set(RV32_COMPILE_BASE
     -mabi=ilp32f
     -fPIC
     -fsemantic-interposition
+    ${RV32_PREFIX_MAP}
     -I
     "${CMAKE_SOURCE_DIR}/runtime/guest/include")
 
@@ -352,8 +400,8 @@ set(LIBBLYTC_INCLUDES
     -I
     "${LIBBLYTC_BITS_DIR}/..")
 
-# Determinism (ADR-0007) and musl-compatibility compile flags.  musl relies
-# on unparenthesised shift idioms (`x >> 64-d`, `1U<<*s-' '`) that are
+# Determinism (ADR-0007) and musl-compatibility compile flags.  musl relies on
+# unparenthesised shift idioms (`x >> 64-d`, `1U<<*s-' '`) that are
 # range-guarded and well-defined; upstream builds itself with -w under clang.
 set(LIBBLYTC_CFLAGS
     -ffp-contract=off

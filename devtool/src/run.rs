@@ -150,6 +150,16 @@ fn serve_cart(cart_path: &Path, mode: Mode, trace: Option<&str>) -> Result<(), R
         println!("  DAP debugger (Lua):    127.0.0.1:{dap_tcp_port}");
         println!("  GDB debugger:          127.0.0.1:{gdb_tcp_port}");
         println!("  (gdb-multiarch: set arch riscv:rv32 && target remote :{gdb_tcp_port})");
+        // Announce the canonical source-path manifest (issue #46 §2) so the VS
+        // Code extension can load the /blyt/* → local mappings instead of
+        // hardcoding them.  Lives in the cart's build dir alongside the .blyt.
+        if let Some(map) = cart_path
+            .parent()
+            .map(|d| d.join("source-map.json"))
+            .filter(|p| p.exists())
+        {
+            println!("  Source map:            {}", map.display());
+        }
     }
 
     serve(

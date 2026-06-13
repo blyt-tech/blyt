@@ -34,8 +34,8 @@ if(NOT FOUND_CLANG)
 endif()
 message(STATUS "blyt SDK: toolchain clang = ${FOUND_CLANG}")
 
-# ccache launcher args for the nested libc++/WASM configures (empty when
-# ccache was not found at configure time — expands to nothing).
+# ccache launcher args for the nested libc++/WASM configures (empty when ccache
+# was not found at configure time — expands to nothing).
 set(CCACHE_LAUNCHER_ARGS "")
 if(BLYT_CCACHE_PROGRAM)
   list(APPEND CCACHE_LAUNCHER_ARGS
@@ -130,6 +130,17 @@ else()
            " -fuse-ld=${FOUND_LLD} -Wno-unused-command-line-argument")
   endif()
 
+  # Canonical path remapping for the release libc++ too (issue #46 §4): no DWARF
+  # is emitted, but __FILE__/assert strings still embed paths, so this keeps the
+  # release archive free of the build machine's absolute paths (byte
+  # reproducibility).  Same abs + ccache-relative + comp_dir forms as debug.
+  file(RELATIVE_PATH _lxx_rel "${LIBCXX_BUILD_DIR}" "${LIBCXX_SOURCE_DIR}")
+  set(_LXX_PREFIX_MAP
+      "-ffile-prefix-map=${LIBCXX_SOURCE_DIR}=/blyt/sdk/src/libcxx -ffile-prefix-map=${_lxx_rel}=/blyt/sdk/src/libcxx -ffile-prefix-map=${LIBCXX_BUILD_DIR}=/blyt/sdk/build-libcxx -ffile-prefix-map=${LIBCXX_SOURCE_DIR}/libcxx/include=/blyt/sdk/include/c++/v1 -ffile-prefix-map=${_lxx_rel}/libcxx/include=/blyt/sdk/include/c++/v1"
+  )
+  string(APPEND _LXX_C_FLAGS " ${_LXX_PREFIX_MAP}")
+  string(APPEND _LXX_CXX_FLAGS " ${_LXX_PREFIX_MAP}")
+
   # Configure
   execute_process(
     COMMAND
@@ -137,17 +148,16 @@ else()
       "${LIBCXX_BUILD_DIR}" -G Ninja "-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi"
       "-DCMAKE_C_COMPILER=${FOUND_CLANG}"
       "-DCMAKE_CXX_COMPILER=${FOUND_CLANGPP}" ${CCACHE_LAUNCHER_ARGS}
-      "-DCMAKE_C_FLAGS=${_LXX_C_FLAGS}"
-      "-DCMAKE_CXX_FLAGS=${_LXX_CXX_FLAGS}" -DCMAKE_BUILD_TYPE=MinSizeRel
-      -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXX_ENABLE_EXCEPTIONS=OFF
-      -DLIBCXX_ENABLE_RTTI=OFF -DLIBCXX_ENABLE_THREADS=OFF
-      -DLIBCXX_ENABLE_FILESYSTEM=OFF -DLIBCXX_ENABLE_LOCALIZATION=OFF
-      -DLIBCXX_HAS_MUSL_LIBC=ON -DLIBCXX_USE_COMPILER_RT=ON
-      -DLIBCXX_CXX_ABI=libcxxabi -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON
-      -DLIBCXXABI_ENABLE_SHARED=OFF -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF
-      -DLIBCXXABI_ENABLE_THREADS=OFF -DLIBCXXABI_USE_COMPILER_RT=ON
-      -DLIBCXXABI_USE_LLVM_UNWINDER=OFF -DLIBCXX_INCLUDE_TESTS=OFF
-      -DLIBCXXABI_INCLUDE_TESTS=OFF
+      "-DCMAKE_C_FLAGS=${_LXX_C_FLAGS}" "-DCMAKE_CXX_FLAGS=${_LXX_CXX_FLAGS}"
+      -DCMAKE_BUILD_TYPE=MinSizeRel -DLIBCXX_ENABLE_SHARED=OFF
+      -DLIBCXX_ENABLE_EXCEPTIONS=OFF -DLIBCXX_ENABLE_RTTI=OFF
+      -DLIBCXX_ENABLE_THREADS=OFF -DLIBCXX_ENABLE_FILESYSTEM=OFF
+      -DLIBCXX_ENABLE_LOCALIZATION=OFF -DLIBCXX_HAS_MUSL_LIBC=ON
+      -DLIBCXX_USE_COMPILER_RT=ON -DLIBCXX_CXX_ABI=libcxxabi
+      -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON -DLIBCXXABI_ENABLE_SHARED=OFF
+      -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF -DLIBCXXABI_ENABLE_THREADS=OFF
+      -DLIBCXXABI_USE_COMPILER_RT=ON -DLIBCXXABI_USE_LLVM_UNWINDER=OFF
+      -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF
       # On macOS, cmake injects -arch arm64 / -isysroot into every build even
       # when cross-compiling.  Setting CMAKE_SYSTEM_NAME=Linux tells cmake this
       # is a Linux cross-compile so it suppresses all Apple toolchain defaults.
@@ -238,6 +248,25 @@ else()
            " -fuse-ld=${FOUND_LLD} -Wno-unused-command-line-argument")
   endif()
 
+  # Canonical DWARF paths for the debug libc++ archive (issue #46 §4): rewrite
+  # the libcxx source tree to /blyt/sdk/src/libcxx and pin comp_dir, so stepping
+  # into precompiled libc++ .cpp resolves from the shipped SDK source on any
+  # machine and the archive is byte-identical across build dirs.  Abs + the
+  # ccache-base_dir-relative form (the nested build runs in its own dir, so the
+  # relative path is computed from there), same rationale as the guest libs. The
+  # libcxx headers already ship in include/c++/v1, so remap them there rather
+  # than duplicating the 15 MB include tree under src/.  This map is more
+  # specific than the general libcxx map and is listed last so it wins for
+  # header paths (clang applies the last matching -ffile-prefix-map).  Both abs
+  # and the ccache-relative form.
+  file(RELATIVE_PATH _lxxd_rel "${LIBCXX_DEBUG_BUILD_DIR}"
+       "${LIBCXX_SOURCE_DIR}")
+  set(_LXXD_PREFIX_MAP
+      "-ffile-prefix-map=${LIBCXX_SOURCE_DIR}=/blyt/sdk/src/libcxx -ffile-prefix-map=${_lxxd_rel}=/blyt/sdk/src/libcxx -ffile-prefix-map=${LIBCXX_DEBUG_BUILD_DIR}=/blyt/sdk/build-libcxx -ffile-prefix-map=${LIBCXX_SOURCE_DIR}/libcxx/include=/blyt/sdk/include/c++/v1 -ffile-prefix-map=${_lxxd_rel}/libcxx/include=/blyt/sdk/include/c++/v1"
+  )
+  string(APPEND _LXXD_C_FLAGS " ${_LXXD_PREFIX_MAP}")
+  string(APPEND _LXXD_CXX_FLAGS " ${_LXXD_PREFIX_MAP}")
+
   execute_process(
     COMMAND
       ${CMAKE_COMMAND} -S "${LIBCXX_SOURCE_DIR}/runtimes" -B
@@ -245,18 +274,17 @@ else()
       "-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi"
       "-DCMAKE_C_COMPILER=${FOUND_CLANG}"
       "-DCMAKE_CXX_COMPILER=${FOUND_CLANGPP}" ${CCACHE_LAUNCHER_ARGS}
-      "-DCMAKE_C_FLAGS=${_LXXD_C_FLAGS}"
-      "-DCMAKE_CXX_FLAGS=${_LXXD_CXX_FLAGS}" -DCMAKE_BUILD_TYPE=Debug
-      -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXX_ENABLE_EXCEPTIONS=OFF
-      -DLIBCXX_ENABLE_RTTI=OFF -DLIBCXX_ENABLE_THREADS=OFF
-      -DLIBCXX_ENABLE_FILESYSTEM=OFF -DLIBCXX_ENABLE_LOCALIZATION=OFF
-      -DLIBCXX_HAS_MUSL_LIBC=ON -DLIBCXX_USE_COMPILER_RT=ON
-      -DLIBCXX_CXX_ABI=libcxxabi -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON
-      -DLIBCXXABI_ENABLE_SHARED=OFF -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF
-      -DLIBCXXABI_ENABLE_THREADS=OFF -DLIBCXXABI_USE_COMPILER_RT=ON
-      -DLIBCXXABI_USE_LLVM_UNWINDER=OFF -DLIBCXX_INCLUDE_TESTS=OFF
-      -DLIBCXXABI_INCLUDE_TESTS=OFF -DCMAKE_SYSTEM_NAME=Linux
-      -DCMAKE_SYSTEM_PROCESSOR=riscv32
+      "-DCMAKE_C_FLAGS=${_LXXD_C_FLAGS}" "-DCMAKE_CXX_FLAGS=${_LXXD_CXX_FLAGS}"
+      -DCMAKE_BUILD_TYPE=Debug -DLIBCXX_ENABLE_SHARED=OFF
+      -DLIBCXX_ENABLE_EXCEPTIONS=OFF -DLIBCXX_ENABLE_RTTI=OFF
+      -DLIBCXX_ENABLE_THREADS=OFF -DLIBCXX_ENABLE_FILESYSTEM=OFF
+      -DLIBCXX_ENABLE_LOCALIZATION=OFF -DLIBCXX_HAS_MUSL_LIBC=ON
+      -DLIBCXX_USE_COMPILER_RT=ON -DLIBCXX_CXX_ABI=libcxxabi
+      -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON -DLIBCXXABI_ENABLE_SHARED=OFF
+      -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF -DLIBCXXABI_ENABLE_THREADS=OFF
+      -DLIBCXXABI_USE_COMPILER_RT=ON -DLIBCXXABI_USE_LLVM_UNWINDER=OFF
+      -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF
+      -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=riscv32
     RESULT_VARIABLE _LXXD_CFG_R
     OUTPUT_QUIET)
   if(NOT _LXXD_CFG_R EQUAL 0)
@@ -284,6 +312,80 @@ else()
 
   message(STATUS "debug libc++ built: ${SDK_LIB_DEBUG}/libc++.a")
 endif()
+
+# -------------------------------------------------------------------------
+# Step 2c: ship guest source for debug stepping (issue #46 §5)
+# -------------------------------------------------------------------------
+# The debug guest libs and libc++ embed canonical /blyt/sdk/src/<component>
+# DWARF paths (§4); ship the matching source trees here so a debug client
+# resolves them against the installed SDK on any machine.  Layout mirrors the
+# prefix maps exactly.  Copied unconditionally — the in-repo build/sdk must be
+# complete because the test suite debugs against it; a release tarball may split
+# this tree into an optional debug package (ADR-0129).  Each third-party tree
+# carries its upstream licence.  libcxx headers are NOT duplicated here: they
+# already ship in include/c++/v1 and the libc++ build remaps header DWARF there.
+set(SDK_SRC "${SDK_DIR}/src")
+file(REMOVE_RECURSE "${SDK_SRC}")
+file(MAKE_DIRECTORY "${SDK_SRC}")
+
+# First-party guest libraries: runtime/guest → src/blyt (src/ + include/).
+file(COPY "${BLYT_SOURCE_DIR}/runtime/guest/" DESTINATION "${SDK_SRC}/blyt")
+
+# Debug-only DAP master hook, compiled into the debug libblyt32lua →
+# src/blyt-dap.
+file(COPY "${BLYT_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"
+          "${BLYT_SOURCE_DIR}/runtime/host/src/dap/master_hook.h"
+     DESTINATION "${SDK_SRC}/blyt-dap")
+
+# musl (libblytc): the compiled subset spans several src/ areas; ship src/,
+# include/ and arch/ wholesale so any linked libc function resolves.
+if(EXISTS "${BLYT_SOURCE_DIR}/third_party/musl/include/stdio.h")
+  foreach(_d src include arch)
+    file(COPY "${BLYT_SOURCE_DIR}/third_party/musl/${_d}"
+         DESTINATION "${SDK_SRC}/musl")
+  endforeach()
+  file(COPY "${BLYT_SOURCE_DIR}/third_party/musl/COPYRIGHT"
+       DESTINATION "${SDK_SRC}/musl")
+endif()
+
+# Lua VM (libblyt32lua): flat layout, source at the tree root → src/lua.
+if(EXISTS "${BLYT_SOURCE_DIR}/third_party/lua/lua.h")
+  file(
+    COPY "${BLYT_SOURCE_DIR}/third_party/lua/"
+    DESTINATION "${SDK_SRC}/lua"
+    FILES_MATCHING
+    PATTERN "*.c"
+    PATTERN "*.h")
+endif()
+
+# rv32emu softfloat builtins, pulled into the debug libblyt32lua.
+if(EXISTS "${BLYT_SOURCE_DIR}/third_party/rv32emu/src/softfloat")
+  file(COPY "${BLYT_SOURCE_DIR}/third_party/rv32emu/src/softfloat"
+       DESTINATION "${SDK_SRC}/rv32emu/src")
+  if(EXISTS "${BLYT_SOURCE_DIR}/third_party/rv32emu/LICENSE")
+    file(COPY "${BLYT_SOURCE_DIR}/third_party/rv32emu/LICENSE"
+         DESTINATION "${SDK_SRC}/rv32emu")
+  endif()
+endif()
+
+# libc++ / libc++abi .cpp sources (public libcxx headers ship in include/c++/v1
+# instead).  Of LLVM libc, only the __support/ utility headers (and libc/shared)
+# are pulled into libc++ — ship just those, not the whole 27 MB libc/src tree.
+if(EXISTS "${LIBCXX_SOURCE_DIR}/libcxx/src")
+  foreach(_d libcxx/src libcxxabi/src libcxxabi/include libc/src/__support
+             libc/shared)
+    if(EXISTS "${LIBCXX_SOURCE_DIR}/${_d}")
+      get_filename_component(_dest_parent "${SDK_SRC}/libcxx/${_d}" DIRECTORY)
+      file(COPY "${LIBCXX_SOURCE_DIR}/${_d}" DESTINATION "${_dest_parent}")
+    endif()
+  endforeach()
+  if(EXISTS "${LIBCXX_SOURCE_DIR}/LICENSE.TXT")
+    file(COPY "${LIBCXX_SOURCE_DIR}/LICENSE.TXT"
+         DESTINATION "${SDK_SRC}/libcxx")
+  endif()
+endif()
+
+message(STATUS "Guest debug source shipped to ${SDK_SRC}")
 
 # -------------------------------------------------------------------------
 # Step 3: SDK headers
@@ -503,7 +605,8 @@ else()
 
   execute_process(
     COMMAND
-      "${HOST_CC}" ${LINK_FLAGS} -fPIC -o "${LIBRETRO_OUT}" ${_libretro_embed_defs}
+      "${HOST_CC}" ${LINK_FLAGS} -fPIC -o "${LIBRETRO_OUT}"
+      ${_libretro_embed_defs}
       "${BLYT_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
       "${EMBEDDED_LIBS_C}" -I
       "${BLYT_SOURCE_DIR}/third_party/libretro-common/include" -I
