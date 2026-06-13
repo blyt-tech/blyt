@@ -1086,6 +1086,19 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         let bytecode_path = build_dir.join("bytecode.luac");
         let mut luac_cmd = Command::new(&luac);
         luac_cmd.arg("-o").arg(&bytecode_path);
+        // Embed a canonical /blyt/cart/… chunk name instead of the absolute build
+        // path luac would otherwise use, so the bytecode is machine-independent
+        // and the DAP layer can reverse-map Lua source paths (issue #46 §6, closes
+        // #26).  Multiple files compile to one chunk; it takes the first file's
+        // canonical name (the long-standing single-chunk limitation is unchanged).
+        if let Some(rel) = lua_files
+            .first()
+            .and_then(|f| f.strip_prefix(project_dir).ok())
+        {
+            luac_cmd
+                .arg("-n")
+                .arg(format!("/blyt/cart/{}", rel.display()));
+        }
         for f in &lua_files {
             luac_cmd.arg(f);
         }
@@ -1461,6 +1474,61 @@ fn collect_lua_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
     }
     files.sort();
     Ok(files)
+}
+
+/// Encode an unsigned value the way Lua's `loadVarint` reads it: base-128,
+/// most-significant group first, every non-final byte has the high bit set, the
+/// final byte has it clear.
+fn lua_encode_varint(mut v: u64) -> Vec<u8> {
+    let mut out = vec![(v & 0x7f) as u8]; // final (low) group, high bit clear
+    v >>= 7;
+    while v > 0 {
+        out.insert(0, 0x80 | (v & 0x7f) as u8);
+        v >>= 7;
+    }
+    out
+}
+
+/// Rewrite the source-name strings luac embedded in `bytecode_path` from the
+/// absolute build path (`@<abs>/src/game/lua/foo.lua`) to the canonical
+/// `@/blyt/cart/src/game/lua/foo.lua`.  In a Lua dump a string is a size varint
+/// (`len + 1`) followed by the bytes, so each rewrite replaces both the varint
+/// and the content.  Idempotent and tolerant: a name that does not match (e.g.
+/// luac was handed a different form) is left as-is.
+fn canonicalize_lua_chunk_names(
+    bytecode_path: &Path,
+    project_dir: &Path,
+    lua_files: &[PathBuf],
+) -> Result<(), BuildError> {
+    let mut bytes = fs::read(bytecode_path)?;
+    for f in lua_files {
+        let rel = match f.strip_prefix(project_dir) {
+            Ok(r) => r,
+            Err(_) => continue, // outside the project; leave untouched
+        };
+        let old = format!("@{}", f.display());
+        let new = format!("@/blyt/cart/{}", rel.display());
+        if old == new {
+            continue;
+        }
+        let mut old_seq = lua_encode_varint(old.len() as u64 + 1);
+        old_seq.extend_from_slice(old.as_bytes());
+        let mut new_seq = lua_encode_varint(new.len() as u64 + 1);
+        new_seq.extend_from_slice(new.as_bytes());
+
+        // Replace every occurrence of the size-prefixed source string.
+        let mut i = 0;
+        while i + old_seq.len() <= bytes.len() {
+            if bytes[i..i + old_seq.len()] == old_seq[..] {
+                bytes.splice(i..i + old_seq.len(), new_seq.iter().copied());
+                i += new_seq.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fs::write(bytecode_path, &bytes)?;
+    Ok(())
 }
 
 fn generate_lua_data_c(bytecode_path: &Path, output_c: &Path) -> Result<(), BuildError> {

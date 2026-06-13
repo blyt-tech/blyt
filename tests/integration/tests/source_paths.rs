@@ -12,8 +12,9 @@
 mod common;
 
 use common::{
-    CartProject, blyt_bin, build_cart, build_debug_cart, repo_root, require_cpp_sdk,
-    require_rust_riscv_target, require_sdk, sdk_dir, write_c_cart_project, write_rust_cart_project,
+    CartProject, blyt_bin, build_cart, build_debug_cart, build_debug_lua_cart, repo_root,
+    require_cpp_sdk, require_lua_sdk, require_rust_riscv_target, require_sdk, sdk_dir,
+    write_c_cart_project, write_rust_cart_project,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -336,5 +337,60 @@ fn debug_rust_cart_canonicalises_toolchain_paths() {
         "SDK crate not canonicalised to /blyt/sdk/rust/blyt"
     );
     // No ~/.rustup, ~/.cargo, repo, or temp project path may leak.
+    assert_no_machine_paths(&bytes, &[&project]);
+}
+
+/// Lua carts embed the source file path as the bytecode chunk name.  It is
+/// canonicalised to @/blyt/cart/… at build time (blyt-luac `-n`), so the cart
+/// is machine-independent and the DAP layer can reverse-map it (issue #46 §6,
+/// closes #26).
+#[test]
+fn debug_lua_cart_has_canonical_chunk_name() {
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hello");
+    CartProject::new()
+        .lua("function blyt_cart_init() end\nfunction blyt_cart_update() blyt.quit() end\nfunction blyt_cart_draw() end\n")
+        .write(&project);
+    let cart = build_debug_lua_cart(&project);
+    let bytes = read(&cart);
+
+    assert!(
+        contains(&bytes, b"@/blyt/cart/src/game/lua/"),
+        "Lua chunk name not canonicalised to @/blyt/cart"
+    );
+    assert_no_machine_paths(&bytes, &[&project]);
+}
+
+/// The #26 repro: building a Lua cart from a *relative* project path must still
+/// embed the canonical chunk name (the bug was a relative chunk name that VS
+/// Code could not open).
+#[test]
+fn lua_relative_invocation_canonical_chunk_name() {
+    use assert_cmd::Command;
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hello");
+    CartProject::new()
+        .lua("function blyt_cart_init() end\nfunction blyt_cart_update() blyt.quit() end\nfunction blyt_cart_draw() end\n")
+        .write(&project);
+
+    let sdk = sdk_dir();
+    let mut cmd = Command::new(blyt_bin());
+    cmd.current_dir(tmp.path())
+        .args(["build", "--debug", "hello"])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_LUAC", sdk.join("bin/blyt-luac"));
+    if sdk.join("bin/blyt-clang").exists() {
+        cmd.env("BLYT_CLANG", sdk.join("bin/blyt-clang"));
+    }
+    cmd.assert().success();
+
+    let bytes = read(&project.join("build/hello.dbg.blyt"));
+    assert!(
+        contains(&bytes, b"@/blyt/cart/src/game/lua/"),
+        "relative invocation did not canonicalise the Lua chunk name"
+    );
     assert_no_machine_paths(&bytes, &[&project]);
 }
