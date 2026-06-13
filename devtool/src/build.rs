@@ -1194,9 +1194,21 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     }
     let c_include_refs: Vec<&Path> = c_include_paths.iter().map(PathBuf::as_path).collect();
 
+    // Collected alongside compilation and written to compile_commands.json (#48).
+    let mut compile_commands: Vec<CompileEntry> = Vec::new();
+
     if languages.contains(&CartLanguage::C) {
         let extra_defines: &[String] = if is_lua { &lua_lib_defines } else { &[] };
         for src in collect_c_files(&project_dir.join("src/game/c"))? {
+            compile_commands.push(c_compile_arguments(
+                &clang,
+                &src,
+                &build_dir,
+                &sdk_include,
+                &c_include_refs,
+                extra_defines,
+                &opt_c_flags,
+            ));
             obj_files.push(compile_c(
                 &clang,
                 &src,
@@ -1232,6 +1244,15 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             lib_archives.push(libcxxabi_a);
         }
         for src in collect_cpp_files(&project_dir.join("src/game/c++"))? {
+            compile_commands.push(cpp_compile_arguments(
+                &clangpp,
+                &src,
+                &build_dir,
+                &sdk_include,
+                &libcxx_include,
+                &c_include_refs,
+                &opt_c_flags,
+            ));
             obj_files.push(compile_cpp(
                 &clangpp,
                 &src,
@@ -1243,6 +1264,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             )?);
         }
     }
+    write_compile_commands(&project_dir.join("build"), project_dir, &compile_commands)?;
     let rust_archive = if languages.contains(&CartLanguage::Rust) {
         let cargo = find_cargo();
         let rust_sdk = find_rust_sdk(&sdk_include)?;
@@ -2134,6 +2156,45 @@ fn collect_c_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), BuildEr
  * Compilation: one .c → one .o
  * ------------------------------------------------------------------------- */
 
+/// Fixed codegen flags for cart C compilation (target, ABI, IEEE/determinism).
+/// Shared by `compile_c` and the `compile_commands.json` emitter so clangd sees
+/// exactly the flags the cart is built with.  Excludes `-c`, includes, defines,
+/// and the per-variant `-g`/`-O`/prefix-map flags, which callers append.
+const C_TARGET_FLAGS: &[&str] = &[
+    "--target=riscv32",
+    "-march=rv32imafc",
+    "-mabi=ilp32f",
+    "-nostdlib",
+    "-fno-exceptions",
+    "-fpie",
+    "-ffunction-sections",
+    "-fdata-sections",
+    "-ffp-contract=off",
+    "-fno-fast-math",
+    "-fwrapv",
+    "-frounding-math",
+    "-fsignaling-nans",
+];
+
+/// Fixed codegen flags for cart C++ compilation — `C_TARGET_FLAGS` plus
+/// `-fno-rtti` (cart C++ is RTTI-free, ADR-0121).
+const CPP_TARGET_FLAGS: &[&str] = &[
+    "--target=riscv32",
+    "-march=rv32imafc",
+    "-mabi=ilp32f",
+    "-nostdlib",
+    "-fno-exceptions",
+    "-fno-rtti",
+    "-fpie",
+    "-ffunction-sections",
+    "-fdata-sections",
+    "-ffp-contract=off",
+    "-fno-fast-math",
+    "-fwrapv",
+    "-frounding-math",
+    "-fsignaling-nans",
+];
+
 fn compile_c(
     clang: &str,
     src: &Path,
@@ -2147,32 +2208,12 @@ fn compile_c(
     let obj = build_dir.join(format!("{stem}.o"));
 
     let mut cmd = Command::new(clang);
-    cmd.args([
-        "--target=riscv32",
-        "-march=rv32imafc",
-        "-mabi=ilp32f",
-        "-nostdlib",
-        "-fno-exceptions",
-        "-fpie",
-        // Per-function/data sections so the link's --gc-sections can drop unused
-        // code (notably dead libc++ std-lib code pulled in transitively).
-        "-ffunction-sections",
-        "-fdata-sections",
-        // Determinism flags (ADR-0007): IEEE 754 strict mode.
-        // -ffp-contract=off  — no implicit FMA fusion (changes rounding)
-        // -fno-fast-math     — no IEEE-breaking optimisations
-        // -fwrapv            — signed integer overflow wraps (no UB)
-        // -frounding-math    — compiler must not assume RNE is fixed
-        // -fsignaling-nans   — NaN operations may signal; no elision
-        "-ffp-contract=off",
-        "-fno-fast-math",
-        "-fwrapv",
-        "-frounding-math",
-        "-fsignaling-nans",
-        "-c",
-    ])
-    .arg("-I")
-    .arg(sdk_include);
+    // Determinism flags (ADR-0007) and target/ABI live in C_TARGET_FLAGS, shared
+    // with the compile_commands.json emitter.
+    cmd.args(C_TARGET_FLAGS)
+        .arg("-c")
+        .arg("-I")
+        .arg(sdk_include);
 
     for inc in extra_includes {
         cmd.arg("-I").arg(inc);
@@ -2245,34 +2286,16 @@ fn compile_cpp(
     let obj = build_dir.join(format!("{stem}.o"));
 
     let mut cmd = Command::new(clangpp);
-    cmd.args([
-        "--target=riscv32",
-        "-march=rv32imafc",
-        "-mabi=ilp32f",
-        "-nostdlib",
-        "-fno-exceptions",
-        "-fno-rtti",
-        "-fpie",
-        // Per-function/data sections so the link's --gc-sections can drop the
-        // unused parts of libc++ pulled in transitively by std::string etc.
-        "-ffunction-sections",
-        "-fdata-sections",
-        // Determinism flags (ADR-0007)
-        "-ffp-contract=off",
-        "-fno-fast-math",
-        "-fwrapv",
-        "-frounding-math",
-        "-fsignaling-nans",
-        "-c",
-    ])
-    // Both paths must be -isystem so they are in the same search group; within
-    // that group, command-line order applies.  Mixing -I (user) and -isystem
-    // (system) puts all -I paths first regardless of position, so libcxx headers
-    // would always lose to the musl headers if the musl path uses -I.
-    .arg("-isystem")
-    .arg(libcxx_include)
-    .arg("-isystem")
-    .arg(sdk_include);
+    cmd.args(CPP_TARGET_FLAGS)
+        .arg("-c")
+        // Both paths must be -isystem so they are in the same search group; within
+        // that group, command-line order applies.  Mixing -I (user) and -isystem
+        // (system) puts all -I paths first regardless of position, so libcxx headers
+        // would always lose to the musl headers if the musl path uses -I.
+        .arg("-isystem")
+        .arg(libcxx_include)
+        .arg("-isystem")
+        .arg(sdk_include);
 
     for inc in extra_includes {
         cmd.arg("-I").arg(inc);
@@ -2292,6 +2315,119 @@ fn compile_cpp(
         return Err(err(format!("compilation failed: {}", src.display())));
     }
     Ok(obj)
+}
+
+/* -------------------------------------------------------------------------
+ * compile_commands.json — clangd database (issue #48)
+ *
+ * Editing cart C/C++ needs clangd to know the cross-compile flags and include
+ * paths; without this it parses against the host toolchain and flags every
+ * blyt/libc++ include as missing.  We emit one entry per user source mirroring
+ * the exact `compile_c`/`compile_cpp` invocation, into <project>/build/, where
+ * clangd discovers it automatically.
+ * ------------------------------------------------------------------------- */
+
+struct CompileEntry {
+    file: PathBuf,
+    arguments: Vec<String>,
+}
+
+fn path_str(p: &Path) -> String {
+    p.display().to_string()
+}
+
+/// The exact argument vector `compile_c` runs for `src` (compiler first).
+fn c_compile_arguments(
+    clang: &str,
+    src: &Path,
+    build_dir: &Path,
+    sdk_include: &Path,
+    extra_includes: &[&Path],
+    extra_defines: &[String],
+    debug_flags: &[String],
+) -> CompileEntry {
+    let stem = src.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
+    let mut a: Vec<String> = vec![clang.to_string()];
+    a.extend(C_TARGET_FLAGS.iter().map(|f| f.to_string()));
+    a.push("-c".into());
+    a.push("-I".into());
+    a.push(path_str(sdk_include));
+    for inc in extra_includes {
+        a.push("-I".into());
+        a.push(path_str(inc));
+    }
+    a.extend(extra_defines.iter().cloned());
+    a.extend(debug_flags.iter().cloned());
+    a.push("-o".into());
+    a.push(path_str(&build_dir.join(format!("{stem}.o"))));
+    a.push(path_str(src));
+    CompileEntry {
+        file: src.to_path_buf(),
+        arguments: a,
+    }
+}
+
+/// The exact argument vector `compile_cpp` runs for `src` (compiler first).
+fn cpp_compile_arguments(
+    clangpp: &str,
+    src: &Path,
+    build_dir: &Path,
+    sdk_include: &Path,
+    libcxx_include: &Path,
+    extra_includes: &[&Path],
+    debug_flags: &[String],
+) -> CompileEntry {
+    let stem = src.file_stem().and_then(OsStr::to_str).unwrap_or("unknown");
+    let mut a: Vec<String> = vec![clangpp.to_string()];
+    a.extend(CPP_TARGET_FLAGS.iter().map(|f| f.to_string()));
+    a.push("-c".into());
+    a.push("-isystem".into());
+    a.push(path_str(libcxx_include));
+    a.push("-isystem".into());
+    a.push(path_str(sdk_include));
+    for inc in extra_includes {
+        a.push("-I".into());
+        a.push(path_str(inc));
+    }
+    a.extend(debug_flags.iter().cloned());
+    a.push("-o".into());
+    a.push(path_str(&build_dir.join(format!("{stem}.o"))));
+    a.push(path_str(src));
+    CompileEntry {
+        file: src.to_path_buf(),
+        arguments: a,
+    }
+}
+
+/// Write `<build_root>/compile_commands.json` (skipped if no C/C++ entries).
+fn write_compile_commands(
+    build_root: &Path,
+    project_dir: &Path,
+    entries: &[CompileEntry],
+) -> Result<(), BuildError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let dir = path_str(project_dir);
+    let mut json = String::from("[\n");
+    for (i, e) in entries.iter().enumerate() {
+        let args = e
+            .arguments
+            .iter()
+            .map(|a| format!("\"{}\"", json_escape(a)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        json.push_str(&format!(
+            "  {{ \"directory\": \"{}\", \"file\": \"{}\", \"arguments\": [{}] }}",
+            json_escape(&dir),
+            json_escape(&path_str(&e.file)),
+            args
+        ));
+        json.push_str(if i + 1 < entries.len() { ",\n" } else { "\n" });
+    }
+    json.push_str("]\n");
+    fs::write(build_root.join("compile_commands.json"), json)?;
+    Ok(())
 }
 
 /* -------------------------------------------------------------------------
