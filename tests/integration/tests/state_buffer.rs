@@ -39,6 +39,7 @@ records:
   Types:
     fields:
       - { name: v_f32,  type: f32  }
+      - { name: v_f64,  type: f64  }
       - { name: v_u32,  type: u32  }
       - { name: v_i8,   type: i8   }
       - { name: v_u8,   type: u8   }
@@ -282,7 +283,7 @@ extern "C" void blyt_cart_draw() {}
 
 // ── Type coverage ──────────────────────────────────────────────────────────
 
-/// All seven field types survive a save/load round-trip.
+/// All field types (incl. f64, Spike U) survive a save/load round-trip.
 #[test]
 fn c_cart_all_field_types_round_trips() {
     require_sdk();
@@ -303,6 +304,7 @@ void blyt_cart_init(void) {
     int32_t slot = -1;
     blyt_buffer_alloc_slot(S_TYPES, &slot);
     blyt_buffer_set_f32 (S_TYPES, slot, S_TYPES_V_F32,  1.5f);
+    blyt_buffer_set_f64 (S_TYPES, slot, S_TYPES_V_F64,  0.123456789012345);
     blyt_buffer_set_u32 (S_TYPES, slot, S_TYPES_V_U32,  0xDEADBEEFu);
     blyt_buffer_set_i8  (S_TYPES, slot, S_TYPES_V_I8,   -42);
     blyt_buffer_set_u8  (S_TYPES, slot, S_TYPES_V_U8,   200);
@@ -311,6 +313,7 @@ void blyt_cart_init(void) {
     blyt_buffer_set_bool(S_TYPES, slot, S_TYPES_V_BOOL, 1);
     blyt_save_write(0);
     blyt_buffer_set_f32 (S_TYPES, slot, S_TYPES_V_F32,  0.0f);
+    blyt_buffer_set_f64 (S_TYPES, slot, S_TYPES_V_F64,  0.0);
     blyt_buffer_set_u32 (S_TYPES, slot, S_TYPES_V_U32,  0);
     blyt_buffer_set_i8  (S_TYPES, slot, S_TYPES_V_I8,   0);
     blyt_buffer_set_u8  (S_TYPES, slot, S_TYPES_V_U8,   0);
@@ -322,13 +325,14 @@ void blyt_cart_init(void) {
 void blyt_cart_update(void) {
     blyt_save_read(0);
     float    vf  = blyt_buffer_get_f32 (S_TYPES, 0, S_TYPES_V_F32);
+    double   vd  = blyt_buffer_get_f64 (S_TYPES, 0, S_TYPES_V_F64);
     uint32_t vu  = blyt_buffer_get_u32 (S_TYPES, 0, S_TYPES_V_U32);
     int8_t   vi8 = blyt_buffer_get_i8  (S_TYPES, 0, S_TYPES_V_I8);
     uint8_t  vu8 = blyt_buffer_get_u8  (S_TYPES, 0, S_TYPES_V_U8);
     int16_t  vi16 = blyt_buffer_get_i16(S_TYPES, 0, S_TYPES_V_I16);
     uint16_t vu16 = blyt_buffer_get_u16(S_TYPES, 0, S_TYPES_V_U16);
     int      vb  = blyt_buffer_get_bool(S_TYPES, 0, S_TYPES_V_BOOL) ? 1 : 0;
-    if (vf == 1.5f && vu == 0xDEADBEEFu && vi8 == -42 && vu8 == 200
+    if (vf == 1.5f && vd == 0.123456789012345 && vu == 0xDEADBEEFu && vi8 == -42 && vu8 == 200
             && vi16 == -1000 && vu16 == 60000 && vb)
         blyt_console_debug("types_ok");
     else
@@ -1012,6 +1016,7 @@ void blyt_cart_init(void) {
     int32_t slot = -1;
     blyt_buffer_alloc_slot(S_TYPES, &slot);
     blyt_buffer_set_f32 (S_TYPES, slot, S_TYPES_V_F32,  1.5f);
+    blyt_buffer_set_f64 (S_TYPES, slot, S_TYPES_V_F64,  0.123456789012345);
     blyt_buffer_set_u32 (S_TYPES, slot, S_TYPES_V_U32,  0xDEADBEEFu);
     blyt_buffer_set_i8  (S_TYPES, slot, S_TYPES_V_I8,   -42);
     blyt_buffer_set_u8  (S_TYPES, slot, S_TYPES_V_U8,   200);
@@ -1020,6 +1025,7 @@ void blyt_cart_init(void) {
     blyt_buffer_set_bool(S_TYPES, slot, S_TYPES_V_BOOL, 1);
     blyt_save_write(0);
     blyt_buffer_set_f32 (S_TYPES, slot, S_TYPES_V_F32,  0.0f);
+    blyt_buffer_set_f64 (S_TYPES, slot, S_TYPES_V_F64,  0.0);
     blyt_buffer_set_u32 (S_TYPES, slot, S_TYPES_V_U32,  0);
     blyt_buffer_set_i8  (S_TYPES, slot, S_TYPES_V_I8,   0);
     blyt_buffer_set_u8  (S_TYPES, slot, S_TYPES_V_U8,   0);
@@ -1031,13 +1037,14 @@ void blyt_cart_init(void) {
 void blyt_cart_update(void) {
     blyt_save_read(0);
     float    vf   = blyt_buffer_get_f32 (S_TYPES, 0, S_TYPES_V_F32);
+    double   vd   = blyt_buffer_get_f64 (S_TYPES, 0, S_TYPES_V_F64);
     uint32_t vu   = blyt_buffer_get_u32 (S_TYPES, 0, S_TYPES_V_U32);
     int8_t   vi8  = blyt_buffer_get_i8  (S_TYPES, 0, S_TYPES_V_I8);
     uint8_t  vu8  = blyt_buffer_get_u8  (S_TYPES, 0, S_TYPES_V_U8);
     int16_t  vi16 = blyt_buffer_get_i16 (S_TYPES, 0, S_TYPES_V_I16);
     uint16_t vu16 = blyt_buffer_get_u16 (S_TYPES, 0, S_TYPES_V_U16);
     int      vb   = blyt_buffer_get_bool(S_TYPES, 0, S_TYPES_V_BOOL) ? 1 : 0;
-    if (vf == 1.5f && vu == 0xDEADBEEFu && vi8 == -42 && vu8 == 200
+    if (vf == 1.5f && vd == 0.123456789012345 && vu == 0xDEADBEEFu && vi8 == -42 && vu8 == 200
             && vi16 == -1000 && vu16 == 60000 && vb)
         blyt_console_debug("types_ok");
     else
