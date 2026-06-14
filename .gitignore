@@ -11,3 +11,4 @@ examples/**/Cargo.lock
 .cache/
 qemu-images/*
 !qemu-images/.gitkeep
+.DS_Store
