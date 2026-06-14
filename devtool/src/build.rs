@@ -288,7 +288,7 @@ fn generate_cart_state(
             let upval = fi + 2; /* upvalue 1=buf_h, 2+=field_h */
             let suffix = type_tag_buf_get_suffix(f.type_tag);
             let push = match f.type_tag {
-                crate::config::TYPE_F32 => format!(
+                crate::config::TYPE_F32 | crate::config::TYPE_F64 => format!(
                     "lua_pushnumber(L, blyt_buffer_get_{suffix}(_bh, (int32_t)_s, (blyt_field_h)lua_tointeger(L, lua_upvalueindex({upval}))))"
                 ),
                 crate::config::TYPE_BOOL => format!(
@@ -322,6 +322,9 @@ fn generate_cart_state(
             let set = match f.type_tag {
                 crate::config::TYPE_F32 => format!(
                     "blyt_buffer_set_{suffix}(_bh, (int32_t)_s, (blyt_field_h)lua_tointeger(L, lua_upvalueindex({upval})), (float)lua_tonumber(L, 3))"
+                ),
+                crate::config::TYPE_F64 => format!(
+                    "blyt_buffer_set_{suffix}(_bh, (int32_t)_s, (blyt_field_h)lua_tointeger(L, lua_upvalueindex({upval})), (double)lua_tonumber(L, 3))"
                 ),
                 crate::config::TYPE_BOOL => format!(
                     "blyt_buffer_set_{suffix}(_bh, (int32_t)_s, (blyt_field_h)lua_tointeger(L, lua_upvalueindex({upval})), (bool)(lua_toboolean(L, 3) != 0))"
