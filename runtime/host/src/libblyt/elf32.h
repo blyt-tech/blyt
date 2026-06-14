@@ -51,13 +51,13 @@ typedef uint32_t Elf32_Off;
 #define EF_RISCV_FLOAT_ABI_DOUBLE 0x0004u
 
 /*
- * Expected e_flags for blyt carts: RVC + ILP32F.
- * Spikes B, C, D all use -march=rv32imfc_zicsr -mabi=ilp32f. Spike S used an
- * ilp32d musl ld.so as a convenience for its seccomp investigation; its
- * "production carts will be ilp32d" conclusion was incidental and contradicts
- * the earlier spikes and ADR-0024. ILP32F is correct for RV32IMAFC.
+ * Expected e_flags for blyt carts: RVC + ILP32D (Spike U).
+ * The console is moving to RV32IMAFDC / ilp32d with hardware doubles; the whole
+ * sysroot and all carts are rebuilt ilp32d (-march=rv32imafdc -mabi=ilp32d).
+ * (Previously ILP32F per the earlier spikes / ADR-0024 — superseded by the
+ * Spike U hardware-double work.)
  */
-#define BLYT_CART_EF_FLAGS (EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_SINGLE)
+#define BLYT_CART_EF_FLAGS (EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE)
 
 /* ELF32 header */
 typedef struct {
