@@ -78,6 +78,13 @@ int blyt_state_get(const blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, u
 int blyt_state_set(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
                    uint32_t value_bits, uint8_t type_tag);
 
+/* 64-bit (f64) accessors — f64 is the only field type wider than a word
+ * (Spike U). f64 SET canonicalises NaN (ADR-0010). */
+int blyt_state_get64(const blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
+                     uint64_t *out_bits);
+int blyt_state_set64(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
+                     uint64_t value_bits);
+
 int blyt_state_alloc_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t *out_slot);
 int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot);
 

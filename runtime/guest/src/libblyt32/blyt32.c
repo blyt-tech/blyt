@@ -41,6 +41,8 @@
 #define BUF_OP_FREE_SLOT 18
 #define BUF_OP_REF 19
 #define BUF_OP_REF_VALID 20
+#define BUF_OP_GET_F64 21 /* Spike U */
+#define BUF_OP_SET_F64 22 /* Spike U */
 
 /* -------------------------------------------------------------------------
  * Internal helpers
@@ -115,6 +117,37 @@ STUB_GET(int8_t, i8, BUF_OP_GET_I8)
 STUB_SET(int8_t, i8, BUF_OP_SET_I8)
 STUB_GET(uint8_t, u8, BUF_OP_GET_U8)
 STUB_SET(uint8_t, u8, BUF_OP_SET_U8)
+
+/* f64 GET/SET are special-cased: the 64-bit value spans two registers
+ * (Spike U). SET: a4=lo, a5=hi. GET: returns a0=lo, a1=hi. */
+double blyt_buffer_get_f64(blyt_buffer_h buf, int32_t slot, blyt_field_h field) {
+    register long a0 __asm__("a0") = BUF_OP_GET_F64;
+    register long a1 __asm__("a1") = (long)(buf);
+    register long a2 __asm__("a2") = (long)(slot);
+    register long a3 __asm__("a3") = (long)(field);
+    register long a7 __asm__("a7") = ECALL_BUF_OP;
+    __asm__ volatile("ecall" : "+r"(a0), "+r"(a1) : "r"(a2), "r"(a3), "r"(a7) : "memory");
+    uint64_t bits = ((uint64_t)(uint32_t)a1 << 32) | (uint32_t)a0;
+    double r;
+    __builtin_memcpy(&r, &bits, sizeof(r));
+    return r;
+}
+
+void blyt_buffer_set_f64(blyt_buffer_h buf, int32_t slot, blyt_field_h field, double v) {
+    uint64_t bits;
+    __builtin_memcpy(&bits, &v, sizeof(v));
+    register long a0 __asm__("a0") = BUF_OP_SET_F64;
+    register long a1 __asm__("a1") = (long)(buf);
+    register long a2 __asm__("a2") = (long)(slot);
+    register long a3 __asm__("a3") = (long)(field);
+    register long a4 __asm__("a4") = (long)(uint32_t)bits;         /* lo */
+    register long a5 __asm__("a5") = (long)(uint32_t)(bits >> 32); /* hi */
+    register long a7 __asm__("a7") = ECALL_BUF_OP;
+    __asm__ volatile("ecall"
+                     : "+r"(a0)
+                     : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
+                     : "memory");
+}
 
 /* bool GET/SET are special-cased because bool is not a fixed-size integer. */
 bool blyt_buffer_get_bool(blyt_buffer_h buf, int32_t slot, blyt_field_h field) {
