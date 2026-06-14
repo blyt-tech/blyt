@@ -131,10 +131,13 @@ async function main() {
     const testScript = path.join(__dirname, 'dap_test.mjs');
     const endpoint   = `tcp://127.0.0.1:${HOST_DAP_PORT}`;
 
+    /* The cart's Lua chunk name is canonicalised to
+     * /blyt/cart/src/game/lua/main.lua at build time (issue #46); breakpoints
+     * match it exactly (issue #51). */
     await new Promise((resolve, reject) => {
         execFile(
             process.execPath,
-            [testScript, endpoint, 'main.lua', BP_LINE],
+            [testScript, endpoint, '/blyt/cart/src/game/lua/main.lua', BP_LINE],
             { timeout: 120000 },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);

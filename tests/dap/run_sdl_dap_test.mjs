@@ -76,11 +76,24 @@ async function main() {
     const testScript = path.join(__dirname, 'dap_test.mjs');
     const endpoint   = `tcp://127.0.0.1:${port}`;
 
+    /* The default cart's Lua chunk name is canonicalised to
+     * /blyt/cart/src/game/lua/main.lua at build time (issue #46).  Breakpoints
+     * match it exactly (issue #51), so pass the canonical path.  In localize
+     * mode, instead hand dap_test the workspace dir + the local source path so it
+     * exercises the relay's inward/outward source-mapping. */
+    const project  = path.dirname(path.dirname(CART));
+    const localize = !!process.env.BLYT_DAP_LOCALIZE;
+    const source   = localize
+        ? path.join(project, 'src/game/lua/main.lua')
+        : '/blyt/cart/src/game/lua/main.lua';
+    const childEnv = { ...process.env };
+    if (localize) childEnv.BLYT_DAP_CWD = project;
+
     await new Promise((resolve, reject) => {
         execFile(
             process.execPath,
-            [testScript, endpoint, 'main.lua', BP_LINE],
-            { timeout: 120000 },
+            [testScript, endpoint, source, BP_LINE],
+            { timeout: 120000, env: childEnv },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);
                 process.stderr.write(stderr);

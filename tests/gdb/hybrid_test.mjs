@@ -264,9 +264,12 @@ async function main() {
 
     await dap.request('launch', {});
 
-    /* Breakpoint at line 3: the Lua call site for blyt_native_work(). */
+    /* Breakpoint at line 3: the Lua call site for blyt_native_work().  The cart's
+     * Lua chunk name is canonicalised to /blyt/cart/src/game/lua/main.lua at build
+     * time (issue #46); breakpoints match it exactly (issue #51). */
+    const canonSrc = '/blyt/cart/src/game/lua/main.lua';
     const sb = await dap.request('setBreakpoints', {
-        source:      { path: 'main.lua', name: 'main.lua' },
+        source:      { path: canonSrc, name: 'main.lua' },
         breakpoints: [{ line: 3 }],
         lines:       [3],
     });

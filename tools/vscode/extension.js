@@ -939,6 +939,7 @@ function activate(context) {
                             name: 'Lua (blyt hybrid)',
                             _blytMode: 'lua',
                             _blytDapPort: hybridDap,
+                            sourceMap: sourceMapPairs(cwd).flat(),
                             _blytPreresolved: true,
                         });
                         return {
@@ -971,6 +972,7 @@ function activate(context) {
                         return {
                             ...config, cart,
                             _blytMode: 'lua', _blytTempId: tempId, _blytDapPort: dapPort,
+                            sourceMap: sourceMapPairs(cwd).flat(),
                         };
                     }
 
@@ -1022,7 +1024,10 @@ function activate(context) {
                 /* Lua cart: connect VS Code's DAP client straight to the relay. */
                 if (isLua) {
                     const tempId = await trackProc(proc, httpPort);
-                    return { ...config, cart, _blytMode: 'lua', _blytTempId: tempId, _blytDapPort: dapPort };
+                    return {
+                        ...config, cart, _blytMode: 'lua', _blytTempId: tempId, _blytDapPort: dapPort,
+                        sourceMap: sourceMapPairs(cwd).flat(),
+                    };
                 }
 
                 /* Native cart: lldb-dap connects to the GDB relay (RISC-V guest). */
@@ -1120,11 +1125,11 @@ function activate(context) {
         vscode.debug.registerDebugAdapterTrackerFactory('blyt', {
             createDebugAdapterTracker(session) {
                 let pendingReveal = false;
-                /* For the Lua DAP path there is no lldb to apply target.source-map,
-                 * so the stackTrace frames carry the raw canonical /blyt/cart path.
-                 * Localise it to the workspace when revealing the stop location.
-                 * (Full call-stack-click rewriting belongs in the DAP server/relay
-                 * — see issue #46 §6.) */
+                /* The Lua DAP relay localises canonical /blyt/cart paths to the
+                 * workspace in stackTrace/loadedSources using the launch sourceMap
+                 * (issue #51), so call-stack-click navigation works for every
+                 * frame.  localizeCartPath stays here only as a defensive fallback
+                 * for the stop-reveal in case a frame ever arrives un-localised. */
                 const luaCwd = session.configuration?._blytMode === 'lua'
                     ? (session.workspaceFolder?.uri.fsPath || '')
                     : '';

@@ -35,6 +35,11 @@ const TEST_RESTART         = !!process.env.BLYT_DAP_TEST_RESTART;
 const EXCEPTION_FILTER     = process.env.BLYT_DAP_EXCEPTION_FILTER || '';
 const EVALUATE_EXPR        = process.env.BLYT_DAP_EVALUATE_EXPR || '';
 const EVALUATE_EXPECT      = process.env.BLYT_DAP_EVALUATE_EXPECT || '';
+/* When set to the workspace dir, the launch request carries a sourceMap so the
+ * relay reverse-maps setBreakpoints paths inward and localises stackTrace /
+ * loadedSources paths outward to this dir (issue #51).  SOURCE_PATH is then the
+ * local workspace path; without it, SOURCE_PATH is the canonical /blyt/cart one. */
+const CWD                  = process.env.BLYT_DAP_CWD || '';
 
 if (!ENDPOINT) {
     process.stderr.write('usage: dap_test.mjs <endpoint> <source_path> <bp_line>\n');
@@ -210,8 +215,10 @@ async function run() {
 
     await nextEvent('initialized');
 
-    /* 2. launch (adapter ignores arguments; cart is already running) */
-    await request('launch', {});
+    /* 2. launch — when a workspace dir is configured, hand the relay a sourceMap
+     * so it reverse-maps breakpoints inward and localises frames outward (#51). */
+    const launchArgs = CWD ? { sourceMap: ['/blyt/cart', CWD, '/blyt/src', CWD] } : {};
+    await request('launch', launchArgs);
 
     /* Exception-filter mode: skip regular BPs, just wait for an exception stop. */
     if (EXCEPTION_FILTER) {
@@ -265,15 +272,31 @@ async function run() {
             frames.some(f => f.line === BP_LINE),
             `some frame is at line ${BP_LINE}`
         );
-        /* Lua chunk names are canonicalised at build time to /blyt/cart/… so
-         * the bytecode is machine-independent and VS Code can reverse-map them
-         * (issue #46 §6, closes #26).  Any frame that carries a source path must
-         * use that canonical prefix, never a relative or absolute build path. */
         const withPath = frames.find(f => f.source && f.source.path);
-        if (withPath) {
+        if (withPath && !CWD) {
+            /* No sourceMap configured: the relay passes the guest's canonical
+             * /blyt/cart/… chunk-name path through unchanged.  This is the #46/#47
+             * invariant — chunk names are machine-independent (closes #26). */
             assert(
                 withPath.source.path.startsWith('/blyt/cart/'),
                 `stackTrace source.path is canonical (got '${withPath.source.path}')`
+            );
+        } else if (withPath) {
+            /* sourceMap configured: the relay localises EVERY frame outward to the
+             * workspace so call-stack-click navigation works (issue #51).  Assert a
+             * non-top frame too, to guard against top-frame-only rewriting. */
+            assert(
+                !withPath.source.path.startsWith('/blyt/'),
+                `stackTrace source.path is localised, not canonical (got '${withPath.source.path}')`
+            );
+            assert(
+                withPath.source.path.startsWith(CWD),
+                `stackTrace source.path is under the workspace (got '${withPath.source.path}')`
+            );
+            const nonTop = frames.slice(1).find(f => f.source && f.source.path);
+            assert(
+                nonTop != null && nonTop.source.path.startsWith(CWD),
+                `non-top frame source.path is localised (got '${nonTop ? nonTop.source.path : 'none'}')`
             );
         }
     }

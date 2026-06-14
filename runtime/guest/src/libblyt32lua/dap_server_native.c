@@ -170,12 +170,19 @@ __attribute__((constructor)) static void dap_native_init(void) {
 #define MSG_MAX (128 * 1024)
 #define MAX_BPS 256
 #define MAX_SRC 512
+#define MAX_SRCMAP 16
 
 typedef struct {
     char src[MAX_SRC];
     int line;
     int id;
 } dap_bp_t;
+
+/* One canonical-prefix → local-root pair from the launch request (issue #51). */
+typedef struct {
+    char canon[MAX_SRC];
+    char local[MAX_SRC];
+} dap_srcmap_t;
 
 static int g_listen_fd = -1;
 static int g_client_fd = -1;
@@ -189,8 +196,12 @@ static dap_bp_t g_bps[MAX_BPS];
 static int g_n_bps = 0;
 static int g_next_bp_id = 1;
 
+static dap_srcmap_t g_srcmap[MAX_SRCMAP];
+static int g_n_srcmap = 0;
+
 static char g_send_buf[MSG_MAX];
 static char g_recv_buf[MSG_MAX];
+static char g_rewrite_buf[MSG_MAX];
 
 /* ── JSON helpers ───────────────────────────────────────────────────────────── */
 
@@ -262,6 +273,91 @@ static int jg_bp_lines(const char *buf, int *out, int max) {
     return n;
 }
 
+/* Parse a flat JSON string array ("key":["a","b",...]) into out[][MAX_SRC]. */
+static int jg_str_array(const char *buf, const char *key, char out[][MAX_SRC], int max) {
+    char k[64];
+    snprintf(k, sizeof k, "\"%s\"", key);
+    const char *p = strstr(buf, k);
+    if (!p)
+        return 0;
+    p = strchr(p, '[');
+    if (!p)
+        return 0;
+    p++;
+    int n = 0;
+    while (*p && *p != ']' && n < max) {
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')
+            p++;
+        if (*p != '"')
+            break;
+        p++;
+        size_t i = 0;
+        while (*p && *p != '"' && i + 1 < MAX_SRC) {
+            if (*p == '\\' && p[1]) {
+                out[n][i++] = p[1];
+                p += 2;
+            } else {
+                out[n][i++] = *p++;
+            }
+        }
+        out[n][i] = 0;
+        n++;
+        if (*p == '"')
+            p++;
+    }
+    return n;
+}
+
+/* ── Source-path mapping (issue #51) ───────────────────────────────────────── */
+
+/* Map a local workspace path back to its canonical /blyt/* form for exact
+ * breakpoint matching.  Writes out; returns 1 if a prefix matched. */
+static int map_path_inward(const char *in, char *out, size_t n) {
+    for (int i = 0; i < g_n_srcmap; i++) {
+        const char *loc = g_srcmap[i].local;
+        size_t ll = strlen(loc);
+        if (ll == 0)
+            continue;
+        if (strcmp(in, loc) == 0) {
+            snprintf(out, n, "%s", g_srcmap[i].canon);
+            return 1;
+        }
+        if (strncmp(in, loc, ll) == 0 && in[ll] == '/') {
+            snprintf(out, n, "%s%s", g_srcmap[i].canon, in + ll);
+            return 1;
+        }
+    }
+    snprintf(out, n, "%s", in);
+    return 0;
+}
+
+/* Rewrite every canonical /blyt/* prefix in `in` to its local root (out[0..n-1]),
+ * boundary-checked so /blyt/cart never eats /blyt/cartoon. */
+static void rewrite_paths_outward(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 1 < n;) {
+        int matched = 0;
+        for (int k = 0; k < g_n_srcmap; k++) {
+            const char *canon = g_srcmap[k].canon;
+            size_t cl = strlen(canon);
+            if (cl == 0 || strncmp(in + i, canon, cl) != 0)
+                continue;
+            char after = in[i + cl];
+            if (after != '/' && after != '"' && after != '\0')
+                continue;
+            const char *loc = g_srcmap[k].local;
+            for (size_t j = 0; loc[j] && o + 1 < n; j++)
+                out[o++] = loc[j];
+            i += cl;
+            matched = 1;
+            break;
+        }
+        if (!matched)
+            out[o++] = in[i++];
+    }
+    out[o] = 0;
+}
+
 /* ── Wire I/O ───────────────────────────────────────────────────────────────── */
 
 static void send_raw(const char *data, size_t len) {
@@ -278,6 +374,12 @@ static void send_raw(const char *data, size_t len) {
 static void send_msg(const char *json) {
     if (g_client_fd < 0)
         return;
+    /* Localise canonical /blyt/* paths to the workspace on every outgoing
+     * message so all stackTrace frames open in the editor (issue #51). */
+    if (g_n_srcmap > 0) {
+        rewrite_paths_outward(json, g_rewrite_buf, sizeof g_rewrite_buf);
+        json = g_rewrite_buf;
+    }
     size_t jlen = strlen(json);
     char hdr[64];
     int hn = snprintf(hdr, sizeof hdr, "Content-Length: %zu\r\n\r\n", jlen);
@@ -346,10 +448,14 @@ static void do_initialize(int seq) {
 }
 
 static void do_set_breakpoints(int seq, const char *msg) {
-    char source[MAX_SRC] = {0};
+    char source_in[MAX_SRC] = {0};
     const char *sp = strstr(msg, "\"source\"");
     if (sp)
-        jgs(sp, "path", source, sizeof source);
+        jgs(sp, "path", source_in, sizeof source_in);
+
+    /* Reverse-map the workspace path to the canonical chunk name (issue #51). */
+    char source[MAX_SRC];
+    map_path_inward(source_in, source, sizeof source);
 
     int lines[MAX_BPS], n = jg_bp_lines(msg, lines, MAX_BPS);
 
@@ -394,6 +500,15 @@ static int dispatch(const char *msg) {
     if (strcmp(cmd, "initialize") == 0) {
         do_initialize(seq);
     } else if (strcmp(cmd, "launch") == 0) {
+        /* Store the launch config's flat "sourceMap":[canon,local,…] (issue #51). */
+        static char flat[2 * MAX_SRCMAP][MAX_SRC];
+        int sn = jg_str_array(msg, "sourceMap", flat, 2 * MAX_SRCMAP);
+        g_n_srcmap = 0;
+        for (int i = 0; i + 1 < sn && g_n_srcmap < MAX_SRCMAP; i += 2) {
+            snprintf(g_srcmap[g_n_srcmap].canon, MAX_SRC, "%s", flat[i]);
+            snprintf(g_srcmap[g_n_srcmap].local, MAX_SRC, "%s", flat[i + 1]);
+            g_n_srcmap++;
+        }
         send_resp(seq, "launch", 1, "{}");
     } else if (strcmp(cmd, "configurationDone") == 0) {
         g_configuration_done = 1;
@@ -564,19 +679,10 @@ int fc_dap_check_hook_line(const char *source, int line, int depth) {
         if (should_break)
             reason = "step";
     } else {
-        /* Check breakpoints — compare basenames for robustness */
-        const char *sb = source;
-        for (const char *q = source; *q; q++)
-            if (*q == '/')
-                sb = q + 1;
+        /* Exact canonical-path match (issue #51): setBreakpoints reverse-maps
+         * inward, so g_bps[i].src and the guest's source are both /blyt/cart/…. */
         for (int i = 0; i < g_n_bps && !should_break; i++) {
-            if (g_bps[i].line != line)
-                continue;
-            const char *bb = g_bps[i].src;
-            for (const char *q = g_bps[i].src; *q; q++)
-                if (*q == '/')
-                    bb = q + 1;
-            if (strcmp(sb, bb) == 0)
+            if (g_bps[i].line == line && strcmp(g_bps[i].src, source) == 0)
                 should_break = 1;
         }
     }

@@ -114,7 +114,9 @@ async function main() {
      * the moment blytdebug starts waiting for it. */
     const gdbSock = await connectGdbStub(gdbPort);
 
-    /* Run dap_test.mjs in TCP mode against the Lua DAP port. */
+    /* Run dap_test.mjs in TCP mode against the Lua DAP port.  The cart's Lua
+     * chunk name is canonicalised to /blyt/cart/src/game/lua/main.lua at build
+     * time (issue #46); breakpoints match it exactly (issue #51). */
     const testScript = path.join(__dirname, 'dap_test.mjs');
     const endpoint   = `tcp://127.0.0.1:${dapPort}`;
     const bpLine     = process.env.BLYT_DAP_BP_LINE || '3';
@@ -122,7 +124,7 @@ async function main() {
     await new Promise((resolve, reject) => {
         execFile(
             process.execPath,
-            [testScript, endpoint, 'main.lua', bpLine],
+            [testScript, endpoint, '/blyt/cart/src/game/lua/main.lua', bpLine],
             { timeout: 30000, env: { ...process.env } },
             (err, stdout, stderr) => {
                 process.stdout.write(stdout);

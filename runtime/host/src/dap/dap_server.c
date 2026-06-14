@@ -40,6 +40,7 @@
 #define MAX_CONDITION 256
 #define MAX_SOURCE_PATH 1024
 #define MAX_SOURCES 64
+#define MAX_SRCMAP 16
 #define MAX_MSG (1 << 20)
 
 /* Inspection-command queue delivered to the guest via BLYT_ECALL_DAP_RECV. */
@@ -53,6 +54,14 @@ typedef struct {
     int id;
     char condition[MAX_CONDITION];
 } dap_bp_t;
+
+/* One canonical-prefix → local-root pair from the launch request's sourceMap.
+ * Carts embed canonical /blyt/* paths in their Lua chunk names (issue #46);
+ * the relay reverses them so VS Code opens the workspace files. */
+typedef struct {
+    char canon[MAX_SOURCE_PATH];
+    char local[MAX_SOURCE_PATH];
+} dap_srcmap_t;
 
 typedef struct {
     pthread_mutex_t mu;
@@ -100,6 +109,12 @@ typedef struct {
 
     /* Conditional breakpoint: condition string for the in-flight return-2 call. */
     char pending_condition[MAX_CONDITION];
+
+    /* Source-map from the launch request (issue #51): outward-rewrites stackTrace
+     * / loadedSource paths to the workspace and inward-maps setBreakpoints paths
+     * back to canonical for exact matching.  Empty = pass paths through verbatim. */
+    dap_srcmap_t srcmap[MAX_SRCMAP];
+    int n_srcmap;
 } dap_state_t;
 
 static dap_state_t g_dap = {.mu = PTHREAD_MUTEX_INITIALIZER, .client_fd = -1};
@@ -172,6 +187,98 @@ static int json_get_int_array(const char *buf, const char *key, int *out, int ma
     return n;
 }
 
+/* Parse a flat JSON string array value ("key":["a","b",...]) into out[][stride].
+ * Returns the number of strings parsed (≤ max). */
+static int json_get_str_array(const char *buf, const char *key, char out[][MAX_SOURCE_PATH],
+                              int max) {
+    char k[64];
+    snprintf(k, sizeof k, "\"%s\"", key);
+    const char *p = strstr(buf, k);
+    if (!p)
+        return 0;
+    p = strchr(p, '[');
+    if (!p)
+        return 0;
+    p++;
+    int n = 0;
+    while (*p && *p != ']' && n < max) {
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')
+            p++;
+        if (*p != '"')
+            break;
+        p++;
+        size_t i = 0;
+        while (*p && *p != '"' && i + 1 < MAX_SOURCE_PATH) {
+            if (*p == '\\' && p[1]) {
+                out[n][i++] = p[1];
+                p += 2;
+            } else {
+                out[n][i++] = *p++;
+            }
+        }
+        out[n][i] = 0;
+        n++;
+        if (*p == '"')
+            p++;
+    }
+    return n;
+}
+
+/* ── Source-path mapping (issue #51) ───────────────────────────────────────── */
+
+/* Map a local workspace path back to its canonical /blyt/* form for exact
+ * breakpoint matching against the guest's chunk names.  Writes to out and
+ * returns 1 if a prefix matched; otherwise copies in verbatim and returns 0.
+ * Caller holds g_dap.mu. */
+static int map_path_inward(const char *in, char *out, size_t n) {
+    for (int i = 0; i < g_dap.n_srcmap; i++) {
+        const char *loc = g_dap.srcmap[i].local;
+        size_t ll = strlen(loc);
+        if (ll == 0)
+            continue;
+        if (strcmp(in, loc) == 0) {
+            snprintf(out, n, "%s", g_dap.srcmap[i].canon);
+            return 1;
+        }
+        if (strncmp(in, loc, ll) == 0 && in[ll] == '/') {
+            snprintf(out, n, "%s%s", g_dap.srcmap[i].canon, in + ll);
+            return 1;
+        }
+    }
+    snprintf(out, n, "%s", in);
+    return 0;
+}
+
+/* Rewrite every canonical /blyt/* source prefix in `in` to its local root,
+ * writing to out[0..n-1].  Applied to every outgoing message so stackTrace and
+ * loadedSource paths open in the editor.  A prefix only matches at a path
+ * boundary (next char '/', '"', or end), so /blyt/cart never eats /blyt/cartoon.
+ * Caller holds g_dap.mu. */
+static void rewrite_paths_outward(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 1 < n;) {
+        int matched = 0;
+        for (int k = 0; k < g_dap.n_srcmap; k++) {
+            const char *canon = g_dap.srcmap[k].canon;
+            size_t cl = strlen(canon);
+            if (cl == 0 || strncmp(in + i, canon, cl) != 0)
+                continue;
+            char after = in[i + cl];
+            if (after != '/' && after != '"' && after != '\0')
+                continue;
+            const char *loc = g_dap.srcmap[k].local;
+            for (size_t j = 0; loc[j] && o + 1 < n; j++)
+                out[o++] = loc[j];
+            i += cl;
+            matched = 1;
+            break;
+        }
+        if (!matched)
+            out[o++] = in[i++];
+    }
+    out[o] = 0;
+}
+
 /* ── Wire I/O ──────────────────────────────────────────────────────────────── */
 
 static int write_all(int fd, const char *p, size_t n) {
@@ -195,13 +302,22 @@ static int write_all(int fd, const char *p, size_t n) {
 static void send_msg(const char *json) {
     if (g_dap.client_fd < 0)
         return;
-    /* Covers responses, events, and guest-built JSON via fc_dap_host_send. */
-    blyt_tracef(BLYT_TRACE_DAP, "send %s", json);
-    char hdr[64];
-    int hn = snprintf(hdr, sizeof hdr, "Content-Length: %zu\r\n\r\n", strlen(json));
+    /* Covers responses, events, and guest-built JSON via fc_dap_host_send.
+     * The lock both serialises writes and guards the static rewrite buffer plus
+     * the source-map it reads (issue #51): localise canonical paths so VS Code
+     * opens the workspace files for every frame, not just the stop-reveal one. */
     pthread_mutex_lock(&g_dap.mu);
+    const char *out = json;
+    if (g_dap.n_srcmap > 0) {
+        static char rewritten[MAX_MSG];
+        rewrite_paths_outward(json, rewritten, sizeof rewritten);
+        out = rewritten;
+    }
+    blyt_tracef(BLYT_TRACE_DAP, "send %s", out);
+    char hdr[64];
+    int hn = snprintf(hdr, sizeof hdr, "Content-Length: %zu\r\n\r\n", strlen(out));
     if (write_all(g_dap.client_fd, hdr, (size_t)hn) == 0)
-        write_all(g_dap.client_fd, json, strlen(json));
+        write_all(g_dap.client_fd, out, strlen(out));
     pthread_mutex_unlock(&g_dap.mu);
 }
 
@@ -278,7 +394,18 @@ static void handle_initialize(int seq, const char *args) {
 }
 
 static void handle_launch(int seq, const char *args) {
-    (void)args;
+    /* The launch config carries a flat "sourceMap":[canon,local,canon,local,…]
+     * array (issue #51).  Store the pairs so the relay can translate paths. */
+    static char flat[2 * MAX_SRCMAP][MAX_SOURCE_PATH];
+    int n = json_get_str_array(args, "sourceMap", flat, 2 * MAX_SRCMAP);
+    pthread_mutex_lock(&g_dap.mu);
+    g_dap.n_srcmap = 0;
+    for (int i = 0; i + 1 < n && g_dap.n_srcmap < MAX_SRCMAP; i += 2) {
+        snprintf(g_dap.srcmap[g_dap.n_srcmap].canon, MAX_SOURCE_PATH, "%s", flat[i]);
+        snprintf(g_dap.srcmap[g_dap.n_srcmap].local, MAX_SOURCE_PATH, "%s", flat[i + 1]);
+        g_dap.n_srcmap++;
+    }
+    pthread_mutex_unlock(&g_dap.mu);
     send_response(seq, "launch", 1, "{}");
 }
 
@@ -377,17 +504,9 @@ static int json_get_bp_array(const char *buf, int *lines, char (*conds)[MAX_COND
     return n;
 }
 
-static const char *basename_of(const char *p) {
-    const char *b = p;
-    for (const char *q = p; *q; q++)
-        if (*q == '/')
-            b = q + 1;
-    return b;
-}
-
 static void handle_set_breakpoints(int seq, const char *args) {
-    char source[MAX_SOURCE_PATH] = {0};
-    json_get_string(args, "path", source, sizeof source);
+    char source_in[MAX_SOURCE_PATH] = {0};
+    json_get_string(args, "path", source_in, sizeof source_in);
 
     int lines[MAX_BREAKPOINTS];
     char conds[MAX_BREAKPOINTS][MAX_CONDITION];
@@ -399,10 +518,13 @@ static void handle_set_breakpoints(int seq, const char *args) {
     }
 
     pthread_mutex_lock(&g_dap.mu);
-    const char *new_base = basename_of(source);
+    /* Reverse-map the workspace path to the cart's canonical chunk name so it
+     * matches exactly against the guest's reported source (issue #51). */
+    char source[MAX_SOURCE_PATH];
+    map_path_inward(source_in, source, sizeof source);
     int kept = 0;
     for (int i = 0; i < g_dap.n_bps; i++) {
-        if (strcmp(basename_of(g_dap.bps[i].source), new_base) != 0) {
+        if (strcmp(g_dap.bps[i].source, source) != 0) {
             if (kept != i)
                 g_dap.bps[kept] = g_dap.bps[i];
             kept++;
@@ -822,13 +944,14 @@ int fc_dap_check_hook_line(const char *source, int line, int depth) {
             reason = "step";
     } else {
         pthread_mutex_lock(&g_dap.mu);
-        const char *src_base = basename_of(source);
         for (int i = 0; i < g_dap.n_bps; i++) {
             if (!g_dap.bps[i].verified)
                 continue;
             if (g_dap.bps[i].line != line)
                 continue;
-            if (strcmp(basename_of(g_dap.bps[i].source), src_base) != 0)
+            /* Exact canonical-path match: both sides speak /blyt/cart/… now that
+             * setBreakpoints reverse-maps inward (issue #51). */
+            if (strcmp(g_dap.bps[i].source, source) != 0)
                 continue;
             if (g_dap.bps[i].condition[0]) {
                 /* Conditional BP: stash condition, return 2 so guest evaluates. */

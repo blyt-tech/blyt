@@ -42,6 +42,7 @@
 #define MAX_VARS 64
 #define MAX_SOURCE_PATH 1024
 #define MAX_SOURCES 64
+#define MAX_SRCMAP 16
 #define MAX_MSG (64 * 1024)
 
 /* ── State ─────────────────────────────────────────────────────────────────── */
@@ -52,6 +53,13 @@ typedef struct {
     int id;
     char condition[MAX_CONDITION];
 } wdap_bp_t;
+
+/* One canonical-prefix → local-root pair from the launch request's sourceMap
+ * (issue #51): reverse-maps /blyt/* chunk-name paths to the workspace. */
+typedef struct {
+    char canon[MAX_SOURCE_PATH];
+    char local[MAX_SOURCE_PATH];
+} wdap_srcmap_t;
 
 static struct {
     int connected;
@@ -76,16 +84,62 @@ static struct {
     int n_sources;
     int exception_filter;
     int hit_bp_id; /* id of the breakpoint that caused the current pause, or 0 */
+
+    wdap_srcmap_t srcmap[MAX_SRCMAP]; /* launch sourceMap, issue #51 */
+    int n_srcmap;
 } g_wdap;
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
 
-static const char *basename_of(const char *p) {
-    const char *b = p;
-    for (const char *q = p; *q; q++)
-        if (*q == '/')
-            b = q + 1;
-    return b;
+/* ── Source-path mapping (issue #51) ───────────────────────────────────────── */
+
+/* Map a local workspace path back to its canonical /blyt/* form for exact
+ * breakpoint matching.  Writes out; returns 1 if a prefix matched. */
+static int map_path_inward(const char *in, char *out, size_t n) {
+    for (int i = 0; i < g_wdap.n_srcmap; i++) {
+        const char *loc = g_wdap.srcmap[i].local;
+        size_t ll = strlen(loc);
+        if (ll == 0)
+            continue;
+        if (strcmp(in, loc) == 0) {
+            snprintf(out, n, "%s", g_wdap.srcmap[i].canon);
+            return 1;
+        }
+        if (strncmp(in, loc, ll) == 0 && in[ll] == '/') {
+            snprintf(out, n, "%s%s", g_wdap.srcmap[i].canon, in + ll);
+            return 1;
+        }
+    }
+    snprintf(out, n, "%s", in);
+    return 0;
+}
+
+/* Rewrite every canonical /blyt/* prefix in `in` to its local root (out[0..n-1]).
+ * Applied to every outgoing message so all stackTrace frames open in the editor.
+ * Boundary-checked so /blyt/cart never eats /blyt/cartoon. */
+static void rewrite_paths_outward(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 1 < n;) {
+        int matched = 0;
+        for (int k = 0; k < g_wdap.n_srcmap; k++) {
+            const char *canon = g_wdap.srcmap[k].canon;
+            size_t cl = strlen(canon);
+            if (cl == 0 || strncmp(in + i, canon, cl) != 0)
+                continue;
+            char after = in[i + cl];
+            if (after != '/' && after != '"' && after != '\0')
+                continue;
+            const char *loc = g_wdap.srcmap[k].local;
+            for (size_t j = 0; loc[j] && o + 1 < n; j++)
+                out[o++] = loc[j];
+            i += cl;
+            matched = 1;
+            break;
+        }
+        if (!matched)
+            out[o++] = in[i++];
+    }
+    out[o] = 0;
 }
 
 /* ── JSON helpers ──────────────────────────────────────────────────────────── */
@@ -156,6 +210,42 @@ static int json_get_int_array(const char *buf, const char *key, int *out, int ma
     return n;
 }
 
+/* Parse a flat JSON string array ("key":["a","b",...]) into out[][MAX_SOURCE_PATH]. */
+static int json_get_str_array(const char *buf, const char *key, char out[][MAX_SOURCE_PATH],
+                              int max) {
+    char k[64];
+    snprintf(k, sizeof k, "\"%s\"", key);
+    const char *p = strstr(buf, k);
+    if (!p)
+        return 0;
+    p = strchr(p, '[');
+    if (!p)
+        return 0;
+    p++;
+    int n = 0;
+    while (*p && *p != ']' && n < max) {
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')
+            p++;
+        if (*p != '"')
+            break;
+        p++;
+        size_t i = 0;
+        while (*p && *p != '"' && i + 1 < MAX_SOURCE_PATH) {
+            if (*p == '\\' && p[1]) {
+                out[n][i++] = p[1];
+                p += 2;
+            } else {
+                out[n][i++] = *p++;
+            }
+        }
+        out[n][i] = 0;
+        n++;
+        if (*p == '"')
+            p++;
+    }
+    return n;
+}
+
 /* ── WebSocket JS helpers ───────────────────────────────────────────────────── */
 
 /* clang-format off */
@@ -195,8 +285,16 @@ static void wdap_trace_conn(void) {
 }
 
 static void send_json(const char *json) {
-    blyt_tracef(BLYT_TRACE_DAP, "send %s", json);
-    wdap_ws_send_js(json);
+    /* Localise canonical /blyt/* paths to the workspace on every outgoing
+     * message so all stackTrace frames open in the editor (issue #51). */
+    const char *out = json;
+    if (g_wdap.n_srcmap > 0) {
+        static char rewritten[MAX_MSG];
+        rewrite_paths_outward(json, rewritten, sizeof rewritten);
+        out = rewritten;
+    }
+    blyt_tracef(BLYT_TRACE_DAP, "send %s", out);
+    wdap_ws_send_js(out);
 }
 
 static void send_response(int request_seq, const char *command, int success,
@@ -246,7 +344,15 @@ static void handle_initialize(int seq, const char *args) {
 }
 
 static void handle_launch(int seq, const char *args) {
-    (void)args;
+    /* Store the launch config's flat "sourceMap":[canon,local,…] (issue #51). */
+    static char flat[2 * MAX_SRCMAP][MAX_SOURCE_PATH];
+    int n = json_get_str_array(args, "sourceMap", flat, 2 * MAX_SRCMAP);
+    g_wdap.n_srcmap = 0;
+    for (int i = 0; i + 1 < n && g_wdap.n_srcmap < MAX_SRCMAP; i += 2) {
+        snprintf(g_wdap.srcmap[g_wdap.n_srcmap].canon, MAX_SOURCE_PATH, "%s", flat[i]);
+        snprintf(g_wdap.srcmap[g_wdap.n_srcmap].local, MAX_SOURCE_PATH, "%s", flat[i + 1]);
+        g_wdap.n_srcmap++;
+    }
     send_response(seq, "launch", 1, "{}");
 }
 
@@ -331,9 +437,9 @@ static int json_get_bp_array(const char *buf, int *lines, char (*conds)[MAX_COND
 }
 
 static void handle_set_breakpoints(int seq, const char *args) {
-    static char source[MAX_SOURCE_PATH];
-    source[0] = '\0';
-    json_get_string(args, "path", source, sizeof source);
+    static char source_in[MAX_SOURCE_PATH];
+    source_in[0] = '\0';
+    json_get_string(args, "path", source_in, sizeof source_in);
 
     int lines[MAX_BREAKPOINTS];
     char conds[MAX_BREAKPOINTS][MAX_CONDITION];
@@ -344,13 +450,13 @@ static void handle_set_breakpoints(int seq, const char *args) {
             conds[i][0] = '\0';
     }
 
-    /* Replace all breakpoints for this source.  Use basename comparison so that
-     * a condition edit sent with a slightly different path format (e.g. macOS
-     * /tmp vs /private/tmp symlink) still clears the previous entry. */
-    const char *new_base = basename_of(source);
+    /* Reverse-map the workspace path to the canonical chunk name so breakpoints
+     * match the guest's reported source exactly (issue #51). */
+    static char source[MAX_SOURCE_PATH];
+    map_path_inward(source_in, source, sizeof source);
     int kept = 0;
     for (int i = 0; i < g_wdap.n_bps; i++) {
-        if (strcmp(basename_of(g_wdap.bps[i].source), new_base) != 0) {
+        if (strcmp(g_wdap.bps[i].source, source) != 0) {
             if (kept != i)
                 g_wdap.bps[kept] = g_wdap.bps[i];
             kept++;
@@ -912,11 +1018,12 @@ bool fc_dap_should_break(lua_State *L, lua_Debug *ar) {
     if (*src == '@')
         src++;
     fc_dap_emit_loaded_source(src);
-    const char *src_base = basename_of(src);
     for (int i = 0; i < g_wdap.n_bps; i++) {
         if (g_wdap.bps[i].line != ar->currentline)
             continue;
-        if (strcmp(basename_of(g_wdap.bps[i].source), src_base) != 0)
+        /* Exact canonical-path match (issue #51): setBreakpoints reverse-maps
+         * inward, so both sides are /blyt/cart/… here. */
+        if (strcmp(g_wdap.bps[i].source, src) != 0)
             continue;
         if (g_wdap.bps[i].condition[0]) {
             if (!eval_condition(L, ar, g_wdap.bps[i].condition))

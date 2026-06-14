@@ -765,3 +765,87 @@ fn sdl_hybrid_lua_c_dap_with_gdb() {
         .assert()
         .success();
 }
+
+/// A cart with a nested call so the stack has more than one Lua frame:
+/// `init()` calls `deep()`, and the breakpoint sits on line 2 inside `deep()`.
+/// At the stop the call stack is deep → init → main chunk, all in main.lua.
+/// `update`'s quit call differs per leg (blyt.quit vs blyt_quit).
+fn nested_call_cart(quit_call: &str) -> String {
+    format!(
+        "function deep()\n\
+         \x20   local a = 1\n\
+         end\n\
+         function init()\n\
+         \x20   deep()\n\
+         end\n\
+         function update() {quit_call} end\n\
+         function draw() end\n"
+    )
+}
+
+/// SDL2 DAP source-map (issue #51): with a sourceMap in the launch request the
+/// relay reverse-maps the workspace breakpoint path inward (so it binds via
+/// exact, not basename, matching) and localises every stackTrace frame outward
+/// to the workspace — including non-top frames, which the #47 stop-reveal alone
+/// did not fix.  run_sdl_dap_test.mjs in localize mode drives both assertions.
+#[test]
+fn sdl_dap_source_map_localizes_frames() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytdebug().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_source_map");
+    CartProject::new()
+        .lua(&nested_call_cart("blyt.quit()"))
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "2")
+        .env("BLYT_DAP_LOCALIZE", "1")
+        .assert()
+        .success();
+}
+
+/// WASM DAP source-map (issue #51): WASM-relay equivalent of
+/// sdl_dap_source_map_localizes_frames — the relay localises every frame and
+/// binds the workspace breakpoint path via the launch sourceMap.
+#[test]
+fn wasm_dap_source_map_localizes_frames() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_source_map");
+    CartProject::new()
+        .lua(&nested_call_cart("blyt_quit()"))
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "2")
+        .env("BLYT_DAP_LOCALIZE", "1")
+        .assert()
+        .success();
+}
