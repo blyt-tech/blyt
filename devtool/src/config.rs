@@ -73,6 +73,7 @@ pub const TYPE_I32: u8 = 4;
 pub const TYPE_U32: u8 = 5;
 pub const TYPE_F32: u8 = 6;
 pub const TYPE_BOOL: u8 = 7;
+pub const TYPE_F64: u8 = 8; /* Spike U: 64-bit double field */
 
 pub fn parse_type_tag(name: &str) -> Option<u8> {
     match name {
@@ -83,6 +84,7 @@ pub fn parse_type_tag(name: &str) -> Option<u8> {
         "i32" => Some(TYPE_I32),
         "u32" => Some(TYPE_U32),
         "f32" => Some(TYPE_F32),
+        "f64" => Some(TYPE_F64),
         "bool" => Some(TYPE_BOOL),
         _ => None,
     }
@@ -97,6 +99,7 @@ pub fn type_tag_c_type(tag: u8) -> &'static str {
         TYPE_I32 => "int32_t",
         TYPE_U32 => "uint32_t",
         TYPE_F32 => "float",
+        TYPE_F64 => "double",
         TYPE_BOOL => "bool",
         _ => "uint8_t",
     }
@@ -111,6 +114,7 @@ pub fn type_tag_rust_type(tag: u8) -> &'static str {
         TYPE_I32 => "i32",
         TYPE_U32 => "u32",
         TYPE_F32 => "f32",
+        TYPE_F64 => "f64",
         TYPE_BOOL => "bool",
         _ => "u8",
     }
@@ -120,7 +124,7 @@ pub fn type_tag_rust_type(tag: u8) -> &'static str {
 /// Integers map to `integer`, f32 to `number`, bool to `boolean`.
 pub fn type_tag_lua_type(tag: u8) -> &'static str {
     match tag {
-        TYPE_F32 => "number",
+        TYPE_F32 | TYPE_F64 => "number",
         TYPE_BOOL => "boolean",
         _ => "integer",
     }
@@ -135,6 +139,7 @@ pub fn type_tag_buf_get_suffix(tag: u8) -> &'static str {
         TYPE_I32 => "i32",
         TYPE_U32 => "u32",
         TYPE_F32 => "f32",
+        TYPE_F64 => "f64",
         TYPE_BOOL => "bool",
         _ => "u8",
     }

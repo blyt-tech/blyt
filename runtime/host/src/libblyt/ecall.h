@@ -51,15 +51,17 @@
 
 /* State buffer op (ADR-0009, ADR-0057, ADR-0058, ADR-0096).
  * a0 = sub-opcode (BUF_OP_*), remaining args per sub-opcode below.
- * For GET ops: a1=buf_h, a2=slot, a3=field_h; returns value bits in a0.
- * For SET ops: a1=buf_h, a2=slot, a3=field_h, a4=value (uint32_t bit pattern).
+ * For GET ops: a1=buf_h, a2=slot, a3=field_h; returns value bits in a0
+ *   (f64: low 32 bits in a0, high 32 bits in a1).
+ * For SET ops: a1=buf_h, a2=slot, a3=field_h, a4=value (uint32_t bit pattern;
+ *   f64: a4=low 32 bits, a5=high 32 bits).
  * For ALLOC/FREE: a1=buf_h, a2=slot (FREE) or a2=out_slot ptr (ALLOC).
  * For REF: a1=buf_h, a2=slot; returns packed ref (gen:16|slot:16) or 0 in a0.
  * For REF_VALID: a1=buf_h, a2=ref; returns 1/0 in a0. */
 #define BLYT_ECALL_BUF_OP 50
 
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
- * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool */
+ * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1
 #define BUF_OP_SET_F32 2
 #define BUF_OP_GET_I32 3
@@ -80,6 +82,8 @@
 #define BUF_OP_FREE_SLOT 18
 #define BUF_OP_REF 19
 #define BUF_OP_REF_VALID 20
+#define BUF_OP_GET_F64 21 /* Spike U: a0=lo, a1=hi */
+#define BUF_OP_SET_F64 22 /* Spike U: a4=lo, a5=hi */
 
 /* Lua C API bridge op (ADR-0130, WASM hybrid carts only).
  * Issued by the bridge-stub variant of libblyt32lua.so while a bridged

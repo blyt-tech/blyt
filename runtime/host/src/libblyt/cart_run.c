@@ -1120,6 +1120,10 @@ static const char *buf_op_name(uint32_t op) {
         return "buf_ref";
     case BUF_OP_REF_VALID:
         return "buf_ref_valid";
+    case BUF_OP_GET_F64:
+        return "buf_get_f64";
+    case BUF_OP_SET_F64:
+        return "buf_set_f64";
     default:
         return "buf_op?";
     }
@@ -1518,6 +1522,19 @@ static void blyt_ecall_handler(riscv_t *rv) {
             int v = blyt_state_ref_valid(sc, buf_id, ref);
             blyt_tracef(BLYT_TRACE_API, "buf_ref_valid(buf=%u, ref=0x%08x) -> %d", buf_id, ref, v);
             rv_set_reg(rv, rv_reg_a0, (uint32_t)v);
+            break;
+        }
+        case BUF_OP_GET_F64: { /* f64: returns lo in a0, hi in a1 (Spike U) */
+            uint64_t bits = 0;
+            blyt_state_get64(sc, buf_id, slot, field, &bits);
+            rv_set_reg(rv, rv_reg_a0, (uint32_t)bits);
+            rv_set_reg(rv, rv_reg_a1, (uint32_t)(bits >> 32));
+            break;
+        }
+        case BUF_OP_SET_F64: { /* f64: a4=lo, a5=hi (Spike U) */
+            uint64_t bits = (uint64_t)value_bits | ((uint64_t)rv_get_reg(rv, rv_reg_a5) << 32);
+            blyt_state_set64(sc, buf_id, slot, field, bits);
+            rv_set_reg(rv, rv_reg_a0, 0);
             break;
         }
         default:

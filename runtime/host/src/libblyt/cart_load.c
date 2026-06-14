@@ -112,6 +112,8 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     /* blyt state buffer API (ADR-0009, ADR-0010, ADR-0057, ADR-0058) */
     "blyt_buffer_get_f32",
     "blyt_buffer_set_f32",
+    "blyt_buffer_get_f64",
+    "blyt_buffer_set_f64",
     "blyt_buffer_get_i32",
     "blyt_buffer_set_i32",
     "blyt_buffer_get_u32",
