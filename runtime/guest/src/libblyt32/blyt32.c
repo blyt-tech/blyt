@@ -140,7 +140,7 @@ void blyt_buffer_set_f64(blyt_buffer_h buf, int32_t slot, blyt_field_h field, do
     register long a1 __asm__("a1") = (long)(buf);
     register long a2 __asm__("a2") = (long)(slot);
     register long a3 __asm__("a3") = (long)(field);
-    register long a4 __asm__("a4") = (long)(uint32_t)bits;         /* lo */
+    register long a4 __asm__("a4") = (long)(uint32_t)bits; /* lo */
     register long a5 __asm__("a5") = (long)(uint32_t)(bits >> 32); /* hi */
     register long a7 __asm__("a7") = ECALL_BUF_OP;
     __asm__ volatile("ecall"
