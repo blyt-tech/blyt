@@ -38,6 +38,8 @@ static size_t field_sizeof_tag(uint8_t tag) {
     case 2:
     case 3:
         return 2; /* i16, u16 */
+    case 8:
+        return 8; /* f64 (Spike U) */
     default:
         return 4; /* i32, u32, f32 */
     }
