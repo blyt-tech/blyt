@@ -155,6 +155,11 @@ double __floatdidf(long long a) {
 double __floatunsidf(unsigned int a) {
     return u2d(ui32_to_f64(a));
 }
+/* uint64 → double — emitted by the Lua VM under LUA_FLOAT_DOUBLE (Spike U)
+ * for unsigned-64-to-double conversions (e.g. size_t/hash → lua_Number). */
+double __floatundidf(unsigned long long a) {
+    return u2d(ui64_to_f64(a));
+}
 
 /* float → double */
 double __extendsfdf2(float a) {
