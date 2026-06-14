@@ -1005,12 +1005,12 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     // Build all libraries before game code.
     let lib_names = discover_libraries(project_dir)?;
     let mut built_libs: Vec<BuiltLib> = Vec::new();
-    // Lua carts: pass LUA_32BITS=1 and LUA_USE_LONGJMP=1 so that src/lib/ C
+    // Lua carts: pass BLYT_LUA_I32_F64=1 and LUA_USE_LONGJMP=1 so that src/lib/ C
     // code calling the Lua C API uses the same numeric types and error-handling
     // path as the blyt Lua VM compiled with these flags.
     let lua_lib_defines: Vec<String> = if is_lua {
         vec![
-            "-DLUA_32BITS=1".to_string(),
+            "-DBLYT_LUA_I32_F64=1".to_string(),
             "-DLUA_USE_LONGJMP=1".to_string(),
         ]
     } else {
@@ -2504,7 +2504,7 @@ pub(crate) fn compile_commands_for(project_dir: &Path) -> Result<Vec<CompileEntr
     // Hybrid Lua+C carts compile the Lua C API with LUA_32BITS; mirror it so
     // clangd parses lua.h the same way.
     let defines: Vec<String> = if is_lua {
-        vec!["-DLUA_32BITS=1".into(), "-DLUA_USE_LONGJMP=1".into()]
+        vec!["-DBLYT_LUA_I32_F64=1".into(), "-DLUA_USE_LONGJMP=1".into()]
     } else {
         vec![]
     };

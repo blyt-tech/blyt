@@ -614,7 +614,7 @@ else()
     CFLAGS
     ${LUA_MUSL_INCLUDES}
     ${LIBBLYTC_CFLAGS}
-    -DLUA_32BITS=1
+    -DBLYT_LUA_I32_F64=1
     -DLUA_USE_LONGJMP=1
     ${LUA_SEED_DEF}
     -I
@@ -661,7 +661,7 @@ else()
       ${LUA_MUSL_INCLUDES}
       ${LIBBLYTC_CFLAGS}
       ${_VOPT}
-      -DLUA_32BITS=1
+      -DBLYT_LUA_I32_F64=1
       -DLUA_USE_LONGJMP=1
       ${LUA_SEED_DEF}
       ${_VLUA_DAP_FLAGS}
@@ -713,7 +713,7 @@ else()
     list(APPEND _guest_lib_outputs "${_VDIR}/libblyt32lua-bridge.so")
   endforeach()
 
-  # blyt-luac — host-native Lua bytecode compiler (LUA_32BITS=1 to match the
+  # blyt-luac — host-native Lua bytecode compiler (BLYT_LUA_I32_F64=1 to match the
   # guest VMs' 4-byte lua_Integer / lua_Number).
   file(GLOB LUA_HOST_SRCS "${LUA_DIR}/*.c")
   foreach(_EXCL "${LUA_DIR}/lua.c" "${LUA_DIR}/onelua.c" "${LUA_DIR}/ltests.c")
@@ -722,12 +722,12 @@ else()
   add_custom_command(
     OUTPUT "${SDK_BIN}/blyt-luac"
     COMMAND
-      "${BLYT_RV32_CLANG}" -DLUA_32BITS=1 ${LUA_SEED_DEF} -O2 -I "${LUA_DIR}"
+      "${BLYT_RV32_CLANG}" -DBLYT_LUA_I32_F64=1 ${LUA_SEED_DEF} -O2 -I "${LUA_DIR}"
       -Wno-unused-parameter -Wno-sign-compare -Wno-implicit-fallthrough
       -Wno-deprecated-non-prototype -o "${SDK_BIN}/blyt-luac" ${LUA_HOST_SRCS}
       "${CMAKE_SOURCE_DIR}/runtime/tools/blyt-luac.c" -lm
     DEPENDS ${LUA_HOST_SRCS} "${CMAKE_SOURCE_DIR}/runtime/tools/blyt-luac.c"
-    COMMENT "Compiling blyt-luac (host-native, LUA_32BITS=1)"
+    COMMENT "Compiling blyt-luac (host-native, BLYT_LUA_I32_F64=1)"
     VERBATIM)
   list(APPEND _guest_lib_outputs "${SDK_BIN}/blyt-luac")
 endif()
@@ -942,7 +942,7 @@ if(BLYT_BUILD_NATIVE)
       ${LUA_MUSL_INCLUDES}
       ${LIBBLYTC_CFLAGS}
       -O2
-      -DLUA_32BITS=1
+      -DBLYT_LUA_I32_F64=1
       -DLUA_USE_LONGJMP=1
       ${LUA_SEED_DEF}
       -I
