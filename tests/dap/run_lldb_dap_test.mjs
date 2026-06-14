@@ -15,11 +15,11 @@
  *   source-breakpoint  — sets a breakpoint by file:line, verifies stopped event
  *   stack-trace        — after stop, verifies function name in frame 0
  *   variables          — after stop, verifies a local variable value
- *   source-map         — verifies source.path uses cwd, not /blyt/src
+ *   source-map         — verifies source.path uses cwd, not /blyt/cart
  *
  * Environment:
  *   BLYT_GDB_BREAK_LINE  — source line number for breakpoint tests (default: 5)
- *   BLYT_SOURCE_FILE     — filename within /blyt/src (default: main.c)
+ *   BLYT_SOURCE_FILE     — filename within /blyt/cart (default: main.c)
  *
  * Exit 0 on success, non-zero on failure.
  * Node.js 22+ required.
@@ -161,7 +161,7 @@ async function testSourceBreakpoint() {
             program: cartPath,
             stopOnEntry: true,
             launchCommands: [
-                `settings set target.source-map /blyt/src ${projectCwd}`,
+                `settings set target.source-map /blyt/cart ${projectCwd}`,
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
@@ -170,7 +170,7 @@ async function testSourceBreakpoint() {
 
         /* setBreakpoints before configurationDone */
         await send('setBreakpoints', {
-            source: { path: `/blyt/src/${sourceFile}` },
+            source: { path: `/blyt/cart/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
         await send('configurationDone');
@@ -204,14 +204,14 @@ async function testAutoStart() {
             program: cartPath,
             stopOnEntry: false,
             launchCommands: [
-                `settings set target.source-map /blyt/src ${projectCwd}`,
+                `settings set target.source-map /blyt/cart ${projectCwd}`,
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
         const launchP = send('launch', launchArgs);
 
         await send('setBreakpoints', {
-            source: { path: `/blyt/src/${sourceFile}` },
+            source: { path: `/blyt/cart/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
         await send('configurationDone');
@@ -235,13 +235,13 @@ async function testStackTrace() {
             program: cartPath,
             stopOnEntry: true,
             launchCommands: [
-                `settings set target.source-map /blyt/src ${projectCwd}`,
+                `settings set target.source-map /blyt/cart ${projectCwd}`,
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
         send('launch', launchArgs);
         await send('setBreakpoints', {
-            source: { path: `/blyt/src/${sourceFile}` },
+            source: { path: `/blyt/cart/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
         const stoppedP = waitEvent('stopped', 60000);
@@ -272,13 +272,13 @@ async function testVariables() {
             program: cartPath,
             stopOnEntry: true,
             launchCommands: [
-                `settings set target.source-map /blyt/src ${projectCwd}`,
+                `settings set target.source-map /blyt/cart ${projectCwd}`,
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
         send('launch', launchArgs);
         await send('setBreakpoints', {
-            source: { path: `/blyt/src/${sourceFile}` },
+            source: { path: `/blyt/cart/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
         const stoppedP = waitEvent('stopped', 60000);
@@ -317,13 +317,13 @@ async function testSourceMap() {
             program: cartPath,
             stopOnEntry: true,
             launchCommands: [
-                `settings set target.source-map /blyt/src ${projectCwd}`,
+                `settings set target.source-map /blyt/cart ${projectCwd}`,
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
         send('launch', launchArgs);
         await send('setBreakpoints', {
-            source: { path: `/blyt/src/${sourceFile}` },
+            source: { path: `/blyt/cart/${sourceFile}` },
             breakpoints: [{ line: breakLine }],
         });
         const stoppedP = waitEvent('stopped', 60000);
@@ -343,7 +343,7 @@ async function testSourceMap() {
             return;
         }
         const sourcePath = frame.source.path;
-        if (sourcePath.startsWith('/blyt/src')) {
+        if (sourcePath.startsWith('/blyt/cart')) {
             throw new Error(`source-map not applied: path is still '${sourcePath}'`);
         }
         if (!sourcePath.startsWith(projectCwd)) {

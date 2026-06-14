@@ -4,10 +4,17 @@
  * Compiled host-native with -DLUA_32BITS=1 so the bytecode it produces
  * matches the RV32 and WASM blyt Lua VMs (both also -DLUA_32BITS=1).
  *
- * Usage: blyt-luac -o <output.luac> <file.lua> [file2.lua ...]
+ * Usage: blyt-luac -o <output.luac> [-n <chunkname>] <file.lua> [file2.lua ...]
  *
  * Multiple source files are concatenated and compiled as one chunk.
  * Globals defined in earlier files are visible in later ones.
+ *
+ * -n <chunkname> sets the chunk's source name embedded in the bytecode
+ * (prefixed with '@', so debuggers treat it as a file path).  blyt passes the
+ * canonical /blyt/cart/… path here so carts are machine-independent and the DAP
+ * layer can reverse-map source paths (issue #46 §6).  Without -n the source
+ * name defaults to the file path (single file) or "cart" (multiple), preserving
+ * the previous behaviour.
  */
 
 #include <stdio.h>
@@ -64,12 +71,15 @@ static char *read_file(const char *path, size_t *out_size) {
 
 int main(int argc, char *argv[]) {
     const char *output = NULL;
+    const char *chunkname = NULL;
     int strip = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output = argv[++i];
+        } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            chunkname = argv[++i];
         } else if (strcmp(argv[i], "-s") == 0) {
             strip = 1;
         }
@@ -85,8 +95,8 @@ int main(int argc, char *argv[]) {
         return 1;
     int nfiles = 0;
     for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-o") == 0) {
-            i++;
+        if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "-n") == 0) {
+            i++; /* skip the option's value too */
             continue;
         }
         if (argv[i][0] == '-')
@@ -110,8 +120,41 @@ int main(int argc, char *argv[]) {
     int rc = 0;
     WBuf wb = {NULL, 0};
 
-    if (nfiles == 1) {
+    /* When a chunk name is given, build the Lua source name "@<name>" once.
+     * The leading '@' marks it as a file path (stripped for display by Lua). */
+    char *namebuf = NULL;
+    if (chunkname) {
+        size_t nlen = strlen(chunkname);
+        namebuf = malloc(nlen + 2);
+        if (!namebuf) {
+            lua_close(L);
+            free(files);
+            return 1;
+        }
+        namebuf[0] = '@';
+        memcpy(namebuf + 1, chunkname, nlen + 1);
+    }
+
+    if (nfiles == 1 && !chunkname) {
         if (luaL_loadfile(L, files[0]) != LUA_OK) {
+            fprintf(stderr, "blyt-luac: %s\n", lua_tostring(L, -1));
+            rc = 1;
+            goto done;
+        }
+    } else if (nfiles == 1) {
+        /* Single file with an explicit chunk name: read it and load via a
+         * buffer so the embedded source name is the canonical one, not the
+         * file path. */
+        size_t sz = 0;
+        char *content = read_file(files[0], &sz);
+        if (!content) {
+            fprintf(stderr, "blyt-luac: cannot read '%s'\n", files[0]);
+            rc = 1;
+            goto done;
+        }
+        int lrc = luaL_loadbuffer(L, content, sz, namebuf);
+        free(content);
+        if (lrc != LUA_OK) {
             fprintf(stderr, "blyt-luac: %s\n", lua_tostring(L, -1));
             rc = 1;
             goto done;
@@ -162,7 +205,7 @@ int main(int argc, char *argv[]) {
         free(contents);
         free(sizes);
 
-        if (luaL_loadbuffer(L, combined, pos, "@cart") != LUA_OK) {
+        if (luaL_loadbuffer(L, combined, pos, namebuf ? namebuf : "@cart") != LUA_OK) {
             fprintf(stderr, "blyt-luac: %s\n", lua_tostring(L, -1));
             free(combined);
             rc = 1;
@@ -194,6 +237,7 @@ int main(int argc, char *argv[]) {
     }
 
 done:
+    free(namebuf);
     free(wb.buf);
     free(files);
     lua_close(L);

@@ -83,6 +83,49 @@ function sdkDir() {
         || process.env.BLYT_SDK_DIR || '').trim();
 }
 
+/* Canonical → local source-path pairs for a cart at `cwd` (issue #46).  Carts
+ * embed canonical /blyt/* paths in their debug info; the debugger reverses them
+ * here.  /blyt/cart and the legacy /blyt/src map to the workspace folder (so the
+ * user's own files open); /blyt/sdk, /blyt/rust and /blyt/cargo come from
+ * build/source-map.json, which `blyt build` writes (the SDK and toolchain source
+ * trees).  Returns an array of [canonical, local] pairs. */
+function sourceMapPairs(cwd) {
+    const pairs = [['/blyt/cart', cwd], ['/blyt/src', cwd]];
+    try {
+        const manifest = JSON.parse(
+            fs.readFileSync(path.join(cwd, 'build', 'source-map.json'), 'utf8')
+        );
+        for (const { prefix, local } of manifest) {
+            if (prefix === '/blyt/cart' || prefix === '/blyt/src') continue;
+            if (prefix && local) pairs.push([prefix, local]);
+        }
+    } catch (_) {
+        /* manifest is optional — fall back to the cart mapping alone. */
+    }
+    return pairs;
+}
+
+/* The lldb-dap launchCommand that installs every source-map pair in one call:
+ *   settings set target.source-map "<canon1>" "<local1>" "<canon2>" "<local2>" …
+ * lldb resolves DWARF paths and source breakpoints in both directions. */
+function sourceMapCommand(cwd) {
+    const args = sourceMapPairs(cwd)
+        .map(([c, l]) => `${JSON.stringify(c)} ${JSON.stringify(l)}`)
+        .join(' ');
+    return `settings set target.source-map ${args}`;
+}
+
+/* Rewrite a canonical /blyt/cart (or legacy /blyt/src) source path to the local
+ * workspace file, for the Lua DAP path (no lldb in the loop to apply the
+ * source-map).  Returns the input unchanged if it is not a cart path. */
+function localizeCartPath(p, cwd) {
+    for (const prefix of ['/blyt/cart', '/blyt/src']) {
+        if (p === prefix) return cwd;
+        if (p.startsWith(prefix + '/')) return path.join(cwd, p.slice(prefix.length + 1));
+    }
+    return p;
+}
+
 /* BLYT_TRACE channels for debug sessions, passed as a --trace parameter to
  * blytdebug / `blyt debug` so failures always carry a protocol/lifecycle
  * trace ('api' stays opt-in — high volume).  Empty disables tracing. */
@@ -909,7 +952,7 @@ function activate(context) {
                             program: debugCart,
                             stopOnEntry: false,
                             launchCommands: [
-                                `settings set target.source-map /blyt/src ${JSON.stringify(cwd)}`,
+                                sourceMapCommand(cwd),
                                 `gdb-remote 127.0.0.1:${hybridGdb}`,
                             ],
                             _blytTempId: hybridTempId,
@@ -946,7 +989,7 @@ function activate(context) {
                         program: debugCart,
                         stopOnEntry: false,
                         launchCommands: [
-                            `settings set target.source-map /blyt/src ${JSON.stringify(cwd)}`,
+                            sourceMapCommand(cwd),
                             `gdb-remote 127.0.0.1:${gdbPort}`,
                         ],
                         _blytTempId: nativeTempId,
@@ -1058,17 +1101,18 @@ function activate(context) {
                  *                    connection; prevents lldb-dap from trying to exec the
                  *                    RISC-V binary locally (which fails on macOS/x86).
                  *
-                 * `blyt build --debug` uses `-ffile-prefix-map=<project_dir>=/blyt/src`
-                 * to store canonical (machine-independent) paths in the DWARF.  We must
-                 * tell lldb the reverse mapping so it can resolve source-line breakpoints
-                 * back to the actual files on disk. */
+                 * `blyt build` stores canonical (machine-independent) /blyt/*
+                 * paths in the DWARF (issue #46).  sourceMapCommand() builds the
+                 * reverse mapping (cart → workspace, plus the SDK/toolchain trees
+                 * from build/source-map.json) so lldb resolves source-line
+                 * breakpoints and frames back to the files on disk. */
                 return {
                     ...config,
                     _blytMode: 'native',
                     program: debugCart,
                     stopOnEntry: false,
                     launchCommands: [
-                        `settings set target.source-map /blyt/src ${JSON.stringify(cwd)}`,
+                        sourceMapCommand(cwd),
                         `gdb-remote 127.0.0.1:${gdbPort}`,
                     ],
                     _blytTempId: tempId,
@@ -1090,6 +1134,14 @@ function activate(context) {
         vscode.debug.registerDebugAdapterTrackerFactory('blyt', {
             createDebugAdapterTracker(session) {
                 let pendingReveal = false;
+                /* For the Lua DAP path there is no lldb to apply target.source-map,
+                 * so the stackTrace frames carry the raw canonical /blyt/cart path.
+                 * Localise it to the workspace when revealing the stop location.
+                 * (Full call-stack-click rewriting belongs in the DAP server/relay
+                 * — see issue #46 §6.) */
+                const luaCwd = session.configuration?._blytMode === 'lua'
+                    ? (session.workspaceFolder?.uri.fsPath || '')
+                    : '';
                 return {
                     onWillReceiveMessage(msg) {
                         const tag = msg.command || msg.event || '?';
@@ -1151,7 +1203,10 @@ function activate(context) {
                             pendingReveal = false;
                             const frame = msg.body?.stackFrames?.[0];
                             if (frame?.source?.path && frame.line) {
-                                const uri = vscode.Uri.file(frame.source.path);
+                                const srcPath = luaCwd
+                                    ? localizeCartPath(frame.source.path, luaCwd)
+                                    : frame.source.path;
+                                const uri = vscode.Uri.file(srcPath);
                                 const line = frame.line - 1;
                                 vscode.window.showTextDocument(uri, {
                                     preserveFocus: false,

@@ -265,6 +265,17 @@ async function run() {
             frames.some(f => f.line === BP_LINE),
             `some frame is at line ${BP_LINE}`
         );
+        /* Lua chunk names are canonicalised at build time to /blyt/cart/… so
+         * the bytecode is machine-independent and VS Code can reverse-map them
+         * (issue #46 §6, closes #26).  Any frame that carries a source path must
+         * use that canonical prefix, never a relative or absolute build path. */
+        const withPath = frames.find(f => f.source && f.source.path);
+        if (withPath) {
+            assert(
+                withPath.source.path.startsWith('/blyt/cart/'),
+                `stackTrace source.path is canonical (got '${withPath.source.path}')`
+            );
+        }
     }
 
     /* 7b. source — VS Code fetches content for sources it cannot open by
