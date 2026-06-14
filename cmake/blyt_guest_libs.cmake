@@ -47,8 +47,8 @@ set(RV32_BASE
     # bare-metal targets which rejects .so inputs; using a Linux triple keeps
     # shared-library semantics.  -nostdlib suppresses the sysroot linkage.
     --target=riscv32-linux-gnu
-    -march=rv32imafc
-    -mabi=ilp32f
+    -march=rv32imafdc
+    -mabi=ilp32d
     -shared
     -fPIC
     -nostdlib
@@ -161,8 +161,8 @@ set(RV32_PREFIX_MAP
 # excluded; -fsemantic-interposition stays (codegen flag, see RV32_BASE).
 set(RV32_COMPILE_BASE
     --target=riscv32-linux-gnu
-    -march=rv32imafc
-    -mabi=ilp32f
+    -march=rv32imafdc
+    -mabi=ilp32d
     -fPIC
     -fsemantic-interposition
     ${RV32_PREFIX_MAP}
@@ -931,8 +931,8 @@ if(BLYT_BUILD_NATIVE)
     # which would conflict with -r (relocatable partial link).
     set(_RV32_PARTIAL
         --target=riscv32-linux-gnu
-        -march=rv32imafc
-        -mabi=ilp32f
+        -march=rv32imafdc
+        -mabi=ilp32d
         -fPIC
         -nostdlib
         -no-pie
@@ -940,8 +940,8 @@ if(BLYT_BUILD_NATIVE)
     # Per-object compile base for the partial link: _RV32_PARTIAL's codegen
     # subset — deliberately NO -fsemantic-interposition (the old single command
     # never had it) and no guest-include -I.
-    set(_RV32_PARTIAL_COMPILE --target=riscv32-linux-gnu -march=rv32imafc
-                              -mabi=ilp32f -fPIC)
+    set(_RV32_PARTIAL_COMPILE --target=riscv32-linux-gnu -march=rv32imafdc
+                              -mabi=ilp32d -fPIC)
     blyt_guest_objects(
       _libblytc_native_objs
       libblytc-native-partial

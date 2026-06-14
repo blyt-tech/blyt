@@ -60,7 +60,7 @@ foreach(_IDX RANGE ${_PAIR_LAST})
     continue()
   endif()
   execute_process(
-    COMMAND "${_CAND_CLANG}" --target=riscv32 -march=rv32imafc -mabi=ilp32f -x c
+    COMMAND "${_CAND_CLANG}" --target=riscv32 -march=rv32imafdc -mabi=ilp32d -x c
             -E - -o /dev/null
     INPUT_FILE /dev/null
     RESULT_VARIABLE _RV32_OK
