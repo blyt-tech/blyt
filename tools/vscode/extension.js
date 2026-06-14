@@ -911,13 +911,8 @@ function activate(context) {
                     }
 
                     /* F5: run with blytdebug and connect the IDE debugger. */
-                    let debugCart = cart;
-                    if (isLua) {
-                        if (!fs.existsSync(cart) && !(await build(cwd, false))) return undefined;
-                    } else {
-                        if (!(await build(cwd, true))) return undefined;
-                        debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
-                    }
+                    if (!(await build(cwd, true))) return undefined;
+                    let debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
 
                     /* Hybrid cart: spawn blytdebug with both --debug and --gdb, then
                      * start a companion Lua DAP session programmatically.  The GDB
@@ -1011,17 +1006,8 @@ function activate(context) {
                     return { ...config, cart, _blytMode: 'run', _blytTempId: tempId };
                 }
 
-                /* Native guest debugging needs DWARF line info, so always build
-                 * with --debug — which emits <name>.dbg.blyt (ADR-0129).  Lua
-                 * steps via the debug runtime, so it only needs the cart present
-                 * and keeps the plain <name>.blyt name. */
-                let debugCart = cart;
-                if (isLua) {
-                    if (!fs.existsSync(cart) && !(await build(cwd, false))) return undefined;
-                } else {
-                    if (!(await build(cwd, true))) return undefined;
-                    debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
-                }
+                if (!(await build(cwd, true))) return undefined;
+                let debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
 
                 output.appendLine(`\n── blyt debug ${debugCart}`);
                 let result;
