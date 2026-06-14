@@ -911,13 +911,8 @@ function activate(context) {
                     }
 
                     /* F5: run with blytdebug and connect the IDE debugger. */
-                    let debugCart = cart;
-                    if (isLua) {
-                        if (!fs.existsSync(cart) && !(await build(cwd, false))) return undefined;
-                    } else {
-                        if (!(await build(cwd, true))) return undefined;
-                        debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
-                    }
+                    if (!(await build(cwd, true))) return undefined;
+                    let debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
 
                     /* Hybrid cart: spawn blytdebug with both --debug and --gdb, then
                      * start a companion Lua DAP session programmatically.  The GDB
