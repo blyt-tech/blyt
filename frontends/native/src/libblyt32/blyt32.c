@@ -262,7 +262,8 @@ static int read_all(int fd, void *buf, unsigned int len) {
 /* SOA: one uint32_t per (buffer, slot, field).  All types stored as 32-bit
  * raw bits; narrower types (i8, u8, i16, u16, bool) use the low bits only.
  * Zero-initialized BSS: all slots start empty and all values start at 0. */
-static uint32_t s_soa[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS][NATIVE_MAX_FIELDS];
+/* 64-bit per field so f64 fits (Spike U); 32-bit fields use the low word. */
+static uint64_t s_soa[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS][NATIVE_MAX_FIELDS];
 
 /* Slot allocation bitset: bit i of byte (i/8) indicates slot i is allocated. */
 static uint8_t s_slot_bits[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS / 8];
@@ -294,6 +295,15 @@ static uint16_t native_gen(uint32_t bi, int32_t s) {
 static uint32_t canon_f32(uint32_t bits) {
     if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u)
         return F32_CANONICAL_NAN;
+    return bits;
+}
+
+/* f64 NaN canonicalisation (ADR-0010), Spike U. */
+#define F64_CANONICAL_NAN 0x7FF8000000000000ULL
+static uint64_t canon_f64(uint64_t bits) {
+    if ((bits & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL &&
+        (bits & 0x000FFFFFFFFFFFFFULL) != 0u)
+        return F64_CANONICAL_NAN;
     return bits;
 }
 
@@ -444,6 +454,25 @@ void blyt_buffer_set_f32(blyt_buffer_h b, int32_t s, blyt_field_h f, float v) {
     blyt32_native_memcpy(&bits, &v, 4);
     blyt32_trace_buf_op("buf_set_f32", b, s, f, bits, 1, 1);
     s_soa[bi][s][fi] = canon_f32(bits);
+}
+
+/* f64 (Spike U): full 64-bit field; stored in the widened SOA slot. */
+double blyt_buffer_get_f64(blyt_buffer_h b, int32_t s, blyt_field_h f) {
+    uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
+    if (!ref_ok(bi, s, fi))
+        return 0.0;
+    uint64_t bits = s_soa[bi][s][fi];
+    double v;
+    blyt32_native_memcpy(&v, &bits, 8);
+    return v;
+}
+void blyt_buffer_set_f64(blyt_buffer_h b, int32_t s, blyt_field_h f, double v) {
+    uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
+    if (!ref_ok(bi, s, fi))
+        return;
+    uint64_t bits;
+    blyt32_native_memcpy(&bits, &v, 8);
+    s_soa[bi][s][fi] = canon_f64(bits);
 }
 
 int32_t blyt_buffer_get_i32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
