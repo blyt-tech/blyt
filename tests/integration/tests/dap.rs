@@ -765,3 +765,139 @@ fn sdl_hybrid_lua_c_dap_with_gdb() {
         .assert()
         .success();
 }
+
+/// A cart with a nested call so the stack has more than one Lua frame:
+/// `init()` calls `deep()`, and the breakpoint sits on line 2 inside `deep()`.
+/// At the stop the call stack is deep → init → main chunk, all in main.lua.
+/// `update`'s quit call differs per leg (blyt.quit vs blyt_quit).
+fn nested_call_cart(quit_call: &str) -> String {
+    format!(
+        "function deep()\n\
+         \x20   local a = 1\n\
+         end\n\
+         function init()\n\
+         \x20   deep()\n\
+         end\n\
+         function update() {quit_call} end\n\
+         function draw() end\n"
+    )
+}
+
+/// SDL2 DAP source-map (issue #51): with a sourceMap in the launch request the
+/// relay reverse-maps the workspace breakpoint path inward (so it binds via
+/// exact, not basename, matching) and localises every stackTrace frame outward
+/// to the workspace — including non-top frames, which the #47 stop-reveal alone
+/// did not fix.  run_sdl_dap_test.mjs in localize mode drives both assertions.
+#[test]
+fn sdl_dap_source_map_localizes_frames() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytdebug().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_source_map");
+    CartProject::new()
+        .lua(&nested_call_cart("blyt.quit()"))
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "2")
+        .env("BLYT_DAP_LOCALIZE", "1")
+        .assert()
+        .success();
+}
+
+/// WASM DAP source-map (issue #51): WASM-relay equivalent of
+/// sdl_dap_source_map_localizes_frames — the relay localises every frame and
+/// binds the workspace breakpoint path via the launch sourceMap.
+#[test]
+fn wasm_dap_source_map_localizes_frames() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_source_map");
+    CartProject::new()
+        .lua(&nested_call_cart("blyt_quit()"))
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "2")
+        .env("BLYT_DAP_LOCALIZE", "1")
+        .assert()
+        .success();
+}
+
+/// Documents the multi-file single-chunk limitation (issue #54): `blyt-luac`
+/// concatenates every Lua file into one chunk named after the first file
+/// (`aaa.lua` here), so the guest reports that one source for ALL frames.  A
+/// breakpoint set in a *non-first* file (`main.lua`) therefore never binds —
+/// neither #51's exact match nor the old basename match can pair `main.lua`
+/// against the reported `aaa.lua` — and frames in later files would open the
+/// wrong file at an offset line.  This is upstream of the #51 relay rewrite.
+///
+/// `#[ignore]`d until #54 makes the compiler emit per-file source names; the BP
+/// in `main.lua` will then bind and stop, and this test will pass as-is.
+#[test]
+#[ignore = "blocked on #54: multi-file carts compile to one chunk named after the first file"]
+fn sdl_dap_multifile_nonfirst_file_breakpoint_binds() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytdebug().exists(),
+        "blytplay not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_multifile");
+    // aaa.lua sorts before main.lua, so it becomes the single chunk's name.
+    // The breakpoint at main.lua:2 must bind despite living in the later file.
+    CartProject::new()
+        .lua_file("aaa.lua", "function helper()\n    return 1\nend\n")
+        .lua(
+            "function init()\n\
+             \x20   local x = helper()\n\
+             \x20   blyt.quit()\n\
+             end\n\
+             function update() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "2")
+        .env("BLYT_DAP_LOCALIZE", "1")
+        .assert()
+        .success();
+}
