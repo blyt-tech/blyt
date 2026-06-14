@@ -213,6 +213,14 @@ jobs:
           cargo build -p blyt
           cargo nextest run --workspace
 
+      # VS Code extension unit tests (pure cart-detection helpers). Cheap:
+      # only needs js-yaml, run via node's built-in test runner.
+      - name: VS Code extension tests
+        run: |
+          cd tools/vscode
+          npm install
+          npm test
+
       # Build every example cart with the assembled SDK to validate that the
       # examples stay buildable. Runs last so it gates on a working SDK. The
       # SDK-installed blyt auto-discovers its tools (blyt-clang, blyt-luac, …)
