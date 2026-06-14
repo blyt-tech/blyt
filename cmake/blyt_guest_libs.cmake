@@ -458,8 +458,14 @@ if(EXISTS "${SF_SRC}/f64_add.c")
   set(SF_PLATFORM_DIR "${CMAKE_BINARY_DIR}/softfloat-rv32")
   file(MAKE_DIRECTORY "${SF_PLATFORM_DIR}")
   # Minimal platform.h: disable thread-local so softfloat_roundingMode is
-  # global.
-  file(WRITE "${SF_PLATFORM_DIR}/platform.h" "#define THREAD_LOCAL\n")
+  # global, and declare the target little-endian.  LITTLEENDIAN is required for
+  # SoftFloat's float128_t to use {v0(low), v64(high)} word order; without it
+  # SoftFloat defaults to big-endian word order (high word at v[0]), which
+  # silently mismatches the compiler's IEEE binary128 memory layout (Spike U:
+  # this broke quad<->compiler interchange, e.g. musl's long-double printf).
+  # f32/f64 are single-word and so were unaffected.
+  file(WRITE "${SF_PLATFORM_DIR}/platform.h"
+       "#define THREAD_LOCAL\n#define LITTLEENDIAN 1\n")
 
   # Core SoftFloat: all s_*.c and f32/f64/f128/conversion files.  Exclude extF80
   # (80-bit), M-variant (multi-word array), bf16, f16.
