@@ -128,6 +128,10 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_buffer_set_bool",
     "blyt_buffer_alloc_slot",
     "blyt_buffer_free_slot",
+    /* Packed entity refs (ADR-0096); blyt_buffer_ref_slot is a static inline
+     * in blyt.h (pure bit math) and is deliberately not an import. */
+    "blyt_buffer_ref",
+    "blyt_buffer_ref_valid",
 
     /* blyt save/load API (ADR-0087, ADR-0125) */
     "blyt_save_write",

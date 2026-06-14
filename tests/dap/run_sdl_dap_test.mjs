@@ -65,6 +65,12 @@ async function main() {
     });
     blytplay.stderr.on('data', (d) => process.stderr.write(d));
 
+    /* Register before anything can exit so an early death is never missed
+     * (a signal exit has code === null and previously passed silently). */
+    const blytplayExit = new Promise((resolve) => {
+        blytplay.on('exit', (code, signal) => resolve({ code, signal }));
+    });
+
     const port = await findDapPort(blytplay);
 
     const testScript = path.join(__dirname, 'dap_test.mjs');
@@ -83,11 +89,21 @@ async function main() {
         );
     });
 
-    /* DAP client sent continue; wait for blytplay to exit (cart calls blyt.quit()). */
-    await new Promise((resolve) => {
-        blytplay.on('exit', resolve);
-        setTimeout(() => { blytplay.kill(); resolve(); }, 5000);
-    });
+    /* DAP client sent continue and the cart calls blyt.quit(): blytplay must
+     * exit on its own, cleanly.  The old code killed it after 5s and passed
+     * regardless, so a post-continue hang or crash was invisible. */
+    const exited = await Promise.race([
+        blytplayExit,
+        new Promise((resolve) => setTimeout(() => resolve(null), 10000)),
+    ]);
+    if (!exited) {
+        blytplay.kill();
+        throw new Error('blytplay did not exit within 10s after the DAP session ended');
+    }
+    if (exited.signal)
+        throw new Error(`blytplay died with signal ${exited.signal}`);
+    if (exited.code !== 0)
+        throw new Error(`blytplay exited with code ${exited.code}`);
 }
 
 main().then(() => process.exit(0)).catch((e) => {

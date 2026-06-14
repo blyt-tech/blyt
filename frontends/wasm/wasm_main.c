@@ -708,6 +708,31 @@ static int wasm_buf_free_slot(lua_State *L) {
                              (int32_t)luaL_checkinteger(L, 2));
     return 0;
 }
+/* Packed entity refs (ADR-0096) — host-Lua fast-path equivalents of the
+ * blyt.buf.ref* bindings in libblyt32lua. */
+static int wasm_buf_ref(lua_State *L) {
+    uint32_t ref = 0;
+    blyt_state_ctx_t *ctx = active_state_ctx();
+    if (ctx)
+        ref = blyt_state_ref(ctx, (uint32_t)luaL_checkinteger(L, 1),
+                             (int32_t)luaL_checkinteger(L, 2));
+    lua_pushinteger(L, (lua_Integer)ref);
+    return 1;
+}
+static int wasm_buf_ref_valid(lua_State *L) {
+    int v = 0;
+    blyt_state_ctx_t *ctx = active_state_ctx();
+    if (ctx)
+        v = blyt_state_ref_valid(ctx, (uint32_t)luaL_checkinteger(L, 1),
+                                 (uint32_t)luaL_checkinteger(L, 2));
+    lua_pushboolean(L, v);
+    return 1;
+}
+static int wasm_buf_ref_slot(lua_State *L) {
+    /* Pure bit math — must match blyt_buffer_ref_slot in blyt.h. */
+    lua_pushinteger(L, (lua_Integer)((uint32_t)luaL_checkinteger(L, 1) & 0xFFFFu));
+    return 1;
+}
 
 static int wasm_lua_save_write(lua_State *L) {
     uint32_t slot = (uint32_t)luaL_checkinteger(L, 1);
@@ -899,6 +924,9 @@ static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
         {"set_bool", wasm_buf_set_bool},
         {"alloc_slot", wasm_buf_alloc_slot},
         {"free_slot", wasm_buf_free_slot},
+        {"ref", wasm_buf_ref},
+        {"ref_valid", wasm_buf_ref_valid},
+        {"ref_slot", wasm_buf_ref_slot},
         {NULL, NULL},
     };
     lua_newtable(L); /* buf subtable */

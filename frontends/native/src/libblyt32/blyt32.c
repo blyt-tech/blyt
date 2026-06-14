@@ -267,6 +267,20 @@ static uint32_t s_soa[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS][NATIVE_MAX_FIELDS];
 /* Slot allocation bitset: bit i of byte (i/8) indicates slot i is allocated. */
 static uint8_t s_slot_bits[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS / 8];
 
+/* Per-slot generation counters (ADR-0096), stored BIASED: the array holds
+ * (generation - 1) so the BSS zero is generation 1 with no initialization
+ * code (ELF constructors do not run on this path — carts enter via the
+ * custom _blyt_entry, not __libc_start_main, so init arrays are skipped).
+ * Public generations are 1..65535 (0 is reserved so a packed ref to slot 0
+ * never equals BLYT_ENTITY_REF_NONE); stored values are 0..65534.  Bumped
+ * on successful free_slot, wrapping 65535 -> 1 (stored: 65534 -> 0) — must
+ * match the emulated path (state_buffer.c) exactly for determinism. */
+static uint16_t s_gen[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS];
+
+static uint16_t native_gen(uint32_t bi, int32_t s) {
+    return (uint16_t)(s_gen[bi][s] + 1u);
+}
+
 /* Save format magic and version (little-endian). */
 #define NATIVE_SAVE_MAGIC_0 'N'
 #define NATIVE_SAVE_MAGIC_1 'L'
@@ -283,10 +297,16 @@ static uint32_t canon_f32(uint32_t bits) {
     return bits;
 }
 
-/* Validate a (buffer, slot, field) reference — all values are zero-based. */
+static int slot_allocated(uint32_t bi, int32_t slot) {
+    return (s_slot_bits[bi][(uint32_t)slot / 8u] >> ((uint32_t)slot % 8u)) & 1u;
+}
+
+/* Validate a (buffer, slot, field) reference — all values are zero-based.
+ * The slot must be allocated: the emulated path (state_buffer.c) rejects
+ * get/set on unallocated slots, so the native path must too. */
 static int ref_ok(uint32_t bi, int32_t slot, uint32_t fi) {
     return bi < NATIVE_MAX_BUF && slot >= 0 && (uint32_t)slot < NATIVE_MAX_SLOTS &&
-           fi < NATIVE_MAX_FIELDS;
+           fi < NATIVE_MAX_FIELDS && slot_allocated(bi, slot);
 }
 
 /* ── Seccomp constructor ─────────────────────────────────────────────────
@@ -559,11 +579,40 @@ blyt_result_t blyt_buffer_alloc_slot(blyt_buffer_h b, int32_t *out_slot) {
 
 blyt_result_t blyt_buffer_free_slot(blyt_buffer_h b, int32_t s) {
     uint32_t bi = b - 1u;
-    if (bi >= NATIVE_MAX_BUF || s < 0 || (uint32_t)s >= NATIVE_MAX_SLOTS)
+    /* Match the emulated path (state_buffer.c): freeing an unallocated slot
+     * is an error and must not bump the generation counter. */
+    if (bi >= NATIVE_MAX_BUF || s < 0 || (uint32_t)s >= NATIVE_MAX_SLOTS || !slot_allocated(bi, s))
         return BLYT_ERR_INVALID_ARG;
     blyt32_trace_call("buf_free_slot", (long)s, 0, 0);
     s_slot_bits[bi][(uint32_t)s / 8u] &= (uint8_t)~(1u << ((uint32_t)s % 8u));
+    /* Zero the freed slot's field data (the emulated path does). */
+    for (uint32_t fi = 0; fi < NATIVE_MAX_FIELDS; fi++)
+        s_soa[bi][s][fi] = 0;
+    /* Bump the generation, wrapping 65535 -> 1 (ADR-0096); stored values are
+     * biased by -1, so the stored wrap is 65534 -> 0. */
+    s_gen[bi][s] = (uint16_t)(s_gen[bi][s] >= 0xFFFEu ? 0 : s_gen[bi][s] + 1);
     return BLYT_OK;
+}
+
+/* ── Packed entity refs (ADR-0096) ──────────────────────────────────────────
+ * blyt_buffer_ref_slot is a static inline in blyt.h (pure bit math). */
+
+blyt_entity_ref_t blyt_buffer_ref(blyt_buffer_h b, int32_t s) {
+    uint32_t bi = b - 1u;
+    blyt_entity_ref_t ref = 0;
+    if (bi < NATIVE_MAX_BUF && s >= 0 && (uint32_t)s < NATIVE_MAX_SLOTS && slot_allocated(bi, s))
+        ref = ((uint32_t)native_gen(bi, s) << 16) | (uint32_t)s;
+    blyt32_trace_call("buf_ref", (long)s, 1, (long)ref);
+    return ref;
+}
+
+bool blyt_buffer_ref_valid(blyt_buffer_h b, blyt_entity_ref_t ref) {
+    uint32_t bi = b - 1u;
+    int32_t s = (int32_t)(ref & 0xFFFFu);
+    int v = ref != 0 && bi < NATIVE_MAX_BUF && (uint32_t)s < NATIVE_MAX_SLOTS &&
+            slot_allocated(bi, s) && native_gen(bi, s) == (uint16_t)(ref >> 16);
+    blyt32_trace_call("buf_ref_valid", (long)ref, 1, (long)v);
+    return v != 0;
 }
 
 /* ── Save / load (Phase 9) ────────────────────────────────────────────────
@@ -573,6 +622,8 @@ blyt_result_t blyt_buffer_free_slot(blyt_buffer_h b, int32_t s) {
  *   [4..7]    version: 1u (uint32)
  *   [8..N]    raw s_soa array
  *   [N..N+B]  raw s_slot_bits array
+ *   [..]      raw s_gen array (per-slot generation counters, ADR-0096;
+ *             stored biased by -1, see the s_gen declaration)
  *
  * BLYT_SAVE_DIR environment variable (set by test runner) determines the
  * directory.  File name: slot_<N>.blys in that directory.
@@ -623,6 +674,12 @@ blyt_result_t blyt_save_write(uint32_t slot) {
         return BLYT_ERR_IO;
     }
 
+    /* Write generation counters (ADR-0096) */
+    if (write_all(fd, s_gen, sizeof(s_gen)) < 0) {
+        blyt_rs_close(fd);
+        return BLYT_ERR_IO;
+    }
+
     blyt_rs_fsync(fd);
     blyt_rs_close(fd);
     blyt32_trace_call("save_write", (long)slot, 1, 0);
@@ -662,6 +719,12 @@ blyt_result_t blyt_save_read(uint32_t slot) {
 
     /* Read slot bitsets */
     if (read_all(fd, s_slot_bits, sizeof(s_slot_bits)) != 0) {
+        blyt_rs_close(fd);
+        return BLYT_ERR_IO;
+    }
+
+    /* Read generation counters (ADR-0096) */
+    if (read_all(fd, s_gen, sizeof(s_gen)) != 0) {
         blyt_rs_close(fd);
         return BLYT_ERR_IO;
     }

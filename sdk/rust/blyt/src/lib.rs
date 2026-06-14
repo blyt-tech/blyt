@@ -14,7 +14,10 @@ use core::ffi::c_char;
 
 pub mod buffer;
 pub mod save;
-pub use buffer::{BlytBufferH, BlytFieldH, BLYT_FIELD_NONE, BLYT_INVALID_SLOT};
+pub use buffer::{
+    BlytBufferH, BlytEntityRef, BlytFieldH, BLYT_ENTITY_REF_NONE, BLYT_FIELD_NONE,
+    BLYT_INVALID_SLOT,
+};
 
 // -------------------------------------------------------------------------
 // Raw C API

@@ -2,7 +2,7 @@ records:
   Globals:
     fields:
       - { name: frame, type: i32 }
-      - { name: player_id, type: i32 }
+      - { name: player, ref: character }
   Character:
     fields:
       - { name: x, type: i32 }

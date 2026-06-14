@@ -786,5 +786,124 @@ void blyt_cart_draw(void) {}
         println!("  PASS: output = {:?}", output.trim());
     }
 
+    // ── Gate 10: entity refs + generation counters on metal ──────────
+    //
+    // The only coverage of the native libblyt32 generation/ref code (ADR-0096)
+    // and its NLBY save extension: lifecycle (alloc/ref/free/stale/realloc),
+    // free-slot field zeroing parity, and gens round-tripping through
+    // blyt_save_write/blyt_save_read.
+    println!("Gate 10: entity refs + generation counters on metal...");
+    {
+        let ref_project = tmp.path().join("ref_metal");
+        CartProject::new()
+            .config(
+                "records:
+  Globals:
+    fields:
+      - { name: target, ref: entity }
+  Entity:
+    fields:
+      - { name: hp, type: i32 }
+state_buffers:
+  globals:
+    record: Globals
+    count: 1
+  entity:
+    record: Entity
+    count: 4
+",
+            )
+            .c(r#"
+#include "blyt.h"
+#include "cart_state.h"
+
+void blyt_cart_init(void) {}
+
+/* On failure prints "ref-metal-fail s<stage>" so the gate log shows which
+ * check diverged. */
+static int s_stage = 0;
+#define CHECK(cond)                                                                                \
+    do {                                                                                           \
+        s_stage++;                                                                                 \
+        if (!(cond)) {                                                                             \
+            char msg[32] = "ref-metal-fail s";                                                     \
+            msg[16] = (char)('0' + s_stage / 10);                                                  \
+            msg[17] = (char)('0' + s_stage % 10);                                                  \
+            msg[18] = '\0';                                                                        \
+            blyt_console_debug(msg);                                                               \
+            blyt_quit();                                                                           \
+            return;                                                                                \
+        }                                                                                          \
+    } while (0)
+
+void blyt_cart_update(void) {
+    int32_t g = -1, e = -1;
+    blyt_buffer_alloc_slot(S_GLOBALS, &g);
+    blyt_buffer_alloc_slot(S_ENTITY, &e);
+    blyt_buffer_set_i32(S_ENTITY, e, S_ENTITY_HP, 7);
+
+    /* lifecycle: gen starts at 1; free goes stale; realloc stays stale */
+    blyt_entity_ref_t r = blyt_buffer_ref(S_ENTITY, e);
+    CHECK(r == ((1u << 16) | (uint32_t)e));        /* s1 */
+    CHECK(blyt_buffer_ref_valid(S_ENTITY, r));     /* s2 */
+    CHECK(blyt_buffer_ref_slot(r) == e);           /* s3 */
+    blyt_buffer_free_slot(S_ENTITY, e);
+    CHECK(!blyt_buffer_ref_valid(S_ENTITY, r));    /* s4 */
+    blyt_buffer_alloc_slot(S_ENTITY, &e);
+    CHECK(!blyt_buffer_ref_valid(S_ENTITY, r));    /* s5 */
+    /* freed slot's field data was zeroed (host parity) */
+    CHECK(blyt_buffer_get_i32(S_ENTITY, e, S_ENTITY_HP) == 0); /* s6 */
+    blyt_entity_ref_t r2 = blyt_buffer_ref(S_ENTITY, e);       /* gen 2 */
+    CHECK(r2 == ((2u << 16) | (uint32_t)e));       /* s7 */
+
+    /* gens round-trip through the NLBY save format */
+    blyt_buffer_set_u32(S_GLOBALS, 0, S_GLOBALS_TARGET, r2);
+    blyt_save_write(0);
+    blyt_buffer_free_slot(S_ENTITY, e); /* gen 3; r2 stale */
+    CHECK(!blyt_buffer_ref_valid(S_ENTITY, r2));   /* s8 */
+    blyt_save_read(0);
+    blyt_entity_ref_t restored = blyt_buffer_get_u32(S_GLOBALS, 0, S_GLOBALS_TARGET);
+    CHECK(restored == r2);                         /* s9 */
+    CHECK(blyt_buffer_ref_valid(S_ENTITY, restored)); /* s10 */
+
+    blyt_console_debug("ref-metal-ok");
+    blyt_quit();
+}
+
+void blyt_cart_draw(void) {}
+"#)
+            .write(&ref_project);
+        let ref_cart = build_cart(&ref_project);
+        assert!(
+            ref_cart.exists(),
+            "ref_metal.blyt not built: {}",
+            ref_cart.display()
+        );
+
+        assert!(
+            qemu.scp_to(&ref_cart, "/tmp/blyt_gate/"),
+            "scp ref_metal.blyt failed"
+        );
+        assert!(qemu.ssh_ok("mkdir -p /tmp/blyt_save_gate_ref"));
+
+        let out = qemu.ssh(
+            "BLYT_SAVE_DIR=/tmp/blyt_save_gate_ref BLYT_TRACE=api \
+             /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/ref_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "ref_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("ref-metal-ok"),
+            "expected 'ref-metal-ok' in output (entity refs on metal)\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    }
+
     println!("Gate tests passed.");
 }

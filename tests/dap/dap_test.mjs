@@ -77,14 +77,20 @@ function nextEvent(name) {
         const check = (e) => {
             if (e.event === name) {
                 clearTimeout(timer);
-                const idx = waiters.indexOf(check);
-                if (idx >= 0) waiters.splice(idx, 1);
+                const widx = waiters.indexOf(check);
+                if (widx >= 0) waiters.splice(widx, 1);
+                /* Consume the event so a later nextEvent() for the same name
+                 * waits for a fresh one instead of resolving with this stale
+                 * entry (e.g. the restart flow must observe the *second*
+                 * "stopped", not instantly re-consume the first). */
+                const qidx = eventQueue.indexOf(e);
+                if (qidx >= 0) eventQueue.splice(qidx, 1);
                 resolve(e);
                 return true;
             }
             return false;
         };
-        /* Check already-buffered events first. */
+        /* Check already-buffered (unconsumed) events first. */
         for (const e of eventQueue) {
             if (check(e)) return;
         }
@@ -344,22 +350,41 @@ async function run() {
                'loadedSources: returns ≥1 source');
     }
 
-    /* 9e. restart (optional) — re-run the cart from scratch and stop again */
+    /* 9e. restart (optional) — re-run the cart from scratch and stop again.
+     * Two full cycles: the second proves restart works from an already
+     * restarted session, not just from the initial one.  Mirrors the manual
+     * VS Code flow: restart → breakpoint hit again → locals inspectable. */
     if (TEST_RESTART) {
-        const stopped3P = nextEvent('stopped');
-        await request('restart', {});
-        await nextEvent('initialized');
-        await request('setBreakpoints', {
-            source:      { path: SOURCE_PATH, name: SOURCE_PATH },
-            breakpoints: [{ line: BP_LINE }],
-            lines:       [BP_LINE],
-        });
-        await request('configurationDone');
-        const stopped3 = await stopped3P;
-        assert(
-            stopped3.body.reason === 'breakpoint' || stopped3.body.reason === 'step',
-            `after restart: stopped again (got "${stopped3.body.reason}")`
-        );
+        for (let cycle = 1; cycle <= 2; cycle++) {
+            const stoppedP = nextEvent('stopped');
+            await request('restart', {});
+            await nextEvent('initialized');
+            await request('setBreakpoints', {
+                source:      { path: SOURCE_PATH, name: SOURCE_PATH },
+                breakpoints: [{ line: BP_LINE }],
+                lines:       [BP_LINE],
+            });
+            await request('configurationDone');
+            const stopped = await stoppedP;
+            assert(
+                stopped.body.reason === 'breakpoint' || stopped.body.reason === 'step',
+                `restart ${cycle}: stopped again (got "${stopped.body.reason}")`
+            );
+            /* Locals are inspectable in the restarted session.  At the
+             * line-3 stop, init has executed `local x = 42` but not yet
+             * `local y = x + 1`. */
+            const rStack = await request('stackTrace', { threadId: 1 });
+            const rFrameId = rStack.stackFrames?.[0]?.id ?? 0;
+            const rScopes = await request('scopes', { frameId: rFrameId });
+            const rVars = await request('variables', {
+                variablesReference: rScopes.scopes[0].variablesReference,
+            });
+            const x = (rVars.variables || []).find((v) => v.name === 'x');
+            assert(
+                x && x.value === '42',
+                `restart ${cycle}: local x == 42 in restarted session (got ${x ? x.value : 'missing'})`
+            );
+        }
         await request('continue', { threadId: 1 });
         _closeConn();
         return;

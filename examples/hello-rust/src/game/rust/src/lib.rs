@@ -4,7 +4,7 @@ use alloc::format;
 use core::cell::Cell;
 include!(env!("BLYT_CART_STATE_RS"));
 
-use blyt::buffer::{alloc_slot, get_i32, set_i32};
+use blyt::buffer::{alloc_slot, entity_ref, get_i32, get_u32, ref_slot, ref_valid, set_i32, set_u32};
 
 /// A mutable global for the blyt cart environment.
 ///
@@ -44,7 +44,7 @@ pub extern "C" fn blyt_cart_init() {
 pub extern "C" fn blyt_cart_on_new_state() {
     alloc_slot(S_GLOBALS);
     let slot = alloc_slot(S_CHARACTER);
-    set_i32(S_GLOBALS, 0, S_GLOBALS_PLAYER_ID, slot);
+    set_u32(S_GLOBALS, 0, S_GLOBALS_PLAYER, entity_ref(S_CHARACTER, slot));
     set_i32(S_CHARACTER, slot, S_CHARACTER_X, 160);
     set_i32(S_CHARACTER, slot, S_CHARACTER_Y, 120);
     blyt::console_debug("init player pos: 160, 120");
@@ -55,12 +55,15 @@ pub extern "C" fn blyt_cart_update() {
     let frame = S_FRAME.get() + 1;
     S_FRAME.set(frame);
     if frame % 10 == 0 {
-        let slot = get_i32(S_GLOBALS, 0, S_GLOBALS_PLAYER_ID);
-        let x = (get_i32(S_CHARACTER, slot, S_CHARACTER_X) + 1) % 320;
-        let y = (get_i32(S_CHARACTER, slot, S_CHARACTER_Y) + 1) % 240;
-        set_i32(S_CHARACTER, slot, S_CHARACTER_X, x);
-        set_i32(S_CHARACTER, slot, S_CHARACTER_Y, y);
-        blyt::console_debug(&format!("update frame {} player pos: {}, {}", frame, x, y));
+        let player = get_u32(S_GLOBALS, 0, S_GLOBALS_PLAYER);
+        if ref_valid(S_CHARACTER, player) {
+            let slot = ref_slot(player);
+            let x = (get_i32(S_CHARACTER, slot, S_CHARACTER_X) + 1) % 320;
+            let y = (get_i32(S_CHARACTER, slot, S_CHARACTER_Y) + 1) % 240;
+            set_i32(S_CHARACTER, slot, S_CHARACTER_X, x);
+            set_i32(S_CHARACTER, slot, S_CHARACTER_Y, y);
+            blyt::console_debug(&format!("update frame {} player pos: {}, {}", frame, x, y));
+        }
     }
 }
 
@@ -68,7 +71,7 @@ pub extern "C" fn blyt_cart_update() {
 pub extern "C" fn blyt_cart_draw() {
     let frame = S_FRAME.get();
     if frame % 10 == 0 {
-        let slot = get_i32(S_GLOBALS, 0, S_GLOBALS_PLAYER_ID);
+        let slot = ref_slot(get_u32(S_GLOBALS, 0, S_GLOBALS_PLAYER));
         let x = get_i32(S_CHARACTER, slot, S_CHARACTER_X);
         let y = get_i32(S_CHARACTER, slot, S_CHARACTER_Y);
         blyt::console_debug(&format!("draw frame {} player pos: {}, {}", frame, x, y));

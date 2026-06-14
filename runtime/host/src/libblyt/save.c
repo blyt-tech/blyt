@@ -9,10 +9,12 @@
  *   [16..N] sections: for each buffer:
  *     [0..3]  section tag "CART"
  *     [4..7]  payload_size (uint32): size of buffer name + SOA data + bitset
+ *             + generation counters
  *     [8..11] name_len (uint32)
  *     [12..]  name bytes (name_len, no NUL)
  *             SOA data: n_fields arrays of (count * sizeof(field)) bytes
  *             slot_bitset: BLYT_MAX_SLOTS/8 bytes
+ *             slot_gens: BLYT_MAX_SLOTS uint16 generation counters (ADR-0096)
  */
 
 #include "save.h"
@@ -127,12 +129,14 @@ int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir, const char *c
         const char *name = bc->name ? bc->name : "";
         uint32_t name_len = (uint32_t)strlen(name);
 
-        /* Compute payload size: name_len field (4) + name bytes + SOA + bitset */
+        /* Compute payload size: name_len field (4) + name bytes + SOA +
+         * bitset + generation counters */
         uint32_t payload = 4 + name_len;
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             payload += (uint32_t)(bc->count * field_sizeof_tag(bc->field_types[fi]));
         }
         payload += BLYT_MAX_SLOTS / 8; /* slot bitset */
+        payload += BLYT_MAX_SLOTS * (uint32_t)sizeof(uint16_t); /* slot gens */
 
         /* Section header: tag (4) + payload_size (4) */
         uint8_t sect_hdr[8];
@@ -166,6 +170,12 @@ int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir, const char *c
 
         /* slot bitset */
         if (fwrite(bc->slot_bitset, 1, BLYT_MAX_SLOTS / 8, f) != BLYT_MAX_SLOTS / 8) {
+            fclose(f);
+            return -1;
+        }
+
+        /* slot generation counters (ADR-0096) */
+        if (fwrite(bc->slot_gens, 1, sizeof(bc->slot_gens), f) != sizeof(bc->slot_gens)) {
             fclose(f);
             return -1;
         }
@@ -278,6 +288,12 @@ int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir, const char *ca
 
         /* Read slot bitset */
         if (fread(bc->slot_bitset, 1, BLYT_MAX_SLOTS / 8, f) != BLYT_MAX_SLOTS / 8) {
+            fclose(f);
+            return -1;
+        }
+
+        /* Read slot generation counters (ADR-0096) */
+        if (fread(bc->slot_gens, 1, sizeof(bc->slot_gens), f) != sizeof(bc->slot_gens)) {
             fclose(f);
             return -1;
         }
