@@ -69,7 +69,7 @@ endif()
 # Step 2b: Build libc++ and libc++abi for RV32IMAFC (C++ cart support)
 #
 # Builds a static libc++.a + libc++abi.a from third_party/libcxx (the LLVM
-# monorepo fork) targeting riscv32imafc / ilp32f.  Configured with:
+# monorepo fork) targeting riscv32imafdc / ilp32d.  Configured with:
 # -fno-exceptions -fno-rtti   (mandatory for cart C++ code)
 # LIBCXX_ENABLE_THREADS=OFF   (carts are single-threaded)
 # LIBCXX_ENABLE_FILESYSTEM=OFF (no filesystem access in sandboxed carts)
@@ -115,10 +115,10 @@ else()
   # gc-sections covers both modes.)
   set(_LXX_SECTION_FLAGS "-ffunction-sections -fdata-sections")
   set(_LXX_C_FLAGS
-      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib ${_LXX_SECTION_FLAGS} ${_LXX_MUSL_FLAGS}"
+      "--target=riscv32-linux-gnu -march=rv32imafdc -mabi=ilp32d -nostdlib ${_LXX_SECTION_FLAGS} ${_LXX_MUSL_FLAGS}"
   )
   set(_LXX_CXX_FLAGS
-      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti ${_LXX_SECTION_FLAGS} ${_LXX_MUSL_FLAGS}"
+      "--target=riscv32-linux-gnu -march=rv32imafdc -mabi=ilp32d -nostdlib -fno-exceptions -fno-rtti ${_LXX_SECTION_FLAGS} ${_LXX_MUSL_FLAGS}"
   )
 
   if(FOUND_LLD)
@@ -235,10 +235,10 @@ else()
   )
   set(_LXXD_SECTION_FLAGS "-ffunction-sections -fdata-sections -O0 -g")
   set(_LXXD_C_FLAGS
-      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib ${_LXXD_SECTION_FLAGS} ${_LXXD_MUSL_FLAGS}"
+      "--target=riscv32-linux-gnu -march=rv32imafdc -mabi=ilp32d -nostdlib ${_LXXD_SECTION_FLAGS} ${_LXXD_MUSL_FLAGS}"
   )
   set(_LXXD_CXX_FLAGS
-      "--target=riscv32-linux-gnu -march=rv32imafc -mabi=ilp32f -nostdlib -fno-exceptions -fno-rtti ${_LXXD_SECTION_FLAGS} ${_LXXD_MUSL_FLAGS}"
+      "--target=riscv32-linux-gnu -march=rv32imafdc -mabi=ilp32d -nostdlib -fno-exceptions -fno-rtti ${_LXXD_SECTION_FLAGS} ${_LXXD_MUSL_FLAGS}"
   )
   if(FOUND_LLD)
     # Same -fuse-ld / unused-argument trade-off as the release build above.
