@@ -7,8 +7,11 @@
  * lua_gettable, lua_settable, luaL_requiref, luaL_openlibs — cart code must
  * communicate with Lua exclusively through the BLYT_LUA_EXPORT_* boundary.
  *
- * Matches the Lua 5.4 ABI compiled with LUA_32BITS=1 (lua_Integer=int,
- * lua_Number=float, as used by all blyt Lua VMs). */
+ * Matches the Lua 5.4 ABI compiled with BLYT_LUA_I32_F64 (lua_Integer=int32,
+ * lua_Number=double — Spike U: int32 keeps the 32-bit console identity, while
+ * lua_Number is IEEE double on the hardware-double stack). This MUST match the
+ * blyt Lua VMs' luaconf; a mismatch on lua_Number would, under RV32D, read a
+ * 64-bit double returned in fa0 as a NaN-boxed single → canonical NaN. */
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,9 +23,9 @@ extern "C" {
 typedef struct lua_State lua_State; /* opaque */
 typedef int (*lua_CFunction)(lua_State *L);
 
-/* LUA_32BITS=1: lua_Integer=int, lua_Number=float on RV32. */
+/* BLYT_LUA_I32_F64: lua_Integer=int32, lua_Number=double on RV32. */
 typedef int lua_Integer;
-typedef float lua_Number;
+typedef double lua_Number;
 
 /* Argument extraction — used by BLYT_LUA_EXPORT_* wrapper bodies. */
 extern lua_Integer lua_tointegerx(lua_State *L, int idx, int *isnum);

@@ -121,6 +121,18 @@ static int lua_buf_set_f32(lua_State *L) {
                         (uint32_t)luaL_checkinteger(L, 3), (float)luaL_checknumber(L, 4));
     return 0;
 }
+/* f64 (Spike U): lua_Number is double, so the value round-trips losslessly. */
+static int lua_buf_get_f64(lua_State *L) {
+    lua_pushnumber(L, blyt_buffer_get_f64((uint32_t)luaL_checkinteger(L, 1),
+                                          (int32_t)luaL_checkinteger(L, 2),
+                                          (uint32_t)luaL_checkinteger(L, 3)));
+    return 1;
+}
+static int lua_buf_set_f64(lua_State *L) {
+    blyt_buffer_set_f64((uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                        (uint32_t)luaL_checkinteger(L, 3), (double)luaL_checknumber(L, 4));
+    return 0;
+}
 static int lua_buf_get_i32(lua_State *L) {
     lua_pushinteger(L, blyt_buffer_get_i32((uint32_t)luaL_checkinteger(L, 1),
                                            (int32_t)luaL_checkinteger(L, 2),
@@ -251,6 +263,8 @@ static void register_blyt32(lua_State *L) {
     } buf_fns[] = {
         {"get_f32", lua_buf_get_f32},
         {"set_f32", lua_buf_set_f32},
+        {"get_f64", lua_buf_get_f64},
+        {"set_f64", lua_buf_set_f64},
         {"get_i32", lua_buf_get_i32},
         {"set_i32", lua_buf_set_i32},
         {"get_u32", lua_buf_get_u32},
