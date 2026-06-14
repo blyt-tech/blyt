@@ -116,6 +116,16 @@ pub fn type_tag_rust_type(tag: u8) -> &'static str {
     }
 }
 
+/// LuaLS/EmmyLua type for a state-buffer field (issue #48 item 1b).
+/// Integers map to `integer`, f32 to `number`, bool to `boolean`.
+pub fn type_tag_lua_type(tag: u8) -> &'static str {
+    match tag {
+        TYPE_F32 => "number",
+        TYPE_BOOL => "boolean",
+        _ => "integer",
+    }
+}
+
 pub fn type_tag_buf_get_suffix(tag: u8) -> &'static str {
     match tag {
         TYPE_I8 => "i8",

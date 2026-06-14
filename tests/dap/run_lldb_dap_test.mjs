@@ -33,6 +33,8 @@ if (!process.env.BLYT_TRACE) process.env.BLYT_TRACE = 'gdb,dap,lifecycle,frame';
 
 import { spawn }       from 'child_process';
 import { fileURLToPath } from 'url';
+import { readFileSync } from 'fs';
+import { join }        from 'path';
 
 const [,, lldbDapPath, gdbPort, cartPath, projectCwd, ...rest] = process.argv;
 let testName = 'initialize';
@@ -49,6 +51,30 @@ if (!lldbDapPath || !gdbPort || !cartPath || !projectCwd) {
 
 const breakLine  = parseInt(process.env.BLYT_GDB_BREAK_LINE || '5', 10);
 const sourceFile = process.env.BLYT_SOURCE_FILE || 'main.c';
+
+/* The canonical source path + line to break at for the sdk-source-breakpoint
+ * test (a path inside the SDK-shipped source, e.g. /blyt/sdk/src/...). */
+const sdkBreakFile = process.env.BLYT_SDK_BREAK_FILE || '';
+const sdkBreakLine = parseInt(process.env.BLYT_SDK_BREAK_LINE || '0', 10);
+
+/* Build the lldb `settings set target.source-map …` command from the cart's
+ * source-map manifest (issue #46 §2 / #48 item 2): /blyt/cart → workspace plus
+ * /blyt/sdk, /blyt/rust, /blyt/cargo from build/source-map.json, so breakpoints
+ * and frames in SDK / std / crate source resolve, not just the cart's own. */
+function sourceMapCommand() {
+    const pairs = [['/blyt/cart', projectCwd]];
+    try {
+        const manifest = JSON.parse(
+            readFileSync(join(projectCwd, 'build', 'source-map.json'), 'utf8')
+        );
+        for (const { prefix, local } of manifest) {
+            if (prefix === '/blyt/cart' || prefix === '/blyt/src') continue;
+            if (prefix && local) pairs.push([prefix, local]);
+        }
+    } catch (_) { /* manifest optional — cart mapping alone */ }
+    const args = pairs.map(([c, l]) => `${JSON.stringify(c)} ${JSON.stringify(l)}`).join(' ');
+    return `settings set target.source-map ${args}`;
+}
 
 /* ── Content-Length framing (DAP protocol) ───────────────────────────────── */
 
@@ -161,7 +187,7 @@ async function testSourceBreakpoint() {
             program: cartPath,
             stopOnEntry: true,
             launchCommands: [
-                `settings set target.source-map /blyt/cart ${projectCwd}`,
+                sourceMapCommand(),
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
@@ -204,7 +230,7 @@ async function testAutoStart() {
             program: cartPath,
             stopOnEntry: false,
             launchCommands: [
-                `settings set target.source-map /blyt/cart ${projectCwd}`,
+                sourceMapCommand(),
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
@@ -235,7 +261,7 @@ async function testStackTrace() {
             program: cartPath,
             stopOnEntry: true,
             launchCommands: [
-                `settings set target.source-map /blyt/cart ${projectCwd}`,
+                sourceMapCommand(),
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
@@ -272,7 +298,7 @@ async function testVariables() {
             program: cartPath,
             stopOnEntry: true,
             launchCommands: [
-                `settings set target.source-map /blyt/cart ${projectCwd}`,
+                sourceMapCommand(),
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
@@ -317,7 +343,7 @@ async function testSourceMap() {
             program: cartPath,
             stopOnEntry: true,
             launchCommands: [
-                `settings set target.source-map /blyt/cart ${projectCwd}`,
+                sourceMapCommand(),
                 `gdb-remote 127.0.0.1:${gdbPort}`,
             ],
         };
@@ -355,6 +381,54 @@ async function testSourceMap() {
     });
 }
 
+/* Set a breakpoint by a *canonical SDK* source path:line (e.g. inside the
+ * statically-linked blyt SDK crate), verify it binds against the SDK DWARF, and
+ * — since the cart calls that code — that it fires.  Proves SDK-shipped source +
+ * the manifest source-map resolve end to end (issue #48 item 2). */
+async function testSdkSourceBreakpoint() {
+    if (!sdkBreakFile || !sdkBreakLine) {
+        throw new Error('BLYT_SDK_BREAK_FILE / BLYT_SDK_BREAK_LINE not set');
+    }
+    await runDap(async ({ send, waitEvent }) => {
+        await send('initialize', { adapterID: 'lldb-dap' });
+        const launchP = send('launch', {
+            program: cartPath,
+            stopOnEntry: true,
+            launchCommands: [sourceMapCommand(), `gdb-remote 127.0.0.1:${gdbPort}`],
+        });
+        const stoppedEntry = waitEvent('stopped');
+
+        const resp = await send('setBreakpoints', {
+            source: { path: sdkBreakFile },
+            breakpoints: [{ line: sdkBreakLine }],
+        });
+        const bp = resp.body?.breakpoints?.[0];
+        if (!bp || !bp.verified) {
+            throw new Error(
+                `SDK breakpoint not verified at ${sdkBreakFile}:${sdkBreakLine} ` +
+                `(${bp?.message ?? 'no breakpoint'})`
+            );
+        }
+        console.log(`PASS: SDK-source breakpoint verified at ${sdkBreakFile}:${sdkBreakLine}`);
+
+        await send('configurationDone');
+        await launchP;
+
+        let ev = await stoppedEntry;
+        if (ev.body.reason === 'entry') {
+            send('continue', { threadId: ev.body.threadId });
+            ev = await waitEvent('stopped', 15000);
+        }
+        if (ev.body.reason !== 'breakpoint') {
+            throw new Error(`expected SDK breakpoint to fire, got stop '${ev.body.reason}'`);
+        }
+        /* The top frame's source must resolve to the SDK file via the source-map. */
+        const st = await send('stackTrace', { threadId: ev.body.threadId });
+        const top = st.body.stackFrames?.[0];
+        console.log(`PASS: SDK breakpoint fired; frame 0 = ${top?.name} @ ${top?.source?.path}`);
+    });
+}
+
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
 const tests = {
@@ -364,6 +438,7 @@ const tests = {
     'stack-trace':     testStackTrace,
     variables:         testVariables,
     'source-map':      testSourceMap,
+    'sdk-source-breakpoint': testSdkSourceBreakpoint,
 };
 
 const test = tests[testName];
