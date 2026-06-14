@@ -390,11 +390,11 @@ include(cmake/blyt_guest_libs.cmake)
 set(_LUA_HOST_DIR "${lua_SOURCE_DIR}")
 if(EXISTS "${_LUA_HOST_DIR}/onelua.c")
   add_library(liblua_host STATIC "${_LUA_HOST_DIR}/onelua.c")
-  # MAKE_LIB=1 suppresses main(). BLYT_LUA_I32_F64=1 matches the ilp32f guest bytecode
-  # integer/float sizes so the host VM can load cart bytecode compiled for
-  # RISC-V. BLYT_LUA_I32_F64=1 is PUBLIC so it propagates to callers (cart_load.c)
-  # that include lua.h — keeping function pointer types consistent with the
-  # library.
+  # MAKE_LIB=1 suppresses main(). BLYT_LUA_I32_F64=1 matches the ilp32f guest
+  # bytecode integer/float sizes so the host VM can load cart bytecode compiled
+  # for RISC-V. BLYT_LUA_I32_F64=1 is PUBLIC so it propagates to callers
+  # (cart_load.c) that include lua.h — keeping function pointer types consistent
+  # with the library.
   target_compile_definitions(
     liblua_host
     PRIVATE MAKE_LIB=1
