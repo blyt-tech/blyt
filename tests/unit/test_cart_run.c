@@ -22,12 +22,13 @@
 
 /*
  * rv32emu headers — common.h first to define RV32_HAS, FORCE_INLINE, etc.
+ * RV32EMU_DIR is in the include path; use bare filenames (not third_party/).
  */
-#include "../../third_party/rv32emu/src/common.h"
-#include "../../third_party/rv32emu/src/io.h"
-#include "../../third_party/rv32emu/src/log.h"
-#include "../../third_party/rv32emu/src/riscv.h"
-#include "../../third_party/rv32emu/src/riscv_private.h"
+#include "common.h"
+#include "io.h"
+#include "log.h"
+#include "riscv.h"
+#include "riscv_private.h"
 
 /* blyt ecall constants */
 #include "ecall.h"
