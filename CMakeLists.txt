@@ -156,6 +156,11 @@ set(FLATCC_INSTALL
 set(FLATCC_DEBUG_CLANG_SANITIZE
     OFF
     CACHE BOOL "" FORCE)
+# Newer clang versions flag [[]] empty attributes as -Wc23-extensions;
+# flatcc enables -Werror for Clang, which would turn that into a build error.
+set(FLATCC_ALLOW_WERROR
+    OFF
+    CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(flatcc)
 # flatcc hardcodes PROJECT_SOURCE_DIR/lib as the archive output, which fails
 # when the source is mounted read-only (e.g. Docker :ro). Override it here so
