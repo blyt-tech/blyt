@@ -100,13 +100,14 @@ jobs:
       # Deps are downloaded via CMake FetchContent at configure time into
       # ~/.cache/blyt/fetchcontent/. Cache the directory keyed on a hash of
       # CMakeLists.txt (which contains all URLs and SHA256 values); a dep
-      # version bump in CMakeLists.txt automatically invalidates the cache.
+      # version bump automatically invalidates the cache. No restore-keys
+      # fallback: a partial restore of a previous cache serves stale extracted
+      # source trees that FetchContent reuses without re-downloading.
       - name: FetchContent cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/blyt/fetchcontent
           key: fetchcontent-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: fetchcontent-
 
       - name: Stamp version
         run: |
