@@ -124,12 +124,12 @@ FetchContent_Declare(
     SHA256=6ea4c369d2914a76566202438e9c52ea456c29663460d5893665298123001b67)
 
 # libcxx: curated libcxx+libcxxabi subtree tarball from blyt-tech/llvm-project.
-set(LIBCXX_VERSION "v22.1.5-blyt-v0-p2")
+set(LIBCXX_VERSION "v22.1.5-blyt-v0-p3")
 FetchContent_Declare(
   libcxx
   URL "https://github.com/blyt-tech/llvm-project/releases/download/${LIBCXX_VERSION}/libcxx-${LIBCXX_VERSION}.tar.gz"
   URL_HASH
-    SHA256=06b183a4c8958cba93719883f5840410119cc23d26a568ad3932b4bdd675bf8f)
+    SHA256=b43606f28b5b68b4741c7ab4a461ab9bb790b01cbe8866a5011c809c6a56ce53)
 
 # Populate deps that don't have their own CMakeLists.txt we want added as a
 # cmake subdirectory.  flatcc uses FetchContent_MakeAvailable below (it has a
