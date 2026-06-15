@@ -1,0 +1,28 @@
+name: Release rv32emu
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create (e.g. g044cdb7-blyt-v0-p3)"
+        required: true
+        type: string
+
+jobs:
+  release:
+    name: Tag and release rv32emu ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone rv32emu fork with softfloat
+        run: |
+          git clone "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/blyt-tech/rv32emu.git" \
+            third_party/rv32emu
+          git -C third_party/rv32emu checkout blyt-patches-v0
+          git -C third_party/rv32emu submodule update --init src/softfloat
+
+      - name: Run release script
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: bash scripts/release-rv32emu.sh "${{ inputs.tag }}"

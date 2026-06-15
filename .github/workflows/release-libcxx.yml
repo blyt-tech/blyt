@@ -1,0 +1,28 @@
+name: Release libcxx
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create (e.g. v22.1.5-blyt-v0-p5)"
+        required: true
+        type: string
+
+jobs:
+  release:
+    name: Tag and release libcxx ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone llvm-project fork
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/blyt-tech/llvm-project.git" \
+            third_party/libcxx
+          git -C third_party/libcxx checkout blyt-patches-v0
+
+      - name: Run release script
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: bash scripts/release-libcxx.sh "${{ inputs.tag }}"

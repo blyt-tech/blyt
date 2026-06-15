@@ -1,0 +1,31 @@
+name: Release fork dep
+
+on:
+  workflow_dispatch:
+    inputs:
+      dep:
+        description: "Dependency name (e.g. musl)"
+        required: true
+        type: string
+      tag:
+        description: "Tag to create (e.g. v1.2.6-blyt-v0-p1)"
+        required: true
+        type: string
+
+jobs:
+  release:
+    name: Tag and release ${{ inputs.dep }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone fork
+        run: |
+          git clone "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/blyt-tech/${{ inputs.dep }}.git" \
+            third_party/${{ inputs.dep }}
+          git -C third_party/${{ inputs.dep }} checkout blyt-patches-v0
+
+      - name: Run release script
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: bash scripts/release-dep.sh "${{ inputs.dep }}" "${{ inputs.tag }}"
