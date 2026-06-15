@@ -82,9 +82,9 @@ if [[ -d "${LIBCXX_DIR}/llvm/cmake" ]]; then
     cp -r "${LIBCXX_DIR}/llvm/cmake" "${STAGE_DIR}/llvm/cmake"
 fi
 
-# libc/ partial: __support, hdr, and shared headers
-# libc/src/__support and libc/hdr are pulled in by libcxx/src via
-# -I${libcxx_SOURCE_DIR}/libc; libc/shared is used by shared utilities.
+# libc/ partial: __support, hdr, include, and shared headers.
+# libcxx/src is compiled with -I${libc_root} so any path of the form
+# libc/<subdir>/... reachable from libcxx sources must be present.
 if [[ -d "${LIBCXX_DIR}/libc" ]]; then
     mkdir -p "${STAGE_DIR}/libc/src"
     if [[ -d "${LIBCXX_DIR}/libc/src/__support" ]]; then
@@ -92,6 +92,9 @@ if [[ -d "${LIBCXX_DIR}/libc" ]]; then
     fi
     if [[ -d "${LIBCXX_DIR}/libc/hdr" ]]; then
         cp -r "${LIBCXX_DIR}/libc/hdr" "${STAGE_DIR}/libc/hdr"
+    fi
+    if [[ -d "${LIBCXX_DIR}/libc/include" ]]; then
+        cp -r "${LIBCXX_DIR}/libc/include" "${STAGE_DIR}/libc/include"
     fi
     if [[ -d "${LIBCXX_DIR}/libc/shared" ]]; then
         cp -r "${LIBCXX_DIR}/libc/shared" "${STAGE_DIR}/libc/shared"
