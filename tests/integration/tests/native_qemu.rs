@@ -11,7 +11,7 @@
 /// Silently skipped if images or qemu-system-riscv64 are not present.
 mod common;
 
-use common::{CartProject, has_luac, repo_root, sdk_dir, write_c_cart_project};
+use common::{CartProject, build_dir, has_luac, repo_root, sdk_dir, write_c_cart_project};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -392,6 +392,28 @@ function draw() end
     );
     qemu.ssh_ok("chmod +x /tmp/blyt_gate/blyt_native");
 
+    // Test binaries: cross-compiled on the host via libblyt32_native_so target.
+    let test_bin_dir = build_dir().join("test-rv32");
+    let seccomp_test = test_bin_dir.join("seccomp_restricted_test");
+    let fcsr_debug = test_bin_dir.join("fcsr_debug_test");
+    let fcsr_release = test_bin_dir.join("fcsr_release_test");
+    for bin in [&seccomp_test, &fcsr_debug, &fcsr_release] {
+        assert!(
+            bin.exists(),
+            "{} not found — rebuild: cmake --build build --target libblyt32_native_so",
+            bin.display()
+        );
+        assert!(
+            qemu.scp_to(bin, "/tmp/blyt_gate/"),
+            "scp {} failed",
+            bin.display()
+        );
+    }
+    qemu.ssh_ok(
+        "chmod +x /tmp/blyt_gate/seccomp_restricted_test \
+         /tmp/blyt_gate/fcsr_debug_test /tmp/blyt_gate/fcsr_release_test",
+    );
+
     // Native RV32 runtime libraries.  libblytc.so is the thin wrapper that
     // DT_NEEDs ld-blyt.so.1 (system musl) so carts can resolve stdlib symbols.
     for lib in ["libblyt32.so", "libblytcommon.so", "libblytc.so"] {
@@ -435,52 +457,6 @@ function draw() end
             "scp hybrid_metal.blyt failed"
         );
     }
-
-    // fcsr_frame_test.c — staged for FCSR gates 5 & 6.
-    qemu.scp_to(
-        &repo_root().join("tests/native/fcsr_frame_test.c"),
-        "/tmp/blyt_gate/",
-    );
-
-    // ── Seccomp test binary (optional) ───────────────────────────────
-    //
-    // Requires riscv32-linux-musl-gcc in the VM (not installed by default).
-    // Cross-compilation of the ILP32 test binary from the CI host requires a
-    // musl-riscv32 sysroot not currently available in CI.
-    let have_seccomp_test = {
-        // SCP the source and header if the compiler is available in the VM.
-        let compiler_present = qemu.ssh_ok("command -v riscv32-linux-musl-gcc");
-        if compiler_present {
-            qemu.scp_to(
-                &repo_root().join("tests/native/seccomp_restricted_test.c"),
-                "/tmp/blyt_gate/",
-            );
-            qemu.ssh_ok("mkdir -p /tmp/blyt_gate/seccomp_h");
-            qemu.scp_to(
-                &repo_root().join("frontends/native/src/libblyt32/seccomp_restricted.h"),
-                "/tmp/blyt_gate/seccomp_h/",
-            );
-            let built = qemu
-                .ssh(
-                    "riscv32-linux-musl-gcc \
-                     -I/tmp/blyt_gate/seccomp_h \
-                     -o /tmp/blyt_gate/seccomp_restricted_test \
-                     /tmp/blyt_gate/seccomp_restricted_test.c 2>&1",
-                )
-                .status
-                .success();
-            if !built {
-                eprintln!("  note: seccomp_restricted_test build failed — gate 2 skipped");
-            }
-            built
-        } else {
-            eprintln!(
-                "  note: riscv32-linux-musl-gcc not in VM — \
-                 restricted seccomp gate will be skipped"
-            );
-            false
-        }
-    };
 
     // ── Diagnostics ───────────────────────────────────────────────────
     // Print environment info before the gate test to help diagnose failures.
@@ -535,19 +511,21 @@ function draw() end
     println!("  PASS: output = {:?}", stdout.trim());
 
     // ── Gate 2: restricted seccomp blocks socket(2) ──────────────────────
-    if have_seccomp_test {
-        println!("Gate 2: restricted seccomp blocks socket(2)...");
-        let out = qemu.ssh("/tmp/blyt_gate/seccomp_restricted_test 2>&1");
-        // SIGSYS (31) → shell exit code 128+31 = 159
-        let rc = out.status.code().unwrap_or(-1);
-        assert_eq!(
-            rc, 159,
-            "expected exit 159 (SIGSYS) from seccomp_restricted_test, got {rc}"
-        );
-        println!("  PASS: exit {rc} (SIGSYS)");
-    } else {
-        println!("Gate 2: SKIP (riscv32-linux-musl-gcc not available in QEMU VM)");
-    }
+    println!("Gate 2: restricted seccomp blocks socket(2)...");
+    let out2 = qemu.ssh("/tmp/blyt_gate/seccomp_restricted_test 2>&1; echo __exit:$?");
+    let out2_txt = String::from_utf8_lossy(&out2.stdout);
+    // macOS OpenSSH returns 255 (not 128+31=159) for SIGSYS-killed processes,
+    // so we read the exit code from the shell's echo instead of out2.status.
+    let inner_rc: i32 = out2_txt
+        .lines()
+        .find(|l| l.starts_with("__exit:"))
+        .and_then(|l| l.trim_start_matches("__exit:").parse().ok())
+        .unwrap_or(-1);
+    assert_eq!(
+        inner_rc, 159,
+        "expected exit 159 (SIGSYS) from seccomp_restricted_test, got {inner_rc}\noutput: {out2_txt}"
+    );
+    println!("  PASS: exit {inner_rc} (SIGSYS)");
 
     // ── Gate 3: FCSR clean — no spurious warning ──────────────────────
     //
@@ -597,65 +575,34 @@ function draw() end
     }
 
     // ── Gates 5 & 6: FCSR standalone binary (debug + release) ────────
-    //
-    // fcsr_frame_test.c contains the check logic inlined so -DNDEBUG at
-    // compile time independently selects the debug (warn+continue) or
-    // release (abort) path, regardless of how libblyt32.so was built.
-    let have_gcc = qemu.ssh_ok("command -v riscv32-linux-musl-gcc");
-    if have_gcc {
-        // Gate 5: debug build — warns, exits 0.
-        println!("Gate 5: FCSR standalone — debug warn (no NDEBUG)...");
-        let build5 = qemu.ssh(
-            "riscv32-linux-musl-gcc \
-             -o /tmp/blyt_gate/fcsr_debug_test \
-             /tmp/blyt_gate/fcsr_frame_test.c 2>&1",
-        );
-        assert!(
-            build5.status.success(),
-            "fcsr_debug_test build failed: {}",
-            String::from_utf8_lossy(&build5.stdout)
-        );
-        let out5 = qemu.ssh("/tmp/blyt_gate/fcsr_debug_test 2>&1");
-        let output5 = String::from_utf8_lossy(&out5.stdout);
-        assert!(
-            out5.status.success(),
-            "fcsr_debug_test exited non-zero ({:?})\noutput: {output5}",
-            out5.status.code()
-        );
-        assert!(
-            output5.contains("non-default FP rounding mode"),
-            "expected FCSR warning in debug standalone output\noutput: {output5}"
-        );
-        println!("  PASS: warning present, exit 0");
+    println!("Gate 5: FCSR standalone — debug warn (no NDEBUG)...");
+    let out5 = qemu.ssh("/tmp/blyt_gate/fcsr_debug_test 2>&1");
+    let output5 = String::from_utf8_lossy(&out5.stdout);
+    assert!(
+        out5.status.success(),
+        "fcsr_debug_test exited non-zero ({:?})\noutput: {output5}",
+        out5.status.code()
+    );
+    assert!(
+        output5.contains("non-default FP rounding mode"),
+        "expected FCSR warning in debug output\noutput: {output5}"
+    );
+    println!("  PASS: warning present, exit 0");
 
-        // Gate 6: release build — aborts, exits 1.
-        println!("Gate 6: FCSR standalone — release abort (-DNDEBUG)...");
-        let build6 = qemu.ssh(
-            "riscv32-linux-musl-gcc -DNDEBUG \
-             -o /tmp/blyt_gate/fcsr_release_test \
-             /tmp/blyt_gate/fcsr_frame_test.c 2>&1",
-        );
-        assert!(
-            build6.status.success(),
-            "fcsr_release_test build failed: {}",
-            String::from_utf8_lossy(&build6.stdout)
-        );
-        let out6 = qemu.ssh("/tmp/blyt_gate/fcsr_release_test 2>&1");
-        let output6 = String::from_utf8_lossy(&out6.stdout);
-        assert_eq!(
-            out6.status.code().unwrap_or(-1),
-            1,
-            "expected exit 1 from fcsr_release_test, got {:?}\noutput: {output6}",
-            out6.status.code()
-        );
-        assert!(
-            output6.contains("aborting for determinism"),
-            "expected abort message in release standalone output\noutput: {output6}"
-        );
-        println!("  PASS: abort message present, exit 1");
-    } else {
-        println!("Gates 5 & 6: SKIP (riscv32-linux-musl-gcc not available in QEMU VM)");
-    }
+    println!("Gate 6: FCSR standalone — release abort (-DNDEBUG)...");
+    let out6 = qemu.ssh("/tmp/blyt_gate/fcsr_release_test 2>&1");
+    let output6 = String::from_utf8_lossy(&out6.stdout);
+    assert_eq!(
+        out6.status.code().unwrap_or(-1),
+        1,
+        "expected exit 1 from fcsr_release_test, got {:?}\noutput: {output6}",
+        out6.status.code()
+    );
+    assert!(
+        output6.contains("aborting for determinism"),
+        "expected abort message in release output\noutput: {output6}"
+    );
+    println!("  PASS: abort message present, exit 1");
 
     // ── Gate 7: pure Lua cart ─────────────────────────────────────────
     if have_lua_gate {
