@@ -57,7 +57,10 @@ echo "==> Creating tarball with softfloat embedded: ${TARBALL_NAME}"
 # so the tarball root is rv32emu's root (not rv32emu-<tag>/).
 git -C "${RV32EMU_DIR}" archive --format=tar --prefix="" "${TAG}" \
     | tar -x -C "${WORK_DIR}" -f -
-# Copy the softfloat subtree (not tracked by the tag, it's a submodule)
+# git archive leaves an empty src/softfloat/ stub for the submodule gitlink.
+# Remove it before copying so cp -r places softfloat AT src/softfloat, not
+# inside it (cp -r src DST/existing-dir copies src INTO DST/existing-dir).
+rm -rf "${WORK_DIR}/src/softfloat"
 cp -r "${RV32EMU_DIR}/src/softfloat" "${WORK_DIR}/src/softfloat"
 # Re-pack as .tar.gz
 tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" \
