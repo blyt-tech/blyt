@@ -813,6 +813,20 @@ void blyt_cart_update(void) {
     CHECK(restored == r2);                         /* s9 */
     CHECK(blyt_buffer_ref_valid(S_ENTITY, restored)); /* s10 */
 
+    /* s11-s13: fill the remaining entity slots (count: 4, one already used) */
+    {
+        int32_t extra_count = 0;
+        for (;;) {
+            int32_t slot = -1;
+            if (blyt_buffer_alloc_slot(S_ENTITY, &slot) != BLYT_OK)
+                break;
+            extra_count++;
+        }
+        /* 1 slot occupied (e=0 restored by save_read); 3 more fill count=4 */
+        CHECK(extra_count == 3);                 /* s11 */
+        blyt_console_debug("alloc_limit: 4\n");
+    }
+
     blyt_console_debug("ref-metal-ok");
     blyt_quit();
 }
@@ -848,6 +862,10 @@ void blyt_cart_draw(void) {}
         assert!(
             output.contains("ref-metal-ok"),
             "expected 'ref-metal-ok' in output (entity refs on metal)\noutput: {output}"
+        );
+        assert!(
+            output.contains("alloc_limit: 4"),
+            "expected 'alloc_limit: 4' in output (slot count enforced on metal)\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
     }

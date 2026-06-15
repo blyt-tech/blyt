@@ -277,6 +277,11 @@ static uint8_t s_slot_bits[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS / 8];
  * match the emulated path (state_buffer.c) exactly for determinism. */
 static uint16_t s_gen[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS];
 
+/* Per-buffer declared slot count from .cart.layouts, loaded at startup.
+ * Initialised to NATIVE_MAX_SLOTS in load_cart_buf_counts(); until then the
+ * array is zero (BSS) but slot functions are not called before startup. */
+static uint32_t s_buf_count[NATIVE_MAX_BUF];
+
 static uint16_t native_gen(uint32_t bi, int32_t s) {
     return (uint16_t)(s_gen[bi][s] + 1u);
 }
@@ -305,7 +310,7 @@ static int slot_allocated(uint32_t bi, int32_t slot) {
  * The slot must be allocated: the emulated path (state_buffer.c) rejects
  * get/set on unallocated slots, so the native path must too. */
 static int ref_ok(uint32_t bi, int32_t slot, uint32_t fi) {
-    return bi < NATIVE_MAX_BUF && slot >= 0 && (uint32_t)slot < NATIVE_MAX_SLOTS &&
+    return bi < NATIVE_MAX_BUF && slot >= 0 && (uint32_t)slot < s_buf_count[bi] &&
            fi < NATIVE_MAX_FIELDS && slot_allocated(bi, slot);
 }
 
@@ -315,7 +320,219 @@ static int ref_ok(uint32_t bi, int32_t slot, uint32_t fi) {
  * musl ILP32 ld.so does not invoke .init_array constructors on this
  * custom entry path (issue #43); called explicitly here instead.
  */
+
+/* Parse the cart ELF's .cart.layouts section to load per-buffer declared slot
+ * counts into s_buf_count[].  Must be called before blyt_install_restricted_filter():
+ * uses openat/statx/mmap/munmap which are in the launcher's RV32 filter but not
+ * in the restricted filter.  On any error the NATIVE_MAX_SLOTS defaults stand.
+ *
+ * FlatBuffer layout assumed (schemas/cart_layouts.fbs):
+ *   CartLayouts: field 1 (buffers) at vtable offset 6
+ *   BufferDecl:  field 2 (count)   at vtable offset 8
+ */
+static void load_cart_buf_counts(void) {
+    /* Safe defaults until/unless the ELF is parsed successfully. */
+    for (uint32_t bi = 0; bi < NATIVE_MAX_BUF; bi++)
+        s_buf_count[bi] = NATIVE_MAX_SLOTS;
+
+    const char *path = getenv("BLYT_CART_PATH");
+    if (!path || !path[0])
+        return;
+
+    int fd = blyt_rs_openat(NATIVE_AT_FDCWD, path, NATIVE_O_RDONLY, 0);
+    if (fd < 0)
+        return;
+
+    /* Get file size via statx (syscall 291; allowed by launcher RV32 filter).
+     * struct statx is 256 bytes; stx_size (uint64_t) is at byte offset 40. */
+    char stx[256];
+    blyt32_native_memset(stx, 0, sizeof(stx));
+    {
+        register long a0 __asm__("a0") = NATIVE_AT_FDCWD;
+        register const char *a1 __asm__("a1") = path;
+        register long a2 __asm__("a2") = 0; /* AT_STATX_SYNC_AS_STAT */
+        register long a3 __asm__("a3") = 0x200; /* STATX_SIZE */
+        register char *a4 __asm__("a4") = stx;
+        register long a7 __asm__("a7") = 291; /* SYS_statx */
+        __asm__ volatile("ecall"
+                         : "+r"(a0)
+                         : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)
+                         : "memory");
+        if (a0 != 0) {
+            blyt_rs_close(fd);
+            return;
+        }
+    }
+    /* stx_size (uint64_t LE) at offset 40; low 32 bits suffice for any cart. */
+    uint32_t file_size;
+    blyt32_native_memcpy(&file_size, stx + 40, 4);
+    if (file_size < 52u) { /* smaller than an ELF32 header */
+        blyt_rs_close(fd);
+        return;
+    }
+
+    /* Map the cart ELF read-only (syscall 222; allowed before restricted filter). */
+    void *map;
+    {
+        register long a0 __asm__("a0") = 0; /* addr = NULL */
+        register long a1 __asm__("a1") = file_size;
+        register long a2 __asm__("a2") = 1; /* PROT_READ */
+        register long a3 __asm__("a3") = 2; /* MAP_PRIVATE */
+        register long a4 __asm__("a4") = fd;
+        register long a5 __asm__("a5") = 0; /* offset = 0 */
+        register long a7 __asm__("a7") = 222; /* SYS_mmap */
+        __asm__ volatile("ecall"
+                         : "+r"(a0)
+                         : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
+                         : "memory");
+        map = (void *)a0;
+    }
+    blyt_rs_close(fd);
+    /* mmap error: low 32 bits ≥ 0xFFFFF000 (last 4 KiB of address space). */
+    if ((uint32_t)(unsigned long)map >= 0xFFFFF000u)
+        return;
+
+    const uint8_t *m = (const uint8_t *)map;
+
+    /* ── Inline ELF32 parse (no elf.h; offsets from the ELF spec) ── */
+    /* ELF32 header: e_shoff at 32 (u32), e_shnum at 48 (u16), e_shstrndx at 50 (u16). */
+    uint32_t e_shoff;
+    uint16_t e_shnum, e_shstrndx;
+    blyt32_native_memcpy(&e_shoff, m + 32, 4);
+    blyt32_native_memcpy(&e_shnum, m + 48, 2);
+    blyt32_native_memcpy(&e_shstrndx, m + 50, 2);
+    /* Each Elf32_Shdr is 40 bytes. */
+    if (e_shoff == 0 || e_shnum == 0 || e_shstrndx >= e_shnum ||
+        (uint64_t)e_shoff + (uint64_t)e_shnum * 40u > file_size)
+        goto done;
+
+    const uint8_t *shdrs = m + e_shoff;
+
+    /* String table: sh_offset at Shdr+16 (u32), sh_size at Shdr+20 (u32). */
+    const uint8_t *strtab_shdr = shdrs + (uint32_t)e_shstrndx * 40u;
+    uint32_t strtab_off, strtab_size;
+    blyt32_native_memcpy(&strtab_off, strtab_shdr + 16, 4);
+    blyt32_native_memcpy(&strtab_size, strtab_shdr + 20, 4);
+    if (strtab_off == 0 || strtab_size == 0 || (uint64_t)strtab_off + strtab_size > file_size)
+        goto done;
+    const char *strtab = (const char *)(m + strtab_off);
+
+    /* Find .cart.layouts section. */
+    static const char kLayouts[] = ".cart.layouts";
+    uint32_t layouts_off = 0, layouts_size = 0;
+    for (uint16_t si = 0; si < e_shnum; si++) {
+        const uint8_t *shdr = shdrs + (uint32_t)si * 40u;
+        uint32_t sh_name;
+        blyt32_native_memcpy(&sh_name, shdr, 4);
+        if (sh_name >= strtab_size)
+            continue;
+        const char *sname = strtab + sh_name;
+        int match = 1;
+        for (unsigned int ci = 0; ci < sizeof(kLayouts); ci++) {
+            if (sname[ci] != kLayouts[ci]) {
+                match = 0;
+                break;
+            }
+        }
+        if (!match)
+            continue;
+        blyt32_native_memcpy(&layouts_off, shdr + 16, 4);
+        blyt32_native_memcpy(&layouts_size, shdr + 20, 4);
+        break;
+    }
+    if (layouts_off == 0 || layouts_size <= 8 || (uint64_t)layouts_off + layouts_size > file_size)
+        goto done;
+
+    /* Skip 8-byte CLAY preamble ("CLAY" + u16 major + u16 minor). */
+    const uint8_t *fb = m + layouts_off + 8;
+    uint32_t fb_size = layouts_size - 8u;
+    if (fb_size < 8u)
+        goto done;
+
+    /* ── Inline FlatBuffer parse (CartLayouts root) ── */
+    /* Root uoffset: *(u32*)fb → CartLayouts table address. */
+    uint32_t root_off;
+    blyt32_native_memcpy(&root_off, fb, 4);
+    if (root_off + 4u > fb_size)
+        goto done;
+    const uint8_t *table = fb + root_off;
+
+    /* Vtable: soffset at table[0..3]; vtable = table - soffset.
+     * soffset = table_addr - vtable_addr (positive ⇒ vtable is before table). */
+    int32_t vtab_soff;
+    blyt32_native_memcpy(&vtab_soff, table, 4);
+    uint32_t table_fb_off = (uint32_t)(table - fb);
+    if (vtab_soff <= 0 || (uint32_t)vtab_soff > table_fb_off)
+        goto done;
+    const uint8_t *vtable = table - (uint32_t)vtab_soff;
+    /* Vtable: vtsize(u16), objsize(u16), then field offsets (u16 each).
+     * CartLayouts field 1 (buffers vector) is at vtable byte offset 6. */
+    uint16_t vtsize;
+    blyt32_native_memcpy(&vtsize, vtable, 2);
+    if (vtsize < 8u || (uint32_t)(vtable - fb) + vtsize > fb_size)
+        goto done;
+    uint16_t buffers_foff; /* field offset within the table object */
+    blyt32_native_memcpy(&buffers_foff, vtable + 6, 2);
+    if (buffers_foff == 0)
+        goto done; /* buffers field not present */
+
+    /* Field value: uoffset at table + buffers_foff, relative to itself. */
+    const uint8_t *fptr = table + buffers_foff;
+    if (fptr + 4u > fb + fb_size)
+        goto done;
+    uint32_t vec_uoff;
+    blyt32_native_memcpy(&vec_uoff, fptr, 4);
+    const uint8_t *vec = fptr + vec_uoff;
+    if (vec + 4u > fb + fb_size)
+        goto done;
+
+    /* Vector: u32 length, then u32 element uoffsets (each relative to itself). */
+    uint32_t vec_len;
+    blyt32_native_memcpy(&vec_len, vec, 4);
+    uint32_t n = vec_len < NATIVE_MAX_BUF ? vec_len : NATIVE_MAX_BUF;
+
+    for (uint32_t bi = 0; bi < n; bi++) {
+        const uint8_t *eref = vec + 4u + bi * 4u;
+        if (eref + 4u > fb + fb_size)
+            break;
+        uint32_t elem_uoff;
+        blyt32_native_memcpy(&elem_uoff, eref, 4);
+        const uint8_t *elem = eref + elem_uoff;
+        if (elem + 4u > fb + fb_size)
+            continue;
+
+        /* BufferDecl vtable: field 2 (count) at vtable byte offset 8. */
+        int32_t e_soff;
+        blyt32_native_memcpy(&e_soff, elem, 4);
+        uint32_t elem_fb_off = (uint32_t)(elem - fb);
+        if (e_soff <= 0 || (uint32_t)e_soff > elem_fb_off)
+            continue;
+        const uint8_t *e_vtable = elem - (uint32_t)e_soff;
+        uint16_t e_vtsize;
+        blyt32_native_memcpy(&e_vtsize, e_vtable, 2);
+        if (e_vtsize < 10u || (uint32_t)(e_vtable - fb) + e_vtsize > fb_size)
+            continue;
+        uint16_t count_foff;
+        blyt32_native_memcpy(&count_foff, e_vtable + 8, 2);
+        if (count_foff == 0)
+            continue; /* count field absent; leave default */
+        const uint8_t *count_ptr = elem + count_foff;
+        if (count_ptr + 4u > fb + fb_size)
+            continue;
+        uint32_t count;
+        blyt32_native_memcpy(&count, count_ptr, 4);
+        s_buf_count[bi] = count < NATIVE_MAX_SLOTS ? count : NATIVE_MAX_SLOTS;
+    }
+
+done:;
+    register long a0 __asm__("a0") = (long)map;
+    register long a1 __asm__("a1") = file_size;
+    register long a7 __asm__("a7") = 215; /* SYS_munmap */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+}
+
 void blyt_runtime_startup(void) {
+    load_cart_buf_counts(); /* must precede restricted filter (uses statx/mmap) */
     if (blyt_install_restricted_filter() != 0) {
         static const char msg[] = "libblyt32: FATAL: seccomp install failed\n";
         blyt_rs_write(2, msg, sizeof(msg) - 1);
@@ -561,7 +778,7 @@ blyt_result_t blyt_buffer_alloc_slot(blyt_buffer_h b, int32_t *out_slot) {
     uint32_t bi = b - 1u;
     if (bi >= NATIVE_MAX_BUF || !out_slot)
         return BLYT_ERR_INVALID_ARG;
-    for (int32_t i = 0; i < NATIVE_MAX_SLOTS; i++) {
+    for (int32_t i = 0; i < (int32_t)s_buf_count[bi]; i++) {
         uint32_t byte = (uint32_t)i / 8u, bit = (uint32_t)i % 8u;
         if (!(s_slot_bits[bi][byte] & (uint8_t)(1u << bit))) {
             s_slot_bits[bi][byte] |= (uint8_t)(1u << bit);
@@ -578,7 +795,7 @@ blyt_result_t blyt_buffer_free_slot(blyt_buffer_h b, int32_t s) {
     uint32_t bi = b - 1u;
     /* Match the emulated path (state_buffer.c): freeing an unallocated slot
      * is an error and must not bump the generation counter. */
-    if (bi >= NATIVE_MAX_BUF || s < 0 || (uint32_t)s >= NATIVE_MAX_SLOTS || !slot_allocated(bi, s))
+    if (bi >= NATIVE_MAX_BUF || s < 0 || (uint32_t)s >= s_buf_count[bi] || !slot_allocated(bi, s))
         return BLYT_ERR_INVALID_ARG;
     blyt32_trace_call("buf_free_slot", (long)s, 0, 0);
     s_slot_bits[bi][(uint32_t)s / 8u] &= (uint8_t)~(1u << ((uint32_t)s % 8u));
@@ -597,7 +814,7 @@ blyt_result_t blyt_buffer_free_slot(blyt_buffer_h b, int32_t s) {
 blyt_entity_ref_t blyt_buffer_ref(blyt_buffer_h b, int32_t s) {
     uint32_t bi = b - 1u;
     blyt_entity_ref_t ref = 0;
-    if (bi < NATIVE_MAX_BUF && s >= 0 && (uint32_t)s < NATIVE_MAX_SLOTS && slot_allocated(bi, s))
+    if (bi < NATIVE_MAX_BUF && s >= 0 && (uint32_t)s < s_buf_count[bi] && slot_allocated(bi, s))
         ref = ((uint32_t)native_gen(bi, s) << 16) | (uint32_t)s;
     blyt32_trace_call("buf_ref", (long)s, 1, (long)ref);
     return ref;
@@ -606,7 +823,7 @@ blyt_entity_ref_t blyt_buffer_ref(blyt_buffer_h b, int32_t s) {
 bool blyt_buffer_ref_valid(blyt_buffer_h b, blyt_entity_ref_t ref) {
     uint32_t bi = b - 1u;
     int32_t s = (int32_t)(ref & 0xFFFFu);
-    int v = ref != 0 && bi < NATIVE_MAX_BUF && (uint32_t)s < NATIVE_MAX_SLOTS &&
+    int v = ref != 0 && bi < NATIVE_MAX_BUF && (uint32_t)s < s_buf_count[bi] &&
             slot_allocated(bi, s) && native_gen(bi, s) == (uint16_t)(ref >> 16);
     blyt32_trace_call("buf_ref_valid", (long)ref, 1, (long)v);
     return v != 0;
