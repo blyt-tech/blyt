@@ -455,6 +455,9 @@ if(EXISTS "${SF_SRC}/f64_add.c")
   # Core SoftFloat: all s_*.c and f32/f64/f128/conversion files.  Exclude extF80
   # (80-bit), M-variant (multi-word array), bf16, f16.
   file(GLOB SF_ALL "${SF_SRC}/*.c")
+  # Exclude macOS AppleDouble sidecar files (._*) that libarchive may extract
+  # from tarballs containing LIBARCHIVE.xattr PAX headers.
+  list(FILTER SF_ALL EXCLUDE REGEX "/\\._")
   foreach(
     _EXCL_PATTERN
     "${SF_SRC}/extF80*"
