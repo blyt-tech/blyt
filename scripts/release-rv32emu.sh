@@ -61,10 +61,12 @@ git -C "${RV32EMU_DIR}" archive --format=tar --prefix="" "${TAG}" \
 # Remove it before copying so cp -r places softfloat AT src/softfloat, not
 # inside it (cp -r src DST/existing-dir copies src INTO DST/existing-dir).
 rm -rf "${WORK_DIR}/src/softfloat"
-cp -r "${RV32EMU_DIR}/src/softfloat" "${WORK_DIR}/src/softfloat"
-# Re-pack as .tar.gz
+# COPYFILE_DISABLE prevents macOS from copying ._* resource-fork sidecar files.
+COPYFILE_DISABLE=1 cp -r "${RV32EMU_DIR}/src/softfloat" "${WORK_DIR}/src/softfloat"
+# Re-pack as .tar.gz; exclude macOS ._* resource-fork sidecars just in case.
 tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" \
     --exclude="./${TARBALL_NAME}" \
+    --exclude='._*' \
     .
 
 echo "==> Creating GitHub release and uploading tarball"
