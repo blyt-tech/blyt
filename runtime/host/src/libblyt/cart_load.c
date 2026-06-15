@@ -1212,10 +1212,42 @@ uint32_t blyt_cart_lua_lifecycle_mask(const blyt_cart_t *cart) {
     lua_State *L = luaL_newstate();
     if (!L)
         return 0;
-    if (luaL_loadbuffer(L, (const char *)lua_bytes, lua_size, "@cart") != LUA_OK ||
-        lua_pcall(L, 0, 0, 0) != LUA_OK) {
-        lua_close(L);
-        return 0;
+
+    /* Handle BLMC multi-chunk format (multi-file carts, issue #54). */
+    const unsigned char *data = (const unsigned char *)lua_bytes;
+    size_t remaining = lua_size;
+    if (remaining >= 8 && data[0] == 'B' && data[1] == 'L' && data[2] == 'M' && data[3] == 'C') {
+        unsigned int nchunks = (unsigned int)data[4] | ((unsigned int)data[5] << 8) |
+                               ((unsigned int)data[6] << 16) | ((unsigned int)data[7] << 24);
+        data += 8;
+        remaining -= 8;
+        for (unsigned int ci = 0; ci < nchunks; ci++) {
+            if (remaining < 4) {
+                lua_close(L);
+                return 0;
+            }
+            unsigned int csz = (unsigned int)data[0] | ((unsigned int)data[1] << 8) |
+                               ((unsigned int)data[2] << 16) | ((unsigned int)data[3] << 24);
+            data += 4;
+            remaining -= 4;
+            if (csz > remaining) {
+                lua_close(L);
+                return 0;
+            }
+            if (luaL_loadbuffer(L, (const char *)data, csz, "@chunk") != LUA_OK ||
+                lua_pcall(L, 0, 0, 0) != LUA_OK) {
+                lua_close(L);
+                return 0;
+            }
+            data += csz;
+            remaining -= csz;
+        }
+    } else {
+        if (luaL_loadbuffer(L, (const char *)lua_bytes, lua_size, "@cart") != LUA_OK ||
+            lua_pcall(L, 0, 0, 0) != LUA_OK) {
+            lua_close(L);
+            return 0;
+        }
     }
     uint32_t mask = 0;
     for (int k = 0; k < 8; k++) {

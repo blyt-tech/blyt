@@ -337,23 +337,65 @@ static lua_State *open_state(void) {
         cart_lua_modules(L);
 
     if (cart_lua_bytecode && cart_lua_bytecode_size) {
-        blyt_console_debug("open_state: before luaL_loadbuffer");
-        int load_result =
-            luaL_loadbuffer(L, (const char *)cart_lua_bytecode, cart_lua_bytecode_size, "@cart");
-        blyt_console_debug(load_result == LUA_OK ? "open_state: loadbuffer OK"
-                                                 : "open_state: loadbuffer FAILED");
-        if (load_result != LUA_OK) {
-            blyt_console_debug(lua_tostring(L, -1));
-            lua_close(L);
-            return NULL;
+        blyt_console_debug("open_state: before load lua bytecode");
+        const unsigned char *data = cart_lua_bytecode;
+        unsigned int remaining = cart_lua_bytecode_size;
+
+        if (remaining >= 8 && data[0] == 'B' && data[1] == 'L' && data[2] == 'M' &&
+            data[3] == 'C') {
+            /* BLMC multi-chunk format: each file compiled as its own chunk
+             * with its own source name and line numbers (issue #54). */
+            unsigned int nchunks = (unsigned int)data[4] | ((unsigned int)data[5] << 8) |
+                                   ((unsigned int)data[6] << 16) | ((unsigned int)data[7] << 24);
+            data += 8;
+            remaining -= 8;
+            for (unsigned int ci = 0; ci < nchunks; ci++) {
+                if (remaining < 4) {
+                    blyt_console_debug("open_state: BLMC truncated");
+                    lua_close(L);
+                    return NULL;
+                }
+                unsigned int csz = (unsigned int)data[0] | ((unsigned int)data[1] << 8) |
+                                   ((unsigned int)data[2] << 16) | ((unsigned int)data[3] << 24);
+                data += 4;
+                remaining -= 4;
+                if (csz > remaining) {
+                    blyt_console_debug("open_state: BLMC chunk size overflow");
+                    lua_close(L);
+                    return NULL;
+                }
+                if (luaL_loadbuffer(L, (const char *)data, csz, "@chunk") != LUA_OK) {
+                    blyt_console_debug(lua_tostring(L, -1));
+                    lua_close(L);
+                    return NULL;
+                }
+                if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+                    blyt_console_debug(lua_tostring(L, -1));
+                    lua_close(L);
+                    return NULL;
+                }
+                data += csz;
+                remaining -= csz;
+            }
+        } else {
+            int load_result = luaL_loadbuffer(L, (const char *)cart_lua_bytecode,
+                                              cart_lua_bytecode_size, "@cart");
+            blyt_console_debug(load_result == LUA_OK ? "open_state: loadbuffer OK"
+                                                     : "open_state: loadbuffer FAILED");
+            if (load_result != LUA_OK) {
+                blyt_console_debug(lua_tostring(L, -1));
+                lua_close(L);
+                return NULL;
+            }
+            blyt_console_debug("open_state: before lua_pcall");
+            if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+                blyt_console_debug(lua_tostring(L, -1));
+                lua_close(L);
+                return NULL;
+            }
+            blyt_console_debug("open_state: lua_pcall done");
         }
-        blyt_console_debug("open_state: before lua_pcall");
-        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-            blyt_console_debug(lua_tostring(L, -1));
-            lua_close(L);
-            return NULL;
-        }
-        blyt_console_debug("open_state: lua_pcall done");
+        blyt_console_debug("open_state: lua bytecode loaded");
     }
 
     return L;
