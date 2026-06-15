@@ -64,12 +64,12 @@ _blyt_fc_local(libopenmpt libopenmpt libopenmpt/libopenmpt.h)
 
 # ── Upstream deps (auto-generated GitHub tarballs) ───────────────────────
 
-set(LUA_VERSION "v5.4.7")
+set(LUA_VERSION "v5.5.0")
 FetchContent_Declare(
   lua
   URL "https://github.com/lua/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=5c39111b3fc4c1c9e56671008955a1730f54a15b95e1f1bd0752b868b929d8e3)
+    SHA256=a33484f7ce4c14e12ea4d51cc5a7353bff2796a8074004b96ae2dc246f33f16e)
 
 set(FLATCC_VERSION "v0.6.1")
 FetchContent_Declare(
