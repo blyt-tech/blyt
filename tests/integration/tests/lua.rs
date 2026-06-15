@@ -1373,3 +1373,53 @@ fn lua_per_callback_mix_libretro() {
     run_cart_libretro(&cart, "lua-init");
     run_cart_libretro(&cart, "native-update");
 }
+
+// ── Spike U: f64 bridge coverage ──────────────────────────────────────────
+
+fn build_lua_c_hybrid_fp_error_unwind_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_fp_unwind");
+    CartProject::new()
+        .c(r#"
+#include "blyt.h"
+#include "blyt_lua_internal.h"
+
+BLYT_LUA_EXPORT_RAW(blow_up) {
+    lua_Number a = luaL_checknumber(L, 1);
+    lua_Number b = luaL_checknumber(L, 2);
+    (void)a; (void)b;
+    luaL_error(L, "test error");
+    return 0;
+}
+"#)
+        .lua(
+            r#"
+function init()
+    local x = 0.123456789012345
+    local ok, err = pcall(blow_up, x, x)
+    if not ok and x == 0.123456789012345 then
+        blyt32.debug.print("fp unwind ok")
+    else
+        blyt32.debug.print("fp unwind fail")
+    end
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+/// Bridge FP-register snapshot/restore: after a bridged call raises luaL_error
+/// and pcall catches it, callee-saved FP regs must be restored so subsequent
+/// f64 values are intact.  WASM-only: the snapshot path is not exercised on
+/// the native rv32 path (no bridge).
+#[test]
+fn lua_c_hybrid_fp_error_unwind_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_hybrid_fp_error_unwind_cart(tmp.path());
+    run_cart_wasm(&cart, "fp unwind ok");
+}
