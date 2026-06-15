@@ -29,11 +29,11 @@ if [[ $# -ne 1 ]]; then
 fi
 
 TAG="$1"
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LIBCXX_DIR="${REPO_DIR}/third_party/libcxx"
+REPO_DIR="${BLYT_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+LIBCXX_DIR="${BLYT_DEP_DIR:-${REPO_DIR}/third_party/libcxx}"
 REPO_SLUG="blyt-tech/llvm-project"
 
-if [[ ! -d "${LIBCXX_DIR}/.git" ]]; then
+if ! git -C "${LIBCXX_DIR}" rev-parse --git-dir > /dev/null 2>&1; then
     echo "Error: ${LIBCXX_DIR} is not a git repository." >&2
     echo "Clone blyt-tech/llvm-project there first:" >&2
     echo "  git clone https://github.com/blyt-tech/llvm-project third_party/libcxx" >&2

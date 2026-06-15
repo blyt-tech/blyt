@@ -25,10 +25,10 @@ fi
 
 DEP="$1"
 TAG="$2"
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DEP_DIR="${REPO_DIR}/third_party/${DEP}"
+REPO_DIR="${BLYT_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+DEP_DIR="${BLYT_DEP_DIR:-${REPO_DIR}/third_party/${DEP}}"
 
-if [[ ! -d "${DEP_DIR}/.git" ]]; then
+if ! git -C "${DEP_DIR}" rev-parse --git-dir > /dev/null 2>&1; then
     echo "Error: ${DEP_DIR} is not a git repository." >&2
     echo "Clone the blyt-tech/${DEP} fork there first:" >&2
     echo "  git clone https://github.com/blyt-tech/${DEP} third_party/${DEP}" >&2

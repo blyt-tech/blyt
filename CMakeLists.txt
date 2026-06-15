@@ -106,30 +106,30 @@ FetchContent_Declare(
 # the fork tags and tarballs exist, clone the fork into third_party/<dep> — the
 # auto-detection macro above will pick it up at configure time.
 
-# rv32emu: custom tarball with softfloat submodule embedded. Run
-# scripts/release-rv32emu.sh to create tag + tarball, then fill in here. Tag
-# convention: g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
-set(RV32EMU_VERSION "TODO-run-scripts/release-rv32emu.sh")
+# rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
+# g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
+set(RV32EMU_VERSION "g4c3ab7c-blyt-v0-p4")
 FetchContent_Declare(
   rv32emu
   URL "https://github.com/blyt-tech/rv32emu/releases/download/${RV32EMU_VERSION}/rv32emu-${RV32EMU_VERSION}.tar.gz"
-  URL_HASH SHA256=TODO)
+  URL_HASH
+    SHA256=bfdd8c14848434d9c78ef40bbf539d370477e38720c2b8b910ec05da4b1024f1)
 
-# musl: auto-generated GitHub tarball from blyt-tech/musl. Run
-# scripts/release-dep.sh musl v1.2.6-blyt-v0-p1, then fill in here.
-set(MUSL_VERSION "TODO-run-scripts/release-dep.sh")
+# musl: auto-generated GitHub tarball from blyt-tech/musl.
+set(MUSL_VERSION "v1.2.6-blyt-v0-p1")
 FetchContent_Declare(
   musl
   URL "https://github.com/blyt-tech/musl/archive/refs/tags/${MUSL_VERSION}.tar.gz"
-  URL_HASH SHA256=TODO)
+  URL_HASH
+    SHA256=6ea4c369d2914a76566202438e9c52ea456c29663460d5893665298123001b67)
 
 # libcxx: curated libcxx+libcxxabi subtree tarball from blyt-tech/llvm-project.
-# Run scripts/release-libcxx.sh v22.1.5-blyt-v0-p5, then fill in here.
-set(LIBCXX_VERSION "TODO-run-scripts/release-libcxx.sh")
+set(LIBCXX_VERSION "v22.1.5-blyt-v0-p1")
 FetchContent_Declare(
   libcxx
   URL "https://github.com/blyt-tech/llvm-project/releases/download/${LIBCXX_VERSION}/libcxx-${LIBCXX_VERSION}.tar.gz"
-  URL_HASH SHA256=TODO)
+  URL_HASH
+    SHA256=13263377a0cd36854df6caca34b3c3cb1aca0bc5b42052074b86013c3d5b6348)
 
 # Populate deps that don't have their own CMakeLists.txt we want added as a
 # cmake subdirectory.  flatcc uses FetchContent_MakeAvailable below (it has a

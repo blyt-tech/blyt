@@ -25,11 +25,11 @@ if [[ $# -ne 1 ]]; then
 fi
 
 TAG="$1"
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-RV32EMU_DIR="${REPO_DIR}/third_party/rv32emu"
+REPO_DIR="${BLYT_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+RV32EMU_DIR="${BLYT_DEP_DIR:-${REPO_DIR}/third_party/rv32emu}"
 REPO_SLUG="blyt-tech/rv32emu"
 
-if [[ ! -d "${RV32EMU_DIR}/.git" ]]; then
+if ! git -C "${RV32EMU_DIR}" rev-parse --git-dir > /dev/null 2>&1; then
     echo "Error: ${RV32EMU_DIR} is not a git repository." >&2
     echo "Clone blyt-tech/rv32emu there first:" >&2
     echo "  git clone https://github.com/blyt-tech/rv32emu third_party/rv32emu" >&2
