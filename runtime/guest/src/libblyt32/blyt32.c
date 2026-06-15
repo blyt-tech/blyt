@@ -230,3 +230,8 @@ __attribute__((noreturn)) void blyt_exit(int code) {
     __asm__ volatile("ecall" : : "r"(a0), "r"(a7));
     __builtin_unreachable();
 }
+
+/* No-op on emulated targets; native libblyt32.so overrides with the
+ * real seccomp install + FCSR reset. */
+void blyt_runtime_startup(void) {
+}

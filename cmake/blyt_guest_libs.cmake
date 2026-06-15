@@ -833,6 +833,57 @@ if(BLYT_BUILD_NATIVE)
       "${SDK_LIB_NATIVE}/libblyt32.so" "${SDK_LIB_NATIVE}/libblytc.so"
       "${SDK_LIB_NATIVE}/libblytcommon.so")
 
+  # ── RV32 native test binaries (QEMU gates 2, 5, 6) ──────────────────────────
+  # Self-contained executables compiled with -nostdlib; no musl sysroot needed.
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test-rv32")
+
+  set(_RV32_EXE_FLAGS
+      --target=riscv32-linux-gnu
+      -march=rv32imafc
+      -mabi=ilp32f
+      -O2
+      -nostdlib
+      -static
+      "-fuse-ld=${BLYT_RV32_LLD}")
+
+  set(_SECCOMP_TEST_OUT "${CMAKE_BINARY_DIR}/test-rv32/seccomp_restricted_test")
+  add_custom_command(
+    OUTPUT "${_SECCOMP_TEST_OUT}"
+    COMMAND "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS}
+            -I "${LIBBLYT32_NATIVE_INC}"
+            -o "${_SECCOMP_TEST_OUT}"
+            "${CMAKE_SOURCE_DIR}/tests/native/seccomp_restricted_test.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/native/seccomp_restricted_test.c"
+            "${LIBBLYT32_NATIVE_INC}/seccomp_restricted.h"
+    COMMENT "Cross-compiling seccomp_restricted_test (RV32 ILP32F)"
+    VERBATIM)
+
+  set(_FCSR_TEST_SRC "${CMAKE_SOURCE_DIR}/tests/native/fcsr_frame_test.c")
+  set(_FCSR_DEBUG_OUT "${CMAKE_BINARY_DIR}/test-rv32/fcsr_debug_test")
+  set(_FCSR_RELEASE_OUT "${CMAKE_BINARY_DIR}/test-rv32/fcsr_release_test")
+  add_custom_command(
+    OUTPUT "${_FCSR_DEBUG_OUT}"
+    COMMAND "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS}
+            -o "${_FCSR_DEBUG_OUT}"
+            "${_FCSR_TEST_SRC}"
+    DEPENDS "${_FCSR_TEST_SRC}"
+    COMMENT "Cross-compiling fcsr_debug_test (RV32 ILP32F)"
+    VERBATIM)
+  add_custom_command(
+    OUTPUT "${_FCSR_RELEASE_OUT}"
+    COMMAND "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS}
+            -DNDEBUG
+            -o "${_FCSR_RELEASE_OUT}"
+            "${_FCSR_TEST_SRC}"
+    DEPENDS "${_FCSR_TEST_SRC}"
+    COMMENT "Cross-compiling fcsr_release_test (RV32 ILP32F, -DNDEBUG)"
+    VERBATIM)
+
+  list(APPEND _native_outputs
+       "${_SECCOMP_TEST_OUT}"
+       "${_FCSR_DEBUG_OUT}"
+       "${_FCSR_RELEASE_OUT}")
+
   # Native libblyt32lua.so — Lua VM + bindings for trusted native exec.
   # ld-blyt.so.1 does not export libc symbols under standard names, so the
   # needed functionality is embedded directly (curated musl subset compiled as a

@@ -105,6 +105,7 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     /* blyt lifecycle (blyt.h / libblytcommon.so) */
     "blyt_main", /* imported by _blyt_entry */
     "blyt_exit", /* imported by _blyt_entry; calls exit_group on native path */
+    "blyt_runtime_startup", /* imported by _blyt_entry; seccomp+FCSR init (issue #43) */
     "blyt_console_debug",
     "blyt_quit",
     "blyt_frame_done",
