@@ -146,6 +146,11 @@ static int child_main(struct launcher_opts *o) {
     if (o->do_validate && validate_cart(o->cart_argv[0]) != 0)
         return 127;
 
+    if (setenv("BLYT_CART_PATH", o->cart_argv[0], 1) != 0) {
+        fprintf(stderr, "blyt_native: setenv BLYT_CART_PATH: %s\n", strerror(errno));
+        return 127;
+    }
+
     if (o->lib_dir) {
         if (setenv("LD_LIBRARY_PATH", o->lib_dir, 1) != 0) {
             fprintf(stderr, "blyt_native: setenv LD_LIBRARY_PATH: %s\n", strerror(errno));
