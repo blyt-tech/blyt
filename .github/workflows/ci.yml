@@ -51,11 +51,9 @@ jobs:
           # still builds on stable. Keep this dated nightly in sync with
           # CART_RUST_TOOLCHAIN in devtool/src/build.rs.
           rustup toolchain install nightly-2026-06-01 --profile minimal --component rust-src
-          # The Rust-cart integration tests gate on the riscv32 target being
-          # installed (has_rust_riscv_target); add it to stable to match
-          # Dockerfile.testing. (build-std supplies std from source; this just
-          # satisfies the test's availability check.)
-          rustup target add riscv32imafc-unknown-none-elf
+          # has_rust_riscv_target() checks for this toolchain by name.
+          # Cart builds use a custom JSON target (riscv32imafdc-blyt-none-elf)
+          # via -Z build-std, so no rustup target add is needed or meaningful.
 
       # v16: v14's cache client predates the cache-service-v2 migration and
       # fails with HTTP 400, so every run reinstalled emsdk into a random
