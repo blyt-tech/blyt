@@ -156,8 +156,8 @@ set(FLATCC_INSTALL
 set(FLATCC_DEBUG_CLANG_SANITIZE
     OFF
     CACHE BOOL "" FORCE)
-# Newer clang versions flag [[]] empty attributes as -Wc23-extensions;
-# flatcc enables -Werror for Clang, which would turn that into a build error.
+# Newer clang versions flag [[]] empty attributes as -Wc23-extensions; flatcc
+# enables -Werror for Clang, which would turn that into a build error.
 set(FLATCC_ALLOW_WERROR
     OFF
     CACHE BOOL "" FORCE)
