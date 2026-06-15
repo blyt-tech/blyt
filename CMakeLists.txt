@@ -228,6 +228,9 @@ file(WRITE "${SOFTFLOAT_PLATFORM_DIR}/platform.h" "")
 # handful of other files) must be excluded.  We glob the source directory then
 # remove those files explicitly.
 file(GLOB SOFTFLOAT_SOURCES "${SOFTFLOAT_SRC}/*.c")
+# Exclude macOS AppleDouble sidecar files (._*) that libarchive may extract from
+# tarballs containing LIBARCHIVE.xattr PAX headers on Linux.
+list(FILTER SOFTFLOAT_SOURCES EXCLUDE REGEX "/\\._")
 set(SOFTFLOAT_EXCLUDE_NAMES
     # Non-FAST_INT64 M-word-array helpers
     bf16_isSignalingNaN.c

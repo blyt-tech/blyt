@@ -61,12 +61,18 @@ git -C "${RV32EMU_DIR}" archive --format=tar --prefix="" "${TAG}" \
 # Remove it before copying so cp -r places softfloat AT src/softfloat, not
 # inside it (cp -r src DST/existing-dir copies src INTO DST/existing-dir).
 rm -rf "${WORK_DIR}/src/softfloat"
-# COPYFILE_DISABLE prevents macOS from copying ._* resource-fork sidecar files.
+# COPYFILE_DISABLE prevents macOS cp from creating ._* resource-fork sidecars
+# and from copying extended attributes to the destination.
 COPYFILE_DISABLE=1 cp -r "${RV32EMU_DIR}/src/softfloat" "${WORK_DIR}/src/softfloat"
-# Re-pack as .tar.gz; exclude macOS ._* resource-fork sidecars just in case.
-tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" \
+# Strip all extended attributes (e.g. com.apple.provenance) from the work tree
+# before packing. Without this, macOS tar embeds xattrs as LIBARCHIVE.xattr.*
+# PAX headers; libarchive on Linux then extracts them as ._* AppleDouble files,
+# which clang tries to compile as C source.
+xattr -rc "${WORK_DIR}"
+# Re-pack as .tar.gz. COPYFILE_DISABLE=1 additionally tells macOS tar (bsdtar)
+# not to include Mac-specific metadata in the archive.
+COPYFILE_DISABLE=1 tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" \
     --exclude="./${TARBALL_NAME}" \
-    --exclude='._*' \
     .
 
 echo "==> Creating GitHub release and uploading tarball"
