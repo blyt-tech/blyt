@@ -784,9 +784,10 @@ static void bridge_lua_op(riscv_t *rv) {
         } else if (opcode == BLYT_LUA_OP_PUSHINTEGER) {
             lua_pushinteger(EX, (lua_Integer)(int32_t)a2);
         } else {
-            float f;
-            memcpy(&f, &a2, 4);
-            lua_pushnumber(EX, (lua_Number)f);
+            uint64_t bits = (uint64_t)a3 << 32 | (uint64_t)a2;
+            double d;
+            memcpy(&d, &bits, 8);
+            lua_pushnumber(EX, (lua_Number)d);
         }
         break;
     }
@@ -806,9 +807,18 @@ static void bridge_lua_op(riscv_t *rv) {
             aux = (uint32_t)isnum;
         } else if (opcode == BLYT_LUA_OP_TONUMBERX) {
             int isnum = 0;
-            float f = (float)lua_tonumberx(EX, ai, &isnum);
-            memcpy(&val, &f, 4);
-            aux = (uint32_t)isnum;
+            double d = (double)lua_tonumberx(EX, ai, &isnum);
+            if (isnum) {
+                uint64_t bits;
+                memcpy(&bits, &d, 8);
+                val = (uint32_t)bits;
+                aux = (uint32_t)(bits >> 32);
+                /* st remains BLYT_LUA_ST_OK */
+            } else {
+                st = BLYT_LUA_ST_NIL;
+                val = 0;
+                aux = 0;
+            }
         } else {
             val = (uint32_t)lua_toboolean(EX, ai);
         }

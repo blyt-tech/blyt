@@ -103,10 +103,10 @@ enum {
     BLYT_LUA_OP_PUSHNIL = 5, /* () */
     BLYT_LUA_OP_PUSHBOOLEAN = 6, /* (b) */
     BLYT_LUA_OP_PUSHINTEGER = 7, /* (n) */
-    BLYT_LUA_OP_PUSHNUMBER = 8, /* (f32 bits) */
+    BLYT_LUA_OP_PUSHNUMBER = 8, /* (lo_u32, hi_u32) — f64 lo+hi pair (Spike U) */
     BLYT_LUA_OP_PUSHLSTRING = 9, /* (ptr, len) */
     BLYT_LUA_OP_TOINTEGERX = 10, /* (idx) -> n, aux=isnum */
-    BLYT_LUA_OP_TONUMBERX = 11, /* (idx) -> f32 bits, aux=isnum */
+    BLYT_LUA_OP_TONUMBERX = 11, /* (idx) -> lo_u32+hi_u32 f64; ST_NIL if !isnum (Spike U) */
     BLYT_LUA_OP_TOBOOLEAN = 12, /* (idx) -> 0/1 */
     BLYT_LUA_OP_TOLSTRING = 13, /* (idx, buf, cap) -> wrote, aux=full len */
     BLYT_LUA_OP_CREATETABLE = 14, /* (narr, nrec) */

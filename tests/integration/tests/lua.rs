@@ -1423,3 +1423,58 @@ fn lua_c_hybrid_fp_error_unwind_wasm() {
     let cart = build_lua_c_hybrid_fp_error_unwind_cart(tmp.path());
     run_cart_wasm(&cart, "fp unwind ok");
 }
+
+fn build_lua_c_hybrid_f64_number_cart(tmp: &std::path::Path) -> std::path::PathBuf {
+    let project = tmp.join("lua_c_f64_number");
+    CartProject::new()
+        .c(r#"
+#include "blyt.h"
+#include "blyt_lua_internal.h"
+
+BLYT_LUA_EXPORT_RAW(f64_echo) {
+    lua_Number v = luaL_checknumber(L, 1);
+    lua_pushnumber(L, v);
+    return 1;
+}
+"#)
+        .lua(
+            r#"
+local EXPECT = 0.123456789012345
+function init()
+    local got = f64_echo(EXPECT)
+    if got == EXPECT then
+        blyt32.debug.print("lua+c f64 ok")
+    else
+        blyt32.debug.print("lua+c f64 fail")
+    end
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+/// lua_Number (double) round-trips through the Lua C API without precision
+/// loss on native rv32.
+#[test]
+fn lua_c_hybrid_f64_number_native() {
+    require_sdk();
+    require_lua_sdk();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_hybrid_f64_number_cart(tmp.path());
+    run_cart_native(&cart, "lua+c f64 ok");
+}
+
+/// lua_Number (double) round-trips through the ECALL bridge without the
+/// top-32-bit truncation that the f32 wire format caused pre-fix.
+#[test]
+fn lua_c_hybrid_f64_number_wasm() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let tmp = TempDir::new().unwrap();
+    let cart = build_lua_c_hybrid_f64_number_cart(tmp.path());
+    run_cart_wasm(&cart, "lua+c f64 ok");
+}

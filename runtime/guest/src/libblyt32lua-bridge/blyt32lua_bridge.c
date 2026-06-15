@@ -158,9 +158,9 @@ void lua_pushinteger(lua_State *L, lua_Integer n) {
 }
 
 void lua_pushnumber(lua_State *L, lua_Number n) {
-    uint32_t bits;
-    __builtin_memcpy(&bits, &n, 4);
-    bridge_op(OP_PUSHNUMBER, L, bits, 0, 0, NULL, NULL);
+    uint64_t bits;
+    __builtin_memcpy(&bits, &n, 8);
+    bridge_op(OP_PUSHNUMBER, L, (uint32_t)bits, (uint32_t)(bits >> 32), 0, NULL, NULL);
 }
 
 const char *lua_pushlstring(lua_State *L, const char *s, size_t_blyt len) {
@@ -186,13 +186,16 @@ lua_Integer lua_tointegerx(lua_State *L, int idx, int *isnum) {
 }
 
 lua_Number lua_tonumberx(lua_State *L, int idx, int *isnum) {
-    uint32_t v, aux;
-    bridge_op(OP_TONUMBERX, L, (uint32_t)idx, 0, 0, &v, &aux);
+    uint32_t lo, hi;
+    uint32_t st = bridge_op(OP_TONUMBERX, L, (uint32_t)idx, 0, 0, &lo, &hi);
     if (isnum)
-        *isnum = (int)aux;
-    lua_Number f;
-    __builtin_memcpy(&f, &v, 4);
-    return f;
+        *isnum = (st == ST_OK) ? 1 : 0;
+    if (st != ST_OK)
+        return (lua_Number)0;
+    uint64_t bits = (uint64_t)hi << 32 | (uint64_t)lo;
+    lua_Number d;
+    __builtin_memcpy(&d, &bits, 8);
+    return d;
 }
 
 int lua_toboolean(lua_State *L, int idx) {
