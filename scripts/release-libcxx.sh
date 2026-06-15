@@ -69,11 +69,18 @@ mkdir -p "${STAGE_DIR}"
 #   libc/src/__support  utility headers pulled in by libcxx
 #   libc/shared         shared utility headers
 #   cmake/              LLVM CMake modules (LLVMVersion.cmake etc.)
+#   llvm/cmake/modules/ AddLLVM, HandleLLVMOptions, GetHostTriple — required
+#                       by runtimes/CMakeLists.txt via hard-coded relative path
+#                       "${CMAKE_CURRENT_SOURCE_DIR}/../llvm/cmake/modules"
 for subtree in runtimes libcxx libcxxabi cmake; do
     if [[ -d "${LIBCXX_DIR}/${subtree}" ]]; then
         cp -r "${LIBCXX_DIR}/${subtree}" "${STAGE_DIR}/${subtree}"
     fi
 done
+if [[ -d "${LIBCXX_DIR}/llvm/cmake" ]]; then
+    mkdir -p "${STAGE_DIR}/llvm"
+    cp -r "${LIBCXX_DIR}/llvm/cmake" "${STAGE_DIR}/llvm/cmake"
+fi
 
 # libc/ partial: only __support and shared headers
 if [[ -d "${LIBCXX_DIR}/libc" ]]; then
