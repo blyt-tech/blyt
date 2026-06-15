@@ -548,6 +548,20 @@ function isHybridCart(projectDir) {
     return langs.has('lua') && langs.size > 1;
 }
 
+/* Return the cart's machine `id` from blyt.info.yaml — this is what
+ * `blyt build` uses for the output filename (`<id>.blyt`), see
+ * default_output in devtool/src/build.rs.  Falls back to the directory
+ * basename when the manifest is missing or unparseable, matching the old
+ * behaviour for projects where dir name == id (every in-repo example). */
+function cartId(projectDir) {
+    const p = path.join(projectDir, 'blyt.info.yaml');
+    try {
+        const info = yaml.load(fs.readFileSync(p, 'utf8'));
+        if (info && typeof info.id === 'string' && info.id) return info.id;
+    } catch { /* fall through to basename */ }
+    return path.basename(projectDir);
+}
+
 /* Find any blyt cart project (Lua or native) for the current context.
  * Returns { projectDir, cart } or null. */
 function detectAnyCart(folder) {
@@ -559,8 +573,8 @@ function detectAnyCart(folder) {
     for (const start of candidates) {
         const projectDir = findCartProject(start);
         if (projectDir) {
-            const name = path.basename(projectDir);
-            const cart = path.join(projectDir, 'build', `${name}.blyt`);
+            const id = cartId(projectDir);
+            const cart = path.join(projectDir, 'build', `${id}.blyt`);
             return { projectDir, cart };
         }
     }
@@ -1261,3 +1275,11 @@ function deactivate() {
 }
 
 module.exports = { activate, deactivate };
+
+/* Pure cart-detection helpers exported for unit testing (see test/). These
+ * have no VS Code dependency; test/cart-detection.test.js stubs the `vscode`
+ * module so this file can be required under plain node. */
+module.exports._test = {
+    findCartProject, readBuildManifest, cartLanguages,
+    isLuaCart, isHybridCart, cartId, detectAnyCart,
+};
