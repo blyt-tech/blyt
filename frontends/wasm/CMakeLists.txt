@@ -216,6 +216,9 @@ file(MAKE_DIRECTORY "${SOFTFLOAT_PLATFORM_DIR}")
 file(WRITE "${SOFTFLOAT_PLATFORM_DIR}/platform.h" "")
 
 file(GLOB SOFTFLOAT_SOURCES "${SOFTFLOAT_SRC}/*.c")
+# Exclude macOS AppleDouble sidecar files (._*) that libarchive may extract from
+# tarballs containing LIBARCHIVE.xattr PAX headers.
+list(FILTER SOFTFLOAT_SOURCES EXCLUDE REGEX "/\\._")
 set(SOFTFLOAT_EXCLUDE_NAMES
     # Non-FAST_INT64 M-word-array helpers
     bf16_isSignalingNaN.c

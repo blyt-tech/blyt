@@ -197,6 +197,15 @@ function(blyt_guest_objects outvar objns)
       continue()
     endif()
     file(RELATIVE_PATH _rel "${CMAKE_SOURCE_DIR}" "${_src}")
+    if(_rel MATCHES "^\\.\\.")
+      # Source is outside the source tree (e.g. FetchContent cache).  A relative
+      # path starting with ".." would escape the per-variant objns directory,
+      # collapsing output paths across variants and triggering cmake's "already
+      # has a custom rule" error.  Use an MD5-addressed path instead.
+      get_filename_component(_fname "${_src}" NAME)
+      string(MD5 _hash "${_src}")
+      set(_rel "_ext/${_hash}/${_fname}")
+    endif()
     set(_obj "${GUEST_OBJ_ROOT}/${objns}/${_rel}.o")
     get_filename_component(_objdir "${_obj}" DIRECTORY)
     file(MAKE_DIRECTORY "${_objdir}")
