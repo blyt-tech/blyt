@@ -231,6 +231,56 @@ function draw() end
     );
 }
 
+/// f64 field survives a save/load round-trip for a native Lua cart (Spike U).
+#[test]
+fn lua_cart_all_field_types_round_trips() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_sb_types");
+
+    CartProject::new()
+        .config(ALL_TYPES_CONFIG)
+        .lua(
+            r#"
+-- buf_id=1 (types), field_idx=2 (v_f64).
+local slot = -1
+local EXPECT = 0.123456789012345
+
+function init()
+    slot = blyt.buf.alloc_slot(1)
+    blyt.buf.set_f64(1, slot, 2, EXPECT)
+    blyt.save_write(0)
+    blyt.buf.set_f64(1, slot, 2, 0.0)
+end
+
+function update()
+    blyt.save_read(0)
+    local v = blyt.buf.get_f64(1, 0, 2)
+    if v == EXPECT then
+        blyt.debug.print("types_ok")
+    else
+        blyt.debug.print("types_fail")
+    end
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_native_with_env(
+        &cart,
+        &[("BLYT_SAVE_DIR", save_dir.path().to_str().unwrap())],
+        "types_ok",
+    );
+}
+
 /// Save/load round-trip for a C++ cart.
 #[test]
 fn cpp_cart_state_buffer_round_trips() {
@@ -1516,6 +1566,53 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
     run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "score=42");
+}
+
+/// f64 field survives a save/load round-trip for a pure-Lua WASM cart (Spike U).
+/// Exercises the host-side wasm_register_state_api path (wasm_buf_get/set_f64).
+#[test]
+fn wasm_lua_cart_all_field_types_round_trips() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_lua_sb_types");
+
+    CartProject::new()
+        .config(ALL_TYPES_CONFIG)
+        .lua(
+            r#"
+-- buf_id=1 (types), field_idx=2 (v_f64).
+local slot = -1
+local EXPECT = 0.123456789012345
+
+function init()
+    slot = blyt.buf.alloc_slot(1)
+    blyt.buf.set_f64(1, slot, 2, EXPECT)
+    blyt.save_write(0)
+    blyt.buf.set_f64(1, slot, 2, 0.0)
+end
+
+function update()
+    blyt.save_read(0)
+    local v = blyt.buf.get_f64(1, 0, 2)
+    if v == EXPECT then
+        blyt.debug.print("types_ok")
+    else
+        blyt.debug.print("types_fail")
+    end
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "types_ok");
 }
 
 /// S proxy global works in the WASM pure-Lua path.  wasm_register_s_proxy()
