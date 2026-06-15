@@ -1730,8 +1730,8 @@ pub(crate) fn find_rust_sdk(sdk_include: &Path) -> Result<PathBuf, BuildError> {
 /* -------------------------------------------------------------------------
  * Rust staticlib build
  *
- * Invokes `cargo build --release` targeting riscv32imafc-unknown-none-elf
- * (ADR-0108, spike-o-results: corrected target string).  The SDK crate is
+ * Invokes `cargo build --release` targeting riscv32imafdc-blyt-none-elf
+ * (custom JSON target, ADR-0108 + ADR-0132).  The SDK crate is
  * injected via --config so game code declares `blyt = "0.1"` and cargo
  * resolves to the SDK path at build time without hard-coding it.
  *
