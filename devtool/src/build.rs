@@ -1148,19 +1148,11 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         let bytecode_path = build_dir.join("bytecode.luac");
         let mut luac_cmd = Command::new(&luac);
         luac_cmd.arg("-o").arg(&bytecode_path);
-        // Embed a canonical /blyt/cart/… chunk name instead of the absolute build
-        // path luac would otherwise use, so the bytecode is machine-independent
-        // and the DAP layer can reverse-map Lua source paths (issue #46 §6, closes
-        // #26).  Multiple files compile to one chunk; it takes the first file's
-        // canonical name (the long-standing single-chunk limitation is unchanged).
-        if let Some(rel) = lua_files
-            .first()
-            .and_then(|f| f.strip_prefix(project_dir).ok())
-        {
-            luac_cmd
-                .arg("-n")
-                .arg(format!("/blyt/cart/{}", rel.display()));
-        }
+        // -P tells blyt-luac to embed a canonical /blyt/cart/… source name for
+        // each file (derived from its path relative to project_dir), making the
+        // bytecode machine-independent and giving each file its own source name
+        // so DAP can map stack frames back to the correct file (issues #46, #54).
+        luac_cmd.arg("-P").arg(project_dir);
         for f in &lua_files {
             luac_cmd.arg(f);
         }

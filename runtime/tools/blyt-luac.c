@@ -4,19 +4,28 @@
  * Compiled host-native with -DLUA_32BITS=1 so the bytecode it produces
  * matches the RV32 and WASM blyt Lua VMs (both also -DLUA_32BITS=1).
  *
- * Usage: blyt-luac -o <output.luac> [-n <chunkname>] <file.lua> [file2.lua ...]
+ * Usage: blyt-luac -o <output.luac> [-n <chunkname>] [-P <project_dir>]
+ *                  <file.lua> [file2.lua ...]
  *
- * Multiple source files are concatenated and compiled as one chunk.
- * Globals defined in earlier files are visible in later ones.
+ * Single file: plain Lua bytecode output.
+ *   -n <chunkname>  sets the source name embedded in the bytecode.
+ *   -P <project_dir>  derives the canonical name as /blyt/cart/<rel>.
  *
- * -n <chunkname> sets the chunk's source name embedded in the bytecode
- * (prefixed with '@', so debuggers treat it as a file path).  blyt passes the
- * canonical /blyt/cart/… path here so carts are machine-independent and the DAP
- * layer can reverse-map source paths (issue #46 §6).  Without -n the source
- * name defaults to the file path (single file) or "cart" (multiple), preserving
- * the previous behaviour.
+ * Multiple files (-P required for canonical names): each file is compiled as
+ * its own chunk so each proto keeps its own source name and per-file line
+ * numbers.  Output uses the BLMC multi-chunk format (see below).  Globals
+ * defined in earlier files remain visible in later ones because the runtime
+ * executes each chunk in order in the same Lua state.
+ *
+ * BLMC format (multi-chunk output):
+ *   [0..3]   "BLMC" magic
+ *   [4..7]   uint32 little-endian chunk count N
+ *   for each chunk:
+ *     [0..3] uint32 little-endian byte count S
+ *     [4..]  S bytes of Lua 5.4 bytecode
  */
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,9 +78,30 @@ static char *read_file(const char *path, size_t *out_size) {
     return buf;
 }
 
+static void write_u32le(FILE *f, uint32_t v) {
+    unsigned char b[4] = {v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, v >> 24};
+    fwrite(b, 1, 4, f);
+}
+
+/* Build the "@/blyt/cart/<rel>" source name for a file given the project dir.
+ * Falls back to "@/blyt/cart/<basename>" if the prefix doesn't match. */
+static void make_namebuf(const char *file, const char *prefix_dir, char *buf, size_t buf_size) {
+    buf[0] = '@';
+    if (prefix_dir) {
+        size_t plen = strlen(prefix_dir);
+        if (strncmp(file, prefix_dir, plen) == 0 && file[plen] == '/') {
+            snprintf(buf + 1, buf_size - 1, "/blyt/cart/%s", file + plen + 1);
+            return;
+        }
+    }
+    const char *slash = strrchr(file, '/');
+    snprintf(buf + 1, buf_size - 1, "/blyt/cart/%s", slash ? slash + 1 : file);
+}
+
 int main(int argc, char *argv[]) {
     const char *output = NULL;
     const char *chunkname = NULL;
+    const char *prefix_dir = NULL;
     int strip = 0;
     int i;
 
@@ -80,6 +110,8 @@ int main(int argc, char *argv[]) {
             output = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             chunkname = argv[++i];
+        } else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
+            prefix_dir = argv[++i];
         } else if (strcmp(argv[i], "-s") == 0) {
             strip = 1;
         }
@@ -95,7 +127,8 @@ int main(int argc, char *argv[]) {
         return 1;
     int nfiles = 0;
     for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "-n") == 0) {
+        if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "-n") == 0 ||
+            strcmp(argv[i], "-P") == 0) {
             i++; /* skip the option's value too */
             continue;
         }
@@ -118,106 +151,118 @@ int main(int argc, char *argv[]) {
     }
 
     int rc = 0;
-    WBuf wb = {NULL, 0};
 
-    /* When a chunk name is given, build the Lua source name "@<name>" once.
-     * The leading '@' marks it as a file path (stripped for display by Lua). */
-    char *namebuf = NULL;
-    if (chunkname) {
-        size_t nlen = strlen(chunkname);
-        namebuf = malloc(nlen + 2);
-        if (!namebuf) {
-            lua_close(L);
-            free(files);
-            return 1;
+    if (nfiles == 1) {
+        /* Single file: plain Lua bytecode output (no BLMC wrapper). */
+        WBuf wb = {NULL, 0};
+
+        if (!chunkname && !prefix_dir) {
+            if (luaL_loadfile(L, files[0]) != LUA_OK) {
+                fprintf(stderr, "blyt-luac: %s\n", lua_tostring(L, -1));
+                rc = 1;
+                goto done_single;
+            }
+        } else {
+            char namebuf[4096];
+            if (chunkname) {
+                size_t nlen = strlen(chunkname);
+                namebuf[0] = '@';
+                memcpy(namebuf + 1, chunkname, nlen + 1);
+            } else {
+                make_namebuf(files[0], prefix_dir, namebuf, sizeof(namebuf));
+            }
+            size_t sz = 0;
+            char *content = read_file(files[0], &sz);
+            if (!content) {
+                fprintf(stderr, "blyt-luac: cannot read '%s'\n", files[0]);
+                rc = 1;
+                goto done_single;
+            }
+            int lrc = luaL_loadbuffer(L, content, sz, namebuf);
+            free(content);
+            if (lrc != LUA_OK) {
+                fprintf(stderr, "blyt-luac: %s\n", lua_tostring(L, -1));
+                rc = 1;
+                goto done_single;
+            }
         }
-        namebuf[0] = '@';
-        memcpy(namebuf + 1, chunkname, nlen + 1);
+
+        if (lua_dump(L, writer_cb, &wb, strip) != 0) {
+            fprintf(stderr, "blyt-luac: dump failed\n");
+            rc = 1;
+            goto done_single;
+        }
+
+        {
+            FILE *out = fopen(output, "wb");
+            if (!out) {
+                fprintf(stderr, "blyt-luac: cannot open '%s' for writing\n", output);
+                rc = 1;
+                goto done_single;
+            }
+            if (fwrite(wb.buf, 1, wb.size, out) != wb.size) {
+                fprintf(stderr, "blyt-luac: write error on '%s'\n", output);
+                fclose(out);
+                rc = 1;
+                goto done_single;
+            }
+            fclose(out);
+        }
+
+    done_single:
+        free(wb.buf);
+        lua_close(L);
+        free(files);
+        return rc;
     }
 
-    if (nfiles == 1 && !chunkname) {
-        if (luaL_loadfile(L, files[0]) != LUA_OK) {
-            fprintf(stderr, "blyt-luac: %s\n", lua_tostring(L, -1));
-            rc = 1;
-            goto done;
+    /* Multi-file: compile each file as its own chunk, output BLMC format.
+     * Each chunk keeps its own source name and line numbers so debuggers can
+     * map stack frames back to the correct file (issue #54). */
+    WBuf *chunks = calloc((size_t)nfiles, sizeof(WBuf));
+    if (!chunks) {
+        lua_close(L);
+        free(files);
+        return 1;
+    }
+
+    for (i = 0; i < nfiles; i++) {
+        char namebuf[4096];
+        if (prefix_dir) {
+            make_namebuf(files[i], prefix_dir, namebuf, sizeof(namebuf));
+        } else if (chunkname) {
+            /* -n with multiple files: use the given name for all (legacy path). */
+            size_t nlen = strlen(chunkname);
+            namebuf[0] = '@';
+            memcpy(namebuf + 1, chunkname, nlen + 1);
+        } else {
+            namebuf[0] = '\0'; /* let luaL_loadfile use the file path */
         }
-    } else if (nfiles == 1) {
-        /* Single file with an explicit chunk name: read it and load via a
-         * buffer so the embedded source name is the canonical one, not the
-         * file path. */
+
         size_t sz = 0;
-        char *content = read_file(files[0], &sz);
+        char *content = read_file(files[i], &sz);
         if (!content) {
-            fprintf(stderr, "blyt-luac: cannot read '%s'\n", files[0]);
+            fprintf(stderr, "blyt-luac: cannot read '%s'\n", files[i]);
             rc = 1;
-            goto done;
+            goto done_multi;
         }
-        int lrc = luaL_loadbuffer(L, content, sz, namebuf);
+
+        lua_settop(L, 0);
+        int lrc = namebuf[0] ? luaL_loadbuffer(L, content, sz, namebuf)
+                             : luaL_loadbuffer(L, content, sz, files[i]);
         free(content);
         if (lrc != LUA_OK) {
             fprintf(stderr, "blyt-luac: %s\n", lua_tostring(L, -1));
             rc = 1;
-            goto done;
+            goto done_multi;
         }
-    } else {
-        /* Concatenate all source files and compile as one chunk.
-         * Globals defined in each file are visible to subsequent files
-         * since they share the same environment. */
-        size_t total = 0;
-        char **contents = malloc((size_t)nfiles * sizeof(char *));
-        size_t *sizes = malloc((size_t)nfiles * sizeof(size_t));
-        if (!contents || !sizes) {
-            free(contents);
-            free(sizes);
-            rc = 1;
-            goto done;
-        }
-        for (i = 0; i < nfiles; i++) {
-            contents[i] = read_file(files[i], &sizes[i]);
-            if (!contents[i]) {
-                fprintf(stderr, "blyt-luac: cannot read '%s'\n", files[i]);
-                for (int j = 0; j < i; j++)
-                    free(contents[j]);
-                free(contents);
-                free(sizes);
-                rc = 1;
-                goto done;
-            }
-            total += sizes[i] + 1; /* +1 for newline between files */
-        }
-        char *combined = malloc(total + 1);
-        if (!combined) {
-            for (i = 0; i < nfiles; i++)
-                free(contents[i]);
-            free(contents);
-            free(sizes);
-            rc = 1;
-            goto done;
-        }
-        size_t pos = 0;
-        for (i = 0; i < nfiles; i++) {
-            memcpy(combined + pos, contents[i], sizes[i]);
-            pos += sizes[i];
-            combined[pos++] = '\n';
-            free(contents[i]);
-        }
-        combined[pos] = '\0';
-        free(contents);
-        free(sizes);
 
-        if (luaL_loadbuffer(L, combined, pos, namebuf ? namebuf : "@cart") != LUA_OK) {
-            fprintf(stderr, "blyt-luac: %s\n", lua_tostring(L, -1));
-            free(combined);
+        if (lua_dump(L, writer_cb, &chunks[i], strip) != 0) {
+            fprintf(stderr, "blyt-luac: dump failed for '%s'\n", files[i]);
             rc = 1;
-            goto done;
+            goto done_multi;
         }
-        free(combined);
-    }
-
-    if (lua_dump(L, writer_cb, &wb, strip) != 0) {
-        fprintf(stderr, "blyt-luac: dump failed\n");
-        rc = 1;
-        goto done;
+        lua_pop(L, 1);
     }
 
     {
@@ -225,21 +270,27 @@ int main(int argc, char *argv[]) {
         if (!out) {
             fprintf(stderr, "blyt-luac: cannot open '%s' for writing\n", output);
             rc = 1;
-            goto done;
+            goto done_multi;
         }
-        if (fwrite(wb.buf, 1, wb.size, out) != wb.size) {
-            fprintf(stderr, "blyt-luac: write error on '%s'\n", output);
-            fclose(out);
-            rc = 1;
-            goto done;
+        fwrite("BLMC", 1, 4, out);
+        write_u32le(out, (uint32_t)nfiles);
+        for (i = 0; i < nfiles; i++) {
+            write_u32le(out, (uint32_t)chunks[i].size);
+            if (fwrite(chunks[i].buf, 1, chunks[i].size, out) != chunks[i].size) {
+                fprintf(stderr, "blyt-luac: write error on '%s'\n", output);
+                fclose(out);
+                rc = 1;
+                goto done_multi;
+            }
         }
         fclose(out);
     }
 
-done:
-    free(namebuf);
-    free(wb.buf);
-    free(files);
+done_multi:
+    for (i = 0; i < nfiles; i++)
+        free(chunks[i].buf);
+    free(chunks);
     lua_close(L);
+    free(files);
     return rc;
 }
