@@ -46,6 +46,7 @@ jobs:
           sudo update-alternatives --install /usr/bin/llvm-ar       llvm-ar       /usr/bin/llvm-ar-22       100
           sudo update-alternatives --install /usr/bin/lldb-dap      lldb-dap      /usr/bin/lldb-dap-22      100
           pip3 install clang-format==22.1.5 cmakelang yamllint
+          npm ci
           # Align stable Rust to the latest release: the runner-image rollout
           # leaves different preinstalled stable versions on different
           # runners (observed 1.95 vs 1.96 across consecutive runs), and
@@ -128,7 +129,7 @@ jobs:
         run: cmake -B build -G Ninja
 
       # The lint target is the single source of truth for the format checks
-      # (clang-format, cmake-format, yamllint, cargo fmt). It needs a
+      # (clang-format, cmake-format, yamllint, cargo fmt, biome). It needs a
       # configured build tree, hence runs after Configure.
       - name: Lint
         run: cmake --build build --target lint

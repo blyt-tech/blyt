@@ -19,10 +19,8 @@
  * Used by the Rust integration test wasm_testcard_frame0_matches_golden.
  */
 
-"use strict";
-
-var nodefs = require("fs");
-var path = require("path");
+var nodefs = require('node:fs');
+var path = require('node:path');
 
 var wasmDir = process.argv[2];
 var cartPath = process.argv[3];
@@ -32,21 +30,23 @@ var frame0OutPath = process.argv[4] || null;
 var envVarsJson = process.argv[5] || null;
 
 if (!wasmDir || !cartPath) {
-  process.stderr.write("usage: run_cart.js <wasm_dir> <cart_path> [<frame0_output> [<env_json>]]\n");
-  process.exit(1);
+	process.stderr.write(
+		'usage: run_cart.js <wasm_dir> <cart_path> [<frame0_output> [<env_json>]]\n',
+	);
+	process.exit(1);
 }
 
-var wasmJsPath = path.join(wasmDir, "blytplay.js");
+var wasmJsPath = path.join(wasmDir, 'blytplay.js');
 if (!nodefs.existsSync(wasmJsPath)) {
-  process.stderr.write("blytplay.js not found at: " + wasmJsPath + "\n");
-  process.exit(1);
+	process.stderr.write(`blytplay.js not found at: ${wasmJsPath}\n`);
+	process.exit(1);
 }
 
 try {
-  global.__blyt_cart_data = new Uint8Array(nodefs.readFileSync(cartPath));
+	global.__blyt_cart_data = new Uint8Array(nodefs.readFileSync(cartPath));
 } catch (e) {
-  process.stderr.write("cannot read cart: " + e.message + "\n");
-  process.exit(1);
+	process.stderr.write(`cannot read cart: ${e.message}\n`);
+	process.exit(1);
 }
 
 /* module_pre.js (inside the Emscripten IIFE) reads these globals:
@@ -55,20 +55,20 @@ try {
  *   __blyt_init_module — extra Module fields (print, printErr) */
 global.__blyt_frame0_path = frame0OutPath;
 if (envVarsJson) {
-  try {
-    global.__blyt_env_vars = JSON.parse(envVarsJson);
-  } catch (e) {
-    process.stderr.write("run_cart.js: invalid env JSON: " + e.message + "\n");
-    process.exit(1);
-  }
+	try {
+		global.__blyt_env_vars = JSON.parse(envVarsJson);
+	} catch (e) {
+		process.stderr.write(`run_cart.js: invalid env JSON: ${e.message}\n`);
+		process.exit(1);
+	}
 }
 global.__blyt_init_module = {
-  print: function (text) {
-    process.stdout.write(text + "\n");
-  },
-  printErr: function (text) {
-    process.stderr.write(text + "\n");
-  },
+	print: (text) => {
+		process.stdout.write(`${text}\n`);
+	},
+	printErr: (text) => {
+		process.stderr.write(`${text}\n`);
+	},
 };
 
 require(path.resolve(wasmJsPath));

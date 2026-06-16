@@ -1053,8 +1053,10 @@ add_custom_target(
           "${CMAKE_SOURCE_DIR}/frontends/wasm/CMakeLists.txt"
   COMMAND yamllint "${CMAKE_SOURCE_DIR}/.github/workflows/ci.yml"
   COMMAND cargo fmt --check --all
+  COMMAND "${CMAKE_SOURCE_DIR}/node_modules/.bin/biome" check
+          "${CMAKE_SOURCE_DIR}"
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-  COMMENT "Linting: clang-format, cmake-format, yamllint, cargo fmt"
+  COMMENT "Linting: clang-format, cmake-format, yamllint, cargo fmt, biome"
   VERBATIM)
 
 # ── test-linux-docker ─────────────────────────────────────────────────────────
