@@ -1,0 +1,7 @@
+{
+	"name": "blyt",
+	"private": true,
+	"devDependencies": {
+		"@biomejs/biome": "2.5.0"
+	}
+}

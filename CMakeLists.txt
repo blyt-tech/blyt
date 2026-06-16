@@ -162,7 +162,18 @@ set(FLATCC_DEBUG_CLANG_SANITIZE
 set(FLATCC_ALLOW_WERROR
     OFF
     CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(flatcc)
+# flatcc ships cmake_minimum_required(VERSION 2.8), which CMake 4.0+ rejects.
+# Populate first so we can patch the file before add_subdirectory runs.
+FetchContent_GetProperties(flatcc)
+if(NOT flatcc_POPULATED)
+  FetchContent_Populate(flatcc)
+  file(READ "${flatcc_SOURCE_DIR}/CMakeLists.txt" _flatcc_cml)
+  string(REPLACE "cmake_minimum_required (VERSION 2.8)"
+                 "cmake_minimum_required (VERSION 3.5)" _flatcc_cml
+                 "${_flatcc_cml}")
+  file(WRITE "${flatcc_SOURCE_DIR}/CMakeLists.txt" "${_flatcc_cml}")
+endif()
+add_subdirectory("${flatcc_SOURCE_DIR}" "${flatcc_BINARY_DIR}")
 # flatcc hardcodes PROJECT_SOURCE_DIR/lib as the archive output, which fails
 # when the source is mounted read-only (e.g. Docker :ro). Override it here so
 # all targets write to the build tree instead.
@@ -1046,6 +1057,31 @@ file(
   "${CMAKE_SOURCE_DIR}/examples/*.h")
 list(FILTER _LINT_C_FILES EXCLUDE REGEX "/(build|node_modules|target)/")
 
+add_custom_command(
+  OUTPUT "${CMAKE_BINARY_DIR}/npm-ci.stamp"
+  COMMAND npm ci
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_BINARY_DIR}/npm-ci.stamp"
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  DEPENDS "${CMAKE_SOURCE_DIR}/package-lock.json"
+          "${CMAKE_SOURCE_DIR}/package.json"
+  COMMENT "Installing JS dependencies (npm ci)"
+  VERBATIM)
+add_custom_target(npm_ci DEPENDS "${CMAKE_BINARY_DIR}/npm-ci.stamp")
+
+add_custom_command(
+  OUTPUT "${CMAKE_BINARY_DIR}/npm-install-wasm-tests.stamp"
+  COMMAND npm install
+  COMMAND npx playwright install chromium
+  COMMAND "${CMAKE_COMMAND}" -E touch
+          "${CMAKE_BINARY_DIR}/npm-install-wasm-tests.stamp"
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/tests/wasm"
+  DEPENDS "${CMAKE_SOURCE_DIR}/tests/wasm/package-lock.json"
+          "${CMAKE_SOURCE_DIR}/tests/wasm/package.json"
+  COMMENT "Installing WASM test dependencies (Playwright)"
+  VERBATIM)
+add_custom_target(wasm_test_deps
+                  DEPENDS "${CMAKE_BINARY_DIR}/npm-install-wasm-tests.stamp")
+
 add_custom_target(
   lint
   COMMAND clang-format --dry-run --Werror ${_LINT_C_FILES}
@@ -1053,9 +1089,12 @@ add_custom_target(
           "${CMAKE_SOURCE_DIR}/frontends/wasm/CMakeLists.txt"
   COMMAND yamllint "${CMAKE_SOURCE_DIR}/.github/workflows/ci.yml"
   COMMAND cargo fmt --check --all
+  COMMAND "${CMAKE_SOURCE_DIR}/node_modules/.bin/biome" check
+          "${CMAKE_SOURCE_DIR}"
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-  COMMENT "Linting: clang-format, cmake-format, yamllint, cargo fmt"
+  COMMENT "Linting: clang-format, cmake-format, yamllint, cargo fmt, biome"
   VERBATIM)
+add_dependencies(lint npm_ci)
 
 # ── test-linux-docker ─────────────────────────────────────────────────────────
 # Run integration tests inside a Linux Docker container that mirrors the GitHub

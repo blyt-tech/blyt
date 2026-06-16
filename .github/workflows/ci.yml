@@ -128,7 +128,7 @@ jobs:
         run: cmake -B build -G Ninja
 
       # The lint target is the single source of truth for the format checks
-      # (clang-format, cmake-format, yamllint, cargo fmt). It needs a
+      # (clang-format, cmake-format, yamllint, cargo fmt, biome). It needs a
       # configured build tree, hence runs after Configure.
       - name: Lint
         run: cmake --build build --target lint
@@ -181,9 +181,8 @@ jobs:
 
       - name: Install Playwright
         run: |
-          cd tests/wasm
-          npm install
-          npx playwright install --with-deps chromium
+          cmake --build build --target wasm_test_deps
+          cd tests/wasm && npx playwright install --with-deps chromium
 
       # The QEMU native ILP32 gate runs inside this step as a regular test:
       # nextest overlaps its ~30s QEMU boot with the other suites. The
