@@ -9,7 +9,8 @@
 			"!**/build-*",
 			"!**/third_party",
 			"!**/examples/*/build",
-			"!**/build-riscv64"
+			"!**/build-riscv64",
+			"!**/emsdk-cache"
 		]
 	},
 	"linter": {
