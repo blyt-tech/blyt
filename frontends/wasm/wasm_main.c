@@ -622,7 +622,7 @@ static void buf_set_bits(lua_State *L, uint32_t bits, uint8_t type_tag) {
                        (uint32_t)luaL_checkinteger(L, 3) & 0xFFFF, bits, type_tag);
 }
 
-/* Type tags: i8=0, u8=1, i16=2, u16=3, i32=4, u32=5, f32=6, bool=7 */
+/* Type tags: i8=0, u8=1, i16=2, u16=3, i32=4, u32=5, f32=6, bool=7, f64=8 */
 static int wasm_buf_get_f32(lua_State *L) {
     uint32_t bits = buf_get_bits(L);
     float f;
@@ -635,6 +635,27 @@ static int wasm_buf_set_f32(lua_State *L) {
     uint32_t bits;
     memcpy(&bits, &f, 4);
     buf_set_bits(L, bits, 6);
+    return 0;
+}
+static int wasm_buf_get_f64(lua_State *L) {
+    uint64_t bits = 0;
+    blyt_state_ctx_t *ctx = active_state_ctx();
+    if (ctx)
+        blyt_state_get64(ctx, (uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                         (uint32_t)luaL_checkinteger(L, 3) & 0xFFFF, &bits);
+    double d;
+    memcpy(&d, &bits, 8);
+    lua_pushnumber(L, (lua_Number)d);
+    return 1;
+}
+static int wasm_buf_set_f64(lua_State *L) {
+    double d = (double)luaL_checknumber(L, 4);
+    uint64_t bits;
+    memcpy(&bits, &d, 8);
+    blyt_state_ctx_t *ctx = active_state_ctx();
+    if (ctx)
+        blyt_state_set64(ctx, (uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                         (uint32_t)luaL_checkinteger(L, 3) & 0xFFFF, bits);
     return 0;
 }
 static int wasm_buf_get_i32(lua_State *L) {
@@ -908,6 +929,8 @@ static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
     } buf_fns[] = {
         {"get_f32", wasm_buf_get_f32},
         {"set_f32", wasm_buf_set_f32},
+        {"get_f64", wasm_buf_get_f64},
+        {"set_f64", wasm_buf_set_f64},
         {"get_i32", wasm_buf_get_i32},
         {"set_i32", wasm_buf_set_i32},
         {"get_u32", wasm_buf_get_u32},

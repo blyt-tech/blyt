@@ -113,6 +113,8 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     /* blyt state buffer API (ADR-0009, ADR-0010, ADR-0057, ADR-0058) */
     "blyt_buffer_get_f32",
     "blyt_buffer_set_f32",
+    "blyt_buffer_get_f64",
+    "blyt_buffer_set_f64",
     "blyt_buffer_get_i32",
     "blyt_buffer_set_i32",
     "blyt_buffer_get_u32",
@@ -1313,7 +1315,7 @@ const char *blyt_cart_err_str(blyt_cart_err_t err) {
     case BLYT_CART_ERR_BAD_MACHINE:
         return "not a RISC-V ELF";
     case BLYT_CART_ERR_BAD_FLAGS:
-        return "e_flags: expected RV32IMAFC ILP32F";
+        return "e_flags: expected RV32IMAFDC ILP32D";
     case BLYT_CART_ERR_BAD_SHDR:
         return "section header table malformed";
     case BLYT_CART_ERR_UNKNOWN_SECT:

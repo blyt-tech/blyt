@@ -218,9 +218,14 @@ struct blyt_session {
     int lua_nexports;
     /* ADR-0130 bridged-call state: register snapshot taken at
      * begin_bridged_call, restored when a wrapper raises a Lua error so
-     * repeated errors do not leak guest stack. */
+     * repeated errors do not leak guest stack.  The FP register file is
+     * snapshotted too (Spike U): with hardware doubles (RV32D) a bridged
+     * wrapper may hold live values in callee-saved FP registers (fs0–fs11),
+     * which the error unwind must restore alongside the integer regs. Raw
+     * 64-bit (FLEN) words; fcsr is the rounding/exception state. */
     uint32_t bridge_saved_regs[32];
     uint32_t bridge_saved_fcsr;
+    uint64_t bridge_saved_fregs[32];
     uint32_t lua_bridge_next_token;
 #endif
 
@@ -779,9 +784,10 @@ static void bridge_lua_op(riscv_t *rv) {
         } else if (opcode == BLYT_LUA_OP_PUSHINTEGER) {
             lua_pushinteger(EX, (lua_Integer)(int32_t)a2);
         } else {
-            float f;
-            memcpy(&f, &a2, 4);
-            lua_pushnumber(EX, (lua_Number)f);
+            uint64_t bits = (uint64_t)a3 << 32 | (uint64_t)a2;
+            double d;
+            memcpy(&d, &bits, 8);
+            lua_pushnumber(EX, (lua_Number)d);
         }
         break;
     }
@@ -801,9 +807,18 @@ static void bridge_lua_op(riscv_t *rv) {
             aux = (uint32_t)isnum;
         } else if (opcode == BLYT_LUA_OP_TONUMBERX) {
             int isnum = 0;
-            float f = (float)lua_tonumberx(EX, ai, &isnum);
-            memcpy(&val, &f, 4);
-            aux = (uint32_t)isnum;
+            double d = (double)lua_tonumberx(EX, ai, &isnum);
+            if (isnum) {
+                uint64_t bits;
+                memcpy(&bits, &d, 8);
+                val = (uint32_t)bits;
+                aux = (uint32_t)(bits >> 32);
+                /* st remains BLYT_LUA_ST_OK */
+            } else {
+                st = BLYT_LUA_ST_NIL;
+                val = 0;
+                aux = 0;
+            }
         } else {
             val = (uint32_t)lua_toboolean(EX, ai);
         }
@@ -1115,6 +1130,10 @@ static const char *buf_op_name(uint32_t op) {
         return "buf_ref";
     case BUF_OP_REF_VALID:
         return "buf_ref_valid";
+    case BUF_OP_GET_F64:
+        return "buf_get_f64";
+    case BUF_OP_SET_F64:
+        return "buf_set_f64";
     default:
         return "buf_op?";
     }
@@ -1513,6 +1532,19 @@ static void blyt_ecall_handler(riscv_t *rv) {
             int v = blyt_state_ref_valid(sc, buf_id, ref);
             blyt_tracef(BLYT_TRACE_API, "buf_ref_valid(buf=%u, ref=0x%08x) -> %d", buf_id, ref, v);
             rv_set_reg(rv, rv_reg_a0, (uint32_t)v);
+            break;
+        }
+        case BUF_OP_GET_F64: { /* f64: returns lo in a0, hi in a1 (Spike U) */
+            uint64_t bits = 0;
+            blyt_state_get64(sc, buf_id, slot, field, &bits);
+            rv_set_reg(rv, rv_reg_a0, (uint32_t)bits);
+            rv_set_reg(rv, rv_reg_a1, (uint32_t)(bits >> 32));
+            break;
+        }
+        case BUF_OP_SET_F64: { /* f64: a4=lo, a5=hi (Spike U) */
+            uint64_t bits = (uint64_t)value_bits | ((uint64_t)rv_get_reg(rv, rv_reg_a5) << 32);
+            blyt_state_set64(sc, buf_id, slot, field, bits);
+            rv_set_reg(rv, rv_reg_a0, 0);
             break;
         }
         default:
@@ -2380,6 +2412,8 @@ static void blyt_bridge_error_unwind(blyt_session_t *session) {
     for (uint32_t i = 1; i < 32; i++) /* x0 is hardwired */
         rv_set_reg(session->rv, i, session->bridge_saved_regs[i]);
     session->rv->csr_fcsr = session->bridge_saved_fcsr;
+    for (uint32_t i = 0; i < 32; i++) /* restore FP file (RV32D, Spike U) */
+        session->rv->F[i].v = session->bridge_saved_fregs[i];
     session->ctx.lua_bridge_active = false;
     session->ctx.lua_bridge_error = false;
 }
@@ -2767,6 +2801,8 @@ int blyt_session_begin_bridged_call(blyt_session_t *s, uint32_t wrap_addr) {
     for (uint32_t i = 0; i < 32; i++)
         s->bridge_saved_regs[i] = rv_get_reg(s->rv, i);
     s->bridge_saved_fcsr = s->rv->csr_fcsr;
+    for (uint32_t i = 0; i < 32; i++) /* FLEN=64 FP file (RV32D, Spike U) */
+        s->bridge_saved_fregs[i] = s->rv->F[i].v;
     if (++s->lua_bridge_next_token == 0)
         ++s->lua_bridge_next_token; /* token is nonzero */
     s->ctx.lua_bridge_token = s->lua_bridge_next_token;

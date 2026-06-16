@@ -15,6 +15,8 @@ pub const BLYT_ENTITY_REF_NONE: BlytEntityRef = 0;
 extern "C" {
     fn blyt_buffer_get_f32(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> f32;
     fn blyt_buffer_set_f32(buf: BlytBufferH, slot: i32, field: BlytFieldH, v: f32);
+    fn blyt_buffer_get_f64(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> f64;
+    fn blyt_buffer_set_f64(buf: BlytBufferH, slot: i32, field: BlytFieldH, v: f64);
     fn blyt_buffer_get_i32(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> i32;
     fn blyt_buffer_set_i32(buf: BlytBufferH, slot: i32, field: BlytFieldH, v: i32);
     fn blyt_buffer_get_u32(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> u32;
@@ -40,6 +42,12 @@ pub fn get_f32(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> f32 {
 }
 pub fn set_f32(buf: BlytBufferH, slot: i32, field: BlytFieldH, v: f32) {
     unsafe { blyt_buffer_set_f32(buf, slot, field, v) }
+}
+pub fn get_f64(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> f64 {
+    unsafe { blyt_buffer_get_f64(buf, slot, field) }
+}
+pub fn set_f64(buf: BlytBufferH, slot: i32, field: BlytFieldH, v: f64) {
+    unsafe { blyt_buffer_set_f64(buf, slot, field, v) }
 }
 pub fn get_i32(buf: BlytBufferH, slot: i32, field: BlytFieldH) -> i32 {
     unsafe { blyt_buffer_get_i32(buf, slot, field) }

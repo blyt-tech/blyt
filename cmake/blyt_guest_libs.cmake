@@ -47,8 +47,8 @@ set(RV32_BASE
     # bare-metal targets which rejects .so inputs; using a Linux triple keeps
     # shared-library semantics.  -nostdlib suppresses the sysroot linkage.
     --target=riscv32-linux-gnu
-    -march=rv32imafc
-    -mabi=ilp32f
+    -march=rv32imafdc
+    -mabi=ilp32d
     -shared
     -fPIC
     -nostdlib
@@ -161,8 +161,8 @@ set(RV32_PREFIX_MAP
 # excluded; -fsemantic-interposition stays (codegen flag, see RV32_BASE).
 set(RV32_COMPILE_BASE
     --target=riscv32-linux-gnu
-    -march=rv32imafc
-    -mabi=ilp32f
+    -march=rv32imafdc
+    -mabi=ilp32d
     -fPIC
     -fsemantic-interposition
     ${RV32_PREFIX_MAP}
@@ -458,8 +458,14 @@ if(EXISTS "${SF_SRC}/f64_add.c")
   set(SF_PLATFORM_DIR "${CMAKE_BINARY_DIR}/softfloat-rv32")
   file(MAKE_DIRECTORY "${SF_PLATFORM_DIR}")
   # Minimal platform.h: disable thread-local so softfloat_roundingMode is
-  # global.
-  file(WRITE "${SF_PLATFORM_DIR}/platform.h" "#define THREAD_LOCAL\n")
+  # global, and declare the target little-endian.  LITTLEENDIAN is required for
+  # SoftFloat's float128_t to use {v0(low), v64(high)} word order; without it
+  # SoftFloat defaults to big-endian word order (high word at v[0]), which
+  # silently mismatches the compiler's IEEE binary128 memory layout (Spike U:
+  # this broke quad<->compiler interchange, e.g. musl's long-double printf).
+  # f32/f64 are single-word and so were unaffected.
+  file(WRITE "${SF_PLATFORM_DIR}/platform.h"
+       "#define THREAD_LOCAL\n#define LITTLEENDIAN 1\n")
 
   # Core SoftFloat: all s_*.c and f32/f64/f128/conversion files.  Exclude extF80
   # (80-bit), M-variant (multi-word array), bf16, f16.
@@ -626,7 +632,7 @@ else()
     CFLAGS
     ${LUA_MUSL_INCLUDES}
     ${LIBBLYTC_CFLAGS}
-    -DLUA_32BITS=1
+    -DBLYT_LUA_I32_F64=1
     -DLUA_USE_LONGJMP=1
     ${LUA_SEED_DEF}
     -I
@@ -673,7 +679,7 @@ else()
       ${LUA_MUSL_INCLUDES}
       ${LIBBLYTC_CFLAGS}
       ${_VOPT}
-      -DLUA_32BITS=1
+      -DBLYT_LUA_I32_F64=1
       -DLUA_USE_LONGJMP=1
       ${LUA_SEED_DEF}
       ${_VLUA_DAP_FLAGS}
@@ -725,7 +731,7 @@ else()
     list(APPEND _guest_lib_outputs "${_VDIR}/libblyt32lua-bridge.so")
   endforeach()
 
-  # blyt-luac — host-native Lua bytecode compiler (LUA_32BITS=1 to match the
+  # blyt-luac — host-native Lua bytecode compiler (BLYT_LUA_I32_F64=1 to match the
   # guest VMs' 4-byte lua_Integer / lua_Number).
   file(GLOB LUA_HOST_SRCS "${LUA_DIR}/*.c")
   foreach(_EXCL "${LUA_DIR}/lua.c" "${LUA_DIR}/onelua.c" "${LUA_DIR}/ltests.c")
@@ -734,12 +740,12 @@ else()
   add_custom_command(
     OUTPUT "${SDK_BIN}/blyt-luac"
     COMMAND
-      "${BLYT_RV32_CLANG}" -DLUA_32BITS=1 ${LUA_SEED_DEF} -O2 -I "${LUA_DIR}"
+      "${BLYT_RV32_CLANG}" -DBLYT_LUA_I32_F64=1 ${LUA_SEED_DEF} -O2 -I "${LUA_DIR}"
       -Wno-unused-parameter -Wno-sign-compare -Wno-implicit-fallthrough
       -Wno-deprecated-non-prototype -o "${SDK_BIN}/blyt-luac" ${LUA_HOST_SRCS}
       "${CMAKE_SOURCE_DIR}/runtime/tools/blyt-luac.c" -lm
     DEPENDS ${LUA_HOST_SRCS} "${CMAKE_SOURCE_DIR}/runtime/tools/blyt-luac.c"
-    COMMENT "Compiling blyt-luac (host-native, LUA_32BITS=1)"
+    COMMENT "Compiling blyt-luac (host-native, BLYT_LUA_I32_F64=1)"
     VERBATIM)
   list(APPEND _guest_lib_outputs "${SDK_BIN}/blyt-luac")
 endif()
@@ -931,8 +937,8 @@ if(BLYT_BUILD_NATIVE)
     # which would conflict with -r (relocatable partial link).
     set(_RV32_PARTIAL
         --target=riscv32-linux-gnu
-        -march=rv32imafc
-        -mabi=ilp32f
+        -march=rv32imafdc
+        -mabi=ilp32d
         -fPIC
         -nostdlib
         -no-pie
@@ -940,8 +946,8 @@ if(BLYT_BUILD_NATIVE)
     # Per-object compile base for the partial link: _RV32_PARTIAL's codegen
     # subset — deliberately NO -fsemantic-interposition (the old single command
     # never had it) and no guest-include -I.
-    set(_RV32_PARTIAL_COMPILE --target=riscv32-linux-gnu -march=rv32imafc
-                              -mabi=ilp32f -fPIC)
+    set(_RV32_PARTIAL_COMPILE --target=riscv32-linux-gnu -march=rv32imafdc
+                              -mabi=ilp32d -fPIC)
     blyt_guest_objects(
       _libblytc_native_objs
       libblytc-native-partial
@@ -1000,7 +1006,7 @@ if(BLYT_BUILD_NATIVE)
       ${LUA_MUSL_INCLUDES}
       ${LIBBLYTC_CFLAGS}
       -O2
-      -DLUA_32BITS=1
+      -DBLYT_LUA_I32_F64=1
       -DLUA_USE_LONGJMP=1
       ${LUA_SEED_DEF}
       -I

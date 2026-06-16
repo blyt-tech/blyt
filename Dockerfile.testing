@@ -15,6 +15,11 @@ FROM --platform=linux/amd64 ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System packages + LLVM 22 ──────────────────────────────────────────────────
+# libc6-dev-riscv64-cross ships gnu/stubs-ilp32f.h (old ABI) but not
+# gnu/stubs-ilp32d.h (ilp32d ABI). The bridge build uses
+# --target=riscv32-linux-gnu -mabi=ilp32d -nostdlib; clang still resolves
+# gnu/stubs.h through the riscv64-linux-gnu sysroot. Empty stub is enough
+# since libc is never linked anyway.
 RUN apt-get update -q \
     && apt-get install -y --no-install-recommends curl ca-certificates gpg \
     && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
@@ -30,6 +35,8 @@ RUN apt-get update -q \
        gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
        libc6-dev-riscv64-cross libgcc-s1-riscv64-cross \
        python3-pip git pkg-config binutils xz-utils \
+    && mkdir -p /usr/riscv64-linux-gnu/include/gnu \
+    && touch /usr/riscv64-linux-gnu/include/gnu/stubs-ilp32d.h \
     && update-alternatives \
        --install /usr/bin/clang        clang        /usr/bin/clang-22        100 \
     && update-alternatives \
@@ -62,7 +69,6 @@ ENV RUSTUP_HOME=/opt/rustup \
     PATH=/opt/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --default-toolchain stable \
-    && rustup target add riscv32imafc-unknown-none-elf \
     # Cart Rust builds use -Z build-std (nightly + rust-src) to recompile
     # core/alloc as PIC for the PIE cart ELF (ADR-0108). Keep this dated nightly
     # in sync with CART_RUST_TOOLCHAIN in devtool/src/build.rs (and ci.yml).

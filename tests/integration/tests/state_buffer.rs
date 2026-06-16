@@ -39,6 +39,7 @@ records:
   Types:
     fields:
       - { name: v_f32,  type: f32  }
+      - { name: v_f64,  type: f64  }
       - { name: v_u32,  type: u32  }
       - { name: v_i8,   type: i8   }
       - { name: v_u8,   type: u8   }
@@ -184,6 +185,92 @@ pub extern "C" fn blyt_cart_draw() {}
     );
 }
 
+/// All field types (incl. f64, Spike U) survive a save/load round-trip for a Rust cart.
+#[test]
+fn rust_cart_all_field_types_round_trips() {
+    require_sdk();
+    require_rust_riscv_target();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_sb_types");
+
+    CartProject::new()
+        .config(ALL_TYPES_CONFIG)
+        .rust(
+            r#"#![no_std]
+include!(env!("BLYT_CART_STATE_RS"));
+
+use blyt::buffer::{
+    alloc_slot, get_bool, get_f32, get_f64, get_i8, get_i16, get_u8, get_u16, get_u32,
+    set_bool, set_f32, set_f64, set_i8, set_i16, set_u8, set_u16, set_u32,
+};
+use blyt::save::{save_read, save_write};
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {
+    let slot = alloc_slot(S_TYPES);
+    set_f32(S_TYPES, slot, S_TYPES_V_F32, 1.5_f32);
+    set_f64(S_TYPES, slot, S_TYPES_V_F64, 0.123456789012345_f64);
+    set_u32(S_TYPES, slot, S_TYPES_V_U32, 0xDEAD_BEEF_u32);
+    set_i8(S_TYPES, slot, S_TYPES_V_I8, -42_i8);
+    set_u8(S_TYPES, slot, S_TYPES_V_U8, 200_u8);
+    set_i16(S_TYPES, slot, S_TYPES_V_I16, -1000_i16);
+    set_u16(S_TYPES, slot, S_TYPES_V_U16, 60000_u16);
+    set_bool(S_TYPES, slot, S_TYPES_V_BOOL, true);
+    save_write(0);
+    set_f32(S_TYPES, slot, S_TYPES_V_F32, 0.0_f32);
+    set_f64(S_TYPES, slot, S_TYPES_V_F64, 0.0_f64);
+    set_u32(S_TYPES, slot, S_TYPES_V_U32, 0);
+    set_i8(S_TYPES, slot, S_TYPES_V_I8, 0);
+    set_u8(S_TYPES, slot, S_TYPES_V_U8, 0);
+    set_i16(S_TYPES, slot, S_TYPES_V_I16, 0);
+    set_u16(S_TYPES, slot, S_TYPES_V_U16, 0);
+    set_bool(S_TYPES, slot, S_TYPES_V_BOOL, false);
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    save_read(0);
+    let vf = get_f32(S_TYPES, 0, S_TYPES_V_F32);
+    let vd = get_f64(S_TYPES, 0, S_TYPES_V_F64);
+    let vu = get_u32(S_TYPES, 0, S_TYPES_V_U32);
+    let vi8 = get_i8(S_TYPES, 0, S_TYPES_V_I8);
+    let vu8 = get_u8(S_TYPES, 0, S_TYPES_V_U8);
+    let vi16 = get_i16(S_TYPES, 0, S_TYPES_V_I16);
+    let vu16 = get_u16(S_TYPES, 0, S_TYPES_V_U16);
+    let vb = get_bool(S_TYPES, 0, S_TYPES_V_BOOL);
+    if vf == 1.5_f32
+        && vd == 0.123456789012345_f64
+        && vu == 0xDEAD_BEEF_u32
+        && vi8 == -42_i8
+        && vu8 == 200_u8
+        && vi16 == -1000_i16
+        && vu16 == 60000_u16
+        && vb
+    {
+        blyt::console_debug("types_ok");
+    } else {
+        blyt::console_debug("types_fail");
+    }
+    blyt::quit();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_native_with_env(
+        &cart,
+        &[("BLYT_SAVE_DIR", save_dir.path().to_str().unwrap())],
+        "types_ok",
+    );
+}
+
 /// Save/load round-trip for a Lua cart.
 #[test]
 fn lua_cart_state_buffer_round_trips() {
@@ -227,6 +314,56 @@ function draw() end
         &cart,
         &[("BLYT_SAVE_DIR", save_dir.path().to_str().unwrap())],
         "score=42",
+    );
+}
+
+/// f64 field survives a save/load round-trip for a native Lua cart (Spike U).
+#[test]
+fn lua_cart_all_field_types_round_trips() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_sb_types");
+
+    CartProject::new()
+        .config(ALL_TYPES_CONFIG)
+        .lua(
+            r#"
+-- buf_id=1 (types), field_idx=2 (v_f64).
+local slot = -1
+local EXPECT = 0.123456789012345
+
+function init()
+    slot = blyt.buf.alloc_slot(1)
+    blyt.buf.set_f64(1, slot, 2, EXPECT)
+    blyt.save_write(0)
+    blyt.buf.set_f64(1, slot, 2, 0.0)
+end
+
+function update()
+    blyt.save_read(0)
+    local v = blyt.buf.get_f64(1, 0, 2)
+    if v == EXPECT then
+        blyt.debug.print("types_ok")
+    else
+        blyt.debug.print("types_fail")
+    end
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_native_with_env(
+        &cart,
+        &[("BLYT_SAVE_DIR", save_dir.path().to_str().unwrap())],
+        "types_ok",
     );
 }
 
@@ -282,7 +419,7 @@ extern "C" void blyt_cart_draw() {}
 
 // ── Type coverage ──────────────────────────────────────────────────────────
 
-/// All seven field types survive a save/load round-trip.
+/// All field types (incl. f64, Spike U) survive a save/load round-trip.
 #[test]
 fn c_cart_all_field_types_round_trips() {
     require_sdk();
@@ -303,6 +440,7 @@ void blyt_cart_init(void) {
     int32_t slot = -1;
     blyt_buffer_alloc_slot(S_TYPES, &slot);
     blyt_buffer_set_f32 (S_TYPES, slot, S_TYPES_V_F32,  1.5f);
+    blyt_buffer_set_f64 (S_TYPES, slot, S_TYPES_V_F64,  0.123456789012345);
     blyt_buffer_set_u32 (S_TYPES, slot, S_TYPES_V_U32,  0xDEADBEEFu);
     blyt_buffer_set_i8  (S_TYPES, slot, S_TYPES_V_I8,   -42);
     blyt_buffer_set_u8  (S_TYPES, slot, S_TYPES_V_U8,   200);
@@ -311,6 +449,7 @@ void blyt_cart_init(void) {
     blyt_buffer_set_bool(S_TYPES, slot, S_TYPES_V_BOOL, 1);
     blyt_save_write(0);
     blyt_buffer_set_f32 (S_TYPES, slot, S_TYPES_V_F32,  0.0f);
+    blyt_buffer_set_f64 (S_TYPES, slot, S_TYPES_V_F64,  0.0);
     blyt_buffer_set_u32 (S_TYPES, slot, S_TYPES_V_U32,  0);
     blyt_buffer_set_i8  (S_TYPES, slot, S_TYPES_V_I8,   0);
     blyt_buffer_set_u8  (S_TYPES, slot, S_TYPES_V_U8,   0);
@@ -322,13 +461,14 @@ void blyt_cart_init(void) {
 void blyt_cart_update(void) {
     blyt_save_read(0);
     float    vf  = blyt_buffer_get_f32 (S_TYPES, 0, S_TYPES_V_F32);
+    double   vd  = blyt_buffer_get_f64 (S_TYPES, 0, S_TYPES_V_F64);
     uint32_t vu  = blyt_buffer_get_u32 (S_TYPES, 0, S_TYPES_V_U32);
     int8_t   vi8 = blyt_buffer_get_i8  (S_TYPES, 0, S_TYPES_V_I8);
     uint8_t  vu8 = blyt_buffer_get_u8  (S_TYPES, 0, S_TYPES_V_U8);
     int16_t  vi16 = blyt_buffer_get_i16(S_TYPES, 0, S_TYPES_V_I16);
     uint16_t vu16 = blyt_buffer_get_u16(S_TYPES, 0, S_TYPES_V_U16);
     int      vb  = blyt_buffer_get_bool(S_TYPES, 0, S_TYPES_V_BOOL) ? 1 : 0;
-    if (vf == 1.5f && vu == 0xDEADBEEFu && vi8 == -42 && vu8 == 200
+    if (vf == 1.5f && vd == 0.123456789012345 && vu == 0xDEADBEEFu && vi8 == -42 && vu8 == 200
             && vi16 == -1000 && vu16 == 60000 && vb)
         blyt_console_debug("types_ok");
     else
@@ -1012,6 +1152,7 @@ void blyt_cart_init(void) {
     int32_t slot = -1;
     blyt_buffer_alloc_slot(S_TYPES, &slot);
     blyt_buffer_set_f32 (S_TYPES, slot, S_TYPES_V_F32,  1.5f);
+    blyt_buffer_set_f64 (S_TYPES, slot, S_TYPES_V_F64,  0.123456789012345);
     blyt_buffer_set_u32 (S_TYPES, slot, S_TYPES_V_U32,  0xDEADBEEFu);
     blyt_buffer_set_i8  (S_TYPES, slot, S_TYPES_V_I8,   -42);
     blyt_buffer_set_u8  (S_TYPES, slot, S_TYPES_V_U8,   200);
@@ -1020,6 +1161,7 @@ void blyt_cart_init(void) {
     blyt_buffer_set_bool(S_TYPES, slot, S_TYPES_V_BOOL, 1);
     blyt_save_write(0);
     blyt_buffer_set_f32 (S_TYPES, slot, S_TYPES_V_F32,  0.0f);
+    blyt_buffer_set_f64 (S_TYPES, slot, S_TYPES_V_F64,  0.0);
     blyt_buffer_set_u32 (S_TYPES, slot, S_TYPES_V_U32,  0);
     blyt_buffer_set_i8  (S_TYPES, slot, S_TYPES_V_I8,   0);
     blyt_buffer_set_u8  (S_TYPES, slot, S_TYPES_V_U8,   0);
@@ -1031,13 +1173,14 @@ void blyt_cart_init(void) {
 void blyt_cart_update(void) {
     blyt_save_read(0);
     float    vf   = blyt_buffer_get_f32 (S_TYPES, 0, S_TYPES_V_F32);
+    double   vd   = blyt_buffer_get_f64 (S_TYPES, 0, S_TYPES_V_F64);
     uint32_t vu   = blyt_buffer_get_u32 (S_TYPES, 0, S_TYPES_V_U32);
     int8_t   vi8  = blyt_buffer_get_i8  (S_TYPES, 0, S_TYPES_V_I8);
     uint8_t  vu8  = blyt_buffer_get_u8  (S_TYPES, 0, S_TYPES_V_U8);
     int16_t  vi16 = blyt_buffer_get_i16 (S_TYPES, 0, S_TYPES_V_I16);
     uint16_t vu16 = blyt_buffer_get_u16 (S_TYPES, 0, S_TYPES_V_U16);
     int      vb   = blyt_buffer_get_bool(S_TYPES, 0, S_TYPES_V_BOOL) ? 1 : 0;
-    if (vf == 1.5f && vu == 0xDEADBEEFu && vi8 == -42 && vu8 == 200
+    if (vf == 1.5f && vd == 0.123456789012345 && vu == 0xDEADBEEFu && vi8 == -42 && vu8 == 200
             && vi16 == -1000 && vu16 == 60000 && vb)
         blyt_console_debug("types_ok");
     else
@@ -1047,6 +1190,89 @@ void blyt_cart_update(void) {
 
 void blyt_cart_draw(void) {}
 "#)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "types_ok");
+}
+
+/// All field types (incl. f64, Spike U) survive a save/load round-trip for a
+/// Rust cart on the WASM target.
+#[test]
+fn wasm_rust_cart_all_field_types_round_trips() {
+    require_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_rust_sb_types");
+
+    CartProject::new()
+        .config(ALL_TYPES_CONFIG)
+        .rust(
+            r#"#![no_std]
+include!(env!("BLYT_CART_STATE_RS"));
+
+use blyt::buffer::{
+    alloc_slot, get_bool, get_f32, get_f64, get_i8, get_i16, get_u8, get_u16, get_u32,
+    set_bool, set_f32, set_f64, set_i8, set_i16, set_u8, set_u16, set_u32,
+};
+use blyt::save::{save_read, save_write};
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {
+    let slot = alloc_slot(S_TYPES);
+    set_f32(S_TYPES, slot, S_TYPES_V_F32, 1.5_f32);
+    set_f64(S_TYPES, slot, S_TYPES_V_F64, 0.123456789012345_f64);
+    set_u32(S_TYPES, slot, S_TYPES_V_U32, 0xDEAD_BEEF_u32);
+    set_i8(S_TYPES, slot, S_TYPES_V_I8, -42_i8);
+    set_u8(S_TYPES, slot, S_TYPES_V_U8, 200_u8);
+    set_i16(S_TYPES, slot, S_TYPES_V_I16, -1000_i16);
+    set_u16(S_TYPES, slot, S_TYPES_V_U16, 60000_u16);
+    set_bool(S_TYPES, slot, S_TYPES_V_BOOL, true);
+    save_write(0);
+    set_f32(S_TYPES, slot, S_TYPES_V_F32, 0.0_f32);
+    set_f64(S_TYPES, slot, S_TYPES_V_F64, 0.0_f64);
+    set_u32(S_TYPES, slot, S_TYPES_V_U32, 0);
+    set_i8(S_TYPES, slot, S_TYPES_V_I8, 0);
+    set_u8(S_TYPES, slot, S_TYPES_V_U8, 0);
+    set_i16(S_TYPES, slot, S_TYPES_V_I16, 0);
+    set_u16(S_TYPES, slot, S_TYPES_V_U16, 0);
+    set_bool(S_TYPES, slot, S_TYPES_V_BOOL, false);
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    save_read(0);
+    let vf = get_f32(S_TYPES, 0, S_TYPES_V_F32);
+    let vd = get_f64(S_TYPES, 0, S_TYPES_V_F64);
+    let vu = get_u32(S_TYPES, 0, S_TYPES_V_U32);
+    let vi8 = get_i8(S_TYPES, 0, S_TYPES_V_I8);
+    let vu8 = get_u8(S_TYPES, 0, S_TYPES_V_U8);
+    let vi16 = get_i16(S_TYPES, 0, S_TYPES_V_I16);
+    let vu16 = get_u16(S_TYPES, 0, S_TYPES_V_U16);
+    let vb = get_bool(S_TYPES, 0, S_TYPES_V_BOOL);
+    if vf == 1.5_f32
+        && vd == 0.123456789012345_f64
+        && vu == 0xDEAD_BEEF_u32
+        && vi8 == -42_i8
+        && vu8 == 200_u8
+        && vi16 == -1000_i16
+        && vu16 == 60000_u16
+        && vb
+    {
+        blyt::console_debug("types_ok");
+    } else {
+        blyt::console_debug("types_fail");
+    }
+    blyt::quit();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#,
+        )
         .write(&project);
 
     let cart = build_cart(&project);
@@ -1509,6 +1735,53 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
     run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "score=42");
+}
+
+/// f64 field survives a save/load round-trip for a pure-Lua WASM cart (Spike U).
+/// Exercises the host-side wasm_register_state_api path (wasm_buf_get/set_f64).
+#[test]
+fn wasm_lua_cart_all_field_types_round_trips() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_lua_sb_types");
+
+    CartProject::new()
+        .config(ALL_TYPES_CONFIG)
+        .lua(
+            r#"
+-- buf_id=1 (types), field_idx=2 (v_f64).
+local slot = -1
+local EXPECT = 0.123456789012345
+
+function init()
+    slot = blyt.buf.alloc_slot(1)
+    blyt.buf.set_f64(1, slot, 2, EXPECT)
+    blyt.save_write(0)
+    blyt.buf.set_f64(1, slot, 2, 0.0)
+end
+
+function update()
+    blyt.save_read(0)
+    local v = blyt.buf.get_f64(1, 0, 2)
+    if v == EXPECT then
+        blyt.debug.print("types_ok")
+    else
+        blyt.debug.print("types_fail")
+    end
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "types_ok");
 }
 
 /// S proxy global works in the WASM pure-Lua path.  wasm_register_s_proxy()

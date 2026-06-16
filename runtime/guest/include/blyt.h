@@ -48,6 +48,8 @@ typedef uint32_t blyt_field_h;
  * ------------------------------------------------------------------------- */
 float blyt_buffer_get_f32(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
 void blyt_buffer_set_f32(blyt_buffer_h buf, int32_t slot, blyt_field_h field, float v);
+double blyt_buffer_get_f64(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
+void blyt_buffer_set_f64(blyt_buffer_h buf, int32_t slot, blyt_field_h field, double v);
 int32_t blyt_buffer_get_i32(blyt_buffer_h buf, int32_t slot, blyt_field_h field);
 void blyt_buffer_set_i32(blyt_buffer_h buf, int32_t slot, blyt_field_h field, int32_t v);
 uint32_t blyt_buffer_get_u32(blyt_buffer_h buf, int32_t slot, blyt_field_h field);

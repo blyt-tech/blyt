@@ -22,9 +22,11 @@
 #define TYPE_U32 5
 #define TYPE_F32 6
 #define TYPE_BOOL 7
+#define TYPE_F64 8 /* Spike U: 64-bit double field */
 
-/* Canonical NaN bit pattern for f32 writes (ADR-0010). */
+/* Canonical NaN bit patterns for FP writes (ADR-0010). */
 #define F32_CANONICAL_NAN UINT32_C(0x7FC00000)
+#define F64_CANONICAL_NAN UINT64_C(0x7FF8000000000000)
 
 static size_t field_sizeof(uint8_t type_tag) {
     switch (type_tag) {
@@ -35,6 +37,8 @@ static size_t field_sizeof(uint8_t type_tag) {
     case TYPE_I16:
     case TYPE_U16:
         return 2;
+    case TYPE_F64:
+        return 8;
     case TYPE_I32:
     case TYPE_U32:
     case TYPE_F32:
@@ -211,6 +215,54 @@ int blyt_state_set(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_
     size_t elem = field_sizeof(tag);
     uint8_t *ptr = (uint8_t *)bc->field_data[fi] + (size_t)slot * elem;
     memcpy(ptr, &value_bits, elem);
+    return 0;
+}
+
+/* 64-bit (f64) get/set — the scalar path above is 32-bit; f64 is the only
+ * field type wider than a word (Spike U). */
+int blyt_state_set64(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
+                     uint64_t value_bits) {
+    blyt_buffer_ctx_t *bc = find_buffer(ctx, buf_id);
+    if (!bc)
+        return -1;
+    if (!slot_is_allocated(bc, slot))
+        return -1;
+    if (field == 0 || field > bc->n_fields)
+        return -1;
+
+    uint32_t fi = field - 1;
+    if (bc->field_types[fi] != TYPE_F64)
+        return -1; /* 64-bit path is f64-only */
+
+    /* NaN canonicalization for f64 (ADR-0010) */
+    double dv;
+    memcpy(&dv, &value_bits, 8);
+    if (isnan(dv))
+        value_bits = F64_CANONICAL_NAN;
+
+    uint8_t *ptr = (uint8_t *)bc->field_data[fi] + (size_t)slot * 8;
+    memcpy(ptr, &value_bits, 8);
+    return 0;
+}
+
+int blyt_state_get64(const blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_t field,
+                     uint64_t *out_bits) {
+    blyt_buffer_ctx_t *bc = find_buffer((blyt_state_ctx_t *)ctx, buf_id);
+    if (!bc)
+        return -1;
+    if (!slot_is_allocated(bc, slot))
+        return -1;
+    if (field == 0 || field > bc->n_fields)
+        return -1;
+
+    uint32_t fi = field - 1;
+    if (bc->field_types[fi] != TYPE_F64)
+        return -1;
+
+    const uint8_t *ptr = (const uint8_t *)bc->field_data[fi] + (size_t)slot * 8;
+    uint64_t bits = 0;
+    memcpy(&bits, ptr, 8);
+    *out_bits = bits;
     return 0;
 }
 

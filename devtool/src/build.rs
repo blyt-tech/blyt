@@ -288,7 +288,7 @@ fn generate_cart_state(
             let upval = fi + 2; /* upvalue 1=buf_h, 2+=field_h */
             let suffix = type_tag_buf_get_suffix(f.type_tag);
             let push = match f.type_tag {
-                crate::config::TYPE_F32 => format!(
+                crate::config::TYPE_F32 | crate::config::TYPE_F64 => format!(
                     "lua_pushnumber(L, blyt_buffer_get_{suffix}(_bh, (int32_t)_s, (blyt_field_h)lua_tointeger(L, lua_upvalueindex({upval}))))"
                 ),
                 crate::config::TYPE_BOOL => format!(
@@ -322,6 +322,9 @@ fn generate_cart_state(
             let set = match f.type_tag {
                 crate::config::TYPE_F32 => format!(
                     "blyt_buffer_set_{suffix}(_bh, (int32_t)_s, (blyt_field_h)lua_tointeger(L, lua_upvalueindex({upval})), (float)lua_tonumber(L, 3))"
+                ),
+                crate::config::TYPE_F64 => format!(
+                    "blyt_buffer_set_{suffix}(_bh, (int32_t)_s, (blyt_field_h)lua_tointeger(L, lua_upvalueindex({upval})), (double)lua_tonumber(L, 3))"
                 ),
                 crate::config::TYPE_BOOL => format!(
                     "blyt_buffer_set_{suffix}(_bh, (int32_t)_s, (blyt_field_h)lua_tointeger(L, lua_upvalueindex({upval})), (bool)(lua_toboolean(L, 3) != 0))"
@@ -1005,12 +1008,12 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     // Build all libraries before game code.
     let lib_names = discover_libraries(project_dir)?;
     let mut built_libs: Vec<BuiltLib> = Vec::new();
-    // Lua carts: pass LUA_32BITS=1 and LUA_USE_LONGJMP=1 so that src/lib/ C
+    // Lua carts: pass BLYT_LUA_I32_F64=1 and LUA_USE_LONGJMP=1 so that src/lib/ C
     // code calling the Lua C API uses the same numeric types and error-handling
     // path as the blyt Lua VM compiled with these flags.
     let lua_lib_defines: Vec<String> = if is_lua {
         vec![
-            "-DLUA_32BITS=1".to_string(),
+            "-DBLYT_LUA_I32_F64=1".to_string(),
             "-DLUA_USE_LONGJMP=1".to_string(),
         ]
     } else {
@@ -1727,15 +1730,23 @@ pub(crate) fn find_rust_sdk(sdk_include: &Path) -> Result<PathBuf, BuildError> {
 /* -------------------------------------------------------------------------
  * Rust staticlib build
  *
- * Invokes `cargo build --release` targeting riscv32imafc-unknown-none-elf
- * (ADR-0108, spike-o-results: corrected target string).  The SDK crate is
+ * Invokes `cargo build --release` targeting riscv32imafdc-blyt-none-elf
+ * (custom JSON target, ADR-0108 + ADR-0132).  The SDK crate is
  * injected via --config so game code declares `blyt = "0.1"` and cargo
  * resolves to the SDK path at build time without hard-coding it.
  *
  * Returns the path to the produced .a file.
  * ------------------------------------------------------------------------- */
 
-const RUST_TARGET: &str = "riscv32imafc-unknown-none-elf";
+/// Custom cart Rust target (Spike U): RV32IMAFDC / ilp32d hard-double ABI.
+/// There is no upstream `riscv32imafdc` target, so a target-spec JSON is shipped
+/// in-tree and resolved by name via `RUST_TARGET_PATH` (set in `cargo_cart_cmd`).
+/// The bare name (not a path) keeps cargo's output dir as `<name>/release/`.
+const RUST_TARGET: &str = "riscv32imafdc-blyt-none-elf";
+
+/// The target-spec JSON, compiled into devtool and materialised into each cart's
+/// `--target-dir` at build time so cargo can resolve `--target <RUST_TARGET>`.
+const RUST_TARGET_SPEC: &str = include_str!("../targets/riscv32imafdc-blyt-none-elf.json");
 
 /// Rust toolchain used to build cart code.  `-Z build-std` is an unstable
 /// cargo feature, so cart Rust builds require nightly + the `rust-src`
@@ -1869,7 +1880,10 @@ fn write_source_map_manifest(
 /// including `core`/`alloc` rebuilt by build-std — must be position
 /// independent.  `panic=abort`: no unwinding runtime; matches the SDK crate.
 fn cart_rustflags(extra: &str) -> String {
-    format!("-C relocation-model=pic -C panic=abort{extra}")
+    // `-Zunstable-options` is required to load the custom target-spec JSON
+    // (riscv32imafdc / ilp32d, Spike U); rustc rejects custom targets without it
+    // even on nightly.
+    format!("-Zunstable-options -C relocation-model=pic -C panic=abort{extra}")
 }
 
 /// sccache wrapper for cart rustc invocations, when available.
@@ -1921,8 +1935,19 @@ fn cart_sccache() -> Option<&'static str> {
 /// Callers may append crate-specific args (e.g. `--config` patches) and must
 /// set `RUSTFLAGS` via `cart_rustflags`.
 fn cargo_cart_cmd(cargo: &str, manifest: &Path, target_dir: &Path) -> Command {
+    // Materialise the custom target-spec JSON into the cart's target dir and
+    // point RUST_TARGET_PATH at it, so cargo resolves `--target <RUST_TARGET>`
+    // by name (Spike U: riscv32imafdc / ilp32d).  Best-effort: if the write
+    // fails, cargo surfaces a clear "target not found" error.
+    let _ = fs::create_dir_all(target_dir);
+    let _ = fs::write(
+        target_dir.join(format!("{RUST_TARGET}.json")),
+        RUST_TARGET_SPEC,
+    );
+
     let mut cmd = Command::new(cargo);
     cmd.env("RUSTUP_TOOLCHAIN", rust_toolchain())
+        .env("RUST_TARGET_PATH", target_dir)
         .args(["build", "--release"])
         .arg("--target")
         .arg(RUST_TARGET)
@@ -2206,8 +2231,8 @@ fn collect_c_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), BuildEr
 /// and the per-variant `-g`/`-O`/prefix-map flags, which callers append.
 const C_TARGET_FLAGS: &[&str] = &[
     "--target=riscv32",
-    "-march=rv32imafc",
-    "-mabi=ilp32f",
+    "-march=rv32imafdc",
+    "-mabi=ilp32d",
     "-nostdlib",
     "-fno-exceptions",
     "-fpie",
@@ -2224,8 +2249,8 @@ const C_TARGET_FLAGS: &[&str] = &[
 /// `-fno-rtti` (cart C++ is RTTI-free, ADR-0121).
 const CPP_TARGET_FLAGS: &[&str] = &[
     "--target=riscv32",
-    "-march=rv32imafc",
-    "-mabi=ilp32f",
+    "-march=rv32imafdc",
+    "-mabi=ilp32d",
     "-nostdlib",
     "-fno-exceptions",
     "-fno-rtti",
@@ -2482,7 +2507,7 @@ pub(crate) fn compile_commands_for(project_dir: &Path) -> Result<Vec<CompileEntr
     // Hybrid Lua+C carts compile the Lua C API with LUA_32BITS; mirror it so
     // clangd parses lua.h the same way.
     let defines: Vec<String> = if is_lua {
-        vec!["-DLUA_32BITS=1".into(), "-DLUA_USE_LONGJMP=1".into()]
+        vec!["-DBLYT_LUA_I32_F64=1".into(), "-DLUA_USE_LONGJMP=1".into()]
     } else {
         vec![]
     };
@@ -2637,8 +2662,8 @@ fn link_cart(
         .unwrap_or_else(|| "-fuse-ld=lld".to_string());
     cmd.args([
         "--target=riscv32",
-        "-march=rv32imafc",
-        "-mabi=ilp32f",
+        "-march=rv32imafdc",
+        "-mabi=ilp32d",
         "-nostdlib",
     ])
     .arg(&fuse_ld)

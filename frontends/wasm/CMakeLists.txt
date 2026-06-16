@@ -365,7 +365,7 @@ set_target_properties(
 
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)
-  list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 LUA_32BITS=1 LUA_USE_LONGJMP=1)
+  list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 BLYT_LUA_I32_F64=1 LUA_USE_LONGJMP=1)
   # Fixed Lua hash seed (ADR-0130/ADR-0066): identical string hashing — and
   # therefore pairs()/lua_next order, table.sort pivots, math.random streams —
   # across the rv32 and WASM execution paths.  0x424C5954 = "BLYT". NOTE: must

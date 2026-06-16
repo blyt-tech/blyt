@@ -336,13 +336,17 @@ pub fn write_rust_cart_project(dir: &std::path::Path, lib_rs: &str) {
 // Rust toolchain probe
 // -------------------------------------------------------------------------
 
-/// Returns true if the riscv32imafc-unknown-none-elf Rust target is installed.
-/// Install with: `rustup target add riscv32imafc-unknown-none-elf`
+/// Returns true if Rust cart builds are possible: the pinned nightly toolchain
+/// (or $BLYT_RUST_TOOLCHAIN override) is installed. Cart builds use a custom
+/// JSON target (riscv32imafdc-blyt-none-elf) via -Z build-std, so the target
+/// never appears in `rustup target list`; the nightly toolchain is the real gate.
 pub fn has_rust_riscv_target() -> bool {
+    let toolchain =
+        std::env::var("BLYT_RUST_TOOLCHAIN").unwrap_or_else(|_| "nightly-2026-06-01".to_string());
     std::process::Command::new("rustup")
-        .args(["target", "list", "--installed"])
+        .args(["toolchain", "list"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("riscv32imafc-unknown-none-elf"))
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&toolchain))
         .unwrap_or(false)
 }
 
@@ -405,10 +409,12 @@ pub fn require_lua_sdk() {
 }
 
 pub fn require_rust_riscv_target() {
+    let toolchain =
+        std::env::var("BLYT_RUST_TOOLCHAIN").unwrap_or_else(|_| "nightly-2026-06-01".to_string());
     assert!(
         has_rust_riscv_target(),
-        "riscv32imafc-unknown-none-elf Rust target not installed — \
-         run `rustup target add riscv32imafc-unknown-none-elf`"
+        "Rust cart toolchain '{toolchain}' not installed — \
+         run `rustup toolchain install {toolchain} --profile minimal --component rust-src`"
     );
 }
 

@@ -64,13 +64,6 @@ _blyt_fc_local(libopenmpt libopenmpt libopenmpt/libopenmpt.h)
 
 # ── Upstream deps (auto-generated GitHub tarballs) ───────────────────────
 
-set(LUA_VERSION "v5.5.0")
-FetchContent_Declare(
-  lua
-  URL "https://github.com/lua/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
-  URL_HASH
-    SHA256=a33484f7ce4c14e12ea4d51cc5a7353bff2796a8074004b96ae2dc246f33f16e)
-
 set(FLATCC_VERSION "v0.6.1")
 FetchContent_Declare(
   flatcc
@@ -106,14 +99,22 @@ FetchContent_Declare(
 # the fork tags and tarballs exist, clone the fork into third_party/<dep> — the
 # auto-detection macro above will pick it up at configure time.
 
+# lua: blyt-tech fork adds BLYT_LUA_I32_F64 (int32 + float64) for RV32D.
+set(LUA_VERSION "v5.5.0-blyt-v0-p1")
+FetchContent_Declare(
+  lua
+  URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=c2d9a3864e7468b4b3dc8f0548ebe82aa5dd64515f9b715342637b0f796e2feb)
+
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
-set(RV32EMU_VERSION "g4c3ab7c-blyt-v0-p6")
+set(RV32EMU_VERSION "g244cfb3-blyt-v0-p7")
 FetchContent_Declare(
   rv32emu
   URL "https://github.com/blyt-tech/rv32emu/releases/download/${RV32EMU_VERSION}/rv32emu-${RV32EMU_VERSION}.tar.gz"
   URL_HASH
-    SHA256=d0081a0a8a29807ee081dd827cbc0323f0e3c61d435bd0078bcee34e99e9581b)
+    SHA256=0fe03e8e8b0190a75a8561a1cfebd14f6a91a15425080d15947c8650ca2dbe9b)
 
 # musl: auto-generated GitHub tarball from blyt-tech/musl.
 set(MUSL_VERSION "v1.2.6-blyt-v0-p1")
@@ -389,15 +390,15 @@ include(cmake/blyt_guest_libs.cmake)
 set(_LUA_HOST_DIR "${lua_SOURCE_DIR}")
 if(EXISTS "${_LUA_HOST_DIR}/onelua.c")
   add_library(liblua_host STATIC "${_LUA_HOST_DIR}/onelua.c")
-  # MAKE_LIB=1 suppresses main(). LUA_32BITS=1 matches the ilp32f guest bytecode
-  # integer/float sizes so the host VM can load cart bytecode compiled for
-  # RISC-V. LUA_32BITS=1 is PUBLIC so it propagates to callers (cart_load.c)
-  # that include lua.h — keeping function pointer types consistent with the
-  # library.
+  # MAKE_LIB=1 suppresses main(). BLYT_LUA_I32_F64=1 matches the ilp32f guest
+  # bytecode integer/float sizes so the host VM can load cart bytecode compiled
+  # for RISC-V. BLYT_LUA_I32_F64=1 is PUBLIC so it propagates to callers
+  # (cart_load.c) that include lua.h — keeping function pointer types consistent
+  # with the library.
   target_compile_definitions(
     liblua_host
     PRIVATE MAKE_LIB=1
-    PUBLIC LUA_32BITS=1)
+    PUBLIC BLYT_LUA_I32_F64=1)
   target_include_directories(liblua_host PUBLIC "${_LUA_HOST_DIR}")
   target_link_libraries(liblua_host PUBLIC m)
   set_target_properties(liblua_host PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -2,7 +2,7 @@
 // Read by the runtime loader; written by blyt build codegen.
 //
 // type_tag values for FieldDecl:
-//   0=i8  1=u8  2=i16  3=u16  4=i32  5=u32  6=f32  7=bool
+//   0=i8  1=u8  2=i16  3=u16  4=i32  5=u32  6=f32  7=bool  8=f64
 
 namespace blyt;
 

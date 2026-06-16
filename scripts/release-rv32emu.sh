@@ -43,10 +43,11 @@ if [[ ! -f "${RV32EMU_DIR}/src/softfloat/source/f64_add.c" ]]; then
 fi
 
 WORK_DIR=$(mktemp -d)
-trap 'rm -rf "${WORK_DIR}"' EXIT
+OUT_DIR=$(mktemp -d)
+trap 'rm -rf "${WORK_DIR}" "${OUT_DIR}"' EXIT
 
 TARBALL_NAME="rv32emu-${TAG}.tar.gz"
-TARBALL_PATH="${WORK_DIR}/${TARBALL_NAME}"
+TARBALL_PATH="${OUT_DIR}/${TARBALL_NAME}"
 
 echo "==> Tagging ${TAG} in third_party/rv32emu"
 git -C "${RV32EMU_DIR}" tag "${TAG}"
@@ -67,13 +68,16 @@ COPYFILE_DISABLE=1 cp -r "${RV32EMU_DIR}/src/softfloat" "${WORK_DIR}/src/softflo
 # Strip all extended attributes (e.g. com.apple.provenance) from the work tree
 # before packing. Without this, macOS tar embeds xattrs as LIBARCHIVE.xattr.*
 # PAX headers; libarchive on Linux then extracts them as ._* AppleDouble files,
-# which clang tries to compile as C source.
-xattr -rc "${WORK_DIR}"
-# Re-pack as .tar.gz. COPYFILE_DISABLE=1 additionally tells macOS tar (bsdtar)
-# not to include Mac-specific metadata in the archive.
-COPYFILE_DISABLE=1 tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" \
-    --exclude="./${TARBALL_NAME}" \
-    .
+# which clang tries to compile as C source. xattr is macOS-only; Linux runners
+# never have these attributes so the stripping step is a no-op there.
+if [[ "$(uname)" == "Darwin" ]]; then
+    xattr -rc "${WORK_DIR}"
+fi
+# Re-pack as .tar.gz into OUT_DIR (separate from WORK_DIR so tar doesn't see
+# the output file inside the directory it's archiving — GNU tar exits 1 when
+# the archive file is inside the source tree even with --exclude).
+# COPYFILE_DISABLE=1 tells macOS tar (bsdtar) not to include Mac-specific metadata.
+COPYFILE_DISABLE=1 tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" .
 
 echo "==> Creating GitHub release and uploading tarball"
 gh release create "${TAG}" \
