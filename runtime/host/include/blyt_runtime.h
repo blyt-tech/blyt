@@ -22,7 +22,7 @@ typedef enum blyt_cart_err {
     BLYT_CART_ERR_BAD_MACHINE = 7, /* e_machine != EM_RISCV */
     BLYT_CART_ERR_BAD_FLAGS = 8, /* e_flags != expected RVC|ILP32F */
     BLYT_CART_ERR_BAD_SHDR = 9, /* section header table out of bounds */
-    BLYT_CART_ERR_UNKNOWN_SECT = 10, /* unrecognised ELF section name */
+    BLYT_CART_ERR_DENIED_SECT = 10, /* denied ELF section (.init_array family) */
     BLYT_CART_ERR_BAD_NEEDED = 11, /* DT_NEEDED allowlist violation */
     BLYT_CART_ERR_NO_CART_INFO = 12, /* .cart.info section missing */
     BLYT_CART_ERR_BAD_PREAMBLE = 13, /* section preamble tag or version mismatch */
