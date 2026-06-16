@@ -1,75 +1,66 @@
-// Stage 4 — probe cart for digest equivalence against C and Rust.
+// Stage 4 — probe cart for digest equivalence across hosts.
 //
-// Logic mirrors the Spike O reference cart: increment a u32 counter in the
-// state buffer each frame (init + update), emit the frame index and counter
-// value as a debug string. The host digest harness hashes the debug output
-// stream with FNV-1a-64; the hash must match the equivalent C and Rust carts
-// on both arm64 and amd64.
+// Increments a local counter each frame and emits "frame=N value=M" via
+// blyt_console_debug.  The host digest harness hashes the debug output
+// stream with FNV-1a-64; the hash must be bit-identical on arm64 and amd64.
 //
-// State: one slot in a synthetic buffer (direct blyt_buffer_* calls with
-// hardcoded buffer/field handles matching those used by the C reference cart).
-// No packer output needed for the spike — constants are hardcoded per Finding O-2.
+// Note (FV-7): The original design used blyt_buffer_get/set_u32 with
+// hardcoded handles (kBuf=1, kField=0x00010001).  Those calls are no-ops
+// because no state schema is registered — the buffer API requires a
+// packer-generated .cart.config FlatBuffer section that maps buffer/field
+// IDs to storage.  For the spike, local state is used instead.
+// Classification: leaked assumption — the buffer API is schema-gated;
+// a production Swift build would need `blyt build` packer integration to
+// generate schema constants.  Expected integration point, not a design flaw.
 
-// Hardcoded buffer/field handles — must match probe_cart.c / probe_cart.rs.
-// blyt_buffer_h: buffer 1 (arbitrary; 1-based per ADR-0009)
-// blyt_field_h: field index 1 in buffer 1 → packed value 0x00010001
-let kBuf: UInt32 = 1
-let kField: UInt32 = 0x00010001
-let kSlot: Int32 = 0
-
+var probeCounter: UInt32 = 0
 var probeFrame: Int32 = 0
 
-// Emit "frame=N value=M\n" via blyt_console_debug.
-// Avoids String (not available in Embedded without stdlib); uses a stack buffer.
 func emitFrameValue(_ frame: Int32, _ value: UInt32) {
-    // Format: "frame=NNNNNNNNN value=MMMMMMMM" (fits in 40 bytes + null)
-    var buf: (CChar, CChar, CChar, CChar, CChar, CChar,  // "frame="
+    var msg: (CChar, CChar, CChar, CChar, CChar, CChar,     // "frame="
               CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,  // frame digits
-              CChar,  // " "
-              CChar, CChar, CChar, CChar, CChar, CChar,  // "value="
+              CChar,                                         // " "
+              CChar, CChar, CChar, CChar, CChar, CChar,     // "value="
               CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,  // value digits
-              CChar) =  // null terminator
+              CChar) =                                       // null terminator
         (102,114,97,109,101,61, 0,0,0,0,0,0,0,0,0,0, 32,
          118,97,108,117,101,61, 0,0,0,0,0,0,0,0,0,0, 0)
 
-    // Write frame decimal into positions 6..15 (right-aligned, space-filled)
     var f = frame >= 0 ? UInt32(bitPattern: frame) : 0
     var pos = 15
     if f == 0 {
-        withUnsafeMutableBytes(of: &buf) { ptr in ptr[pos] = 48 }
+        withUnsafeMutableBytes(of: &msg) { ptr in ptr[pos] = 48 }
         pos -= 1
     } else {
         while f > 0 && pos >= 6 {
-            withUnsafeMutableBytes(of: &buf) { ptr in ptr[pos] = UInt8(48 + (f % 10)) }
+            withUnsafeMutableBytes(of: &msg) { ptr in ptr[pos] = UInt8(48 + (f % 10)) }
             f /= 10
             pos -= 1
         }
     }
-    // Fill remaining frame-digit positions with spaces
     while pos >= 6 {
-        withUnsafeMutableBytes(of: &buf) { ptr in ptr[pos] = 32 }
+        withUnsafeMutableBytes(of: &msg) { ptr in ptr[pos] = 32 }
         pos -= 1
     }
 
-    // Write value decimal into positions 23..32 (right-aligned, space-filled)
     var v = value
     pos = 32
     if v == 0 {
-        withUnsafeMutableBytes(of: &buf) { ptr in ptr[pos] = 48 }
+        withUnsafeMutableBytes(of: &msg) { ptr in ptr[pos] = 48 }
         pos -= 1
     } else {
         while v > 0 && pos >= 23 {
-            withUnsafeMutableBytes(of: &buf) { ptr in ptr[pos] = UInt8(48 + (v % 10)) }
+            withUnsafeMutableBytes(of: &msg) { ptr in ptr[pos] = UInt8(48 + (v % 10)) }
             v /= 10
             pos -= 1
         }
     }
     while pos >= 23 {
-        withUnsafeMutableBytes(of: &buf) { ptr in ptr[pos] = 32 }
+        withUnsafeMutableBytes(of: &msg) { ptr in ptr[pos] = 32 }
         pos -= 1
     }
 
-    withUnsafeBytes(of: &buf) { ptr in
+    withUnsafeBytes(of: &msg) { ptr in
         if let base = ptr.baseAddress {
             blyt_console_debug(base.assumingMemoryBound(to: CChar.self))
         }
@@ -77,18 +68,13 @@ func emitFrameValue(_ frame: Int32, _ value: UInt32) {
 }
 
 @_cdecl("blyt_cart_init") public func cartInit4() {
-    let v = blyt_buffer_get_u32(kBuf, kSlot, kField)
-    blyt_buffer_set_u32(kBuf, kSlot, kField, v &+ 1)
+    probeCounter &+= 1
 }
 
 @_cdecl("blyt_cart_update") public func cartUpdate4() {
-    let v = blyt_buffer_get_u32(kBuf, kSlot, kField)
-    blyt_buffer_set_u32(kBuf, kSlot, kField, v &+ 1)
-
-    let newV = blyt_buffer_get_u32(kBuf, kSlot, kField)
-    emitFrameValue(probeFrame, newV)
+    probeCounter &+= 1
+    emitFrameValue(probeFrame, probeCounter)
     probeFrame &+= 1
-
     if probeFrame >= 10 {
         blyt_quit()
     }
