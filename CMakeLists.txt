@@ -1057,6 +1057,18 @@ file(
   "${CMAKE_SOURCE_DIR}/examples/*.h")
 list(FILTER _LINT_C_FILES EXCLUDE REGEX "/(build|node_modules|target)/")
 
+file(
+  GLOB_RECURSE
+  _LINT_LUA_FILES
+  "${CMAKE_SOURCE_DIR}/examples/*.lua"
+  "${CMAKE_SOURCE_DIR}/runtime/*.lua"
+  "${CMAKE_SOURCE_DIR}/frontends/*.lua"
+  "${CMAKE_SOURCE_DIR}/tests/*.lua"
+  "${CMAKE_SOURCE_DIR}/sdk/*.lua"
+  "${CMAKE_SOURCE_DIR}/devtool/*.lua")
+list(FILTER _LINT_LUA_FILES EXCLUDE REGEX
+     "/(build|node_modules|target|third_party)/")
+
 add_custom_command(
   OUTPUT "${CMAKE_BINARY_DIR}/npm-ci.stamp"
   COMMAND npm ci
@@ -1091,8 +1103,11 @@ add_custom_target(
   COMMAND cargo fmt --check --all
   COMMAND "${CMAKE_SOURCE_DIR}/node_modules/.bin/biome" check
           "${CMAKE_SOURCE_DIR}"
+  COMMAND luacheck ${_LINT_LUA_FILES}
+  COMMAND stylua --check ${_LINT_LUA_FILES}
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-  COMMENT "Linting: clang-format, cmake-format, yamllint, cargo fmt, biome"
+  COMMENT
+    "Linting: clang-format, cmake-format, yamllint, cargo fmt, biome, luacheck, stylua"
   VERBATIM)
 add_dependencies(lint npm_ci)
 

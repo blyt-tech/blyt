@@ -34,9 +34,14 @@ end
 function draw()
     if frame % 10 == 0 then
         local slot = blyt.buf.ref_slot(S.globals[0].player)
-        greeting.log("draw frame " .. frame ..
-                     " player pos: " .. S.character[slot].x ..
-                     ", " .. S.character[slot].y)
+        greeting.log(
+            "draw frame "
+                .. frame
+                .. " player pos: "
+                .. S.character[slot].x
+                .. ", "
+                .. S.character[slot].y
+        )
     end
 end
 
@@ -44,6 +49,6 @@ function on_save_state()
     S.globals[0].frame = frame
 end
 
-function on_load_state(info)
+function on_load_state(_info)
     frame = S.globals[0].frame
 end
