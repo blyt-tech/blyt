@@ -393,7 +393,13 @@ set(LIBBLYTC_SRCS
     "${MUSL_DIR}/src/stdio/__uflow.c"
     "${MUSL_DIR}/src/stdio/__fmodeflags.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_arena.c"
-    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c")
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c"
+    "${MUSL_DIR}/src/malloc/posix_memalign.c"
+    "${MUSL_DIR}/src/stdio/sscanf.c"
+    "${MUSL_DIR}/src/stdio/vsscanf.c"
+    "${MUSL_DIR}/src/stdio/vfscanf.c"
+    "${MUSL_DIR}/src/setjmp/riscv32/setjmp.S"
+    "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S")
 
 set(LIBBLYTC_INCLUDES
     -I

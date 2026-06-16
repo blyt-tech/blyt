@@ -320,6 +320,40 @@ unsigned long long __umoddi3(unsigned long long a, unsigned long long b) {
 }
 
 /* -------------------------------------------------------------------------
+ * 64-bit integer shifts and arithmetic (RV32 LLVM emits these for i64 ops)
+ * Shifts and __muldi3 use plain C — RV32M lowers them to native insns.
+ * __divdi3/__moddi3 delegate to __udivdi3/__umoddi3 to avoid recursive
+ * codegen (the compiler emits __divdi3 for i64 /, so the body cannot
+ * contain i64 /).
+ * ------------------------------------------------------------------------- */
+
+long long __ashldi3(long long a, int b) {
+    return (unsigned long long)a << b;
+}
+unsigned long long __lshrdi3(unsigned long long a, int b) {
+    return a >> b;
+}
+long long __ashrdi3(long long a, int b) {
+    return a >> b;
+}
+long long __muldi3(long long a, long long b) {
+    return a * b;
+}
+long long __divdi3(long long a, long long b) {
+    int neg = (a < 0) ^ (b < 0);
+    unsigned long long ua = (a < 0) ? (unsigned long long)(~a) + 1 : (unsigned long long)a;
+    unsigned long long ub = (b < 0) ? (unsigned long long)(~b) + 1 : (unsigned long long)b;
+    unsigned long long q = __udivdi3(ua, ub);
+    return neg ? -(long long)q : (long long)q;
+}
+long long __moddi3(long long a, long long b) {
+    unsigned long long ua = (a < 0) ? (unsigned long long)(~a) + 1 : (unsigned long long)a;
+    unsigned long long ub = (b < 0) ? (unsigned long long)(~b) + 1 : (unsigned long long)b;
+    unsigned long long r = __umoddi3(ua, ub);
+    return (a < 0) ? -(long long)r : (long long)r;
+}
+
+/* -------------------------------------------------------------------------
  * Floating-point environment stubs (no hardware FP exception support)
  * The rv32emu FCSR is managed directly by the emulator; these stubs satisfy
  * linker references from musl code that we don't call at runtime.
