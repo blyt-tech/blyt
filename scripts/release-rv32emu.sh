@@ -67,8 +67,11 @@ COPYFILE_DISABLE=1 cp -r "${RV32EMU_DIR}/src/softfloat" "${WORK_DIR}/src/softflo
 # Strip all extended attributes (e.g. com.apple.provenance) from the work tree
 # before packing. Without this, macOS tar embeds xattrs as LIBARCHIVE.xattr.*
 # PAX headers; libarchive on Linux then extracts them as ._* AppleDouble files,
-# which clang tries to compile as C source.
-xattr -rc "${WORK_DIR}"
+# which clang tries to compile as C source. xattr is macOS-only; Linux runners
+# never have these attributes so the stripping step is a no-op there.
+if [[ "$(uname)" == "Darwin" ]]; then
+    xattr -rc "${WORK_DIR}"
+fi
 # Re-pack as .tar.gz. COPYFILE_DISABLE=1 additionally tells macOS tar (bsdtar)
 # not to include Mac-specific metadata in the archive.
 COPYFILE_DISABLE=1 tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" \
