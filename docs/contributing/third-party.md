@@ -93,6 +93,22 @@ Before merging a blyt PR that touches fork deps:
 Main always points at a stable tag. Pre-release tags are ephemeral and
 removed after the feature lands.
 
+### Post-merge cleanup
+
+After the blyt PR merges and CI on main is green, delete the pre-release
+release and tag from each affected fork:
+
+```sh
+gh release delete v1.2.6-blyt-v0-p2-mypatch --repo blyt-tech/musl --yes --cleanup-tag
+# or
+gh release delete g<sha>-blyt-v0-p4-mypatch --repo blyt-tech/rv32emu --yes --cleanup-tag
+```
+
+`--cleanup-tag` deletes the tag along with the release. For rv32emu this
+also removes the uploaded tarball asset. For deps that use GitHub's
+auto-generated tarball (musl, lua) there is no asset to remove, but the
+release entry and tag are still cleaned up the same way.
+
 ## Custom tarballs
 
 Two deps need custom tarballs because GitHub's auto-generated archive is
