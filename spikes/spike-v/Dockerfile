@@ -77,7 +77,21 @@ FROM base AS stage0
 
 WORKDIR /spike-v
 
-COPY trivial.swift .
+# Build context is the repo root (Makefile passes -f spikes/spike-v/Dockerfile .).
+# COPY from relative paths within the repo.
+COPY runtime/guest/include/blyt.h \
+     runtime/guest/include/blyt_lua_internal.h \
+     /spike-v/include/
+COPY spikes/spike-v/trivial.swift \
+     spikes/spike-v/cart.swift \
+     spikes/spike-v/abi_witness.swift \
+     spikes/spike-v/arc_cart.swift \
+     spikes/spike-v/probe_cart.swift \
+     spikes/spike-v/blyt_bridge.h \
+     /spike-v/src/
+
+# Rewrite blyt_bridge.h include path for the Docker layout.
+RUN sed -i 's|../../runtime/guest/include/blyt.h|/spike-v/include/blyt.h|' /spike-v/src/blyt_bridge.h
 
 # FV-finding: the correct triple for the pre-built Embedded Swift modules is
 # `riscv32-none-none-eabi`, NOT `riscv32-unknown-none-elf` (which the brief
@@ -98,11 +112,11 @@ RUN swiftc \
       -Xcc -mabi=ilp32d \
       -Xllvm -mattr=+m,+a,+f,+d,+c \
       -wmo -Osize -parse-as-library \
-      -emit-object -o trivial.o \
-      trivial.swift
+      -emit-object -o /spike-v/trivial.o \
+      /spike-v/src/trivial.swift
 
 # Verify: EF_RISCV_FLOAT_ABI_DOUBLE (flags 0x5) + rv32...f...d...c...
-RUN llvm-readelf -h -A trivial.o | tee /spike-v/stage0-readelf.txt
+RUN llvm-readelf -h -A /spike-v/trivial.o | tee /spike-v/stage0-readelf.txt
 # llvm-readelf-22 renders the flag as "double-float ABI" (flags 0x5), not
 # the symbolic name EF_RISCV_FLOAT_ABI_DOUBLE.  Match the actual output.
 RUN grep -q "double-float ABI" /spike-v/stage0-readelf.txt \
@@ -112,3 +126,68 @@ RUN grep -q "double-float ABI" /spike-v/stage0-readelf.txt \
 RUN grep -q "d2p2" /spike-v/stage0-readelf.txt \
     && echo "STAGE 0 GATE: D extension (d2p2) present — PASS" \
     || ( echo "STAGE 0 GATE: D extension not found in arch attr" ; cat /spike-v/stage0-readelf.txt ; exit 1 )
+
+# ── Stage 1 — compile all cart sources with bridging header ──────────────────
+# Also used for Stages 2–4: compile each cart source to a separate object file.
+# Objects are extracted to the host for linking against the blyt SDK.
+#
+# -import-bridging-header: Embedded Swift's mechanism for C interop without
+# a module map. The bridging header imports blyt.h, making the guest API
+# available to Swift cart code.
+#
+# FV-4 (preliminary): The bridging-header mechanism is Embedded Swift-specific.
+# Rust uses extern "C" blocks + bindgen; C++ uses #include directly; C uses
+# #include. The bridging-header approach is a per-language extension point —
+# the cart API surface (blyt.h) is language-agnostic, but the import mechanism
+# is not. Expected extension point, not a leaked assumption.
+FROM stage0 AS stage1-compile
+
+WORKDIR /spike-v
+
+# Compile cart.swift (Stage 1 minimal cart)
+RUN swiftc \
+      -enable-experimental-feature Embedded \
+      -target riscv32-none-none-eabi \
+      -Xcc -march=rv32imafdc \
+      -Xcc -mabi=ilp32d \
+      -Xllvm -mattr=+m,+a,+f,+d,+c \
+      -import-bridging-header /spike-v/src/blyt_bridge.h \
+      -wmo -Osize -parse-as-library \
+      -emit-object -o /spike-v/cart.o \
+      /spike-v/src/cart.swift
+
+# Compile abi_witness.swift (Stage 2)
+RUN swiftc \
+      -enable-experimental-feature Embedded \
+      -target riscv32-none-none-eabi \
+      -Xcc -march=rv32imafdc \
+      -Xcc -mabi=ilp32d \
+      -Xllvm -mattr=+m,+a,+f,+d,+c \
+      -import-bridging-header /spike-v/src/blyt_bridge.h \
+      -wmo -Osize -parse-as-library \
+      -emit-object -o /spike-v/abi_witness.o \
+      /spike-v/src/abi_witness.swift
+
+# Compile arc_cart.swift (Stage 3)
+RUN swiftc \
+      -enable-experimental-feature Embedded \
+      -target riscv32-none-none-eabi \
+      -Xcc -march=rv32imafdc \
+      -Xcc -mabi=ilp32d \
+      -Xllvm -mattr=+m,+a,+f,+d,+c \
+      -import-bridging-header /spike-v/src/blyt_bridge.h \
+      -wmo -Osize -parse-as-library \
+      -emit-object -o /spike-v/arc_cart.o \
+      /spike-v/src/arc_cart.swift
+
+# Compile probe_cart.swift (Stage 4)
+RUN swiftc \
+      -enable-experimental-feature Embedded \
+      -target riscv32-none-none-eabi \
+      -Xcc -march=rv32imafdc \
+      -Xcc -mabi=ilp32d \
+      -Xllvm -mattr=+m,+a,+f,+d,+c \
+      -import-bridging-header /spike-v/src/blyt_bridge.h \
+      -wmo -Osize -parse-as-library \
+      -emit-object -o /spike-v/probe_cart.o \
+      /spike-v/src/probe_cart.swift
