@@ -33,6 +33,12 @@ jobs:
             clang-22 lld-22 llvm-22 lldb-22 \
             qemu-system-misc gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
             libc6-dev-riscv64-cross libgcc-s1-riscv64-cross
+          # libc6-dev-riscv64-cross ships stubs-ilp32f.h but not stubs-ilp32d.h.
+          # Clang still resolves gnu/stubs.h through the riscv64-linux-gnu sysroot
+          # when building ILP32D guest code; an empty stub is sufficient since
+          # libc is never linked (matches the fix already in Dockerfile.testing).
+          sudo mkdir -p /usr/riscv64-linux-gnu/include/gnu
+          sudo touch /usr/riscv64-linux-gnu/include/gnu/stubs-ilp32d.h
           sudo update-alternatives --install /usr/bin/clang        clang        /usr/bin/clang-22        100
           sudo update-alternatives --install /usr/bin/clang++       clang++       /usr/bin/clang++-22       100
           sudo update-alternatives --install /usr/bin/ld.lld        ld.lld        /usr/bin/ld.lld-22        100
