@@ -108,12 +108,13 @@ FetchContent_Declare(
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
-set(RV32EMU_VERSION "g4c3ab7c-blyt-v0-p6")
+set(RV32EMU_VERSION "g244cfb3-blyt-v0-p7-rv32d")
 FetchContent_Declare(
   rv32emu
   URL "https://github.com/blyt-tech/rv32emu/releases/download/${RV32EMU_VERSION}/rv32emu-${RV32EMU_VERSION}.tar.gz"
   URL_HASH
-    SHA256=d0081a0a8a29807ee081dd827cbc0323f0e3c61d435bd0078bcee34e99e9581b)
+    # TODO: replace with SHA256 from scripts/release-rv32emu.sh g244cfb3-blyt-v0-p7-rv32d
+    SHA256=0000000000000000000000000000000000000000000000000000000000000000)
 
 # musl: auto-generated GitHub tarball from blyt-tech/musl.
 set(MUSL_VERSION "v1.2.6-blyt-v0-p1")

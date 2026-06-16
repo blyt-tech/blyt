@@ -1313,7 +1313,7 @@ const char *blyt_cart_err_str(blyt_cart_err_t err) {
     case BLYT_CART_ERR_BAD_MACHINE:
         return "not a RISC-V ELF";
     case BLYT_CART_ERR_BAD_FLAGS:
-        return "e_flags: expected RV32IMAFC ILP32F";
+        return "e_flags: expected RV32IMAFDC ILP32D";
     case BLYT_CART_ERR_BAD_SHDR:
         return "section header table malformed";
     case BLYT_CART_ERR_UNKNOWN_SECT:
