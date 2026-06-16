@@ -46,7 +46,6 @@ jobs:
           sudo update-alternatives --install /usr/bin/llvm-ar       llvm-ar       /usr/bin/llvm-ar-22       100
           sudo update-alternatives --install /usr/bin/lldb-dap      lldb-dap      /usr/bin/lldb-dap-22      100
           pip3 install clang-format==22.1.5 cmakelang yamllint
-          npm ci
           # Align stable Rust to the latest release: the runner-image rollout
           # leaves different preinstalled stable versions on different
           # runners (observed 1.95 vs 1.96 across consecutive runs), and

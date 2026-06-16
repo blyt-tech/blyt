@@ -1046,6 +1046,17 @@ file(
   "${CMAKE_SOURCE_DIR}/examples/*.h")
 list(FILTER _LINT_C_FILES EXCLUDE REGEX "/(build|node_modules|target)/")
 
+add_custom_command(
+  OUTPUT "${CMAKE_BINARY_DIR}/npm-ci.stamp"
+  COMMAND npm ci
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_BINARY_DIR}/npm-ci.stamp"
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  DEPENDS "${CMAKE_SOURCE_DIR}/package-lock.json"
+          "${CMAKE_SOURCE_DIR}/package.json"
+  COMMENT "Installing JS dependencies (npm ci)"
+  VERBATIM)
+add_custom_target(npm_ci DEPENDS "${CMAKE_BINARY_DIR}/npm-ci.stamp")
+
 add_custom_target(
   lint
   COMMAND clang-format --dry-run --Werror ${_LINT_C_FILES}
@@ -1058,6 +1069,7 @@ add_custom_target(
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
   COMMENT "Linting: clang-format, cmake-format, yamllint, cargo fmt, biome"
   VERBATIM)
+add_dependencies(lint npm_ci)
 
 # ── test-linux-docker ─────────────────────────────────────────────────────────
 # Run integration tests inside a Linux Docker container that mirrors the GitHub
