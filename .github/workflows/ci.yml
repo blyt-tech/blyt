@@ -181,9 +181,8 @@ jobs:
 
       - name: Install Playwright
         run: |
-          cd tests/wasm
-          npm install
-          npx playwright install --with-deps chromium
+          cmake --build build --target wasm_test_deps
+          cd tests/wasm && npx playwright install --with-deps chromium
 
       # The QEMU native ILP32 gate runs inside this step as a regular test:
       # nextest overlaps its ~30s QEMU boot with the other suites. The
