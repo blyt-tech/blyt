@@ -43,10 +43,11 @@ if [[ ! -f "${RV32EMU_DIR}/src/softfloat/source/f64_add.c" ]]; then
 fi
 
 WORK_DIR=$(mktemp -d)
-trap 'rm -rf "${WORK_DIR}"' EXIT
+OUT_DIR=$(mktemp -d)
+trap 'rm -rf "${WORK_DIR}" "${OUT_DIR}"' EXIT
 
 TARBALL_NAME="rv32emu-${TAG}.tar.gz"
-TARBALL_PATH="${WORK_DIR}/${TARBALL_NAME}"
+TARBALL_PATH="${OUT_DIR}/${TARBALL_NAME}"
 
 echo "==> Tagging ${TAG} in third_party/rv32emu"
 git -C "${RV32EMU_DIR}" tag "${TAG}"
@@ -72,11 +73,11 @@ COPYFILE_DISABLE=1 cp -r "${RV32EMU_DIR}/src/softfloat" "${WORK_DIR}/src/softflo
 if [[ "$(uname)" == "Darwin" ]]; then
     xattr -rc "${WORK_DIR}"
 fi
-# Re-pack as .tar.gz. COPYFILE_DISABLE=1 additionally tells macOS tar (bsdtar)
-# not to include Mac-specific metadata in the archive.
-COPYFILE_DISABLE=1 tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" \
-    --exclude="./${TARBALL_NAME}" \
-    .
+# Re-pack as .tar.gz into OUT_DIR (separate from WORK_DIR so tar doesn't see
+# the output file inside the directory it's archiving — GNU tar exits 1 when
+# the archive file is inside the source tree even with --exclude).
+# COPYFILE_DISABLE=1 tells macOS tar (bsdtar) not to include Mac-specific metadata.
+COPYFILE_DISABLE=1 tar -C "${WORK_DIR}" -czf "${TARBALL_PATH}" .
 
 echo "==> Creating GitHub release and uploading tarball"
 gh release create "${TAG}" \
