@@ -138,19 +138,16 @@ endfunction()
 # /blyt/sdk/src/blyt-dap.
 file(RELATIVE_PATH _rel_guest "${CMAKE_BINARY_DIR}"
      "${CMAKE_SOURCE_DIR}/runtime/guest")
-file(RELATIVE_PATH _rel_musl "${CMAKE_BINARY_DIR}"
-     "${CMAKE_SOURCE_DIR}/third_party/musl")
-file(RELATIVE_PATH _rel_lua "${CMAKE_BINARY_DIR}"
-     "${CMAKE_SOURCE_DIR}/third_party/lua")
-file(RELATIVE_PATH _rel_rv32 "${CMAKE_BINARY_DIR}"
-     "${CMAKE_SOURCE_DIR}/third_party/rv32emu")
+file(RELATIVE_PATH _rel_musl "${CMAKE_BINARY_DIR}" "${musl_SOURCE_DIR}")
+file(RELATIVE_PATH _rel_lua "${CMAKE_BINARY_DIR}" "${lua_SOURCE_DIR}")
+file(RELATIVE_PATH _rel_rv32 "${CMAKE_BINARY_DIR}" "${rv32emu_SOURCE_DIR}")
 file(RELATIVE_PATH _rel_dap "${CMAKE_BINARY_DIR}"
      "${CMAKE_SOURCE_DIR}/runtime/host/src/dap")
 set(RV32_PREFIX_MAP
     "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/guest=/blyt/sdk/src/blyt"
-    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/third_party/musl=/blyt/sdk/src/musl"
-    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/third_party/lua=/blyt/sdk/src/lua"
-    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/third_party/rv32emu=/blyt/sdk/src/rv32emu"
+    "-ffile-prefix-map=${musl_SOURCE_DIR}=/blyt/sdk/src/musl"
+    "-ffile-prefix-map=${lua_SOURCE_DIR}=/blyt/sdk/src/lua"
+    "-ffile-prefix-map=${rv32emu_SOURCE_DIR}=/blyt/sdk/src/rv32emu"
     "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/host/src/dap=/blyt/sdk/src/blyt-dap"
     "-ffile-prefix-map=${_rel_guest}=/blyt/sdk/src/blyt"
     "-ffile-prefix-map=${_rel_musl}=/blyt/sdk/src/musl"
@@ -200,6 +197,15 @@ function(blyt_guest_objects outvar objns)
       continue()
     endif()
     file(RELATIVE_PATH _rel "${CMAKE_SOURCE_DIR}" "${_src}")
+    if(_rel MATCHES "^\\.\\.")
+      # Source is outside the source tree (e.g. FetchContent cache).  A relative
+      # path starting with ".." would escape the per-variant objns directory,
+      # collapsing output paths across variants and triggering cmake's "already
+      # has a custom rule" error.  Use an MD5-addressed path instead.
+      get_filename_component(_fname "${_src}" NAME)
+      string(MD5 _hash "${_src}")
+      set(_rel "_ext/${_hash}/${_fname}")
+    endif()
     set(_obj "${GUEST_OBJ_ROOT}/${objns}/${_rel}.o")
     get_filename_component(_objdir "${_obj}" DIRECTORY)
     file(MAKE_DIRECTORY "${_objdir}")
@@ -277,7 +283,7 @@ endforeach()
 set(LIBBLYTCOMMON_OUT "${SDK_LIB}/libblytcommon.so")
 
 # ── musl bits/ generation (configure time) ──────────────────────────────────
-set(MUSL_DIR "${CMAKE_SOURCE_DIR}/third_party/musl")
+set(MUSL_DIR "${musl_SOURCE_DIR}")
 set(LIBBLYTC_BITS_DIR "${CMAKE_BINARY_DIR}/libblytc/bits")
 set(LIBBLYTC_ALLTYPES_H "${LIBBLYTC_BITS_DIR}/alltypes.h")
 
@@ -318,8 +324,11 @@ if(EXISTS "${MUSL_DIR}/include/stdio.h")
     endif()
   endif()
 else()
-  message(STATUS "libblytc.so: third_party/musl not initialised — skipping \
-(run: git submodule update --init third_party/musl)")
+  message(
+    STATUS
+      "libblytc.so: musl source not available — skipping \
+(re-run cmake -B build to re-fetch, or clone blyt-tech/musl into third_party/musl)"
+  )
   set(MUSL_DIR "")
 endif()
 
@@ -442,7 +451,7 @@ set(LIBBLYTC_OUT "${SDK_LIB}/libblytc.so")
 # (cart_load.c's import allowlist already permits them, ADR-0112).  Same RISC-V
 # NaN-propagation specialisation rv32emu uses on the host, so behaviour is
 # bit-identical to the emulator.
-set(SF_SRC "${CMAKE_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
+set(SF_SRC "${rv32emu_SOURCE_DIR}/src/softfloat/source")
 set(BLYT_HAVE_SOFTFLOAT FALSE)
 if(EXISTS "${SF_SRC}/f64_add.c")
   set(BLYT_HAVE_SOFTFLOAT TRUE)
@@ -455,6 +464,9 @@ if(EXISTS "${SF_SRC}/f64_add.c")
   # Core SoftFloat: all s_*.c and f32/f64/f128/conversion files.  Exclude extF80
   # (80-bit), M-variant (multi-word array), bf16, f16.
   file(GLOB SF_ALL "${SF_SRC}/*.c")
+  # Exclude macOS AppleDouble sidecar files (._*) that libarchive may extract
+  # from tarballs containing LIBARCHIVE.xattr PAX headers.
+  list(FILTER SF_ALL EXCLUDE REGEX "/\\._")
   foreach(
     _EXCL_PATTERN
     "${SF_SRC}/extF80*"
@@ -497,7 +509,7 @@ if(EXISTS "${SF_SRC}/f64_add.c")
   set(SF_BUILTINS
       "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32lua/softfloat_builtins.c")
 else()
-  message(STATUS "Guest SoftFloat: rv32emu submodule not initialised — \
+  message(STATUS "Guest SoftFloat: rv32emu source not available — \
 libblyt32.so will lack double/64-bit builtins")
   set(SF_ALL "")
   set(SF_RISCV "")
@@ -557,10 +569,10 @@ set(_guest_lib_outputs
     "${SDK_LIB_DEBUG}/libblytc.so" "${SDK_LIB_DEBUG}/libblyt32.so")
 
 # ── Lua guest libraries (ADR-0025/0066/0111/0130) ───────────────────────────
-set(LUA_DIR "${CMAKE_SOURCE_DIR}/third_party/lua")
+set(LUA_DIR "${lua_SOURCE_DIR}")
 if(NOT EXISTS "${LUA_DIR}/lvm.c")
   message(STATUS "Lua guest libraries: skipped \
-(run: git submodule update --init third_party/lua)")
+(re-run cmake -B build to re-fetch, or clone lua/lua into third_party/lua)")
 else()
   file(GLOB LUA_GUEST_SRCS "${LUA_DIR}/*.c")
   # Remove standalone interpreter, bytecode compiler, and excluded sandboxed
@@ -849,10 +861,10 @@ if(BLYT_BUILD_NATIVE)
   set(_SECCOMP_TEST_OUT "${CMAKE_BINARY_DIR}/test-rv32/seccomp_restricted_test")
   add_custom_command(
     OUTPUT "${_SECCOMP_TEST_OUT}"
-    COMMAND "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS}
-            -I "${LIBBLYT32_NATIVE_INC}"
-            -o "${_SECCOMP_TEST_OUT}"
-            "${CMAKE_SOURCE_DIR}/tests/native/seccomp_restricted_test.c"
+    COMMAND
+      "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS} -I "${LIBBLYT32_NATIVE_INC}" -o
+      "${_SECCOMP_TEST_OUT}"
+      "${CMAKE_SOURCE_DIR}/tests/native/seccomp_restricted_test.c"
     DEPENDS "${CMAKE_SOURCE_DIR}/tests/native/seccomp_restricted_test.c"
             "${LIBBLYT32_NATIVE_INC}/seccomp_restricted.h"
     COMMENT "Cross-compiling seccomp_restricted_test (RV32 ILP32F)"
@@ -863,25 +875,20 @@ if(BLYT_BUILD_NATIVE)
   set(_FCSR_RELEASE_OUT "${CMAKE_BINARY_DIR}/test-rv32/fcsr_release_test")
   add_custom_command(
     OUTPUT "${_FCSR_DEBUG_OUT}"
-    COMMAND "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS}
-            -o "${_FCSR_DEBUG_OUT}"
+    COMMAND "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS} -o "${_FCSR_DEBUG_OUT}"
             "${_FCSR_TEST_SRC}"
     DEPENDS "${_FCSR_TEST_SRC}"
     COMMENT "Cross-compiling fcsr_debug_test (RV32 ILP32F)"
     VERBATIM)
   add_custom_command(
     OUTPUT "${_FCSR_RELEASE_OUT}"
-    COMMAND "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS}
-            -DNDEBUG
-            -o "${_FCSR_RELEASE_OUT}"
-            "${_FCSR_TEST_SRC}"
+    COMMAND "${BLYT_RV32_CLANG}" ${_RV32_EXE_FLAGS} -DNDEBUG -o
+            "${_FCSR_RELEASE_OUT}" "${_FCSR_TEST_SRC}"
     DEPENDS "${_FCSR_TEST_SRC}"
     COMMENT "Cross-compiling fcsr_release_test (RV32 ILP32F, -DNDEBUG)"
     VERBATIM)
 
-  list(APPEND _native_outputs
-       "${_SECCOMP_TEST_OUT}"
-       "${_FCSR_DEBUG_OUT}"
+  list(APPEND _native_outputs "${_SECCOMP_TEST_OUT}" "${_FCSR_DEBUG_OUT}"
        "${_FCSR_RELEASE_OUT}")
 
   # Native libblyt32lua.so — Lua VM + bindings for trusted native exec.

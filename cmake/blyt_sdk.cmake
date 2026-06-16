@@ -58,11 +58,14 @@ if(NOT EXISTS "${SDK_LIB}/libblyt32.so")
                       "`cmake --build build` (guest_libs target) first.")
 endif()
 
-set(MUSL_DIR "${BLYT_SOURCE_DIR}/third_party/musl")
+set(MUSL_DIR "${BLYT_MUSL_SOURCE_DIR}")
 set(LIBBLYTC_BITS_DIR "${BLYT_BINARY_DIR}/libblytc/bits")
 if(NOT EXISTS "${MUSL_DIR}/include/stdio.h")
-  message(FATAL_ERROR "third_party/musl not initialised. "
-                      "Run: git submodule update --init third_party/musl")
+  message(
+    FATAL_ERROR
+      "musl source not found at ${MUSL_DIR}. "
+      "Re-run cmake -B build to re-fetch, "
+      "or clone blyt-tech/musl into third_party/musl.")
 endif()
 
 # -------------------------------------------------------------------------
@@ -81,15 +84,15 @@ endif()
 # (FOUND_CLANGPP is empty)
 # -------------------------------------------------------------------------
 
-set(LIBCXX_SOURCE_DIR "${BLYT_SOURCE_DIR}/third_party/libcxx")
+set(LIBCXX_SOURCE_DIR "${BLYT_LIBCXX_SOURCE_DIR}")
 set(LIBCXX_BUILD_DIR "${BLYT_BINARY_DIR}/build-libcxx-rv32")
 set(SDK_INC_LIBCXX "${SDK_INC}/c++/v1")
 
 if(NOT EXISTS "${LIBCXX_SOURCE_DIR}/runtimes/CMakeLists.txt")
   message(
-    WARNING
-      "third_party/libcxx not initialised — C++ cart support will not be built.\n"
-      "Run: git submodule update --init third_party/libcxx")
+    WARNING "libcxx source not found — C++ cart support will not be built.\n"
+            "Re-run cmake -B build to re-fetch, "
+            "or clone blyt-tech/llvm-project into third_party/libcxx.")
 elseif(NOT FOUND_CLANGPP)
   message(WARNING "clang++ not found — C++ cart support will not be built.")
 elseif(EXISTS "${SDK_LIB}/libc++.a" AND EXISTS
@@ -158,6 +161,7 @@ else()
       -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF -DLIBCXXABI_ENABLE_THREADS=OFF
       -DLIBCXXABI_USE_COMPILER_RT=ON -DLIBCXXABI_USE_LLVM_UNWINDER=OFF
       -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF
+      -DLLVM_INCLUDE_TESTS=OFF
       # On macOS, cmake injects -arch arm64 / -isysroot into every build even
       # when cross-compiling.  Setting CMAKE_SYSTEM_NAME=Linux tells cmake this
       # is a Linux cross-compile so it suppresses all Apple toolchain defaults.
@@ -284,6 +288,7 @@ else()
       -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF -DLIBCXXABI_ENABLE_THREADS=OFF
       -DLIBCXXABI_USE_COMPILER_RT=ON -DLIBCXXABI_USE_LLVM_UNWINDER=OFF
       -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF
+      -DLLVM_INCLUDE_TESTS=OFF
       -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=riscv32
     RESULT_VARIABLE _LXXD_CFG_R
     OUTPUT_QUIET)
@@ -339,19 +344,17 @@ file(COPY "${BLYT_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"
 
 # musl (libblytc): the compiled subset spans several src/ areas; ship src/,
 # include/ and arch/ wholesale so any linked libc function resolves.
-if(EXISTS "${BLYT_SOURCE_DIR}/third_party/musl/include/stdio.h")
+if(EXISTS "${BLYT_MUSL_SOURCE_DIR}/include/stdio.h")
   foreach(_d src include arch)
-    file(COPY "${BLYT_SOURCE_DIR}/third_party/musl/${_d}"
-         DESTINATION "${SDK_SRC}/musl")
+    file(COPY "${BLYT_MUSL_SOURCE_DIR}/${_d}" DESTINATION "${SDK_SRC}/musl")
   endforeach()
-  file(COPY "${BLYT_SOURCE_DIR}/third_party/musl/COPYRIGHT"
-       DESTINATION "${SDK_SRC}/musl")
+  file(COPY "${BLYT_MUSL_SOURCE_DIR}/COPYRIGHT" DESTINATION "${SDK_SRC}/musl")
 endif()
 
 # Lua VM (libblyt32lua): flat layout, source at the tree root → src/lua.
-if(EXISTS "${BLYT_SOURCE_DIR}/third_party/lua/lua.h")
+if(EXISTS "${BLYT_LUA_SOURCE_DIR}/lua.h")
   file(
-    COPY "${BLYT_SOURCE_DIR}/third_party/lua/"
+    COPY "${BLYT_LUA_SOURCE_DIR}/"
     DESTINATION "${SDK_SRC}/lua"
     FILES_MATCHING
     PATTERN "*.c"
@@ -359,11 +362,11 @@ if(EXISTS "${BLYT_SOURCE_DIR}/third_party/lua/lua.h")
 endif()
 
 # rv32emu softfloat builtins, pulled into the debug libblyt32lua.
-if(EXISTS "${BLYT_SOURCE_DIR}/third_party/rv32emu/src/softfloat")
-  file(COPY "${BLYT_SOURCE_DIR}/third_party/rv32emu/src/softfloat"
+if(EXISTS "${BLYT_RV32EMU_SOURCE_DIR}/src/softfloat")
+  file(COPY "${BLYT_RV32EMU_SOURCE_DIR}/src/softfloat"
        DESTINATION "${SDK_SRC}/rv32emu/src")
-  if(EXISTS "${BLYT_SOURCE_DIR}/third_party/rv32emu/LICENSE")
-    file(COPY "${BLYT_SOURCE_DIR}/third_party/rv32emu/LICENSE"
+  if(EXISTS "${BLYT_RV32EMU_SOURCE_DIR}/LICENSE")
+    file(COPY "${BLYT_RV32EMU_SOURCE_DIR}/LICENSE"
          DESTINATION "${SDK_SRC}/rv32emu")
   endif()
 endif()
@@ -608,12 +611,11 @@ else()
       "${HOST_CC}" ${LINK_FLAGS} -fPIC -o "${LIBRETRO_OUT}"
       ${_libretro_embed_defs}
       "${BLYT_SOURCE_DIR}/frontends/libretro/blyt_libretro.c"
-      "${EMBEDDED_LIBS_C}" -I
-      "${BLYT_SOURCE_DIR}/third_party/libretro-common/include" -I
+      "${EMBEDDED_LIBS_C}" -I "${BLYT_LIBRETRO_COMMON_SOURCE_DIR}/include" -I
       "${BLYT_SOURCE_DIR}/runtime/host/include" "${BLYT_BINARY_DIR}/libblyt.a"
       "${BLYT_BINARY_DIR}/liblibblytemu.a"
       "${BLYT_BINARY_DIR}/liblibsoftfloat.a"
-      "${BLYT_SOURCE_DIR}/third_party/flatcc/lib/libflatccrt.a"
+      "${BLYT_BINARY_DIR}/flatcc-lib/libflatccrt.a"
     RESULT_VARIABLE R)
   if(NOT R EQUAL 0)
     message(FATAL_ERROR "Failed to build blyt_libretro.so")
@@ -683,7 +685,10 @@ if(EMCC)
         "${BLYT_SOURCE_DIR}/frontends/wasm" "-DBLYT_GUEST_LIB_DIR=${_WLIBS}"
         "-DBLYT_VERSION=${BLYT_VERSION}" "-DBLYT_WASM_NAME=${_WNAME}"
         "-DBLYT_WASM_OUT_DIR=${_WDEST}" "-DBLYT_DAP=${_WDBG}"
-        "-DBLYT_GDB=${_WDBG}" ${CCACHE_LAUNCHER_ARGS} -G Ninja
+        "-DBLYT_GDB=${_WDBG}" "-DBLYT_LUA_SOURCE_DIR=${BLYT_LUA_SOURCE_DIR}"
+        "-DBLYT_RV32EMU_SOURCE_DIR=${BLYT_RV32EMU_SOURCE_DIR}"
+        "-DBLYT_FLATCC_SOURCE_DIR=${BLYT_FLATCC_SOURCE_DIR}"
+        ${CCACHE_LAUNCHER_ARGS} -G Ninja
       RESULT_VARIABLE R
       OUTPUT_QUIET)
     if(NOT R EQUAL 0)

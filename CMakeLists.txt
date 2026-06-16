@@ -17,6 +17,132 @@ file(READ "${CMAKE_BINARY_DIR}/version.txt" BLYT_VERSION)
 string(STRIP "${BLYT_VERSION}" BLYT_VERSION)
 message(STATUS "blyt version: ${BLYT_VERSION}")
 
+# -------------------------------------------------------------------------
+# Third-party dependencies via FetchContent (issue #61)
+#
+# All deps are downloaded as versioned tarballs into a shared cache at
+# ~/.cache/blyt/fetchcontent/ (set via FETCHCONTENT_BASE_DIR), so every worktree
+# shares the same downloads.  CI caches this directory keyed on a hash of
+# CMakeLists.txt.
+#
+# Local patch development: clone a blyt-tech fork into third_party/<dep>
+# (gitignored) and check out blyt-patches-v0.  cmake auto-detects a populated
+# checkout via a per-dep sentinel file and sets FETCHCONTENT_SOURCE_DIR_<dep>
+# automatically — no -D flags needed. See docs/contributing/third-party.md for
+# the full patch workflow.
+#
+# Fork tags follow v<upstream>-blyt-v0-p<N> (stable) or
+# v<upstream>-blyt-v0-p<N>-<feature> (pre-release, deleted after merge). See
+# scripts/release-*.sh to create tags and tarballs.
+# -------------------------------------------------------------------------
+include(FetchContent)
+
+set(FETCHCONTENT_BASE_DIR
+    "$ENV{HOME}/.cache/blyt/fetchcontent"
+    CACHE PATH "FetchContent download cache (shared across worktrees)")
+
+# Auto-detect local fork checkouts in third_party/ by looking for a sentinel
+# file that only exists when the checkout is populated.  Empty gitlink stubs
+# (e.g. uninitialised submodule directories in a new worktree) are ignored.
+macro(_blyt_fc_local dep dir sentinel)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/${dir}/${sentinel}")
+    set("FETCHCONTENT_SOURCE_DIR_${dep}"
+        "${CMAKE_SOURCE_DIR}/third_party/${dir}"
+        CACHE PATH "" FORCE)
+    message(STATUS "FetchContent ${dep}: using local third_party/${dir}/")
+  endif()
+endmacro()
+
+_blyt_fc_local(lua lua onelua.c)
+_blyt_fc_local(flatcc flatcc include/flatcc/flatcc.h)
+_blyt_fc_local(rv32emu rv32emu src/riscv.h)
+_blyt_fc_local(musl musl include/stdio.h)
+_blyt_fc_local(libcxx libcxx runtimes/CMakeLists.txt)
+_blyt_fc_local(libretro_common libretro-common include/libretro.h)
+_blyt_fc_local(zstd zstd lib/zstd.h)
+_blyt_fc_local(libopenmpt libopenmpt libopenmpt/libopenmpt.h)
+
+# ── Upstream deps (auto-generated GitHub tarballs) ───────────────────────
+
+set(LUA_VERSION "v5.5.0")
+FetchContent_Declare(
+  lua
+  URL "https://github.com/lua/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=a33484f7ce4c14e12ea4d51cc5a7353bff2796a8074004b96ae2dc246f33f16e)
+
+set(FLATCC_VERSION "v0.6.1")
+FetchContent_Declare(
+  flatcc
+  URL "https://github.com/dvidelabs/flatcc/archive/refs/tags/${FLATCC_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=2533c2f1061498499f15acc7e0937dcf35bc68e685d237325124ae0d6c600c2b)
+
+set(LIBRETRO_COMMON_COMMIT "ff11f01109a0a319f6f918abc706cf9a8614054e")
+FetchContent_Declare(
+  libretro_common
+  URL "https://github.com/libretro/libretro-common/archive/${LIBRETRO_COMMON_COMMIT}.tar.gz"
+  URL_HASH
+    SHA256=db386da56830d294cd8ed0109c13b7cc7dad8efd29dda7847048f506951546fd)
+
+# zstd and libopenmpt are declared but not yet used by the build; the
+# declarations are here so the infrastructure is in place when needed.
+set(ZSTD_VERSION "v1.5.7")
+FetchContent_Declare(
+  zstd
+  URL "https://github.com/facebook/zstd/archive/refs/tags/${ZSTD_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3)
+
+set(LIBOPENMPT_VERSION "libopenmpt-0.8.7")
+FetchContent_Declare(
+  libopenmpt
+  URL "https://github.com/OpenMPT/openmpt/archive/refs/tags/${LIBOPENMPT_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=2a73f6aa795eced6856e480deaece29775f3d654a7fc024195a69d8d3d94f3e2)
+
+# ── blyt-tech fork deps (custom tarballs) ────────────────────────────────
+# SHA256 values below are filled in after running scripts/release-*.sh. Until
+# the fork tags and tarballs exist, clone the fork into third_party/<dep> — the
+# auto-detection macro above will pick it up at configure time.
+
+# rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
+# g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
+set(RV32EMU_VERSION "g4c3ab7c-blyt-v0-p6")
+FetchContent_Declare(
+  rv32emu
+  URL "https://github.com/blyt-tech/rv32emu/releases/download/${RV32EMU_VERSION}/rv32emu-${RV32EMU_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=d0081a0a8a29807ee081dd827cbc0323f0e3c61d435bd0078bcee34e99e9581b)
+
+# musl: auto-generated GitHub tarball from blyt-tech/musl.
+set(MUSL_VERSION "v1.2.6-blyt-v0-p1")
+FetchContent_Declare(
+  musl
+  URL "https://github.com/blyt-tech/musl/archive/refs/tags/${MUSL_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=6ea4c369d2914a76566202438e9c52ea456c29663460d5893665298123001b67)
+
+# libcxx: curated libcxx+libcxxabi subtree tarball from blyt-tech/llvm-project.
+set(LIBCXX_VERSION "v22.1.5-blyt-v0-p4")
+FetchContent_Declare(
+  libcxx
+  URL "https://github.com/blyt-tech/llvm-project/releases/download/${LIBCXX_VERSION}/libcxx-${LIBCXX_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=9f74509d795211615a55f42ab414388831b4e59d43ac3e10e149de66bb4cd5b5)
+
+# Populate deps that don't have their own CMakeLists.txt we want added as a
+# cmake subdirectory.  flatcc uses FetchContent_MakeAvailable below (it has a
+# CMakeLists.txt and we do want add_subdirectory). lua_POPULATED /
+# rv32emu_POPULATED etc. are set by FetchContent_Populate and guard against
+# double-populate across multiple include() of this file.
+foreach(_dep lua rv32emu musl libcxx libretro_common)
+  FetchContent_GetProperties(${_dep})
+  if(NOT ${_dep}_POPULATED)
+    FetchContent_Populate(${_dep})
+  endif()
+endforeach()
+
 # flatcc — pure C FlatBuffers schema compiler, built from source (ADR-0126)
 set(FLATCC_TEST
     OFF
@@ -30,7 +156,12 @@ set(FLATCC_INSTALL
 set(FLATCC_DEBUG_CLANG_SANITIZE
     OFF
     CACHE BOOL "" FORCE)
-add_subdirectory(third_party/flatcc EXCLUDE_FROM_ALL)
+# Newer clang versions flag [[]] empty attributes as -Wc23-extensions; flatcc
+# enables -Werror for Clang, which would turn that into a build error.
+set(FLATCC_ALLOW_WERROR
+    OFF
+    CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(flatcc)
 # flatcc hardcodes PROJECT_SOURCE_DIR/lib as the archive output, which fails
 # when the source is mounted read-only (e.g. Docker :ro). Override it here so
 # all targets write to the build tree instead.
@@ -92,8 +223,7 @@ endif()
 # Berkeley SoftFloat — IEEE 754 software FP for the F extension. rv32emu's
 # Makefile generates an empty platform.h; we replicate that here.
 # -------------------------------------------------------------------------
-set(SOFTFLOAT_SRC
-    "${CMAKE_SOURCE_DIR}/third_party/rv32emu/src/softfloat/source")
+set(SOFTFLOAT_SRC "${rv32emu_SOURCE_DIR}/src/softfloat/source")
 set(SOFTFLOAT_PLATFORM_DIR "${CMAKE_BINARY_DIR}/softfloat")
 file(MAKE_DIRECTORY "${SOFTFLOAT_PLATFORM_DIR}")
 file(WRITE "${SOFTFLOAT_PLATFORM_DIR}/platform.h" "")
@@ -103,6 +233,9 @@ file(WRITE "${SOFTFLOAT_PLATFORM_DIR}/platform.h" "")
 # handful of other files) must be excluded.  We glob the source directory then
 # remove those files explicitly.
 file(GLOB SOFTFLOAT_SOURCES "${SOFTFLOAT_SRC}/*.c")
+# Exclude macOS AppleDouble sidecar files (._*) that libarchive may extract from
+# tarballs containing LIBARCHIVE.xattr PAX headers on Linux.
+list(FILTER SOFTFLOAT_SOURCES EXCLUDE REGEX "/\\._")
 set(SOFTFLOAT_EXCLUDE_NAMES
     # Non-FAST_INT64 M-word-array helpers
     bf16_isSignalingNaN.c
@@ -183,7 +316,7 @@ target_compile_options(
 # compile only the user-mode sources (no JIT, no SDL, no system/MMU, no
 # GDBSTUB).
 # -------------------------------------------------------------------------
-set(RV32EMU_DIR "${CMAKE_SOURCE_DIR}/third_party/rv32emu/src")
+set(RV32EMU_DIR "${rv32emu_SOURCE_DIR}/src")
 
 set(RV32EMU_SOURCES
     ${RV32EMU_DIR}/riscv.c
@@ -253,7 +386,7 @@ include(cmake/blyt_guest_libs.cmake)
 # Host-native Lua static library for cart inspection
 # (blyt_cart_lua_lifecycle_mask). Uses onelua.c which bundles all Lua sources;
 # MAKE_LIB=1 suppresses main().
-set(_LUA_HOST_DIR "${CMAKE_SOURCE_DIR}/third_party/lua")
+set(_LUA_HOST_DIR "${lua_SOURCE_DIR}")
 if(EXISTS "${_LUA_HOST_DIR}/onelua.c")
   add_library(liblua_host STATIC "${_LUA_HOST_DIR}/onelua.c")
   # MAKE_LIB=1 suppresses main(). LUA_32BITS=1 matches the ilp32f guest bytecode
@@ -292,7 +425,7 @@ set_target_properties(libblyt libblytemu libsoftfloat
 target_include_directories(
   libblyt
   PUBLIC runtime/host/include
-  PRIVATE runtime/host/src/libblyt third_party/flatcc/include
+  PRIVATE runtime/host/src/libblyt ${flatcc_SOURCE_DIR}/include
           "${GENERATED_DIR}" ${RV32EMU_DIR})
 # cart_run.c includes common.h explicitly; the -D flags ensure feature macros
 # expand correctly when rv32emu headers are pulled in from cart_run.c.
@@ -396,7 +529,7 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
   target_include_directories(
     libblyt_debug
     PUBLIC runtime/host/include
-    PRIVATE runtime/host/src/libblyt third_party/flatcc/include
+    PRIVATE runtime/host/src/libblyt ${flatcc_SOURCE_DIR}/include
             "${GENERATED_DIR}" ${RV32EMU_DIR})
   target_compile_definitions(libblyt_debug PRIVATE ${RV32EMU_FEATURE_DEFS})
   target_link_libraries(
@@ -499,7 +632,7 @@ function(blyt_add_player target runtime_lib)
     target_link_options(${target} PRIVATE ${_SDL2_LDFLAGS})
   endif()
   target_include_directories(
-    ${target} PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
+    ${target} PRIVATE "${libretro_common_SOURCE_DIR}/include"
                       "${CMAKE_SOURCE_DIR}/runtime/host/include")
   # Players emit directly into the SDK layout: BLYT_LIB_DIR auto-inference
   # resolves <binary>/../lib[/debug], and tests run the sdk/bin copies — so
@@ -554,9 +687,8 @@ if(LIBBLYTC_OUT)
                                    "${EMBEDDED_LIBS_C}")
   target_link_libraries(blyt_libretro PRIVATE libblyt)
   target_include_directories(
-    blyt_libretro
-    PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libretro-common/include"
-            "${CMAKE_SOURCE_DIR}/runtime/host/include")
+    blyt_libretro PRIVATE "${libretro_common_SOURCE_DIR}/include"
+                          "${CMAKE_SOURCE_DIR}/runtime/host/include")
   # ADR-0129: the shipped libretro core is release-only — no GDB/DAP, embeds the
   # optimized release guest libs.  Debug stepping is served via blyt debug
   # (WASM) and the native blytdebug player, not the libretro core.
@@ -717,7 +849,7 @@ endif()
 
 add_executable(test_cart_load tests/unit/test_cart_load.c)
 target_include_directories(
-  test_cart_load PRIVATE runtime/host/src/libblyt third_party/flatcc/include
+  test_cart_load PRIVATE runtime/host/src/libblyt ${flatcc_SOURCE_DIR}/include
                          "${TEST_GENERATED_DIR}")
 target_link_libraries(test_cart_load PRIVATE libblyt flatccrt)
 add_dependencies(test_cart_load flatbuffers_test_generated)
@@ -773,7 +905,7 @@ target_link_libraries(test_session_api PRIVATE libblyt)
 if(LIBBLYTC_OUT)
   add_executable(test_libretro_core tests/unit/test_libretro_core.c)
   target_include_directories(test_libretro_core
-                             PRIVATE third_party/libretro-common/include)
+                             PRIVATE ${libretro_common_SOURCE_DIR}/include)
   target_link_libraries(test_libretro_core PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
@@ -803,7 +935,13 @@ add_custom_target(
     -DBLYT_RV32_LLDB_DAP=${BLYT_RV32_LLDB_DAP}
     -DBLYT_CCACHE_PROGRAM=${BLYT_CCACHE_PROGRAM}
     -DCMAKE_HOST_SYSTEM_NAME=${CMAKE_HOST_SYSTEM_NAME}
-    -DCMAKE_HOST_SYSTEM_PROCESSOR=${CMAKE_HOST_SYSTEM_PROCESSOR} -P
+    -DCMAKE_HOST_SYSTEM_PROCESSOR=${CMAKE_HOST_SYSTEM_PROCESSOR}
+    -DBLYT_MUSL_SOURCE_DIR=${musl_SOURCE_DIR}
+    -DBLYT_LIBCXX_SOURCE_DIR=${libcxx_SOURCE_DIR}
+    -DBLYT_LUA_SOURCE_DIR=${lua_SOURCE_DIR}
+    -DBLYT_RV32EMU_SOURCE_DIR=${rv32emu_SOURCE_DIR}
+    -DBLYT_FLATCC_SOURCE_DIR=${flatcc_SOURCE_DIR}
+    -DBLYT_LIBRETRO_COMMON_SOURCE_DIR=${libretro_common_SOURCE_DIR} -P
     ${CMAKE_SOURCE_DIR}/cmake/blyt_sdk.cmake
   USES_TERMINAL
   COMMENT "Assembling blyt SDK in build/sdk/"
@@ -932,6 +1070,10 @@ add_custom_target(
 # Docker image and build volumes so switching architectures does not require a
 # full rebuild of the other.
 #
+# Named Docker volumes used: blyt-linux-build-<arch>      build tree (cmake +
+# cargo output) blyt-compiler-cache-<arch>   ccache + sccache compiler caches
+# blyt-fetchcontent-cache-<arch>  FetchContent tarball downloads
+#
 # Delete volumes with: docker volume rm blyt-linux-build-amd64
 set(BLYT_LINUX_TEST_FILTER
     ""
@@ -962,6 +1104,10 @@ if(_BLYT_DOCKER)
       # the configure step and the devtool.
       -v blyt-compiler-cache-${BLYT_LINUX_ARCH}:/ccache -e
       CCACHE_DIR=/ccache/ccache -e SCCACHE_DIR=/ccache/sccache
+      # FetchContent tarball cache: persisted in a named volume so deps are not
+      # re-downloaded on every docker run (mirrors the CI actions/cache).
+      -v
+      "blyt-fetchcontent-cache-${BLYT_LINUX_ARCH}:/root/.cache/blyt/fetchcontent"
       # The native RISC-V QEMU gate is host-independent and would run nested
       # under Rosetta here; skip it in the Docker image (runs natively + in CI).
       -e BLYT_SKIP_QEMU_GATE=1 blyt-testing-${BLYT_LINUX_ARCH} bash -c

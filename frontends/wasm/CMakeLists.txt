@@ -82,11 +82,15 @@ message(STATUS "blyt WASM: guest libs from ${BLYT_GUEST_LIB_DIR}")
 # -------------------------------------------------------------------------
 # Optional Lua-direct support
 #
-# When third_party/lua is initialised, compile the Lua VM sources and the
-# blyt32lua bindings directly into the WASM module so Lua carts run without
-# going through rv32emu.  Enabled automatically when the submodule is present.
+# When Lua sources are available, compile the Lua VM sources and the blyt32lua
+# bindings directly into the WASM module so Lua carts run without going through
+# rv32emu.  BLYT_LUA_SOURCE_DIR is set by blyt_sdk.cmake (which gets it from
+# FetchContent); falls back to third_party/lua for local dev.
 # -------------------------------------------------------------------------
-set(LUA_DIR "${BLYT_ROOT}/third_party/lua")
+if(NOT DEFINED BLYT_LUA_SOURCE_DIR)
+  set(BLYT_LUA_SOURCE_DIR "${BLYT_ROOT}/third_party/lua")
+endif()
+set(LUA_DIR "${BLYT_LUA_SOURCE_DIR}")
 set(BLYT_LUA_SOURCES "")
 if(EXISTS "${LUA_DIR}/lvm.c")
   file(GLOB LUA_ALL_SRCS "${LUA_DIR}/*.c")
@@ -107,7 +111,7 @@ if(EXISTS "${LUA_DIR}/lvm.c")
 else()
   message(
     STATUS
-      "blyt WASM: Lua-direct support disabled (third_party/lua not initialised)"
+      "blyt WASM: Lua-direct support disabled (Lua sources not found at ${LUA_DIR})"
   )
 endif()
 
@@ -135,7 +139,7 @@ else()
   if(BLYT_DAP AND NOT EXISTS "${LUA_DIR}/lvm.c")
     message(
       STATUS
-        "blyt WASM: DAP disabled (requires BLYT_LUA; third_party/lua not initialised)"
+        "blyt WASM: DAP disabled (requires BLYT_LUA; Lua sources not found at ${LUA_DIR})"
     )
   else()
     message(STATUS "blyt WASM: DAP disabled")
@@ -200,13 +204,21 @@ add_custom_command(
 # -------------------------------------------------------------------------
 # Berkeley SoftFloat (same subset as the host cmake build)
 # -------------------------------------------------------------------------
-set(RV32EMU_DIR "${BLYT_ROOT}/third_party/rv32emu/src")
+# BLYT_RV32EMU_SOURCE_DIR is set by blyt_sdk.cmake; falls back to local dev
+# checkout.
+if(NOT DEFINED BLYT_RV32EMU_SOURCE_DIR)
+  set(BLYT_RV32EMU_SOURCE_DIR "${BLYT_ROOT}/third_party/rv32emu")
+endif()
+set(RV32EMU_DIR "${BLYT_RV32EMU_SOURCE_DIR}/src")
 set(SOFTFLOAT_SRC "${RV32EMU_DIR}/softfloat/source")
 set(SOFTFLOAT_PLATFORM_DIR "${CMAKE_BINARY_DIR}/softfloat")
 file(MAKE_DIRECTORY "${SOFTFLOAT_PLATFORM_DIR}")
 file(WRITE "${SOFTFLOAT_PLATFORM_DIR}/platform.h" "")
 
 file(GLOB SOFTFLOAT_SOURCES "${SOFTFLOAT_SRC}/*.c")
+# Exclude macOS AppleDouble sidecar files (._*) that libarchive may extract from
+# tarballs containing LIBARCHIVE.xattr PAX headers.
+list(FILTER SOFTFLOAT_SOURCES EXCLUDE REGEX "/\\._")
 set(SOFTFLOAT_EXCLUDE_NAMES
     # Non-FAST_INT64 M-word-array helpers
     bf16_isSignalingNaN.c
@@ -298,7 +310,12 @@ set(RV32EMU_FEATURE_DEFS
 # -------------------------------------------------------------------------
 # flatccrt sources (runtime only; flatcc_cli is a host tool, not needed here)
 # -------------------------------------------------------------------------
-file(GLOB FLATCCRT_SOURCES "${BLYT_ROOT}/third_party/flatcc/src/runtime/*.c")
+# BLYT_FLATCC_SOURCE_DIR is set by blyt_sdk.cmake; falls back to local dev
+# checkout.
+if(NOT DEFINED BLYT_FLATCC_SOURCE_DIR)
+  set(BLYT_FLATCC_SOURCE_DIR "${BLYT_ROOT}/third_party/flatcc")
+endif()
+file(GLOB FLATCCRT_SOURCES "${BLYT_FLATCC_SOURCE_DIR}/src/runtime/*.c")
 
 # -------------------------------------------------------------------------
 # blytplay executable
@@ -409,7 +426,7 @@ target_include_directories(
           "${SOFTFLOAT_SRC}/include"
           "${SOFTFLOAT_SRC}/RISCV"
           "${SOFTFLOAT_PLATFORM_DIR}"
-          "${BLYT_ROOT}/third_party/flatcc/include"
+          "${BLYT_FLATCC_SOURCE_DIR}/include"
           "${GENERATED_DIR}"
           "${BLYT_ROOT}/runtime/host/include"
           "${BLYT_ROOT}/runtime/host/src/libblyt"

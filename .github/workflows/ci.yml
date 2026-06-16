@@ -97,33 +97,17 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
-      # Cache the submodule object stores keyed on the gitlink SHAs (the
-      # nested rv32emu/softfloat SHA is pinned by rv32emu's commit, so the
-      # third_party tree hash covers it). On a hit, the update --init below
-      # checks out from the cached objects with no network (~70s -> ~5s).
-      - name: Compute submodule cache key
-        id: subkey
-        run: |
-          echo "key=$(git ls-tree HEAD -- third_party \
-            | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache submodules
+      # Deps are downloaded via CMake FetchContent at configure time into
+      # ~/.cache/blyt/fetchcontent/. Cache the directory keyed on a hash of
+      # CMakeLists.txt (which contains all URLs and SHA256 values); a dep
+      # version bump automatically invalidates the cache. No restore-keys
+      # fallback: a partial restore of a previous cache serves stale extracted
+      # source trees that FetchContent reuses without re-downloading.
+      - name: FetchContent cache
         uses: actions/cache@v4
         with:
-          path: .git/modules
-          key: submodules-${{ steps.subkey.outputs.key }}
-
-      - name: Init submodules
-        run: |
-          git submodule update --init --depth 1 \
-            third_party/flatcc \
-            third_party/rv32emu \
-            third_party/musl \
-            third_party/libretro-common \
-            third_party/libcxx \
-            third_party/lua
-          git -C third_party/rv32emu submodule update --init --depth 1 \
-            src/softfloat
+          path: ~/.cache/blyt/fetchcontent
+          key: fetchcontent-${{ hashFiles('CMakeLists.txt') }}
 
       - name: Stamp version
         run: |
