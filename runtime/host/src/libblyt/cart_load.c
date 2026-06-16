@@ -15,7 +15,8 @@
 #include "cart_layouts_verifier.h"
 
 /* -------------------------------------------------------------------------
- * Section name allowlist (ADR-0112: reject unknown ELF sections)
+ * Section name denylist (ADR-0112 amendment: reject constructor/destructor
+ * sections that would execute at load time, bypassing the cart lifecycle)
  * ------------------------------------------------------------------------- */
 
 /* Interpreter path required in every cart (ADR-0112, ADR-0119).
@@ -23,54 +24,13 @@
  * Carts with a different PT_INTERP are rejected — unknown interpreter. */
 #define BLYT_INTERP_PATH "/lib/ld-blyt.so.1"
 
-static const char *const KNOWN_SECTIONS_EXACT[] = {
-    "",
-    ".interp",
-    ".text",
-    ".data",
-    ".bss",
-    ".sbss", /* RISC-V small-data BSS (GP-relative) */
-    ".sdata", /* RISC-V small-data (GP-relative) */
-    ".rodata",
-    ".dynamic",
-    ".dynsym",
-    ".dynstr",
-    ".plt",
-    ".got",
-    ".got.plt",
-    ".symtab",
-    ".strtab",
-    ".shstrtab",
-    ".gnu.hash",
-    ".hash",
-    ".eh_frame",
-    ".eh_frame_hdr",
-    ".relro_padding", /* lld page-alignment pad between RELRO and data */
-    ".comment",
-    ".gnu.version",
-    ".gnu.version_r",
-    ".gnu.version_d",
-    ".cart.info",
-    ".cart.config",
-    ".cart.resources",
-    ".cart.lua",
-    ".cart.layouts",
-    ".lua_exports",
-    "__lcxx_override", /* libc++ replaceable global operator new/delete (C++ carts) */
-    NULL,
+static const char *const DENIED_SECTIONS[] = {
+    ".init_array", ".fini_array", ".preinit_array", ".ctors", ".dtors", NULL,
 };
 
-static const char *const KNOWN_SECTIONS_PREFIX[] = {
-    ".text.", ".data.",  ".bss.",    ".rodata.", ".rel.",   ".rela.",
-    ".note.", ".debug_", ".zdebug_", ".gnu.",    ".riscv.", NULL,
-};
-
-static int section_name_known(const char *name) {
-    for (int i = 0; KNOWN_SECTIONS_EXACT[i]; i++)
-        if (strcmp(name, KNOWN_SECTIONS_EXACT[i]) == 0)
-            return 1;
-    for (int i = 0; KNOWN_SECTIONS_PREFIX[i]; i++)
-        if (strncmp(name, KNOWN_SECTIONS_PREFIX[i], strlen(KNOWN_SECTIONS_PREFIX[i])) == 0)
+static int section_name_denied(const char *name) {
+    for (int i = 0; DENIED_SECTIONS[i]; i++)
+        if (strcmp(name, DENIED_SECTIONS[i]) == 0)
             return 1;
     return 0;
 }
@@ -743,8 +703,8 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         }
         const char *name = shstrtab + sh->sh_name;
 
-        if (!section_name_known(name)) {
-            err = BLYT_CART_ERR_UNKNOWN_SECT;
+        if (section_name_denied(name)) {
+            err = BLYT_CART_ERR_DENIED_SECT;
             goto fail;
         }
 
@@ -1318,8 +1278,8 @@ const char *blyt_cart_err_str(blyt_cart_err_t err) {
         return "e_flags: expected RV32IMAFDC ILP32D";
     case BLYT_CART_ERR_BAD_SHDR:
         return "section header table malformed";
-    case BLYT_CART_ERR_UNKNOWN_SECT:
-        return "unknown ELF section";
+    case BLYT_CART_ERR_DENIED_SECT:
+        return "denied ELF section";
     case BLYT_CART_ERR_BAD_NEEDED:
         return "DT_NEEDED: library not on allowlist";
     case BLYT_CART_ERR_NO_CART_INFO:

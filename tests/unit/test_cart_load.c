@@ -386,13 +386,114 @@ static void mut_ebreak_in_code(Blob *b) {
  * Section / FlatBuffers mutations
  * ------------------------------------------------------------------------- */
 
-static void mut_unknown_section(Blob *b) {
+/* Rename .cart.config to an unknown name — denylist pass-through: should succeed. */
+static void mut_unknown_section_passthrough(Blob *b) {
     Elf32_Ehdr *eh = (Elf32_Ehdr *)b->buf;
-    /* Use e_shstrndx so this stays correct regardless of section ordering */
     size_t shstrtab_off = (size_t)((Elf32_Shdr *)(b->buf + eh->e_shoff))[eh->e_shstrndx].sh_offset;
-    /* Replace ".cart.config\0" (13 bytes at index SHSTR_IDX_CART_CONFIG) */
+    /* Replace ".cart.config\0" (13 bytes at SHSTR_IDX_CART_CONFIG) */
     memcpy(b->buf + shstrtab_off + SHSTR_IDX_CART_CONFIG, ".unknown_sec", 13);
 }
+static void mut_init_array_section(Blob *b) {
+    Elf32_Ehdr *eh = (Elf32_Ehdr *)b->buf;
+    size_t shstrtab_off = (size_t)((Elf32_Shdr *)(b->buf + eh->e_shoff))[eh->e_shstrndx].sh_offset;
+    memcpy(b->buf + shstrtab_off + SHSTR_IDX_CART_CONFIG, ".init_array\0", 12);
+}
+static void mut_fini_array_section(Blob *b) {
+    Elf32_Ehdr *eh = (Elf32_Ehdr *)b->buf;
+    size_t shstrtab_off = (size_t)((Elf32_Shdr *)(b->buf + eh->e_shoff))[eh->e_shstrndx].sh_offset;
+    memcpy(b->buf + shstrtab_off + SHSTR_IDX_CART_CONFIG, ".fini_array\0", 12);
+}
+static void mut_ctors_section(Blob *b) {
+    Elf32_Ehdr *eh = (Elf32_Ehdr *)b->buf;
+    size_t shstrtab_off = (size_t)((Elf32_Shdr *)(b->buf + eh->e_shoff))[eh->e_shstrndx].sh_offset;
+    memcpy(b->buf + shstrtab_off + SHSTR_IDX_CART_CONFIG, ".ctors\0", 7);
+}
+static void mut_dtors_section(Blob *b) {
+    Elf32_Ehdr *eh = (Elf32_Ehdr *)b->buf;
+    size_t shstrtab_off = (size_t)((Elf32_Shdr *)(b->buf + eh->e_shoff))[eh->e_shstrndx].sh_offset;
+    memcpy(b->buf + shstrtab_off + SHSTR_IDX_CART_CONFIG, ".dtors\0", 7);
+}
+/* ELF with .preinit_array section — name too long for shstrtab mutation. */
+static Blob build_elf_preinit_array(void) {
+    /* Shstrtab offsets: 0=null, 1=.shstrtab, 11=.cart.info, 22=.preinit_array */
+    static const char SHSTR2[] = "\0.shstrtab\0.cart.info\0.preinit_array\0";
+    size_t shstr2_sz = sizeof(SHSTR2) - 1;
+
+    Blob ci_fb = build_cart_info(0, 0, TEST_CART_ID, TEST_CART_TITLE, TEST_CART_VERSION);
+    Blob ci = add_preamble(&ci_fb, CART_INFO_TAG);
+
+    size_t shnum = 4; /* null, .shstrtab, .cart.info, .preinit_array */
+    size_t phsz = PHNUM * sizeof(Elf32_Phdr);
+
+    size_t off_ph = sizeof(Elf32_Ehdr);
+    size_t off_interp = off_ph + phsz;
+    size_t off_shstr = align4(off_interp + TEST_INTERP_LEN);
+    size_t off_ci = align4(off_shstr + shstr2_sz);
+    size_t off_code = align4(off_ci + ci.size);
+    size_t off_shdrs = align4(off_code + CODE_SIZE);
+    size_t total = off_shdrs + shnum * sizeof(Elf32_Shdr);
+
+    Blob b = {calloc(1, total), total};
+
+    Elf32_Ehdr *eh = (Elf32_Ehdr *)b.buf;
+    eh->e_ident[EI_MAG0] = ELFMAG0;
+    eh->e_ident[EI_MAG1] = ELFMAG1;
+    eh->e_ident[EI_MAG2] = ELFMAG2;
+    eh->e_ident[EI_MAG3] = ELFMAG3;
+    eh->e_ident[EI_CLASS] = ELFCLASS32;
+    eh->e_ident[EI_DATA] = ELFDATA2LSB;
+    eh->e_ident[EI_OSABI] = ELFOSABI_NONE;
+    eh->e_machine = EM_RISCV;
+    eh->e_flags = BLYT_CART_EF_FLAGS;
+    eh->e_ehsize = (Elf32_Half)sizeof(Elf32_Ehdr);
+    eh->e_phentsize = (Elf32_Half)sizeof(Elf32_Phdr);
+    eh->e_phnum = PHNUM;
+    eh->e_phoff = (Elf32_Off)off_ph;
+    eh->e_shentsize = (Elf32_Half)sizeof(Elf32_Shdr);
+    eh->e_shnum = (Elf32_Half)shnum;
+    eh->e_shstrndx = 1;
+    eh->e_shoff = (Elf32_Off)off_shdrs;
+    eh->e_entry = LOAD_VADDR;
+
+    Elf32_Phdr *ph = (Elf32_Phdr *)(b.buf + off_ph);
+    ph[PH_INTERP].p_type = PT_INTERP;
+    ph[PH_INTERP].p_offset = (Elf32_Off)off_interp;
+    ph[PH_INTERP].p_filesz = (Elf32_Word)TEST_INTERP_LEN;
+    ph[PH_INTERP].p_memsz = (Elf32_Word)TEST_INTERP_LEN;
+    ph[PH_INTERP].p_flags = PF_R;
+    ph[PH_INTERP].p_align = 1;
+    ph[PH_CODE].p_type = PT_LOAD;
+    ph[PH_CODE].p_offset = (Elf32_Off)off_code;
+    ph[PH_CODE].p_vaddr = LOAD_VADDR;
+    ph[PH_CODE].p_paddr = LOAD_VADDR;
+    ph[PH_CODE].p_filesz = CODE_SIZE;
+    ph[PH_CODE].p_memsz = CODE_SIZE;
+    ph[PH_CODE].p_flags = PF_R | PF_X;
+    ph[PH_CODE].p_align = 4;
+    ph[PH_RELRO].p_type = PT_GNU_RELRO;
+    ph[PH_RELRO].p_flags = PF_R;
+
+    memcpy(b.buf + off_interp, TEST_INTERP_PATH, TEST_INTERP_LEN);
+    memcpy(b.buf + off_shstr, SHSTR2, shstr2_sz);
+    memcpy(b.buf + off_ci, ci.buf, ci.size);
+
+    Elf32_Shdr *sh = (Elf32_Shdr *)(b.buf + off_shdrs);
+    sh[1].sh_name = 1; /* .shstrtab */
+    sh[1].sh_type = SHT_STRTAB;
+    sh[1].sh_offset = (Elf32_Off)off_shstr;
+    sh[1].sh_size = (Elf32_Word)shstr2_sz;
+    sh[2].sh_name = 11; /* .cart.info */
+    sh[2].sh_type = SHT_PROGBITS;
+    sh[2].sh_offset = (Elf32_Off)off_ci;
+    sh[2].sh_size = (Elf32_Word)ci.size;
+    sh[3].sh_name = 22; /* .preinit_array — empty, just tests the name check */
+    sh[3].sh_type = SHT_PROGBITS;
+
+    blob_free(&ci);
+    blob_free(&ci_fb);
+    return b;
+}
+
 static void mut_bad_ci_preamble(Blob *b) {
     Elf32_Ehdr *eh = (Elf32_Ehdr *)b->buf;
     Elf32_Shdr *sh = (Elf32_Shdr *)(b->buf + eh->e_shoff);
@@ -702,8 +803,22 @@ int main(void) {
     check_mutated("ecall in code", BLYT_CART_ERR_BAD_OPCODE, mut_ecall_in_code);
     check_mutated("ebreak in code", BLYT_CART_ERR_BAD_OPCODE, mut_ebreak_in_code);
 
+    /* Section denylist */
+    check_mutated("unknown section passes through", BLYT_CART_OK, mut_unknown_section_passthrough);
+    check_mutated(".init_array denied", BLYT_CART_ERR_DENIED_SECT, mut_init_array_section);
+    check_mutated(".fini_array denied", BLYT_CART_ERR_DENIED_SECT, mut_fini_array_section);
+    check_mutated(".ctors denied", BLYT_CART_ERR_DENIED_SECT, mut_ctors_section);
+    check_mutated(".dtors denied", BLYT_CART_ERR_DENIED_SECT, mut_dtors_section);
+    {
+        Blob elf = build_elf_preinit_array();
+        char *path = write_temp(&elf);
+        check(".preinit_array denied", path, BLYT_CART_ERR_DENIED_SECT);
+        unlink(path);
+        free(path);
+        blob_free(&elf);
+    }
+
     /* Section / FlatBuffers */
-    check_mutated("unknown section", BLYT_CART_ERR_UNKNOWN_SECT, mut_unknown_section);
     check_mutated("bad .cart.info preamble", BLYT_CART_ERR_BAD_PREAMBLE, mut_bad_ci_preamble);
     {
         Blob elf = build_elf_bad_api_version();
