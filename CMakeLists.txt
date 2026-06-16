@@ -64,13 +64,6 @@ _blyt_fc_local(libopenmpt libopenmpt libopenmpt/libopenmpt.h)
 
 # ── Upstream deps (auto-generated GitHub tarballs) ───────────────────────
 
-set(LUA_VERSION "v5.5.0")
-FetchContent_Declare(
-  lua
-  URL "https://github.com/lua/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
-  URL_HASH
-    SHA256=a33484f7ce4c14e12ea4d51cc5a7353bff2796a8074004b96ae2dc246f33f16e)
-
 set(FLATCC_VERSION "v0.6.1")
 FetchContent_Declare(
   flatcc
@@ -106,6 +99,14 @@ FetchContent_Declare(
 # the fork tags and tarballs exist, clone the fork into third_party/<dep> — the
 # auto-detection macro above will pick it up at configure time.
 
+# lua: blyt-tech fork adds BLYT_LUA_I32_F64 (int32 + float64) for RV32D.
+set(LUA_VERSION "v5.5.0-blyt-v0-p1-rv32d")
+FetchContent_Declare(
+  lua
+  URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
+  URL_HASH
+    SHA256=eecbef52552897a46baa87a9aae4b71dea1270a8da7157413140868edaa95105)
+
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
 set(RV32EMU_VERSION "g244cfb3-blyt-v0-p7-rv32d")
@@ -113,8 +114,7 @@ FetchContent_Declare(
   rv32emu
   URL "https://github.com/blyt-tech/rv32emu/releases/download/${RV32EMU_VERSION}/rv32emu-${RV32EMU_VERSION}.tar.gz"
   URL_HASH
-    # TODO: replace with SHA256 from scripts/release-rv32emu.sh g244cfb3-blyt-v0-p7-rv32d
-    SHA256=0000000000000000000000000000000000000000000000000000000000000000)
+    SHA256=7fe79dfd581e2f539c2f78cd95d3654183fe57d6b1e8ca18fd56eb0a25f88ebe)
 
 # musl: auto-generated GitHub tarball from blyt-tech/musl.
 set(MUSL_VERSION "v1.2.6-blyt-v0-p1")
