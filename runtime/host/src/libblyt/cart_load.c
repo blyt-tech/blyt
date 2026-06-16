@@ -106,6 +106,7 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "realloc",
     "calloc",
     "aligned_alloc", /* C++ over-aligned operator new (libc++) */
+    "posix_memalign",
     "abort",
 
     /* libblytc.so — string */
@@ -125,6 +126,11 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "strrchr",
     "strstr",
     "strtok",
+    "strtok_r",
+    "strdup",
+    "strndup",
+    "strcasecmp",
+    "strncasecmp",
     "mempcpy",
     "stpcpy",
     "stpncpy",
@@ -155,6 +161,10 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "snprintf",
     "vsnprintf",
 
+    /* libblytc.so — formatted input */
+    "sscanf",
+    "vsscanf",
+
     /* libblytc.so — in-memory FILE bridge (ADR-0120) */
     "fmemopen",
     "fclose",
@@ -166,6 +176,11 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "feof",
     "ferror",
     "clearerr",
+
+    /* libblytc.so — non-local jumps (safe within a single frame callback;
+     * using across frame boundaries would break save-state — ADR-0112) */
+    "setjmp",
+    "longjmp",
 
     /* libblytc.so — ctype */
     "isalpha",
@@ -277,6 +292,19 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "logb",
     "ilogb",
 
+    /* libblytc.so — math (f64 less-common variants) */
+    "erf",
+    "erfc",
+    "expm1",
+    "log1p",
+    "asinh",
+    "acosh",
+    "atanh",
+    "lgamma",
+    "tgamma",
+    "j0",
+    "j1",
+
     /* libblytc.so — locale (localeconv; C locale only) */
     "localeconv",
 
@@ -334,6 +362,13 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     /* 64-bit integer arithmetic */
     "__udivdi3",
     "__umoddi3",
+    /* 64-bit shifts and signed arithmetic (LLVM may emit as calls on RV32) */
+    "__lshrdi3",
+    "__ashrdi3",
+    "__ashldi3",
+    "__muldi3",
+    "__divdi3",
+    "__moddi3",
     /* classification helpers (isnan, isinf, signbit) */
     "__fpclassify",
     "__fpclassifyf",
@@ -341,6 +376,9 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "__signbit",
     "__signbitf",
     "__signbitl",
+    /* stack-protection canary (compiler stack-protector pass) */
+    "__stack_chk_guard",
+    "__stack_chk_fail",
 
     NULL,
 };

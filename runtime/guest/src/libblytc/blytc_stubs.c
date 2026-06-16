@@ -224,3 +224,13 @@ char *strerror(int errnum) {
     (void)errnum;
     return strerror_msg;
 }
+
+/* ---- stack-protection canary ----
+ * Fixed canary: the cart VM boundary provides the real containment; a fixed
+ * value satisfies compiler-generated stack-check code without needing entropy.
+ * Value is the traditional null/newline/CR terminator canary (deterministic). */
+uintptr_t __stack_chk_guard = 0x000a0dff;
+
+void __stack_chk_fail(void) {
+    blytc_abort();
+}
