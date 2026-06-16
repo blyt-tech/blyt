@@ -100,21 +100,21 @@ FetchContent_Declare(
 # auto-detection macro above will pick it up at configure time.
 
 # lua: blyt-tech fork adds BLYT_LUA_I32_F64 (int32 + float64) for RV32D.
-set(LUA_VERSION "v5.5.0-blyt-v0-p1-rv32d")
+set(LUA_VERSION "v5.5.0-blyt-v0-p1")
 FetchContent_Declare(
   lua
   URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=eecbef52552897a46baa87a9aae4b71dea1270a8da7157413140868edaa95105)
+    SHA256=c2d9a3864e7468b4b3dc8f0548ebe82aa5dd64515f9b715342637b0f796e2feb)
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
-set(RV32EMU_VERSION "g244cfb3-blyt-v0-p7-rv32d")
+set(RV32EMU_VERSION "g244cfb3-blyt-v0-p7")
 FetchContent_Declare(
   rv32emu
   URL "https://github.com/blyt-tech/rv32emu/releases/download/${RV32EMU_VERSION}/rv32emu-${RV32EMU_VERSION}.tar.gz"
   URL_HASH
-    SHA256=7fe79dfd581e2f539c2f78cd95d3654183fe57d6b1e8ca18fd56eb0a25f88ebe)
+    SHA256=0fe03e8e8b0190a75a8561a1cfebd14f6a91a15425080d15947c8650ca2dbe9b)
 
 # musl: auto-generated GitHub tarball from blyt-tech/musl.
 set(MUSL_VERSION "v1.2.6-blyt-v0-p1")
