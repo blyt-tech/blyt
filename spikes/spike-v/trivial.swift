@@ -1,0 +1,3 @@
+// Stage 0 probe — trivial function to verify Embedded Swift emits riscv32/ilp32d.
+// Gate: llvm-readelf -h -A trivial.o shows EF_RISCV_FLOAT_ABI_DOUBLE + rv32...f...d...c...
+@_cdecl("probe_trivial") public func probeTrivial() -> Int32 { return 42 }
