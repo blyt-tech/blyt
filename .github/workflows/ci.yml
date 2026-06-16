@@ -32,7 +32,8 @@ jobs:
           sudo apt-get install -y cmake ninja-build libsdl2-dev \
             clang-22 lld-22 llvm-22 lldb-22 \
             qemu-system-misc gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
-            libc6-dev-riscv64-cross libgcc-s1-riscv64-cross
+            libc6-dev-riscv64-cross libgcc-s1-riscv64-cross \
+            lua-check
           # libc6-dev-riscv64-cross ships stubs-ilp32f.h but not stubs-ilp32d.h.
           # Clang still resolves gnu/stubs.h through the riscv64-linux-gnu sysroot
           # when building ILP32D guest code; an empty stub is sufficient since
@@ -100,6 +101,11 @@ jobs:
       # large win. Prebuilt binary install (~2s).
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+
+      - name: Install stylua
+        uses: taiki-e/install-action@v2
+        with:
+          tool: stylua@2.5.2
 
       # Deps are downloaded via CMake FetchContent at configure time into
       # ~/.cache/blyt/fetchcontent/. Cache the directory keyed on a hash of

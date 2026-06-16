@@ -44,6 +44,6 @@ function on_save_state()
     S.globals[0].frame = frame
 end
 
-function on_load_state(info)
+function on_load_state(_info)
     frame = S.globals[0].frame
 end
