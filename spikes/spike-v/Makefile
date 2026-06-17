@@ -118,7 +118,7 @@ stage-1-compile: docker-build-arm64 | $(BUILD_DIR)
 	  cat /spike-v/cart.o > $(BUILD_DIR)/cart.o
 
 stage-1-stubs: | $(BUILD_DIR)
-	@echo "--- Stage 1: compiling blyt_entry + blyt_interp + swift_stubs ---"
+	@echo "--- Stage 1: compiling blyt_entry + blyt_interp ---"
 	# Linker script: minimal, C/Rust/Swift pattern (not the Lua hybrid script).
 	printf 'ENTRY(_blyt_entry)\n' > $(BUILD_DIR)/cart.ld
 	printf '/* Generated. */\nvoid blyt_main(void);\n__attribute__((noreturn)) void blyt_exit(int);\nvoid blyt_runtime_startup(void);\nvoid _blyt_entry(void) { blyt_runtime_startup(); blyt_main(); blyt_exit(0); }\n' \
@@ -134,12 +134,6 @@ stage-1-stubs: | $(BUILD_DIR)
 	  --target=riscv32 -march=rv32imafdc -mabi=ilp32d \
 	  -fpic -ffunction-sections -fdata-sections \
 	  -o $(BUILD_DIR)/_blyt_interp.o $(BUILD_DIR)/_blyt_interp.c
-	# FV-5: Swift Embedded runtime needs posix_memalign and stack canary symbols
-	# not currently exported by libblyt32.so. swift_stubs.c provides bridge impls.
-	$(BLYT_CLANG) -c \
-	  --target=riscv32 -march=rv32imafdc -mabi=ilp32d \
-	  -fpic -ffunction-sections -fdata-sections \
-	  -o $(BUILD_DIR)/swift_stubs.o $(REPO_ROOT)/spikes/spike-v/swift_stubs.c
 
 stage-1-link: stage-1-compile stage-1-stubs
 	@echo "--- Stage 1: linking Swift cart ELF ---"
@@ -164,7 +158,6 @@ stage-1-link: stage-1-compile stage-1-stubs
 	  $(BUILD_DIR)/_blyt_entry.o \
 	  $(BUILD_DIR)/_blyt_interp.o \
 	  $(BUILD_DIR)/cart.o \
-	  $(BUILD_DIR)/swift_stubs.o \
 	  -L$(BLYT_LIB_DIR) \
 	  -lblyt32 \
 	  -o $(BUILD_DIR)/cart_raw.elf
@@ -181,16 +174,14 @@ stage-1-link: stage-1-compile stage-1-stubs
 	  --set-section-flags .cart.info=alloc,readonly \
 	  --remove-section=.riscv.attributes \
 	  --remove-section=.comment \
-	  --remove-section=.swift_modhash \
 	  --strip-debug \
 	  --strip-unneeded \
 	  --remove-section=.symtab \
 	  --remove-section=.strtab \
 	  $(BUILD_DIR)/cart_raw.elf \
 	  $(BUILD_DIR)/cart.blyt
-	# FV-6: .swift_modhash is not in cart_load.c's section allowlist.
-	# Removed above. Production Swift support would add ".swift_modhash" to
-	# KNOWN_SECTIONS_EXACT[] in cart_load.c (or ".swift" prefix to KNOWN_SECTIONS_PREFIX[]).
+	# Note: .swift_modhash no longer needs stripping — cart_load.c now uses a
+	# denylist (PR #74) and passes unknown sections through.
 
 stage-1-run: stage-1-link
 	@echo "--- Stage 1: running Swift cart via blytplay ---"
