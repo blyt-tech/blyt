@@ -715,11 +715,17 @@ struct LanguageConfig {
     sources: Option<Vec<String>>,
 }
 
+enum ExternalOutputType {
+    Object,  // @OBJFILE@ → <lang>.o, pushed to obj_files
+    Archive, // @LIBFILE@ → <lang>.a, pushed to lib_archives
+}
+
 struct ExternalCompileConfig {
     language: String,
     extension: String,
     command_template: String,
     strip_sections: Vec<String>,
+    output_type: ExternalOutputType,
 }
 
 enum BuildLanguages {
@@ -770,6 +776,11 @@ fn read_cart_languages(project_dir: &Path) -> Result<BuildLanguages, BuildError>
             err("blyt.build.yaml: `compile_command` requires `language:` to be set")
         })?;
         validate_compile_command_template(&cmd)?;
+        let output_type = if cmd.contains("@LIBFILE@") {
+            ExternalOutputType::Archive
+        } else {
+            ExternalOutputType::Object
+        };
         let extension = manifest
             .source_extension
             .map(|s| s.strip_prefix('.').map(str::to_string).unwrap_or(s))
@@ -779,6 +790,7 @@ fn read_cart_languages(project_dir: &Path) -> Result<BuildLanguages, BuildError>
             extension,
             command_template: cmd,
             strip_sections: manifest.strip_sections.unwrap_or_default(),
+            output_type,
         }));
     }
 
@@ -1418,7 +1430,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
                 .map(|p| p.join("bin"))
                 .unwrap_or_else(|| PathBuf::from("bin"))
         });
-        obj_files.push(compile_external(
+        let output = compile_external(
             cfg,
             project_dir,
             &build_dir,
@@ -1427,7 +1439,11 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             &sdk_bin,
             &objcopy,
             debug,
-        )?);
+        )?;
+        match cfg.output_type {
+            ExternalOutputType::Object => obj_files.push(output),
+            ExternalOutputType::Archive => lib_archives.push(output),
+        }
     }
 
     let raw_elf = build_dir.join("cart.elf");
@@ -2377,6 +2393,7 @@ fn tokenize_command(cmd: &str) -> Vec<String> {
 const KNOWN_PLACEHOLDERS: &[&str] = &[
     "@SRCFILES@",
     "@OBJFILE@",
+    "@LIBFILE@",
     "@SDK_INCLUDE@",
     "@SDK_LIB@",
     "@SDK_BIN@",
@@ -2384,10 +2401,20 @@ const KNOWN_PLACEHOLDERS: &[&str] = &[
 ];
 
 fn validate_compile_command_template(cmd: &str) -> Result<(), BuildError> {
-    if !cmd.contains("@OBJFILE@") {
-        return Err(err(
-            "blyt.build.yaml: compile_command must contain @OBJFILE@",
-        ));
+    let has_obj = cmd.contains("@OBJFILE@");
+    let has_lib = cmd.contains("@LIBFILE@");
+    match (has_obj, has_lib) {
+        (true, true) => {
+            return Err(err(
+                "blyt.build.yaml: compile_command cannot contain both @OBJFILE@ and @LIBFILE@",
+            ));
+        }
+        (false, false) => {
+            return Err(err(
+                "blyt.build.yaml: compile_command must contain either @OBJFILE@ or @LIBFILE@",
+            ));
+        }
+        _ => {}
     }
     if !cmd.contains("@SRCFILES@") {
         return Err(err(
@@ -2423,13 +2450,16 @@ fn compile_external(
 ) -> Result<PathBuf, BuildError> {
     let src_files = collect_external_source_files(project_dir, config)?;
 
-    // Use the language name as the object filename, with path-unsafe chars replaced.
+    // Use the language name as the output filename, with path-unsafe chars replaced.
     let safe_name = config.language.replace(['/', '\\', ' '], "_");
-    let obj_path = build_dir.join(format!("{safe_name}.o"));
+    let (out_path, out_placeholder) = match config.output_type {
+        ExternalOutputType::Object => (build_dir.join(format!("{safe_name}.o")), "@OBJFILE@"),
+        ExternalOutputType::Archive => (build_dir.join(format!("{safe_name}.a")), "@LIBFILE@"),
+    };
 
     let tokens = tokenize_command(&config.command_template);
 
-    let obj_str = obj_path.to_string_lossy();
+    let out_str = out_path.to_string_lossy();
     let inc_str = sdk_include.to_string_lossy();
     let lib_str = sdk_lib.to_string_lossy();
     let bin_str = sdk_bin.to_string_lossy();
@@ -2443,7 +2473,7 @@ fn compile_external(
             }
         } else {
             let expanded = token
-                .replace("@OBJFILE@", &obj_str)
+                .replace(out_placeholder, &out_str)
                 .replace("@SDK_INCLUDE@", &inc_str)
                 .replace("@SDK_LIB@", &lib_str)
                 .replace("@SDK_BIN@", &bin_str)
@@ -2465,10 +2495,10 @@ fn compile_external(
         )));
     }
 
-    if !obj_path.exists() {
+    if !out_path.exists() {
         return Err(err(format!(
-            "compile_command exited 0 but @OBJFILE@ was not created: {}",
-            obj_path.display()
+            "compile_command exited 0 but {out_placeholder} was not created: {}",
+            out_path.display()
         )));
     }
 
@@ -2476,7 +2506,7 @@ fn compile_external(
         let status = Command::new(objcopy)
             .arg("--remove-section")
             .arg(section)
-            .arg(&obj_path)
+            .arg(&out_path)
             .status()
             .map_err(|e| err(format!("failed to run objcopy for strip_sections: {e}")))?;
         if !status.success() {
@@ -2484,7 +2514,7 @@ fn compile_external(
         }
     }
 
-    Ok(obj_path)
+    Ok(out_path)
 }
 
 /* -------------------------------------------------------------------------
@@ -3199,6 +3229,146 @@ mod tests {
         ] {
             assert!(!cart_id_valid(bad), "{bad:?} should be invalid");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_compile_command_template
+    // -----------------------------------------------------------------------
+
+    fn ok_cmd(template: &str) {
+        validate_compile_command_template(template)
+            .unwrap_or_else(|e| panic!("expected ok for {template:?}, got: {e}"));
+    }
+
+    fn err_cmd(template: &str, needle: &str) {
+        let e = validate_compile_command_template(template)
+            .expect_err(&format!("expected error for {template:?}"))
+            .to_string();
+        assert!(
+            e.contains(needle),
+            "error {e:?} should contain {needle:?} (template={template:?})"
+        );
+    }
+
+    #[test]
+    fn compile_command_template_objfile_valid() {
+        ok_cmd("compiler -o @OBJFILE@ @SRCFILES@");
+    }
+
+    #[test]
+    fn compile_command_template_libfile_valid() {
+        ok_cmd("compiler -o @LIBFILE@ @SRCFILES@");
+    }
+
+    #[test]
+    fn compile_command_template_both_output_placeholders_fail() {
+        err_cmd(
+            "compiler -o @OBJFILE@ @LIBFILE@ @SRCFILES@",
+            "cannot contain both @OBJFILE@ and @LIBFILE@",
+        );
+    }
+
+    #[test]
+    fn compile_command_template_no_output_placeholder_fails() {
+        err_cmd(
+            "compiler @SRCFILES@",
+            "must contain either @OBJFILE@ or @LIBFILE@",
+        );
+    }
+
+    #[test]
+    fn compile_command_template_missing_srcfiles_fails() {
+        err_cmd("compiler -o @OBJFILE@", "@SRCFILES@");
+    }
+
+    #[test]
+    fn compile_command_template_unknown_placeholder_fails() {
+        err_cmd(
+            "compiler -o @OBJFILE@ @SRCFILES@ @UNKNOWN@",
+            "unknown placeholder",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // tokenize_command
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tokenize_command_basic() {
+        assert_eq!(
+            tokenize_command("a b  c\td"),
+            vec!["a", "b", "c", "d"],
+            "whitespace splits into tokens"
+        );
+    }
+
+    #[test]
+    fn tokenize_command_single_quotes() {
+        assert_eq!(
+            tokenize_command("cmd 'hello world' end"),
+            vec!["cmd", "hello world", "end"],
+        );
+    }
+
+    #[test]
+    fn tokenize_command_double_quotes() {
+        assert_eq!(
+            tokenize_command(r#"cmd "hello world" end"#),
+            vec!["cmd", "hello world", "end"],
+        );
+    }
+
+    #[test]
+    fn tokenize_command_empty_and_newlines() {
+        assert_eq!(
+            tokenize_command("a\nb\r\nc"),
+            vec!["a", "b", "c"],
+            "newlines are whitespace"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // read_cart_languages — external compile path
+    // -----------------------------------------------------------------------
+
+    fn write_build_yaml(dir: &std::path::Path, text: &str) {
+        fs::write(dir.join("blyt.build.yaml"), text).unwrap();
+    }
+
+    #[test]
+    fn read_cart_languages_external_objfile() {
+        let dir = tempfile::tempdir().unwrap();
+        write_build_yaml(
+            dir.path(),
+            "language: swift\ncompile_command: \"swiftc -o @OBJFILE@ @SRCFILES@\"\n",
+        );
+        let langs = read_cart_languages(dir.path()).unwrap();
+        let BuildLanguages::External(cfg) = langs else {
+            panic!("expected External variant");
+        };
+        assert_eq!(cfg.language, "swift");
+        assert!(
+            matches!(cfg.output_type, ExternalOutputType::Object),
+            "expected Object output type"
+        );
+    }
+
+    #[test]
+    fn read_cart_languages_external_libfile() {
+        let dir = tempfile::tempdir().unwrap();
+        write_build_yaml(
+            dir.path(),
+            "language: zig\ncompile_command: \"zig build-lib -femit-bin=@LIBFILE@ @SRCFILES@\"\n",
+        );
+        let langs = read_cart_languages(dir.path()).unwrap();
+        let BuildLanguages::External(cfg) = langs else {
+            panic!("expected External variant");
+        };
+        assert_eq!(cfg.language, "zig");
+        assert!(
+            matches!(cfg.output_type, ExternalOutputType::Archive),
+            "expected Archive output type"
+        );
     }
 
     #[test]

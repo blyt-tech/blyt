@@ -256,10 +256,18 @@ fn strip_sections_without_compile_command_fails() {
 }
 
 #[test]
-fn compile_command_missing_objfile_placeholder_fails() {
+fn compile_command_missing_output_placeholder_fails() {
     assert_build_manifest_fails(
         "language: swift\ncompile_command: \"swiftc @SRCFILES@\"\n",
-        "@OBJFILE@",
+        "must contain either @OBJFILE@ or @LIBFILE@",
+    );
+}
+
+#[test]
+fn compile_command_both_output_placeholders_fails() {
+    assert_build_manifest_fails(
+        "language: swift\ncompile_command: \"swiftc -o @OBJFILE@ @LIBFILE@ @SRCFILES@\"\n",
+        "cannot contain both @OBJFILE@ and @LIBFILE@",
     );
 }
 
