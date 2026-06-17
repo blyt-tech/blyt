@@ -1,0 +1,16 @@
+languages:
+  swift:
+    source_extension: .swift
+    compile_command: >-
+      swiftc
+      -enable-experimental-feature Embedded
+      -target riscv32-none-none-eabi
+      -Xcc -march=rv32imafdc
+      -Xcc -mabi=ilp32d
+      -Xllvm -mattr=+m,+a,+f,+d,+c
+      -Xcc -I@SDK_INCLUDE@
+      -Xcc -I@CART_GENERATED_C@
+      -import-bridging-header src/game/swift/blyt_bridge.h
+      -wmo -Osize -parse-as-library
+      -emit-object -o @OBJFILE@
+      @SRCFILES@
