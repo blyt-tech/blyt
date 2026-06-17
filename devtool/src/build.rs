@@ -702,6 +702,9 @@ enum CartLanguage {
 struct BuildManifest {
     language: Option<String>,
     languages: Option<BTreeMap<String, Option<LanguageConfig>>>,
+    compile_command: Option<String>,
+    source_extension: Option<String>,
+    strip_sections: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -710,6 +713,18 @@ struct BuildManifest {
 struct LanguageConfig {
     codegen: Option<bool>,
     sources: Option<Vec<String>>,
+}
+
+struct ExternalCompileConfig {
+    language: String,
+    extension: String,
+    command_template: String,
+    strip_sections: Vec<String>,
+}
+
+enum BuildLanguages {
+    Builtin(BTreeSet<CartLanguage>),
+    External(ExternalCompileConfig),
 }
 
 fn parse_language_str(s: &str) -> Result<CartLanguage, BuildError> {
@@ -725,26 +740,66 @@ fn parse_language_str(s: &str) -> Result<CartLanguage, BuildError> {
     }
 }
 
-fn read_cart_languages(project_dir: &Path) -> Result<BTreeSet<CartLanguage>, BuildError> {
+fn read_cart_languages(project_dir: &Path) -> Result<BuildLanguages, BuildError> {
     let manifest_path = project_dir.join("blyt.build.yaml");
     if !manifest_path.exists() {
-        return Ok(BTreeSet::from([CartLanguage::Lua]));
+        return Ok(BuildLanguages::Builtin(BTreeSet::from([CartLanguage::Lua])));
     }
     let text = fs::read_to_string(&manifest_path)?;
     let manifest: BuildManifest =
         serde_yaml::from_str(&text).map_err(|e| err(format!("blyt.build.yaml: {e}")))?;
+
+    if manifest.source_extension.is_some() && manifest.compile_command.is_none() {
+        return Err(err(
+            "blyt.build.yaml: `source_extension` requires `compile_command`",
+        ));
+    }
+    if manifest.strip_sections.is_some() && manifest.compile_command.is_none() {
+        return Err(err(
+            "blyt.build.yaml: `strip_sections` requires `compile_command`",
+        ));
+    }
+
+    if let Some(cmd) = manifest.compile_command {
+        if manifest.languages.is_some() {
+            return Err(err(
+                "blyt.build.yaml: `compile_command` cannot be used with `languages:` map",
+            ));
+        }
+        let lang = manifest.language.ok_or_else(|| {
+            err("blyt.build.yaml: `compile_command` requires `language:` to be set")
+        })?;
+        validate_compile_command_template(&cmd)?;
+        let extension = manifest
+            .source_extension
+            .map(|s| s.strip_prefix('.').map(str::to_string).unwrap_or(s))
+            .unwrap_or_else(|| lang.clone());
+        return Ok(BuildLanguages::External(ExternalCompileConfig {
+            language: lang,
+            extension,
+            command_template: cmd,
+            strip_sections: manifest.strip_sections.unwrap_or_default(),
+        }));
+    }
+
     match (manifest.language, manifest.languages) {
         (None, None) => Err(err("blyt.build.yaml: no language declaration — \
              add `language: lua` (or other language) or a `languages:` map")),
         (Some(_), Some(_)) => Err(err(
             "blyt.build.yaml: `language` and `languages` cannot both be set",
         )),
-        (Some(lang), None) => Ok(BTreeSet::from([parse_language_str(&lang)?])),
+        (Some(lang), None) => Ok(BuildLanguages::Builtin(BTreeSet::from([
+            parse_language_str(&lang)?,
+        ]))),
         (None, Some(map)) => {
             if map.is_empty() {
                 return Err(err("blyt.build.yaml: `languages:` map is empty"));
             }
-            map.keys().map(|k| parse_language_str(k)).collect()
+            Ok(BuildLanguages::Builtin(
+                map.keys()
+                    .map(|k| parse_language_str(k))
+                    .collect::<Result<_, _>>()?,
+            ))
         }
     }
 }
@@ -867,7 +922,11 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         .map(Path::to_path_buf)
         .unwrap_or_else(|| sdk_include.clone());
 
-    let languages = read_cart_languages(project_dir)?;
+    let (languages, external_config): (BTreeSet<CartLanguage>, Option<ExternalCompileConfig>) =
+        match read_cart_languages(project_dir)? {
+            BuildLanguages::Builtin(s) => (s, None),
+            BuildLanguages::External(c) => (BTreeSet::new(), Some(c)),
+        };
     let is_lua = languages.contains(&CartLanguage::Lua);
 
     let native_count = languages
@@ -942,6 +1001,16 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             )));
         }
     }
+    if let Some(ref cfg) = external_config {
+        if collect_external_source_files(project_dir, cfg)?.is_empty() {
+            return Err(err(format!(
+                "no .{} files found for language {:?} — searched {} and src/lib/*/",
+                cfg.extension,
+                cfg.language,
+                project_dir.join("src/game").join(&cfg.language).display()
+            )));
+        }
+    }
 
     // Canonical source-path remapping (issue #46).  Every path embedded in a
     // cart — DWARF, Rust panic Location strings, C __FILE__/assert — is rewritten
@@ -1005,8 +1074,13 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
         rust_remap_flags
     };
 
-    // Build all libraries before game code.
-    let lib_names = discover_libraries(project_dir)?;
+    // Build all libraries before game code.  Skipped for external compile: lib
+    // sources with the target extension are collected into @SRCFILES@ directly.
+    let lib_names = if external_config.is_none() {
+        discover_libraries(project_dir)?
+    } else {
+        Vec::new()
+    };
     let mut built_libs: Vec<BuiltLib> = Vec::new();
     // Lua carts: pass BLYT_LUA_I32_F64=1 and LUA_USE_LONGJMP=1 so that src/lib/ C
     // code calling the Lua C API uses the same numeric types and error-handling
@@ -1058,6 +1132,8 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
 
     let build_dir = if is_lua {
         project_dir.join("build/game/lua")
+    } else if let Some(ref cfg) = external_config {
+        project_dir.join("build/game").join(&cfg.language)
     } else {
         project_dir.join("build/game/c")
     };
@@ -1334,6 +1410,25 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     } else {
         None
     };
+
+    if let Some(ref cfg) = external_config {
+        let sdk_bin = lib_dir.parent().map(|p| p.join("bin")).unwrap_or_else(|| {
+            sdk_include
+                .parent()
+                .map(|p| p.join("bin"))
+                .unwrap_or_else(|| PathBuf::from("bin"))
+        });
+        obj_files.push(compile_external(
+            cfg,
+            project_dir,
+            &build_dir,
+            &sdk_include,
+            &lib_dir,
+            &sdk_bin,
+            &objcopy,
+            debug,
+        )?);
+    }
 
     let raw_elf = build_dir.join("cart.elf");
     link_cart(
@@ -2192,6 +2287,204 @@ fn run_archive(ar: &str, objs: &[PathBuf], output: &Path) -> Result<(), BuildErr
         return Err(err(format!("archive failed: {}", output.display())));
     }
     Ok(())
+}
+
+/* -------------------------------------------------------------------------
+ * External compile command — arbitrary language via user-supplied command
+ * ------------------------------------------------------------------------- */
+
+fn collect_files_by_extension(
+    dir: &Path,
+    ext: &str,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), BuildError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_by_extension(&path, ext, out)?;
+        } else if path.extension().and_then(OsStr::to_str) == Some(ext) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_external_source_files(
+    project_dir: &Path,
+    config: &ExternalCompileConfig,
+) -> Result<Vec<PathBuf>, BuildError> {
+    let ext = config.extension.as_str();
+    let mut files = Vec::new();
+    collect_files_by_extension(
+        &project_dir.join("src/game").join(&config.language),
+        ext,
+        &mut files,
+    )?;
+    let lib_root = project_dir.join("src/lib");
+    if lib_root.exists() {
+        for entry in fs::read_dir(&lib_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files_by_extension(&path, ext, &mut files)?;
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn tokenize_command(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\n' | '\r' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            '\'' => {
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    current.push(c);
+                }
+            }
+            '"' => {
+                for c in chars.by_ref() {
+                    if c == '"' {
+                        break;
+                    }
+                    current.push(c);
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+const KNOWN_PLACEHOLDERS: &[&str] = &[
+    "@SRCFILES@",
+    "@OBJFILE@",
+    "@SDK_INCLUDE@",
+    "@SDK_LIB@",
+    "@SDK_BIN@",
+    "@DEBUG@",
+];
+
+fn validate_compile_command_template(cmd: &str) -> Result<(), BuildError> {
+    if !cmd.contains("@OBJFILE@") {
+        return Err(err(
+            "blyt.build.yaml: compile_command must contain @OBJFILE@",
+        ));
+    }
+    if !cmd.contains("@SRCFILES@") {
+        return Err(err(
+            "blyt.build.yaml: compile_command must contain @SRCFILES@",
+        ));
+    }
+    // Scan for any @...@ patterns that aren't in the known set.
+    let mut rest = cmd;
+    while let Some(at) = rest.find('@') {
+        rest = &rest[at + 1..];
+        if let Some(end) = rest.find('@') {
+            let candidate = format!("@{}@", &rest[..end]);
+            if !KNOWN_PLACEHOLDERS.contains(&candidate.as_str()) {
+                return Err(err(format!(
+                    "blyt.build.yaml: compile_command contains unknown placeholder {candidate:?}"
+                )));
+            }
+            rest = &rest[end + 1..];
+        }
+    }
+    Ok(())
+}
+
+fn compile_external(
+    config: &ExternalCompileConfig,
+    project_dir: &Path,
+    build_dir: &Path,
+    sdk_include: &Path,
+    sdk_lib: &Path,
+    sdk_bin: &Path,
+    objcopy: &str,
+    debug: bool,
+) -> Result<PathBuf, BuildError> {
+    let src_files = collect_external_source_files(project_dir, config)?;
+
+    // Use the language name as the object filename, with path-unsafe chars replaced.
+    let safe_name = config.language.replace(['/', '\\', ' '], "_");
+    let obj_path = build_dir.join(format!("{safe_name}.o"));
+
+    let tokens = tokenize_command(&config.command_template);
+
+    let obj_str = obj_path.to_string_lossy();
+    let inc_str = sdk_include.to_string_lossy();
+    let lib_str = sdk_lib.to_string_lossy();
+    let bin_str = sdk_bin.to_string_lossy();
+    let debug_str = if debug { "1" } else { "0" };
+
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    for token in &tokens {
+        if token == "@SRCFILES@" {
+            for f in &src_files {
+                argv.push(f.as_os_str().to_os_string());
+            }
+        } else {
+            let expanded = token
+                .replace("@OBJFILE@", &obj_str)
+                .replace("@SDK_INCLUDE@", &inc_str)
+                .replace("@SDK_LIB@", &lib_str)
+                .replace("@SDK_BIN@", &bin_str)
+                .replace("@DEBUG@", debug_str);
+            argv.push(std::ffi::OsString::from(expanded));
+        }
+    }
+
+    let status = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(project_dir)
+        .status()
+        .map_err(|e| err(format!("failed to run compile_command {:?}: {e}", argv[0])))?;
+
+    if !status.success() {
+        return Err(err(format!(
+            "compile_command failed for language {:?}",
+            config.language
+        )));
+    }
+
+    if !obj_path.exists() {
+        return Err(err(format!(
+            "compile_command exited 0 but @OBJFILE@ was not created: {}",
+            obj_path.display()
+        )));
+    }
+
+    for section in &config.strip_sections {
+        let status = Command::new(objcopy)
+            .arg("--remove-section")
+            .arg(section)
+            .arg(&obj_path)
+            .status()
+            .map_err(|e| err(format!("failed to run objcopy for strip_sections: {e}")))?;
+        if !status.success() {
+            return Err(err(format!("objcopy --remove-section {section:?} failed")));
+        }
+    }
+
+    Ok(obj_path)
 }
 
 /* -------------------------------------------------------------------------
