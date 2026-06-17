@@ -1123,8 +1123,7 @@ add_custom_target(
           --output-on-failure
   COMMAND cargo nextest run -p blyt
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  USES_TERMINAL
-  VERBATIM
+  USES_TERMINAL VERBATIM
   COMMENT "Running C unit tests (ctest) and Rust devtool unit tests")
 add_dependencies(test-unit test_cart_load test_cart_run)
 if(TARGET test_gdb_stub)
@@ -1139,14 +1138,13 @@ endif()
 # Integration tests always invoke the blyt binary from build/sdk/bin/ so there
 # is no stale target/ binary concern.
 #
-# Usage: cmake --build build --target test-integration
-# Single test: cmake -DBLYT_TEST_FILTER=<name> -B build
-#              cmake --build build --target test-integration
+# Usage: cmake --build build --target test-integration Single test: cmake
+# -DBLYT_TEST_FILTER=<name> -B build cmake --build build --target
+# test-integration
 #
 set(BLYT_TEST_FILTER
     ""
-    CACHE STRING
-          "cargo nextest filter for test-integration (e.g. lua_hello)")
+    CACHE STRING "cargo nextest filter for test-integration (e.g. lua_hello)")
 if(BLYT_TEST_FILTER)
   set(_blyt_nextest_filter ${BLYT_TEST_FILTER})
 else()
@@ -1154,12 +1152,10 @@ else()
 endif()
 add_custom_target(
   test-integration
-  COMMAND
-    ${CMAKE_COMMAND} -E env BLYT_BUILD_DIR=${CMAKE_BINARY_DIR} cargo nextest
-    run -p integration ${_blyt_nextest_filter}
+  COMMAND ${CMAKE_COMMAND} -E env BLYT_BUILD_DIR=${CMAKE_BINARY_DIR} cargo
+          nextest run -p integration ${_blyt_nextest_filter}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  USES_TERMINAL
-  VERBATIM
+  USES_TERMINAL VERBATIM
   COMMENT "Running Rust integration tests (cargo nextest -p integration)")
 add_dependencies(test-integration sdk blyt_native_riscv64)
 
