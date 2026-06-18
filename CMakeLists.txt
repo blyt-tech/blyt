@@ -1158,9 +1158,6 @@ add_custom_target(
   USES_TERMINAL VERBATIM
   COMMENT "Running Rust integration tests (cargo nextest -p integration)")
 add_dependencies(test-integration sdk)
-if(TARGET blyt_native_riscv64)
-  add_dependencies(test-integration blyt_native_riscv64)
-endif()
 
 # ── test-linux-docker ─────────────────────────────────────────────────────────
 # Run integration tests inside a Linux Docker container that mirrors the GitHub
