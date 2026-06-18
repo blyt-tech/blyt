@@ -798,6 +798,18 @@ fn read_cart_languages(project_dir: &Path) -> Result<BuildLanguages, BuildError>
                     }
                     external = Some((key, cfg));
                 } else {
+                    if cfg.source_extension.is_some() {
+                        return Err(err(format!(
+                            "blyt.build.yaml: `{key}`: \
+                             `source_extension` requires `compile_command`"
+                        )));
+                    }
+                    if cfg.strip_sections.is_some() {
+                        return Err(err(format!(
+                            "blyt.build.yaml: `{key}`: \
+                             `strip_sections` requires `compile_command`"
+                        )));
+                    }
                     builtin.insert(parse_language_str(&key)?);
                 }
             }
