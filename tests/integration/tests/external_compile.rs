@@ -42,16 +42,14 @@ fn write_external_c_project(dir: &std::path::Path) {
     fs::write(
         dir.join("blyt.build.yaml"),
         format!(
-            "language: c-via-external\n\
-             source_extension: .c\n\
-             compile_command: >\n  \
-               {clang_str}\n  \
-               --target=riscv32 -march=rv32imafdc -mabi=ilp32d\n  \
-               -nostdlib -fpie -ffunction-sections -fdata-sections\n  \
-               -ffp-contract=off -fno-fast-math -fwrapv -frounding-math -fsignaling-nans\n  \
-               -O2 -c -I@SDK_INCLUDE@\n  \
-               -o @OBJFILE@\n  \
-               @SRCFILES@\n",
+            "languages:\n  c-via-external:\n    source_extension: .c\n    compile_command: >\n      \
+             {clang_str}\n      \
+             --target=riscv32 -march=rv32imafdc -mabi=ilp32d\n      \
+             -nostdlib -fpie -ffunction-sections -fdata-sections\n      \
+             -ffp-contract=off -fno-fast-math -fwrapv -frounding-math -fsignaling-nans\n      \
+             -O2 -c -I@SDK_INCLUDE@\n      \
+             -o @OBJFILE@\n      \
+             @SRCFILES@\n",
         ),
     )
     .unwrap();
@@ -140,14 +138,12 @@ fn external_compile_picks_up_lib_sources() {
     fs::write(
         project.join("blyt.build.yaml"),
         format!(
-            "language: c-via-external\n\
-             source_extension: .c\n\
-             compile_command: >\n  \
-               {clang_str}\n  \
-               --target=riscv32 -march=rv32imafdc -mabi=ilp32d\n  \
-               -nostdlib -fpie --ld-path={lld_str} -r -I@SDK_INCLUDE@\n  \
-               -o @OBJFILE@\n  \
-               @SRCFILES@\n",
+            "languages:\n  c-via-external:\n    source_extension: .c\n    compile_command: >\n      \
+             {clang_str}\n      \
+             --target=riscv32 -march=rv32imafdc -mabi=ilp32d\n      \
+             -nostdlib -fpie --ld-path={lld_str} -r -I@SDK_INCLUDE@\n      \
+             -o @OBJFILE@\n      \
+             @SRCFILES@\n",
             clang_str = clang_str,
             lld_str = lld_str,
         ),
@@ -224,25 +220,9 @@ fn assert_build_manifest_fails(build_yaml: &str, expected: &str) {
 }
 
 #[test]
-fn compile_command_without_language_fails() {
-    assert_build_manifest_fails(
-        "compile_command: \"blyt-clang -o @OBJFILE@ @SRCFILES@\"\n",
-        "requires `language:`",
-    );
-}
-
-#[test]
-fn compile_command_with_languages_map_fails() {
-    assert_build_manifest_fails(
-        "languages:\n  c:\ncompile_command: \"blyt-clang -o @OBJFILE@ @SRCFILES@\"\n",
-        "cannot be used with `languages:`",
-    );
-}
-
-#[test]
 fn source_extension_without_compile_command_fails() {
     assert_build_manifest_fails(
-        "language: c\nsource_extension: .c\n",
+        "languages:\n  c:\n    source_extension: .c\n",
         "requires `compile_command`",
     );
 }
@@ -250,7 +230,7 @@ fn source_extension_without_compile_command_fails() {
 #[test]
 fn strip_sections_without_compile_command_fails() {
     assert_build_manifest_fails(
-        "language: c\nstrip_sections:\n  - .foo\n",
+        "languages:\n  c:\n    strip_sections:\n      - .foo\n",
         "requires `compile_command`",
     );
 }
@@ -258,7 +238,7 @@ fn strip_sections_without_compile_command_fails() {
 #[test]
 fn compile_command_missing_output_placeholder_fails() {
     assert_build_manifest_fails(
-        "language: swift\ncompile_command: \"swiftc @SRCFILES@\"\n",
+        "languages:\n  swift:\n    compile_command: \"swiftc @SRCFILES@\"\n",
         "must contain either @OBJFILE@ or @LIBFILE@",
     );
 }
@@ -266,7 +246,7 @@ fn compile_command_missing_output_placeholder_fails() {
 #[test]
 fn compile_command_both_output_placeholders_fails() {
     assert_build_manifest_fails(
-        "language: swift\ncompile_command: \"swiftc -o @OBJFILE@ @LIBFILE@ @SRCFILES@\"\n",
+        "languages:\n  swift:\n    compile_command: \"swiftc -o @OBJFILE@ @LIBFILE@ @SRCFILES@\"\n",
         "cannot contain both @OBJFILE@ and @LIBFILE@",
     );
 }
@@ -274,7 +254,7 @@ fn compile_command_both_output_placeholders_fails() {
 #[test]
 fn compile_command_missing_srcfiles_placeholder_fails() {
     assert_build_manifest_fails(
-        "language: swift\ncompile_command: \"swiftc -o @OBJFILE@\"\n",
+        "languages:\n  swift:\n    compile_command: \"swiftc -o @OBJFILE@\"\n",
         "@SRCFILES@",
     );
 }
@@ -283,7 +263,7 @@ fn compile_command_missing_srcfiles_placeholder_fails() {
 fn compile_command_unknown_placeholder_fails() {
     // Validation fires at manifest parse time — no SDK or source files needed.
     assert_build_manifest_fails(
-        "language: swift\ncompile_command: \"swiftc -o @OBJFILE@ @SRCFILES@ @UNKNOWN@\"\n",
+        "languages:\n  swift:\n    compile_command: \"swiftc -o @OBJFILE@ @SRCFILES@ @UNKNOWN@\"\n",
         "unknown placeholder",
     );
 }
@@ -292,7 +272,7 @@ fn compile_command_unknown_placeholder_fails() {
 fn compile_command_no_source_files_fails() {
     // Source-file check fires in early validation — no SDK needed.
     assert_build_manifest_fails(
-        "language: swift\nsource_extension: .swift\ncompile_command: \"swiftc -o @OBJFILE@ @SRCFILES@\"\n",
+        "languages:\n  swift:\n    source_extension: .swift\n    compile_command: \"swiftc -o @OBJFILE@ @SRCFILES@\"\n",
         "no .swift files",
     );
 }
