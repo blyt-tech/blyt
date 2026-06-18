@@ -1003,7 +1003,9 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     }
     if languages.contains(&CartLanguage::C) {
         let c_src_dir = project_dir.join("src/game/c");
-        if collect_c_files(&c_src_dir)?.is_empty() {
+        // In an External cart, `c:` may be declared for codegen only (cart_state.h)
+        // without any C source files to compile — that is valid.
+        if external_config.is_none() && collect_c_files(&c_src_dir)?.is_empty() {
             return Err(err(format!(
                 "no .c files found under {}",
                 c_src_dir.display()
@@ -1184,11 +1186,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
 
     /* Parse blyt.config.yaml and generate state buffer codegen artifacts. */
     let cart_config = crate::config::read_cart_config(project_dir).map_err(|e| err(e))?;
-    let needs_c = languages.contains(&CartLanguage::C)
-        || languages.contains(&CartLanguage::Cpp)
-        || external_config
-            .as_ref()
-            .map_or(false, |c| c.command_template.contains("@CART_GENERATED_C@"));
+    let needs_c = languages.contains(&CartLanguage::C) || languages.contains(&CartLanguage::Cpp);
     let needs_rust = languages.contains(&CartLanguage::Rust);
     let cart_state =
         generate_cart_state(project_dir, &build_dir, &cart_config, needs_c, needs_rust)?;
