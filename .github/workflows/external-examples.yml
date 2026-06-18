@@ -1,0 +1,208 @@
+name: External Examples
+
+# Manually triggered: builds and smoke-tests carts under examples/external/
+# using toolchains that are not part of the standard blyt SDK (e.g. Swift).
+# Each language gets its own job so failures are isolated and toolchain caches
+# are independent.  The blyt SDK is built once (Build SDK job) and shared via
+# a workflow artifact; smoke tests use the same blytplay binary as CI.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ─── Build blyt SDK ─────────────────────────────────────────────────────────
+  # Identical to the CI Build + Build SDK steps but without lint, tests, or
+  # the riscv64 cross-build.  The assembled sdk/ tree is uploaded as an
+  # artifact so language-specific jobs can download it rather than rebuild it.
+  build-sdk:
+    name: Build SDK
+    runs-on: ubuntu-latest
+
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/apt.llvm.org.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] \
+            https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libsdl2-dev \
+            clang-22 lld-22 llvm-22 \
+            gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross libgcc-s1-riscv64-cross
+          sudo mkdir -p /usr/riscv64-linux-gnu/include/gnu
+          sudo touch /usr/riscv64-linux-gnu/include/gnu/stubs-ilp32d.h
+          sudo update-alternatives --install /usr/bin/clang       clang       /usr/bin/clang-22       100
+          sudo update-alternatives --install /usr/bin/clang++      clang++      /usr/bin/clang++-22      100
+          sudo update-alternatives --install /usr/bin/ld.lld       ld.lld       /usr/bin/ld.lld-22       100
+          sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-22 100
+          sudo update-alternatives --install /usr/bin/llvm-ar      llvm-ar      /usr/bin/llvm-ar-22      100
+          rustup update stable
+          # Keep in sync with CART_RUST_TOOLCHAIN in devtool/src/build.rs.
+          rustup toolchain install nightly-2026-06-01 --profile minimal --component rust-src
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v16
+        with:
+          version: 6.0.0
+          actions-cache-folder: emsdk-cache
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: external-examples-sdk-clang22
+          max-size: 1.5G
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: FetchContent cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/blyt/fetchcontent
+          key: fetchcontent-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Stamp version
+        run: |
+          mkdir -p build
+          VERSION=$(cat version.txt)
+          if [[ "$VERSION" == *-dev ]]; then
+            echo "${VERSION}-$(date +%Y%m%d-%H%M%S)" > build/version.txt
+          else
+            cp version.txt build/version.txt
+          fi
+
+      - name: Configure
+        run: cmake -B build -G Ninja
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Build SDK
+        run: cmake --build build --target sdk
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blyt-sdk
+          path: build/sdk/
+          retention-days: 1
+
+  # ─── Swift Embedded ─────────────────────────────────────────────────────────
+  # Builds examples/external/swift-embedded/ (and any future .swift carts)
+  # using a swift.org development snapshot.  The snapshot (~1.2 GB compressed)
+  # is cached after the first run; subsequent runs restore it in ~30 s.
+  # To update the snapshot: change SWIFT_SNAPSHOT below — the cache key changes
+  # automatically and the new snapshot is downloaded on the next run.
+  swift-embedded:
+    name: Swift Embedded
+    needs: build-sdk
+    runs-on: ubuntu-latest
+
+    env:
+      SWIFT_SNAPSHOT: swift-DEVELOPMENT-SNAPSHOT-2026-06-12-a
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download SDK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: blyt-sdk
+          path: build/sdk/
+
+      - name: Restore SDK executable bits
+        run: chmod +x build/sdk/bin/*
+
+      - name: Cache Swift toolchain
+        id: swift-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/swift
+          key: ${{ env.SWIFT_SNAPSHOT }}-ubuntu24
+
+      - name: Install Swift toolchain
+        if: steps.swift-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /opt/swift
+          curl -fL \
+            "https://download.swift.org/development/ubuntu2404/${SWIFT_SNAPSHOT}/${SWIFT_SNAPSHOT}-ubuntu24.04.tar.gz" \
+            | tar -xz --strip-components=1 -C /opt/swift
+
+      - name: Add Swift to PATH
+        run: echo "/opt/swift/usr/bin" >> "$GITHUB_PATH"
+
+      - name: Build external Swift examples
+        env:
+          BLYT_SDK_DIR: ${{ github.workspace }}/build/sdk
+        run: |
+          failed=()
+          for ex in examples/external/*/; do
+            [ -f "${ex}blyt.info.yaml" ] || continue
+            lang=$(grep '^ *swift:' "${ex}blyt.build.yaml" 2>/dev/null)
+            [ -n "$lang" ] || continue
+            name="${ex%/}"
+            echo "::group::blyt build ${name}"
+            if build/sdk/bin/blyt build "${ex}"; then
+              echo "ok: ${name}"
+            else
+              echo "::error::example failed to build: ${name}"
+              failed+=("${name}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Swift examples failed to build: ${failed[*]}"
+            exit 1
+          fi
+
+      - name: Smoke-test external Swift examples
+        run: |
+          failed=()
+          expected=(
+            "init player pos: 160, 120"
+            "update frame 10 player pos: 161, 121"
+            "draw frame 10 player pos: 161, 121"
+          )
+          for ex in examples/external/*/; do
+            [ -f "${ex}blyt.info.yaml" ] || continue
+            lang=$(grep '^ *swift:' "${ex}blyt.build.yaml" 2>/dev/null)
+            [ -n "$lang" ] || continue
+            name="${ex%/}"
+            cart="${ex}build/$(basename "${name}").blyt"
+            echo "::group::smoke ${name}"
+            out=$(build/sdk/bin/blytplay --headless --quit-after 10 "${cart}" 2>&1)
+            ok=true
+            for line in "${expected[@]}"; do
+              if ! printf '%s' "${out}" | grep -qF "${line}"; then
+                echo "::error::${name}: missing: ${line}"
+                ok=false
+              fi
+            done
+            out_ns=$(build/sdk/bin/blytplay --headless --reset-every-frame --quit-after 10 "${cart}" 2>&1)
+            for line in "${expected[@]}"; do
+              if ! printf '%s' "${out_ns}" | grep -qF "${line}"; then
+                echo "::error::${name} (--reset-every-frame): missing: ${line}"
+                ok=false
+              fi
+            done
+            if ${ok}; then
+              echo "ok: ${name}"
+            else
+              failed+=("${name}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Swift smoke tests failed: ${failed[*]}"
+            exit 1
+          fi

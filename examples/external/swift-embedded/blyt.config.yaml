@@ -1,0 +1,10 @@
+records:
+  State:
+    fields:
+      - { name: frame, type: i32 }
+      - { name: x, type: i32 }
+      - { name: y, type: i32 }
+state_buffers:
+  state:
+    record: State
+    count: 1
