@@ -144,8 +144,8 @@ jobs:
         # GDB/DAP) — ADR-0129.
         run: cmake --build build
 
-      - name: C unit tests
-        run: ctest --test-dir build --output-on-failure
+      - name: Unit tests
+        run: cmake --build build --target test-unit
 
       - name: Build SDK
         # Guest libs (release + debug + native) are already built into sdk/
@@ -193,18 +193,15 @@ jobs:
       # The QEMU native ILP32 gate runs inside this step as a regular test:
       # nextest overlaps its ~30s QEMU boot with the other suites. The
       # BLYT_QEMU_* env points at the files downloaded above — when
-      # BLYT_QEMU_IMAGE_URL is unset they don't exist and the gate skips,
-      # matching the old dedicated step's `if:` behaviour.
-      - name: Rust tests (unit + integration)
+      # BLYT_QEMU_IMAGE_URL is unset they don't exist and the gate skips.
+      # BLYT_BUILD_DIR is injected by the CMake target via cmake -E env.
+      - name: Integration tests
         timeout-minutes: 20
         env:
-          BLYT_BUILD_DIR: ${{ github.workspace }}/build
           BLYT_QEMU_KERNEL: /tmp/blyt-qemu/Image
           BLYT_QEMU_ROOTFS: /tmp/blyt-qemu/rootfs.qcow2
           BLYT_QEMU_SSH_KEY: /tmp/blyt-qemu/id_ed25519
-        run: |
-          cargo build -p blyt
-          cargo nextest run --workspace
+        run: cmake --build build --target test-integration
 
       # VS Code extension unit tests (pure cart-detection helpers). Cheap:
       # only needs js-yaml, run via node's built-in test runner.

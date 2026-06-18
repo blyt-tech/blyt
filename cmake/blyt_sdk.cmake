@@ -484,14 +484,15 @@ set(_cargo_target_dir "${BLYT_BINARY_DIR}/cargo-target")
 set(ENV{CARGO_HOME} "${BLYT_BINARY_DIR}/cargo-home")
 set(ENV{CARGO_TARGET_DIR} "${_cargo_target_dir}")
 execute_process(
-  COMMAND cargo build --manifest-path "${BLYT_SOURCE_DIR}/Cargo.toml" --bin blyt
+  COMMAND cargo build --release --manifest-path "${BLYT_SOURCE_DIR}/Cargo.toml"
+          --bin blyt
   RESULT_VARIABLE R)
 unset(ENV{CARGO_HOME})
 unset(ENV{CARGO_TARGET_DIR})
 if(NOT R EQUAL 0)
   message(FATAL_ERROR "Failed to build blyt devtool")
 endif()
-file(COPY "${_cargo_target_dir}/debug/blyt" DESTINATION "${SDK_BIN}")
+file(COPY "${_cargo_target_dir}/release/blyt" DESTINATION "${SDK_BIN}")
 
 # Copy Rust SDK crate so blyt can find it via sdk_root_from_exe().
 file(COPY "${BLYT_SOURCE_DIR}/sdk/rust" DESTINATION "${SDK_DIR}")

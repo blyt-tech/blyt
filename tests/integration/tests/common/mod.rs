@@ -43,28 +43,9 @@ pub fn blytdebug() -> PathBuf {
     sdk_dir().join("bin/blytdebug")
 }
 
-/// Path to the `blyt` devtool binary.
-///
-/// Uses `CARGO_BIN_EXE_blyt` when Cargo sets it (same-package tests), then
-/// falls back to the workspace `target/{profile}/blyt` path.  This is needed
-/// because `blyt` lives in the `devtool` package while these tests are in the
-/// `tests/integration` package, and Cargo 1.77+ only sets `CARGO_BIN_EXE_*`
-/// for same-package binaries.
+/// Path to the `blyt` devtool binary — always the SDK copy.
 pub fn blyt_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_blyt") {
-        return PathBuf::from(p);
-    }
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    // When CARGO_TARGET_DIR is set (e.g. Docker/CI with an out-of-tree build),
-    // the binary lives there rather than in the repo's own target/ directory.
-    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        return PathBuf::from(target_dir).join(profile).join("blyt");
-    }
-    repo_root().join("target").join(profile).join("blyt")
+    sdk_dir().join("bin/blyt")
 }
 
 // -------------------------------------------------------------------------
@@ -691,14 +672,14 @@ pub fn test_session_api() -> PathBuf {
 /// build/build-wasm[-debug] emit their artifacts directly here via
 /// BLYT_WASM_OUT_DIR, so this is always the authoritative copy.
 pub fn find_wasm_dir() -> PathBuf {
-    build_dir().join("sdk/share/wasm")
+    sdk_dir().join("share/wasm")
 }
 
 /// Locate the DEBUG WASM runtime dir (blytdebug.*, built with BLYT_DAP/BLYT_GDB).
 /// The release blytplay has DAP/GDB compiled out (ADR-0129), so the WASM DAP/GDB
 /// tests must use this variant.
 pub fn find_wasm_debug_dir() -> PathBuf {
-    build_dir().join("sdk/share/wasm-debug")
+    sdk_dir().join("share/wasm-debug")
 }
 
 // -------------------------------------------------------------------------
