@@ -14,4 +14,7 @@ languages:
       -wmo -Osize -parse-as-library
       -emit-object -o @OBJFILE@
       @SRCFILES@
+  # Declares the C language so blyt generates cart_state.h (state buffer
+  # constants). No .c source files are compiled — Swift imports the header
+  # via blyt_bridge.h and @CART_GENERATED_C@.
   c:
