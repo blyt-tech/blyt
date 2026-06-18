@@ -147,3 +147,249 @@ pub fn parse_depfile(path: &Path) -> Vec<PathBuf> {
         .map(PathBuf::from)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TaskInput;
+    use tempfile::TempDir;
+
+    fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    // --- parse_depfile ---
+
+    #[test]
+    fn parse_depfile_missing_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let result = parse_depfile(&dir.path().join("missing.d"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_depfile_no_colon_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "no_colon.d", b"foo.o foo.c foo.h\n");
+        assert!(parse_depfile(&path).is_empty());
+    }
+
+    #[test]
+    fn parse_depfile_single_line() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "single.d", b"foo.o: foo.c include/foo.h\n");
+        let deps = parse_depfile(&path);
+        assert_eq!(
+            deps,
+            vec![PathBuf::from("foo.c"), PathBuf::from("include/foo.h")]
+        );
+    }
+
+    #[test]
+    fn parse_depfile_continuation_lines() {
+        let dir = TempDir::new().unwrap();
+        let content = b"foo.o: foo.c \\\n  include/a.h \\\n  include/b.h\n";
+        let path = write_file(&dir, "multi.d", content);
+        let deps = parse_depfile(&path);
+        assert_eq!(
+            deps,
+            vec![
+                PathBuf::from("foo.c"),
+                PathBuf::from("include/a.h"),
+                PathBuf::from("include/b.h"),
+            ]
+        );
+    }
+
+    // --- outputs_exist ---
+
+    #[test]
+    fn outputs_exist_empty_slice_is_true() {
+        assert!(outputs_exist(&[]));
+    }
+
+    #[test]
+    fn outputs_exist_all_present() {
+        let dir = TempDir::new().unwrap();
+        let a = write_file(&dir, "a.o", b"x");
+        let b = write_file(&dir, "b.o", b"y");
+        assert!(outputs_exist(&[a, b]));
+    }
+
+    #[test]
+    fn outputs_exist_one_missing() {
+        let dir = TempDir::new().unwrap();
+        let a = write_file(&dir, "a.o", b"x");
+        let missing = dir.path().join("missing.o");
+        assert!(!outputs_exist(&[a, missing]));
+    }
+
+    // --- check_inputs: File inputs ---
+
+    #[test]
+    fn check_inputs_new_file_needs_run() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "src.c", b"int main() {}");
+        let inputs = vec![TaskInput::File(path)];
+        let (map, needs_run) = check_inputs(&inputs, None);
+        assert!(needs_run);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn check_inputs_fast_path_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "src.c", b"int main() {}");
+
+        // First pass — establish state.
+        let (map, _) = check_inputs(&[TaskInput::File(path.clone())], None);
+        let prev = TaskState {
+            inputs: map,
+            outputs: vec![],
+        };
+
+        // Second pass with same mtime — should take fast path, no run needed.
+        let (_, needs_run) = check_inputs(&[TaskInput::File(path)], Some(&prev));
+        assert!(!needs_run);
+    }
+
+    #[test]
+    fn check_inputs_slow_path_content_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let content = b"int main() {}";
+        let path = write_file(&dir, "src.c", content);
+
+        let (map, _) = check_inputs(&[TaskInput::File(path.clone())], None);
+        let key = path.to_string_lossy().into_owned();
+        let real_fs = map[&key].clone();
+
+        // Simulate a touched mtime (force slow path) but identical content.
+        let stale = FileState {
+            mtime: real_fs.mtime.saturating_sub(1),
+            ..real_fs.clone()
+        };
+        let prev = TaskState {
+            inputs: [(key, stale)].into_iter().collect(),
+            outputs: vec![],
+        };
+
+        let (_, needs_run) = check_inputs(&[TaskInput::File(path)], Some(&prev));
+        assert!(
+            !needs_run,
+            "content is the same, slow path should detect no change"
+        );
+    }
+
+    #[test]
+    fn check_inputs_slow_path_content_changed() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "src.c", b"int main() {}");
+
+        let (map, _) = check_inputs(&[TaskInput::File(path.clone())], None);
+        let key = path.to_string_lossy().into_owned();
+        let real_fs = map[&key].clone();
+
+        // Same size and stale mtime but a different hash — simulates content change
+        // discovered only by hashing.
+        let stale = FileState {
+            mtime: real_fs.mtime.saturating_sub(1),
+            hash: real_fs.hash ^ 0xdead_beef,
+            ..real_fs
+        };
+        let prev = TaskState {
+            inputs: [(key, stale)].into_iter().collect(),
+            outputs: vec![],
+        };
+
+        let (_, needs_run) = check_inputs(&[TaskInput::File(path)], Some(&prev));
+        assert!(needs_run, "hash mismatch should trigger rerun");
+    }
+
+    #[test]
+    fn check_inputs_missing_file_needs_run() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("gone.c");
+        let (map, needs_run) = check_inputs(&[TaskInput::File(missing)], None);
+        assert!(needs_run);
+        assert!(
+            map.is_empty(),
+            "missing file should not appear in new state"
+        );
+    }
+
+    // --- check_inputs: Value inputs ---
+
+    #[test]
+    fn check_inputs_new_value_needs_run() {
+        let inputs = vec![TaskInput::Value("v1".to_string())];
+        let (map, needs_run) = check_inputs(&inputs, None);
+        assert!(needs_run);
+        assert!(map.contains_key("value:v1"));
+    }
+
+    #[test]
+    fn check_inputs_same_value_no_run() {
+        let inputs = vec![TaskInput::Value("v1".to_string())];
+        let (map, _) = check_inputs(&inputs, None);
+        let prev = TaskState {
+            inputs: map,
+            outputs: vec![],
+        };
+        let (_, needs_run) = check_inputs(&inputs, Some(&prev));
+        assert!(!needs_run);
+    }
+
+    #[test]
+    fn check_inputs_changed_value_needs_run() {
+        let inputs_v1 = vec![TaskInput::Value("v1".to_string())];
+        let (map, _) = check_inputs(&inputs_v1, None);
+        let prev = TaskState {
+            inputs: map,
+            outputs: vec![],
+        };
+
+        let inputs_v2 = vec![TaskInput::Value("v2".to_string())];
+        let (_, needs_run) = check_inputs(&inputs_v2, Some(&prev));
+        assert!(needs_run);
+    }
+
+    // --- save/load roundtrip ---
+
+    #[test]
+    fn save_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let state_file = dir.path().join("task.state");
+        let state = TaskState {
+            inputs: [(
+                "value:foo".to_string(),
+                FileState {
+                    size: 0,
+                    mtime: 0,
+                    hash: 42,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            outputs: vec!["out/foo.o".to_string()],
+        };
+        save_task_state(&state_file, &state).unwrap();
+        let loaded = load_task_state(&state_file).unwrap();
+        assert_eq!(loaded.outputs, state.outputs);
+        assert_eq!(loaded.inputs["value:foo"].hash, 42);
+    }
+
+    #[test]
+    fn load_task_state_missing_returns_none() {
+        let dir = TempDir::new().unwrap();
+        assert!(load_task_state(&dir.path().join("no.state")).is_none());
+    }
+
+    #[test]
+    fn load_task_state_corrupt_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "bad.state", b"not json {{{{");
+        assert!(load_task_state(&path).is_none());
+    }
+}
