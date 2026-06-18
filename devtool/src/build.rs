@@ -160,14 +160,20 @@ fn generate_cart_state(
     project_dir: &Path,
     build_dir: &Path,
     cfg: &CartConfig,
+    generate_c: bool,
+    generate_rust: bool,
 ) -> Result<CartStateFiles, BuildError> {
     use crate::config::{type_tag_buf_get_suffix, type_tag_c_type, type_tag_rust_type};
 
     let blyt_dir = build_dir.join("blyt");
     let c_dir = blyt_dir.join("c");
     let rust_dir = blyt_dir.join("rust");
-    fs::create_dir_all(&c_dir)?;
-    fs::create_dir_all(&rust_dir)?;
+    if generate_c {
+        fs::create_dir_all(&c_dir)?;
+    }
+    if generate_rust {
+        fs::create_dir_all(&rust_dir)?;
+    }
 
     let c_path = c_dir.join("cart_state.h");
     let rs_path = rust_dir.join("cart_state.rs");
@@ -459,8 +465,12 @@ fn generate_cart_state(
     c_out.push_str("#endif /* BLYT_CART_STATE_H */\n");
     rs_out.push_str("/* end of generated constants */\n");
 
-    fs::write(&c_path, &c_out)?;
-    fs::write(&rs_path, &rs_out)?;
+    if generate_c {
+        fs::write(&c_path, &c_out)?;
+    }
+    if generate_rust {
+        fs::write(&rs_path, &rs_out)?;
+    }
 
     /* ---- .cart.layouts FlatBuffer binary ---- */
     let layouts_bytes = cart_layouts_bytes(cfg);
@@ -702,9 +712,6 @@ enum CartLanguage {
 struct BuildManifest {
     language: Option<String>,
     languages: Option<BTreeMap<String, Option<LanguageConfig>>>,
-    compile_command: Option<String>,
-    source_extension: Option<String>,
-    strip_sections: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -713,6 +720,9 @@ struct BuildManifest {
 struct LanguageConfig {
     codegen: Option<bool>,
     sources: Option<Vec<String>>,
+    compile_command: Option<String>,
+    source_extension: Option<String>,
+    strip_sections: Option<Vec<String>>,
 }
 
 enum ExternalOutputType {
@@ -730,7 +740,12 @@ struct ExternalCompileConfig {
 
 enum BuildLanguages {
     Builtin(BTreeSet<CartLanguage>),
-    External(ExternalCompileConfig),
+    External {
+        /// Additional builtin languages (C, Rust, …) compiled alongside the
+        /// external compile_command.  Empty for single-language external carts.
+        builtin: BTreeSet<CartLanguage>,
+        cfg: ExternalCompileConfig,
+    },
 }
 
 fn parse_language_str(s: &str) -> Result<CartLanguage, BuildError> {
@@ -755,45 +770,6 @@ fn read_cart_languages(project_dir: &Path) -> Result<BuildLanguages, BuildError>
     let manifest: BuildManifest =
         serde_yaml::from_str(&text).map_err(|e| err(format!("blyt.build.yaml: {e}")))?;
 
-    if manifest.source_extension.is_some() && manifest.compile_command.is_none() {
-        return Err(err(
-            "blyt.build.yaml: `source_extension` requires `compile_command`",
-        ));
-    }
-    if manifest.strip_sections.is_some() && manifest.compile_command.is_none() {
-        return Err(err(
-            "blyt.build.yaml: `strip_sections` requires `compile_command`",
-        ));
-    }
-
-    if let Some(cmd) = manifest.compile_command {
-        if manifest.languages.is_some() {
-            return Err(err(
-                "blyt.build.yaml: `compile_command` cannot be used with `languages:` map",
-            ));
-        }
-        let lang = manifest.language.ok_or_else(|| {
-            err("blyt.build.yaml: `compile_command` requires `language:` to be set")
-        })?;
-        validate_compile_command_template(&cmd)?;
-        let output_type = if cmd.contains("@LIBFILE@") {
-            ExternalOutputType::Archive
-        } else {
-            ExternalOutputType::Object
-        };
-        let extension = manifest
-            .source_extension
-            .map(|s| s.strip_prefix('.').map(str::to_string).unwrap_or(s))
-            .unwrap_or_else(|| lang.clone());
-        return Ok(BuildLanguages::External(ExternalCompileConfig {
-            language: lang,
-            extension,
-            command_template: cmd,
-            strip_sections: manifest.strip_sections.unwrap_or_default(),
-            output_type,
-        }));
-    }
-
     match (manifest.language, manifest.languages) {
         (None, None) => Err(err("blyt.build.yaml: no language declaration — \
              add `language: lua` (or other language) or a `languages:` map")),
@@ -807,11 +783,50 @@ fn read_cart_languages(project_dir: &Path) -> Result<BuildLanguages, BuildError>
             if map.is_empty() {
                 return Err(err("blyt.build.yaml: `languages:` map is empty"));
             }
-            Ok(BuildLanguages::Builtin(
-                map.keys()
-                    .map(|k| parse_language_str(k))
-                    .collect::<Result<_, _>>()?,
-            ))
+            // Partition into external (has compile_command) and builtin languages.
+            // At most one language may carry a compile_command.
+            let mut external: Option<(String, LanguageConfig)> = None;
+            let mut builtin: BTreeSet<CartLanguage> = BTreeSet::new();
+            for (key, config) in map {
+                let cfg = config.unwrap_or_default();
+                if cfg.compile_command.is_some() {
+                    if external.is_some() {
+                        return Err(err(
+                            "blyt.build.yaml: at most one language in `languages:` \
+                             may have `compile_command`",
+                        ));
+                    }
+                    external = Some((key, cfg));
+                } else {
+                    builtin.insert(parse_language_str(&key)?);
+                }
+            }
+            match external {
+                None => Ok(BuildLanguages::Builtin(builtin)),
+                Some((lang, lang_cfg)) => {
+                    let cmd = lang_cfg.compile_command.unwrap();
+                    validate_compile_command_template(&cmd)?;
+                    let output_type = if cmd.contains("@LIBFILE@") {
+                        ExternalOutputType::Archive
+                    } else {
+                        ExternalOutputType::Object
+                    };
+                    let extension = lang_cfg
+                        .source_extension
+                        .map(|s| s.strip_prefix('.').map(str::to_string).unwrap_or(s))
+                        .unwrap_or_else(|| lang.clone());
+                    Ok(BuildLanguages::External {
+                        builtin,
+                        cfg: ExternalCompileConfig {
+                            language: lang,
+                            extension,
+                            command_template: cmd,
+                            strip_sections: lang_cfg.strip_sections.unwrap_or_default(),
+                            output_type,
+                        },
+                    })
+                }
+            }
         }
     }
 }
@@ -937,7 +952,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
     let (languages, external_config): (BTreeSet<CartLanguage>, Option<ExternalCompileConfig>) =
         match read_cart_languages(project_dir)? {
             BuildLanguages::Builtin(s) => (s, None),
-            BuildLanguages::External(c) => (BTreeSet::new(), Some(c)),
+            BuildLanguages::External { builtin, cfg } => (builtin, Some(cfg)),
         };
     let is_lua = languages.contains(&CartLanguage::Lua);
 
@@ -1169,7 +1184,14 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
 
     /* Parse blyt.config.yaml and generate state buffer codegen artifacts. */
     let cart_config = crate::config::read_cart_config(project_dir).map_err(|e| err(e))?;
-    let cart_state = generate_cart_state(project_dir, &build_dir, &cart_config)?;
+    let needs_c = languages.contains(&CartLanguage::C)
+        || languages.contains(&CartLanguage::Cpp)
+        || external_config
+            .as_ref()
+            .map_or(false, |c| c.command_template.contains("@CART_GENERATED_C@"));
+    let needs_rust = languages.contains(&CartLanguage::Rust);
+    let cart_state =
+        generate_cart_state(project_dir, &build_dir, &cart_config, needs_c, needs_rust)?;
 
     /* Generate the cart entry point stub.  _blyt_entry is the ELF e_entry:
      *   - On native RISC-V hardware: ld.so jumps here after loading
@@ -1437,6 +1459,7 @@ pub fn run(project_dir: &Path, output: Option<&Path>, debug: bool) -> Result<Pat
             &sdk_include,
             &lib_dir,
             &sdk_bin,
+            &cart_state.c_include_dir,
             &objcopy,
             debug,
         )?;
@@ -1577,8 +1600,7 @@ fn find_clang() -> String {
     if let Ok(c) = std::env::var("BLYT_CLANG") {
         return c;
     }
-    // SDK layout: use the blyt-prefixed clang symlink from bin/
-    if let Some(sdk) = sdk_root_from_exe() {
+    for sdk in sdk_candidates() {
         let p = sdk.join("bin/blyt-clang");
         if p.exists() {
             return p.to_string_lossy().into_owned();
@@ -1591,8 +1613,7 @@ fn find_objcopy() -> String {
     if let Ok(o) = std::env::var("BLYT_OBJCOPY") {
         return o;
     }
-    // SDK layout: use the blyt-prefixed objcopy symlink from bin/
-    if let Some(sdk) = sdk_root_from_exe() {
+    for sdk in sdk_candidates() {
         let p = sdk.join("bin/blyt-objcopy");
         if p.exists() {
             return p.to_string_lossy().into_owned();
@@ -1605,7 +1626,7 @@ fn find_ar() -> String {
     if let Ok(a) = std::env::var("BLYT_AR") {
         return a;
     }
-    if let Some(sdk) = sdk_root_from_exe() {
+    for sdk in sdk_candidates() {
         let p = sdk.join("bin/blyt-llvm-ar");
         if p.exists() {
             return p.to_string_lossy().into_owned();
@@ -1614,11 +1635,20 @@ fn find_ar() -> String {
     "llvm-ar".to_string()
 }
 
+/// Iterator over candidate SDK roots, in priority order:
+/// 1. $BLYT_SDK_DIR — set by the user or CI
+/// 2. sdk_root_from_exe() — when running as build/sdk/bin/blyt
+fn sdk_candidates() -> impl Iterator<Item = PathBuf> {
+    let from_env = std::env::var("BLYT_SDK_DIR").ok().map(PathBuf::from);
+    let from_exe = sdk_root_from_exe();
+    from_env.into_iter().chain(from_exe)
+}
+
 fn find_clangpp() -> String {
     if let Ok(c) = std::env::var("BLYT_CLANGPP") {
         return c;
     }
-    if let Some(sdk) = sdk_root_from_exe() {
+    for sdk in sdk_candidates() {
         let p = sdk.join("bin/blyt-clang++");
         if p.exists() {
             return p.to_string_lossy().into_owned();
@@ -1631,7 +1661,7 @@ fn find_luac() -> String {
     if let Ok(c) = std::env::var("BLYT_LUAC") {
         return c;
     }
-    if let Some(sdk) = sdk_root_from_exe() {
+    for sdk in sdk_candidates() {
         let p = sdk.join("bin/blyt-luac");
         if p.exists() {
             return p.to_string_lossy().into_owned();
@@ -2398,6 +2428,7 @@ const KNOWN_PLACEHOLDERS: &[&str] = &[
     "@SDK_LIB@",
     "@SDK_BIN@",
     "@DEBUG@",
+    "@CART_GENERATED_C@",
 ];
 
 fn validate_compile_command_template(cmd: &str) -> Result<(), BuildError> {
@@ -2445,6 +2476,7 @@ fn compile_external(
     sdk_include: &Path,
     sdk_lib: &Path,
     sdk_bin: &Path,
+    cart_state_include: &Path,
     objcopy: &str,
     debug: bool,
 ) -> Result<PathBuf, BuildError> {
@@ -2463,6 +2495,7 @@ fn compile_external(
     let inc_str = sdk_include.to_string_lossy();
     let lib_str = sdk_lib.to_string_lossy();
     let bin_str = sdk_bin.to_string_lossy();
+    let csi_str = cart_state_include.to_string_lossy();
     let debug_str = if debug { "1" } else { "0" };
 
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
@@ -2477,6 +2510,7 @@ fn compile_external(
                 .replace("@SDK_INCLUDE@", &inc_str)
                 .replace("@SDK_LIB@", &lib_str)
                 .replace("@SDK_BIN@", &bin_str)
+                .replace("@CART_GENERATED_C@", &csi_str)
                 .replace("@DEBUG@", debug_str);
             argv.push(std::ffi::OsString::from(expanded));
         }
@@ -3340,12 +3374,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_build_yaml(
             dir.path(),
-            "language: swift\ncompile_command: \"swiftc -o @OBJFILE@ @SRCFILES@\"\n",
+            "languages:\n  swift:\n    compile_command: \"swiftc -o @OBJFILE@ @SRCFILES@\"\n",
         );
         let langs = read_cart_languages(dir.path()).unwrap();
-        let BuildLanguages::External(cfg) = langs else {
+        let BuildLanguages::External { builtin, cfg } = langs else {
             panic!("expected External variant");
         };
+        assert!(builtin.is_empty(), "expected no builtin languages");
         assert_eq!(cfg.language, "swift");
         assert!(
             matches!(cfg.output_type, ExternalOutputType::Object),
@@ -3358,16 +3393,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_build_yaml(
             dir.path(),
-            "language: zig\ncompile_command: \"zig build-lib -femit-bin=@LIBFILE@ @SRCFILES@\"\n",
+            "languages:\n  zig:\n    compile_command: \"zig build-lib -femit-bin=@LIBFILE@ @SRCFILES@\"\n",
         );
         let langs = read_cart_languages(dir.path()).unwrap();
-        let BuildLanguages::External(cfg) = langs else {
+        let BuildLanguages::External { builtin, cfg } = langs else {
             panic!("expected External variant");
         };
+        assert!(builtin.is_empty(), "expected no builtin languages");
         assert_eq!(cfg.language, "zig");
         assert!(
             matches!(cfg.output_type, ExternalOutputType::Archive),
             "expected Archive output type"
+        );
+    }
+
+    #[test]
+    fn read_cart_languages_external_with_c() {
+        let dir = tempfile::tempdir().unwrap();
+        write_build_yaml(
+            dir.path(),
+            "languages:\n  swift:\n    compile_command: \"swiftc -o @OBJFILE@ @SRCFILES@\"\n    source_extension: .swift\n  c:\n",
+        );
+        let langs = read_cart_languages(dir.path()).unwrap();
+        let BuildLanguages::External { builtin, cfg } = langs else {
+            panic!("expected External variant");
+        };
+        assert_eq!(builtin, BTreeSet::from([CartLanguage::C]));
+        assert_eq!(cfg.language, "swift");
+        assert_eq!(cfg.extension, "swift");
+        assert!(
+            matches!(cfg.output_type, ExternalOutputType::Object),
+            "expected Object output type"
         );
     }
 
