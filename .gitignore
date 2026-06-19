@@ -1,5 +1,6 @@
 build/
 build-*/
+!devtool/src/build/
 target/
 # third_party/ is gitignored: deps are fetched via CMake FetchContent at
 # configure time into ~/.cache/blyt/fetchcontent/ (shared across worktrees).

@@ -2,6 +2,7 @@ mod build;
 mod cart_info_generated;
 mod cart_layouts_generated;
 mod config;
+mod engine;
 mod export;
 mod run;
 mod setup;
@@ -80,6 +81,10 @@ struct BuildArgs {
     /// Build with debug information (-g, -O0, path remapping for GDB/DAP)
     #[arg(long)]
     debug: bool,
+
+    /// Bypass incremental build state and rerun all tasks unconditionally
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Subcommand)]
@@ -130,10 +135,11 @@ fn main() {
                     output,
                 }),
             debug,
+            force,
             ..
         }) => {
             let dir = project_dir.as_deref().unwrap_or(Path::new("."));
-            build::run(dir, output.as_deref(), debug)
+            build::run(dir, output.as_deref(), debug, force)
                 .map_err(|e| e.to_string())
                 .and_then(|cart| export::run(&cart, None).map_err(|e| e.to_string()))
         }
@@ -143,19 +149,22 @@ fn main() {
             project_dir,
             output,
             debug,
+            force,
         }) => {
             let dir = project_dir.as_deref().unwrap_or(Path::new("."));
-            build::run(dir, output.as_deref(), debug)
+            build::run(dir, output.as_deref(), debug, force)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
 
         Commands::Build(BuildArgs {
             sub: Some(BuildSubcommand::Lib { name, project_dir }),
+            force,
+            debug,
             ..
         }) => {
             let dir = project_dir.as_deref().unwrap_or(Path::new("."));
-            build::build_single_lib(dir, &name)
+            build::build_single_lib(dir, &name, debug, force)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
