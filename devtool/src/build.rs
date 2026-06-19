@@ -2264,9 +2264,9 @@ pub fn build_single_lib(
         let cargo = find_cargo();
         let sdk_include = find_sdk_include()?;
         let rust_sdk = find_rust_sdk(&sdk_include)?;
-        let lib_build_dir = project_dir.join("build/lib").join(lib_name).join(variant);
+        let lib_build_dir = project_dir.join("build/lib").join(lib_name);
         fs::create_dir_all(&lib_build_dir)?;
-        let state_dir = project_dir.join("build/.blyt-tasks").join(variant);
+        let state_dir = project_dir.join("build/.blyt-tasks/lib").join(lib_name);
         let output = lib_build_dir.join("lib.a");
         let tasks: Vec<Box<dyn Task>> = vec![Box::new(CompileRustTask {
             key_str: format!("cargo_lib/{lib_name}"),
@@ -2292,8 +2292,8 @@ pub fn build_single_lib(
     let clangpp = find_clangpp();
     let ar = find_ar();
     let sdk_include = find_sdk_include()?;
-    let lib_build_dir = project_dir.join("build/lib").join(lib_name).join(variant);
-    let state_dir = project_dir.join("build/.blyt-tasks").join(variant);
+    let lib_build_dir = project_dir.join("build/lib").join(lib_name);
+    let state_dir = project_dir.join("build/.blyt-tasks/lib").join(lib_name);
 
     let c_files = collect_c_files(&src_dir)?;
     let cpp_files = collect_cpp_files(&src_dir)?;
