@@ -488,6 +488,55 @@ pub fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     ))
 }
 
+/// Build a dev ELF (`build/.elf`) by running `blyt run <project_dir>` and
+/// killing it once the ELF has been produced.  Requires the SDK (for `blyt`
+/// and `blyt-luac`); does not require the WASM runtime.
+///
+/// `blyt run` builds the dev ELF as its first step before starting the HTTP
+/// server, so this helper works whether or not the WASM runtime is present.
+pub fn build_dev_elf(project_dir: &std::path::Path) -> PathBuf {
+    use std::io::{BufRead, BufReader};
+    let sdk = sdk_dir();
+    let mut cmd = std::process::Command::new(blyt_bin());
+    cmd.args(["run", project_dir.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if sdk_clang.exists() {
+        cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    let sdk_luac = sdk.join("bin/blyt-luac");
+    if sdk_luac.exists() {
+        cmd.env("BLYT_LUAC", &sdk_luac);
+    }
+    // Capture stdout so we can detect when the ELF is ready; suppress stderr
+    // (WASM-missing errors are expected and not failures here).
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("blyt run spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            // EOF: process exited (WASM absent but ELF already built).
+            Ok(0) | Err(_) => break,
+            // "built: /path/to/build/.elf" — ELF ready; process may still serve.
+            Ok(_) if line.starts_with("built: ") => break,
+            _ => {}
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let elf_path = project_dir.join("build/.elf");
+    assert!(
+        elf_path.exists(),
+        "build/.elf not created by blyt run: {}",
+        elf_path.display()
+    );
+    elf_path
+}
+
 /// Run `blyt build <project_dir>` with Lua-specific env vars and return the cart path.
 pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     use assert_cmd::Command;
