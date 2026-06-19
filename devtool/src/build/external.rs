@@ -267,3 +267,103 @@ fn compile_external(
 
     Ok(out_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TaskInput;
+    use tempfile::tempdir;
+
+    fn make_task(
+        src_files: Vec<PathBuf>,
+        command_template: &str,
+        debug: bool,
+        output_type: ExternalOutputType,
+        output: PathBuf,
+    ) -> CompileExternalTask {
+        CompileExternalTask {
+            key_str: "ext/swift".to_string(),
+            config: ExternalCompileConfig {
+                language: "swift".to_string(),
+                extension: "swift".to_string(),
+                command_template: command_template.to_string(),
+                strip_sections: vec![],
+                output_type,
+            },
+            project_dir: PathBuf::from("/project"),
+            build_dir: PathBuf::from("/build"),
+            sdk_include: PathBuf::from("/sdk/include"),
+            sdk_lib: PathBuf::from("/sdk/lib"),
+            sdk_bin: PathBuf::from("/sdk/bin"),
+            cart_state_include: PathBuf::from("/build/blyt/c"),
+            objcopy: "llvm-objcopy".to_string(),
+            debug,
+            src_files,
+            output,
+        }
+    }
+
+    #[test]
+    fn inputs_contains_src_files_and_template() {
+        let d = tempdir().unwrap();
+        let f1 = d.path().join("main.swift");
+        let out = d.path().join("swift.o");
+        let task = make_task(
+            vec![f1.clone()],
+            "swiftc -o @OBJFILE@ @SRCFILES@",
+            false,
+            ExternalOutputType::Object,
+            out,
+        );
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(f1)));
+        assert!(inputs.contains(&TaskInput::Value(
+            "swiftc -o @OBJFILE@ @SRCFILES@".to_string()
+        )));
+    }
+
+    #[test]
+    fn inputs_debug_flag_distinguishes_debug_from_release() {
+        let d = tempdir().unwrap();
+        let out = d.path().join("swift.o");
+        let debug_task = make_task(
+            vec![],
+            "swiftc -o @OBJFILE@ @SRCFILES@",
+            true,
+            ExternalOutputType::Object,
+            out.clone(),
+        );
+        let release_task = make_task(
+            vec![],
+            "swiftc -o @OBJFILE@ @SRCFILES@",
+            false,
+            ExternalOutputType::Object,
+            out,
+        );
+        assert!(
+            debug_task
+                .inputs()
+                .contains(&TaskInput::Value("debug=true".to_string()))
+        );
+        assert!(
+            release_task
+                .inputs()
+                .contains(&TaskInput::Value("debug=false".to_string()))
+        );
+        assert_ne!(debug_task.inputs(), release_task.inputs());
+    }
+
+    #[test]
+    fn outputs_is_single_path() {
+        let d = tempdir().unwrap();
+        let out = d.path().join("swift.o");
+        let task = make_task(
+            vec![],
+            "swiftc -o @OBJFILE@ @SRCFILES@",
+            false,
+            ExternalOutputType::Object,
+            out.clone(),
+        );
+        assert_eq!(task.outputs(), vec![out]);
+    }
+}

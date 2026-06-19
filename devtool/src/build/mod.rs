@@ -2311,6 +2311,7 @@ mod tests {
     use super::external::{tokenize_command, validate_compile_command_template};
     use super::*;
     use crate::cart_info_generated::blyt::root_as_cart_info;
+    use tempfile::tempdir;
 
     fn test_fields() -> InfoFields {
         InfoFields {
@@ -2552,5 +2553,212 @@ mod tests {
         fs::remove_file(dir.path().join("blyt.info.yaml")).unwrap();
         let e = read_cart_info(dir.path()).unwrap_err().to_string();
         assert!(e.contains("blyt.info.yaml not found"));
+    }
+
+    // --- codegen task inputs/outputs ---
+
+    #[test]
+    fn codegen_tasks_input_config_when_present() {
+        let d = tempdir().unwrap();
+        let cfg = d.path().join("blyt.config.yaml");
+        fs::write(&cfg, "").unwrap();
+        let build = d.path().join("build");
+
+        for task in [
+            &GenerateCHeaderTask {
+                project_dir: d.path().to_path_buf(),
+                build_dir: build.clone(),
+            } as &dyn Task,
+            &GenerateRustStateTask {
+                project_dir: d.path().to_path_buf(),
+                build_dir: build.clone(),
+            },
+            &GenerateLayoutsTask {
+                project_dir: d.path().to_path_buf(),
+                build_dir: build.clone(),
+            },
+            &GenerateLuaGlueTask {
+                project_dir: d.path().to_path_buf(),
+                build_dir: build.clone(),
+            },
+        ] {
+            assert!(
+                task.inputs().contains(&TaskInput::File(cfg.clone())),
+                "{} must include blyt.config.yaml in inputs",
+                task.key()
+            );
+        }
+    }
+
+    #[test]
+    fn codegen_tasks_empty_inputs_without_config() {
+        let d = tempdir().unwrap();
+        let build = d.path().join("build");
+        for task in [
+            &GenerateCHeaderTask {
+                project_dir: d.path().to_path_buf(),
+                build_dir: build.clone(),
+            } as &dyn Task,
+            &GenerateRustStateTask {
+                project_dir: d.path().to_path_buf(),
+                build_dir: build.clone(),
+            },
+        ] {
+            assert!(
+                task.inputs().is_empty(),
+                "{} must have no inputs when blyt.config.yaml absent",
+                task.key()
+            );
+        }
+    }
+
+    #[test]
+    fn codegen_task_outputs() {
+        let build = PathBuf::from("/build");
+        let project = PathBuf::from("/proj");
+        assert_eq!(
+            GenerateCHeaderTask {
+                project_dir: project.clone(),
+                build_dir: build.clone()
+            }
+            .outputs(),
+            vec![build.join("blyt/c/cart_state.h")]
+        );
+        assert_eq!(
+            GenerateRustStateTask {
+                project_dir: project.clone(),
+                build_dir: build.clone()
+            }
+            .outputs(),
+            vec![build.join("blyt/rust/cart_state.rs")]
+        );
+        assert_eq!(
+            GenerateLayoutsTask {
+                project_dir: project.clone(),
+                build_dir: build.clone()
+            }
+            .outputs(),
+            vec![build.join("cart.layouts.bin")]
+        );
+        assert_eq!(
+            GenerateLuaGlueTask {
+                project_dir: project,
+                build_dir: build.clone()
+            }
+            .outputs(),
+            vec![build.join("__blyt_lua_glue.c")]
+        );
+    }
+
+    // --- AssembleLibArchiveTask ---
+
+    #[test]
+    fn archive_task_inputs_and_outputs() {
+        let d = tempdir().unwrap();
+        let o1 = d.path().join("a.o");
+        let o2 = d.path().join("b.o");
+        let out = d.path().join("libcart.a");
+        let task = AssembleLibArchiveTask {
+            key_str: "archive/mylib".to_string(),
+            ar: "llvm-ar".to_string(),
+            obj_files: vec![o1.clone(), o2.clone()],
+            output: out.clone(),
+        };
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(o1)));
+        assert!(inputs.contains(&TaskInput::File(o2)));
+        assert!(inputs.contains(&TaskInput::Value("llvm-ar".to_string())));
+        assert_eq!(task.outputs(), vec![out]);
+    }
+
+    // --- LinkElfTask ---
+
+    #[test]
+    fn link_task_inputs_files_and_compiler() {
+        let obj = PathBuf::from("/build/foo.o");
+        let ld = PathBuf::from("/sdk/ld/blyt.ld");
+        let out = PathBuf::from("/build/cart.elf");
+        let task = LinkElfTask {
+            clang: "clang".to_string(),
+            obj_files: vec![obj.clone()],
+            rust_archive: None,
+            lib_archives: vec![],
+            ld_script: ld.clone(),
+            lib_dir: PathBuf::from("/sdk/lib"),
+            output: out.clone(),
+            is_lua: false,
+        };
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(obj)));
+        assert!(inputs.contains(&TaskInput::File(ld)));
+        assert!(inputs.contains(&TaskInput::Value("clang".to_string())));
+        assert_eq!(task.outputs(), vec![out]);
+    }
+
+    #[test]
+    fn link_task_includes_rust_archive_and_lib_archives() {
+        let rust_ar = PathBuf::from("/build/libcart.a");
+        let lib_ar = PathBuf::from("/build/lib/libmylib.a");
+        let task = LinkElfTask {
+            clang: "clang".to_string(),
+            obj_files: vec![],
+            rust_archive: Some(rust_ar.clone()),
+            lib_archives: vec![lib_ar.clone()],
+            ld_script: PathBuf::from("/sdk/ld/blyt.ld"),
+            lib_dir: PathBuf::from("/sdk/lib"),
+            output: PathBuf::from("/build/cart.elf"),
+            is_lua: false,
+        };
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(rust_ar)));
+        assert!(inputs.contains(&TaskInput::File(lib_ar)));
+    }
+
+    // --- AssembleCartTask ---
+
+    #[test]
+    fn assemble_cart_inputs_and_outputs() {
+        let elf = PathBuf::from("/build/cart.elf");
+        let info = PathBuf::from("/build/cart.info");
+        let luac = PathBuf::from("/build/cart.luac");
+        let out = PathBuf::from("/build/cart.blyt");
+        let task = AssembleCartTask {
+            objcopy: "llvm-objcopy".to_string(),
+            raw_elf: elf.clone(),
+            cart_info_file: info.clone(),
+            output: out.clone(),
+            extra_sections: vec![(".cart.lua".to_string(), luac.clone())],
+            debug: false,
+        };
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(elf)));
+        assert!(inputs.contains(&TaskInput::File(info)));
+        assert!(inputs.contains(&TaskInput::File(luac)));
+        assert!(inputs.contains(&TaskInput::Value("llvm-objcopy".to_string())));
+        assert!(inputs.contains(&TaskInput::Value("debug=false".to_string())));
+        assert_eq!(task.outputs(), vec![out]);
+    }
+
+    #[test]
+    fn assemble_cart_debug_flag_differs_between_variants() {
+        let make = |debug: bool| AssembleCartTask {
+            objcopy: "llvm-objcopy".to_string(),
+            raw_elf: PathBuf::from("/build/cart.elf"),
+            cart_info_file: PathBuf::from("/build/cart.info"),
+            output: PathBuf::from("/build/cart.blyt"),
+            extra_sections: vec![],
+            debug,
+        };
+        assert!(
+            make(true)
+                .inputs()
+                .contains(&TaskInput::Value("debug=true".to_string()))
+        );
+        assert!(
+            make(false)
+                .inputs()
+                .contains(&TaskInput::Value("debug=false".to_string()))
+        );
+        assert_ne!(make(true).inputs(), make(false).inputs());
     }
 }

@@ -103,6 +103,74 @@ pub(super) fn collect_lua_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> 
     Ok(files)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TaskInput;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn compile_lua_inputs_contains_files_and_compiler() {
+        let d = tempdir().unwrap();
+        let f1 = d.path().join("main.lua");
+        let f2 = d.path().join("util.lua");
+        fs::write(&f1, "").unwrap();
+        fs::write(&f2, "").unwrap();
+        let out = d.path().join("cart.luac");
+        let task = CompileLuaTask {
+            luac: "luac".to_string(),
+            lua_files: vec![f1.clone(), f2.clone()],
+            project_dir: d.path().to_path_buf(),
+            output: out.clone(),
+        };
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(f1)));
+        assert!(inputs.contains(&TaskInput::File(f2)));
+        assert!(inputs.contains(&TaskInput::Value("luac".to_string())));
+    }
+
+    #[test]
+    fn compile_lua_outputs() {
+        let d = tempdir().unwrap();
+        let out = d.path().join("cart.luac");
+        let task = CompileLuaTask {
+            luac: "luac".to_string(),
+            lua_files: vec![],
+            project_dir: d.path().to_path_buf(),
+            output: out.clone(),
+        };
+        assert_eq!(task.outputs(), vec![out]);
+    }
+
+    #[test]
+    fn generate_lua_data_inputs_and_outputs() {
+        let d = tempdir().unwrap();
+        let bc = d.path().join("cart.luac");
+        let out_c = d.path().join("cart_lua_data.c");
+        let task = GenerateLuaDataTask {
+            bytecode_path: bc.clone(),
+            output_c: out_c.clone(),
+        };
+        assert_eq!(task.inputs(), vec![TaskInput::File(bc)]);
+        assert_eq!(task.outputs(), vec![out_c]);
+    }
+
+    #[test]
+    fn generate_lua_data_c_hex_format() {
+        let d = tempdir().unwrap();
+        let bc = d.path().join("cart.luac");
+        fs::write(&bc, b"\x01\x02\x03").unwrap();
+        let out_c = d.path().join("cart_lua_data.c");
+        generate_lua_data_c(&bc, &out_c).unwrap();
+        let src = fs::read_to_string(&out_c).unwrap();
+        assert!(src.contains("0x01,"), "byte 1 hex");
+        assert!(src.contains("0x02,"), "byte 2 hex");
+        assert!(src.contains("0x03,"), "byte 3 hex");
+        assert!(src.contains("cart_lua_bytecode_size = 3u"), "size symbol");
+    }
+}
+
 fn generate_lua_data_c(bytecode_path: &Path, output_c: &Path) -> Result<(), BuildError> {
     let bytecode = fs::read(bytecode_path)?;
     let mut src = String::with_capacity(bytecode.len() * 5 + 128);

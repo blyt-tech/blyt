@@ -202,6 +202,101 @@ fn compile_c(
     Ok(obj)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TaskInput;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn make(src: PathBuf, build_dir: PathBuf) -> Box<dyn Task> {
+        let project_dir = src.parent().unwrap().to_path_buf();
+        make_c_task(
+            &project_dir,
+            src,
+            build_dir,
+            "clang",
+            Path::new("/sdk/include"),
+            vec![],
+            vec![],
+            vec![],
+            "game",
+        )
+    }
+
+    #[test]
+    fn inputs_contains_src_and_compiler() {
+        let d = tempdir().unwrap();
+        let src = d.path().join("foo.c");
+        fs::write(&src, "").unwrap();
+        let build = d.path().join("build");
+        let task = make(src.clone(), build);
+        let inputs = task.inputs();
+        assert!(
+            inputs.contains(&TaskInput::File(src)),
+            "src file must be in inputs"
+        );
+        assert!(
+            inputs.contains(&TaskInput::Value("clang".to_string())),
+            "compiler must be in inputs"
+        );
+    }
+
+    #[test]
+    fn inputs_includes_debug_flags_and_defines() {
+        let d = tempdir().unwrap();
+        let src = d.path().join("foo.c");
+        fs::write(&src, "").unwrap();
+        let build = d.path().join("build");
+        let task = make_c_task(
+            d.path(),
+            src.clone(),
+            build,
+            "clang",
+            Path::new("/sdk/include"),
+            vec![],
+            vec!["-DFOO=1".to_string()],
+            vec!["-g".to_string()],
+            "game",
+        );
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::Value("-g".to_string())));
+        assert!(inputs.contains(&TaskInput::Value("-DFOO=1".to_string())));
+    }
+
+    #[test]
+    fn inputs_parses_depfile_when_present() {
+        let d = tempdir().unwrap();
+        let src = d.path().join("foo.c");
+        fs::write(&src, "").unwrap();
+        let build = d.path().join("build");
+        fs::create_dir_all(&build).unwrap();
+        let header = d.path().join("bar.h");
+        fs::write(&header, "").unwrap();
+        fs::write(
+            build.join("foo.d"),
+            format!("foo.o: foo.c {}\n", header.display()),
+        )
+        .unwrap();
+        let task = make(src.clone(), build);
+        let inputs = task.inputs();
+        assert!(
+            inputs.contains(&TaskInput::File(header)),
+            "depfile-declared header must appear in inputs"
+        );
+    }
+
+    #[test]
+    fn outputs_is_stem_dot_o_in_build_dir() {
+        let d = tempdir().unwrap();
+        let src = d.path().join("foo.c");
+        fs::write(&src, "").unwrap();
+        let build = d.path().join("build");
+        let task = make(src, build.clone());
+        assert_eq!(task.outputs(), vec![build.join("foo.o")]);
+    }
+}
+
 pub(super) fn c_compile_arguments(
     clang: &str,
     src: &Path,

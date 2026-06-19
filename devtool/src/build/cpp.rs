@@ -199,6 +199,91 @@ fn compile_cpp(
     Ok(obj)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TaskInput;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn make(src: PathBuf, build_dir: PathBuf) -> Box<dyn Task> {
+        let project_dir = src.parent().unwrap().to_path_buf();
+        make_cpp_task(
+            &project_dir,
+            src,
+            build_dir,
+            "clang++",
+            Path::new("/sdk/include"),
+            PathBuf::from("/sdk/libcxx/include"),
+            vec![],
+            vec![],
+            "game",
+        )
+    }
+
+    #[test]
+    fn inputs_contains_src_and_compiler() {
+        let d = tempdir().unwrap();
+        let src = d.path().join("foo.cpp");
+        fs::write(&src, "").unwrap();
+        let build = d.path().join("build");
+        let task = make(src.clone(), build);
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(src)));
+        assert!(inputs.contains(&TaskInput::Value("clang++".to_string())));
+    }
+
+    #[test]
+    fn inputs_includes_debug_flags() {
+        let d = tempdir().unwrap();
+        let src = d.path().join("foo.cpp");
+        fs::write(&src, "").unwrap();
+        let task = make_cpp_task(
+            d.path(),
+            src,
+            d.path().join("build"),
+            "clang++",
+            Path::new("/sdk/include"),
+            PathBuf::from("/sdk/libcxx/include"),
+            vec![],
+            vec!["-g".to_string()],
+            "game",
+        );
+        assert!(task.inputs().contains(&TaskInput::Value("-g".to_string())));
+    }
+
+    #[test]
+    fn inputs_parses_depfile_when_present() {
+        let d = tempdir().unwrap();
+        let src = d.path().join("foo.cpp");
+        fs::write(&src, "").unwrap();
+        let build = d.path().join("build");
+        fs::create_dir_all(&build).unwrap();
+        let header = d.path().join("bar.h");
+        fs::write(&header, "").unwrap();
+        fs::write(
+            build.join("foo.d"),
+            format!("foo.o: foo.cpp {}\n", header.display()),
+        )
+        .unwrap();
+        let task = make(src, build);
+        assert!(
+            task.inputs().contains(&TaskInput::File(header)),
+            "depfile-declared header must appear in inputs"
+        );
+    }
+
+    #[test]
+    fn outputs_is_stem_dot_o_in_build_dir() {
+        let d = tempdir().unwrap();
+        let src = d.path().join("foo.cpp");
+        fs::write(&src, "").unwrap();
+        let build = d.path().join("build");
+        let task = make(src, build.clone());
+        assert_eq!(task.outputs(), vec![build.join("foo.o")]);
+    }
+}
+
 pub(super) fn cpp_compile_arguments(
     clangpp: &str,
     src: &Path,

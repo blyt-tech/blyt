@@ -7,6 +7,7 @@ pub use runner::run_tasks;
 use std::path::PathBuf;
 
 /// A single input to a build task.
+#[derive(Debug, PartialEq)]
 pub enum TaskInput {
     /// A file whose content is tracked via size+mtime fast path and xxh3 slow path.
     File(PathBuf),

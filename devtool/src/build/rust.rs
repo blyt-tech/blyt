@@ -302,6 +302,101 @@ fn collect_rust_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Buil
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TaskInput;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn base_task(manifest: PathBuf, source_dir: PathBuf, output: PathBuf) -> CompileRustTask {
+        CompileRustTask {
+            key_str: "test".to_string(),
+            label_str: "test".to_string(),
+            cargo: "cargo".to_string(),
+            manifest,
+            build_dir: PathBuf::from("/build"),
+            rust_sdk_path: PathBuf::from("/sdk/rust/blyt"),
+            rust_lib_patches: vec![],
+            extra_rustflags: String::new(),
+            is_lua: false,
+            cart_state_rs: None,
+            output,
+            source_dir,
+        }
+    }
+
+    #[test]
+    fn inputs_contains_manifest_and_rustflags() {
+        let d = tempdir().unwrap();
+        let manifest = d.path().join("Cargo.toml");
+        fs::write(&manifest, "").unwrap();
+        let src_dir = d.path().join("src");
+        let out = d.path().join("libcart.a");
+        let mut task = base_task(manifest.clone(), src_dir, out);
+        task.extra_rustflags = "-C opt-level=2".to_string();
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(manifest)));
+        assert!(inputs.contains(&TaskInput::Value("-C opt-level=2".to_string())));
+    }
+
+    #[test]
+    fn inputs_collects_rs_files_from_source_dir() {
+        let d = tempdir().unwrap();
+        let manifest = d.path().join("Cargo.toml");
+        fs::write(&manifest, "").unwrap();
+        let src_dir = d.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let lib_rs = src_dir.join("lib.rs");
+        fs::write(&lib_rs, "").unwrap();
+        let task = base_task(manifest, src_dir, d.path().join("libcart.a"));
+        assert!(
+            task.inputs().contains(&TaskInput::File(lib_rs)),
+            "src/lib.rs must appear in inputs"
+        );
+    }
+
+    #[test]
+    fn inputs_includes_cart_state_rs_when_set() {
+        let d = tempdir().unwrap();
+        let manifest = d.path().join("Cargo.toml");
+        fs::write(&manifest, "").unwrap();
+        let cart_state = d.path().join("cart_state.rs");
+        fs::write(&cart_state, "").unwrap();
+        let mut task = base_task(manifest, d.path().join("src"), d.path().join("libcart.a"));
+        task.cart_state_rs = Some(cart_state.clone());
+        assert!(task.inputs().contains(&TaskInput::File(cart_state)));
+    }
+
+    #[test]
+    fn inputs_omits_cart_state_rs_when_none() {
+        let d = tempdir().unwrap();
+        let manifest = d.path().join("Cargo.toml");
+        fs::write(&manifest, "").unwrap();
+        let task = base_task(manifest, d.path().join("src"), d.path().join("libcart.a"));
+        assert!(task.cart_state_rs.is_none());
+        let has_rs_file = task.inputs().iter().any(|i| {
+            matches!(i, TaskInput::File(p) if p.extension().map(|e| e == "rs").unwrap_or(false))
+        });
+        assert!(
+            !has_rs_file,
+            "no .rs file inputs when cart_state_rs is None and src_dir absent"
+        );
+    }
+
+    #[test]
+    fn outputs_is_single_archive_path() {
+        let d = tempdir().unwrap();
+        let out = d.path().join("libcart.a");
+        let task = base_task(
+            d.path().join("Cargo.toml"),
+            d.path().join("src"),
+            out.clone(),
+        );
+        assert_eq!(task.outputs(), vec![out]);
+    }
+}
+
 /// Discover Rust libraries in `src/lib/`: any subdirectory with a `Cargo.toml`
 /// is treated as a Rust crate.  The directory name is used as the crate name
 /// for `--config` patch injection; the `Cargo.toml` [package] name must match.
