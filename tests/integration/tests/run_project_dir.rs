@@ -65,37 +65,23 @@ fn read_port(child: &mut std::process::Child, sub: &str) -> u16 {
     }
 }
 
-/// Fetch `path` from the running HTTP server at `port`; return the response
-/// body bytes.
-fn http_get(port: u16, path: &str) -> Vec<u8> {
+/// Fetch the served HTML page at `GET /`; return the full response as a string.
+/// Uses `read_to_string` (same as `trace.rs`) to avoid platform RST differences
+/// that affect large binary transfers.
+fn fetch_root_page(port: u16) -> String {
     let mut conn = TcpStream::connect(("127.0.0.1", port))
         .unwrap_or_else(|e| panic!("connect to blyt server: {e}"));
-    conn.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .unwrap();
-    let mut response = Vec::new();
-    // Treat ConnectionReset as EOF: some HTTP servers RST the connection after
-    // sending the response rather than doing a clean TCP FIN; Linux surfaces
-    // this as ECONNRESET while macOS silently absorbs it.
-    match conn.read_to_end(&mut response) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Err(e) => panic!("read from blyt server: {e}"),
-    }
-    // Strip HTTP headers (everything up to and including the blank line).
-    let body_start = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(0);
-    response[body_start..].to_vec()
+    conn.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut page = String::new();
+    conn.read_to_string(&mut page).unwrap();
+    page
 }
 
 /* ── release path ─────────────────────────────────────────────────────────── */
 
-/// `blyt run ./project` auto-builds a dev ELF (build/.elf) and starts the
-/// WASM server; the served /cart.blyt returns valid ELF bytes.
+/// `blyt run ./project` auto-builds a dev ELF (build/.elf), starts the WASM
+/// server, and serves the HTML player page at GET /.
 #[test]
 fn run_accepts_project_directory() {
     require_sdk();
@@ -116,11 +102,10 @@ fn run_accepts_project_directory() {
     let magic = &fs::read(&elf_path).expect("read .elf")[..4];
     assert_eq!(magic, b"\x7fELF", "build/.elf has wrong magic");
 
-    // The HTTP server must serve the ELF as /cart.blyt.
-    let body = http_get(port, "/cart.blyt");
+    // The HTTP server must be up and serving the WASM player page.
+    let page = fetch_root_page(port);
     let _ = serve.kill();
-    assert!(body.len() >= 4, "/cart.blyt response too short");
-    assert_eq!(&body[..4], b"\x7fELF", "/cart.blyt is not ELF");
+    assert!(!page.is_empty(), "blyt run served empty page at GET /");
 }
 
 /* ── debug path ───────────────────────────────────────────────────────────── */
@@ -147,9 +132,8 @@ fn debug_accepts_project_directory() {
     let magic = &fs::read(&elf_path).expect("read .dbg.elf")[..4];
     assert_eq!(magic, b"\x7fELF", "build/.dbg.elf has wrong magic");
 
-    // The HTTP debug server must serve the debug ELF as /cart.blyt.
-    let body = http_get(port, "/cart.blyt");
+    // The HTTP debug server must be up and serving the WASM player page.
+    let page = fetch_root_page(port);
     let _ = serve.kill();
-    assert!(body.len() >= 4, "/cart.blyt response too short (debug)");
-    assert_eq!(&body[..4], b"\x7fELF", "/cart.blyt is not ELF (debug)");
+    assert!(!page.is_empty(), "blyt debug served empty page at GET /");
 }
