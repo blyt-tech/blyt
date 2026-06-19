@@ -75,7 +75,14 @@ fn http_get(port: u16, path: &str) -> Vec<u8> {
     )
     .unwrap();
     let mut response = Vec::new();
-    conn.read_to_end(&mut response).unwrap();
+    // Treat ConnectionReset as EOF: some HTTP servers RST the connection after
+    // sending the response rather than doing a clean TCP FIN; Linux surfaces
+    // this as ECONNRESET while macOS silently absorbs it.
+    match conn.read_to_end(&mut response) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("read from blyt server: {e}"),
+    }
     // Strip HTTP headers (everything up to and including the blank line).
     let body_start = response
         .windows(4)
