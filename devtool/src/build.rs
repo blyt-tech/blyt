@@ -150,39 +150,19 @@ fn cart_layouts_bytes(cfg: &CartConfig) -> Vec<u8> {
  * ------------------------------------------------------------------------- */
 
 #[allow(dead_code)]
-struct CartStateFiles {
-    rust_module: PathBuf,   /* build/blyt/rust/cart_state.rs */
-    layouts_bin: PathBuf,   /* build/cart.layouts.bin */
-    c_include_dir: PathBuf, /* build/blyt/c/ */
+/// Computed outputs from blyt.config.yaml; no files are written.
+struct CartStateData {
+    c_header: String,
+    rust_state: String,
+    layouts_bytes: Vec<u8>,
     /// C function body for register_cart_state_S(); empty when no buffers.
     lua_c_snippet: String,
     buffers_present: bool,
 }
 
-fn generate_cart_state(
-    project_dir: &Path,
-    build_dir: &Path,
-    cfg: &CartConfig,
-    generate_c: bool,
-    generate_rust: bool,
-) -> Result<CartStateFiles, BuildError> {
+fn compute_cart_state(cfg: &CartConfig) -> Result<CartStateData, BuildError> {
     use crate::config::{type_tag_buf_get_suffix, type_tag_c_type, type_tag_rust_type};
 
-    let blyt_dir = build_dir.join("blyt");
-    let c_dir = blyt_dir.join("c");
-    let rust_dir = blyt_dir.join("rust");
-    if generate_c {
-        fs::create_dir_all(&c_dir)?;
-    }
-    if generate_rust {
-        fs::create_dir_all(&rust_dir)?;
-    }
-
-    let c_path = c_dir.join("cart_state.h");
-    let rs_path = rust_dir.join("cart_state.rs");
-    let layouts_bin = build_dir.join("cart.layouts.bin");
-
-    let _ = project_dir; /* reserved for future use */
     let buffers_present = !cfg.state_buffers.is_empty();
 
     /* ---- C header ---- */
@@ -463,28 +443,16 @@ fn generate_cart_state(
     lua_c_fn.push_str(&lua_c_proxy_setup);
     lua_c_fn.push_str("}\n");
 
-    let lua_c = format!("{lua_c_proxy_fns}{lua_c_fn}");
-
     c_out.push_str("#endif /* BLYT_CART_STATE_H */\n");
     rs_out.push_str("/* end of generated constants */\n");
 
-    if generate_c {
-        fs::write(&c_path, &c_out)?;
-    }
-    if generate_rust {
-        fs::write(&rs_path, &rs_out)?;
-    }
-
-    /* ---- .cart.layouts FlatBuffer binary ---- */
     let layouts_bytes = cart_layouts_bytes(cfg);
-    if !layouts_bytes.is_empty() {
-        fs::write(&layouts_bin, &layouts_bytes)?;
-    }
+    let lua_c = format!("{lua_c_proxy_fns}{lua_c_fn}");
 
-    Ok(CartStateFiles {
-        rust_module: rs_path,
-        layouts_bin,
-        c_include_dir: c_dir,
+    Ok(CartStateData {
+        c_header: c_out,
+        rust_state: rs_out,
+        layouts_bytes,
         lua_c_snippet: if buffers_present {
             lua_c
         } else {
@@ -664,6 +632,15 @@ SECTIONS {
 
 fn err(msg: impl Into<String>) -> BuildError {
     build_err(msg)
+}
+
+fn config_file_input(project_dir: &Path) -> Vec<TaskInput> {
+    let p = project_dir.join("blyt.config.yaml");
+    if p.exists() {
+        vec![TaskInput::File(p)]
+    } else {
+        vec![]
+    }
 }
 
 fn variant_str(debug: bool) -> &'static str {
@@ -882,82 +859,125 @@ impl Task for CompileCppTask {
     }
 }
 
-struct CodegenTask {
+struct GenerateCHeaderTask {
     project_dir: PathBuf,
     build_dir: PathBuf,
-    needs_c: bool,
-    needs_rust: bool,
-    is_lua: bool,
-    buffers_present: bool,
 }
 
-impl CodegenTask {
-    fn declared_outputs(&self) -> Vec<PathBuf> {
-        let mut v = Vec::new();
-        let blyt_dir = self.build_dir.join("blyt");
-        if self.needs_c && self.buffers_present {
-            v.push(blyt_dir.join("c/cart_state.h"));
-        }
-        if self.needs_rust && self.buffers_present {
-            v.push(blyt_dir.join("rust/cart_state.rs"));
-        }
-        if self.buffers_present {
-            v.push(self.build_dir.join("cart.layouts.bin"));
-        }
-        if self.is_lua {
-            v.push(self.build_dir.join("__blyt_lua_glue.c"));
-        }
-        v
-    }
-}
-
-impl Task for CodegenTask {
+impl Task for GenerateCHeaderTask {
     fn key(&self) -> &str {
-        "codegen"
+        "generate_c_header"
     }
     fn label(&self) -> String {
-        "codegen  cart_state".to_string()
+        "generate cart_state.h".to_string()
     }
     fn inputs(&self) -> Vec<TaskInput> {
-        let config_path = self.project_dir.join("blyt.config.yaml");
-        if config_path.exists() {
-            vec![TaskInput::File(config_path)]
-        } else {
-            vec![]
-        }
+        config_file_input(&self.project_dir)
     }
     fn outputs(&self) -> Vec<PathBuf> {
-        self.declared_outputs()
+        vec![self.build_dir.join("blyt/c/cart_state.h")]
     }
     fn run(&self) -> Result<(), BuildError> {
-        let cart_config = crate::config::read_cart_config(&self.project_dir).map_err(err)?;
-        let cart_state = generate_cart_state(
-            &self.project_dir,
-            &self.build_dir,
-            &cart_config,
-            self.needs_c,
-            self.needs_rust,
-        )?;
-        if self.is_lua {
-            let glue_src = self.build_dir.join("__blyt_lua_glue.c");
-            generate_lua_glue_c(
-                &glue_src,
-                cart_state.buffers_present,
-                &cart_state.lua_c_snippet,
-            )?;
-        }
+        let cfg = crate::config::read_cart_config(&self.project_dir).map_err(err)?;
+        let data = compute_cart_state(&cfg)?;
+        let dir = self.build_dir.join("blyt/c");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("cart_state.h"), data.c_header)?;
         Ok(())
     }
 }
 
-struct LuaBytecodeTask {
+struct GenerateRustStateTask {
+    project_dir: PathBuf,
+    build_dir: PathBuf,
+}
+
+impl Task for GenerateRustStateTask {
+    fn key(&self) -> &str {
+        "generate_rust_state"
+    }
+    fn label(&self) -> String {
+        "generate cart_state.rs".to_string()
+    }
+    fn inputs(&self) -> Vec<TaskInput> {
+        config_file_input(&self.project_dir)
+    }
+    fn outputs(&self) -> Vec<PathBuf> {
+        vec![self.build_dir.join("blyt/rust/cart_state.rs")]
+    }
+    fn run(&self) -> Result<(), BuildError> {
+        let cfg = crate::config::read_cart_config(&self.project_dir).map_err(err)?;
+        let data = compute_cart_state(&cfg)?;
+        let dir = self.build_dir.join("blyt/rust");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("cart_state.rs"), data.rust_state)?;
+        Ok(())
+    }
+}
+
+struct GenerateLayoutsTask {
+    project_dir: PathBuf,
+    build_dir: PathBuf,
+}
+
+impl Task for GenerateLayoutsTask {
+    fn key(&self) -> &str {
+        "generate_layouts"
+    }
+    fn label(&self) -> String {
+        "generate cart.layouts.bin".to_string()
+    }
+    fn inputs(&self) -> Vec<TaskInput> {
+        config_file_input(&self.project_dir)
+    }
+    fn outputs(&self) -> Vec<PathBuf> {
+        vec![self.build_dir.join("cart.layouts.bin")]
+    }
+    fn run(&self) -> Result<(), BuildError> {
+        let cfg = crate::config::read_cart_config(&self.project_dir).map_err(err)?;
+        let data = compute_cart_state(&cfg)?;
+        fs::write(self.build_dir.join("cart.layouts.bin"), data.layouts_bytes)?;
+        Ok(())
+    }
+}
+
+struct GenerateLuaGlueTask {
+    project_dir: PathBuf,
+    build_dir: PathBuf,
+}
+
+impl Task for GenerateLuaGlueTask {
+    fn key(&self) -> &str {
+        "generate_lua_glue"
+    }
+    fn label(&self) -> String {
+        "generate __blyt_lua_glue.c".to_string()
+    }
+    fn inputs(&self) -> Vec<TaskInput> {
+        config_file_input(&self.project_dir)
+    }
+    fn outputs(&self) -> Vec<PathBuf> {
+        vec![self.build_dir.join("__blyt_lua_glue.c")]
+    }
+    fn run(&self) -> Result<(), BuildError> {
+        let cfg = crate::config::read_cart_config(&self.project_dir).map_err(err)?;
+        let data = compute_cart_state(&cfg)?;
+        generate_lua_glue_c(
+            &self.build_dir.join("__blyt_lua_glue.c"),
+            data.buffers_present,
+            &data.lua_c_snippet,
+        )
+    }
+}
+
+struct CompileLuaTask {
     luac: String,
     lua_files: Vec<PathBuf>,
     project_dir: PathBuf,
     output: PathBuf,
 }
 
-impl Task for LuaBytecodeTask {
+impl Task for CompileLuaTask {
     fn key(&self) -> &str {
         "lua_bytecode"
     }
@@ -1018,14 +1038,14 @@ impl Task for GenerateLuaDataTask {
     }
 }
 
-struct ArchiveTask {
+struct AssembleLibArchiveTask {
     key_str: String,
     ar: String,
     obj_files: Vec<PathBuf>,
     output: PathBuf,
 }
 
-impl Task for ArchiveTask {
+impl Task for AssembleLibArchiveTask {
     fn key(&self) -> &str {
         &self.key_str
     }
@@ -1055,7 +1075,7 @@ impl Task for ArchiveTask {
     }
 }
 
-struct CargoTask {
+struct CompileRustTask {
     key_str: String,
     label_str: String,
     cargo: String,
@@ -1070,7 +1090,7 @@ struct CargoTask {
     source_dir: PathBuf,
 }
 
-impl Task for CargoTask {
+impl Task for CompileRustTask {
     fn key(&self) -> &str {
         &self.key_str
     }
@@ -1116,7 +1136,7 @@ impl Task for CargoTask {
     }
 }
 
-struct ExternalCompileTask {
+struct CompileExternalTask {
     key_str: String,
     config: ExternalCompileConfig,
     project_dir: PathBuf,
@@ -1131,7 +1151,7 @@ struct ExternalCompileTask {
     output: PathBuf,
 }
 
-impl Task for ExternalCompileTask {
+impl Task for CompileExternalTask {
     fn key(&self) -> &str {
         &self.key_str
     }
@@ -1167,7 +1187,7 @@ impl Task for ExternalCompileTask {
     }
 }
 
-struct LinkTask {
+struct LinkElfTask {
     clang: String,
     obj_files: Vec<PathBuf>,
     rust_archive: Option<PathBuf>,
@@ -1178,7 +1198,7 @@ struct LinkTask {
     is_lua: bool,
 }
 
-impl Task for LinkTask {
+impl Task for LinkElfTask {
     fn key(&self) -> &str {
         "link"
     }
@@ -1218,7 +1238,7 @@ impl Task for LinkTask {
     }
 }
 
-struct FinaliseTask {
+struct AssembleCartTask {
     objcopy: String,
     raw_elf: PathBuf,
     cart_info_file: PathBuf,
@@ -1227,7 +1247,7 @@ struct FinaliseTask {
     debug: bool,
 }
 
-impl Task for FinaliseTask {
+impl Task for AssembleCartTask {
     fn key(&self) -> &str {
         "finalise"
     }
@@ -1781,17 +1801,31 @@ pub fn run(
 
     let mut tasks: Vec<Box<dyn Task>> = Vec::new();
 
-    // Codegen (cart_state.h / cart_state.rs / layouts.bin / lua_glue.c).
-    // Always add the task; if outputs() is empty (no buffers, no Lua) the runner
-    // treats it as always up-to-date.
-    tasks.push(Box::new(CodegenTask {
-        project_dir: project_dir.to_path_buf(),
-        build_dir: build_dir.clone(),
-        needs_c,
-        needs_rust,
-        is_lua,
-        buffers_present,
-    }));
+    // Codegen: one task per output, pushed only when relevant.
+    if needs_c && buffers_present {
+        tasks.push(Box::new(GenerateCHeaderTask {
+            project_dir: project_dir.to_path_buf(),
+            build_dir: build_dir.clone(),
+        }));
+    }
+    if needs_rust && buffers_present {
+        tasks.push(Box::new(GenerateRustStateTask {
+            project_dir: project_dir.to_path_buf(),
+            build_dir: build_dir.clone(),
+        }));
+    }
+    if buffers_present {
+        tasks.push(Box::new(GenerateLayoutsTask {
+            project_dir: project_dir.to_path_buf(),
+            build_dir: build_dir.clone(),
+        }));
+    }
+    if is_lua {
+        tasks.push(Box::new(GenerateLuaGlueTask {
+            project_dir: project_dir.to_path_buf(),
+            build_dir: build_dir.clone(),
+        }));
+    }
 
     // Compile entry stub and interp stub.
     tasks.push(Box::new(make_c_task(
@@ -1825,7 +1859,7 @@ pub fn run(
         let data_c = build_dir.join("cart_lua_data.c");
         let glue_src = build_dir.join("__blyt_lua_glue.c");
 
-        tasks.push(Box::new(LuaBytecodeTask {
+        tasks.push(Box::new(CompileLuaTask {
             luac: luac.clone(),
             lua_files,
             project_dir: project_dir.to_path_buf(),
@@ -1846,7 +1880,7 @@ pub fn run(
             vec![],
             "compile_c",
         )));
-        // Glue C is produced by CodegenTask; compile it here.
+        // Glue C is produced by GenerateLuaGlueTask; compile it here.
         tasks.push(Box::new(make_c_task(
             project_dir,
             glue_src,
@@ -1924,7 +1958,7 @@ pub fn run(
             lib_obj_files.push(task.outputs()[0].clone());
             tasks.push(Box::new(task));
         }
-        tasks.push(Box::new(ArchiveTask {
+        tasks.push(Box::new(AssembleLibArchiveTask {
             key_str: format!("archive/{name}"),
             ar: ar.clone(),
             obj_files: lib_obj_files,
@@ -1942,7 +1976,7 @@ pub fn run(
             fs::create_dir_all(&lib_build_dir)?;
             let output = lib_build_dir.join("lib.a");
             lib_archives.push(output.clone());
-            tasks.push(Box::new(CargoTask {
+            tasks.push(Box::new(CompileRustTask {
                 key_str: format!("cargo_lib/{lib_name}"),
                 label_str: format!("cargo    src/lib/{lib_name}/"),
                 cargo: cargo.clone(),
@@ -2049,7 +2083,7 @@ pub fn run(
             None
         };
         let output = rust_build_dir.join("cart.a");
-        tasks.push(Box::new(CargoTask {
+        tasks.push(Box::new(CompileRustTask {
             key_str: "cargo_game".to_string(),
             label_str: "cargo    src/game/rust/".to_string(),
             cargo,
@@ -2083,7 +2117,7 @@ pub fn run(
         };
         let src_files = collect_external_source_files(project_dir, cfg)?;
         let is_obj = matches!(cfg.output_type, ExternalOutputType::Object);
-        tasks.push(Box::new(ExternalCompileTask {
+        tasks.push(Box::new(CompileExternalTask {
             key_str: format!("external/{}", cfg.language),
             config: ExternalCompileConfig {
                 language: cfg.language.clone(),
@@ -2153,7 +2187,7 @@ pub fn run(
 
     // Link.
     let raw_elf = build_dir.join("cart.elf");
-    tasks.push(Box::new(LinkTask {
+    tasks.push(Box::new(LinkElfTask {
         clang: clang.clone(),
         obj_files: obj_files.clone(),
         rust_archive: rust_archive_path.clone(),
@@ -2183,7 +2217,7 @@ pub fn run(
             build_dir.join("cart.layouts.bin"),
         ));
     }
-    tasks.push(Box::new(FinaliseTask {
+    tasks.push(Box::new(AssembleCartTask {
         objcopy: objcopy.clone(),
         raw_elf,
         cart_info_file,
@@ -2234,7 +2268,7 @@ pub fn build_single_lib(
         fs::create_dir_all(&lib_build_dir)?;
         let state_dir = project_dir.join("build/.blyt-tasks").join(variant);
         let output = lib_build_dir.join("lib.a");
-        let tasks: Vec<Box<dyn Task>> = vec![Box::new(CargoTask {
+        let tasks: Vec<Box<dyn Task>> = vec![Box::new(CompileRustTask {
             key_str: format!("cargo_lib/{lib_name}"),
             label_str: format!("cargo    src/lib/{lib_name}/"),
             cargo,
@@ -2314,7 +2348,7 @@ pub fn build_single_lib(
         tasks.push(Box::new(task));
     }
     let archive = lib_build_dir.join("lib.a");
-    tasks.push(Box::new(ArchiveTask {
+    tasks.push(Box::new(AssembleLibArchiveTask {
         key_str: format!("archive/{lib_name}"),
         ar,
         obj_files,
