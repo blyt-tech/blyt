@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::engine::fingerprint::{
     TaskState, check_inputs, load_task_state, outputs_exist, save_task_state,
 };
-use crate::engine::{BuildError, Task};
+use crate::engine::{BuildError, Task, TaskInput};
 
 /// Run an ordered list of tasks, skipping any whose inputs are up-to-date.
 ///
@@ -14,6 +14,19 @@ use crate::engine::{BuildError, Task};
 /// `state_dir` is the directory under which per-task state files are stored
 /// (typically `build/.blyt-tasks/<variant>/`).
 pub fn run_tasks(tasks: &[Box<dyn Task>], state_dir: &Path, force: bool) -> Result<(), BuildError> {
+    // The blyt executable is an implicit input to every task so that rebuilding
+    // blyt itself invalidates all cached task state — same principle as tracking
+    // compiler paths. Resolved once per run_tasks call.
+    let blyt_exe = std::env::current_exe().ok();
+
+    let effective_inputs = |task: &dyn Task| -> Vec<TaskInput> {
+        let mut v = task.inputs();
+        if let Some(ref exe) = blyt_exe {
+            v.push(TaskInput::File(exe.clone()));
+        }
+        v
+    };
+
     for task in tasks {
         let state_file = state_dir.join(format!("{}.state", task.key()));
         let outputs = task.outputs();
@@ -22,7 +35,8 @@ pub fn run_tasks(tasks: &[Box<dyn Task>], state_dir: &Path, force: bool) -> Resu
             let outputs_ok = outputs_exist(&outputs);
             if outputs_ok {
                 let prev = load_task_state(&state_file);
-                let (new_inputs, needs_run) = check_inputs(&task.inputs(), prev.as_ref());
+                let (new_inputs, needs_run) =
+                    check_inputs(&effective_inputs(task.as_ref()), prev.as_ref());
                 if !needs_run {
                     // Up-to-date: persist any mtime refreshes from the fast path.
                     let updated = TaskState {
@@ -42,7 +56,7 @@ pub fn run_tasks(tasks: &[Box<dyn Task>], state_dir: &Path, force: bool) -> Resu
         task.run()?;
 
         // Record the post-run fingerprint so the next build can skip this task.
-        let (new_inputs, _) = check_inputs(&task.inputs(), None);
+        let (new_inputs, _) = check_inputs(&effective_inputs(task.as_ref()), None);
         let state = TaskState {
             inputs: new_inputs,
             outputs: outputs
