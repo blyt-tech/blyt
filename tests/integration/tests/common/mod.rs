@@ -488,6 +488,33 @@ pub fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     ))
 }
 
+/// Build a dev ELF (`build/.elf`) via `blyt build code <project_dir>`.
+/// Requires the SDK; does not require the WASM runtime.
+pub fn build_dev_elf(project_dir: &std::path::Path) -> PathBuf {
+    use assert_cmd::Command;
+    let sdk = sdk_dir();
+    let mut cmd = Command::new(blyt_bin());
+    cmd.args(["build", "code", project_dir.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"));
+    let sdk_clang = sdk.join("bin/blyt-clang");
+    if sdk_clang.exists() {
+        cmd.env("BLYT_CLANG", &sdk_clang);
+    }
+    let sdk_luac = sdk.join("bin/blyt-luac");
+    if sdk_luac.exists() {
+        cmd.env("BLYT_LUAC", &sdk_luac);
+    }
+    cmd.assert().success();
+    let elf_path = project_dir.join("build/.elf");
+    assert!(
+        elf_path.exists(),
+        "build/.elf not created by blyt build code: {}",
+        elf_path.display()
+    );
+    elf_path
+}
+
 /// Run `blyt build <project_dir>` with Lua-specific env vars and return the cart path.
 pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     use assert_cmd::Command;

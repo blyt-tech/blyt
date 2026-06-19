@@ -117,6 +117,20 @@ enum BuildSubcommand {
         /// Path to the cart project directory (default: current directory)
         project_dir: Option<PathBuf>,
     },
+
+    /// Build the dev ELF (build/.elf or build/.dbg.elf) for use with blytplay/blytdebug
+    Code {
+        /// Path to the cart project directory (default: current directory)
+        project_dir: Option<PathBuf>,
+
+        /// Build with debug information (produces build/.dbg.elf)
+        #[arg(long)]
+        debug: bool,
+
+        /// Bypass incremental build state and rerun all tasks unconditionally
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -165,6 +179,21 @@ fn main() {
         }) => {
             let dir = project_dir.as_deref().unwrap_or(Path::new("."));
             build::build_single_lib(dir, &name, debug, force)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+
+        Commands::Build(BuildArgs {
+            sub:
+                Some(BuildSubcommand::Code {
+                    project_dir,
+                    debug,
+                    force,
+                }),
+            ..
+        }) => {
+            let dir = project_dir.as_deref().unwrap_or(Path::new("."));
+            build::build_for_dev(dir, debug, force)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }

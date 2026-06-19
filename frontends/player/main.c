@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h> /* stat, S_ISDIR */
 #include <unistd.h> /* setenv, readlink */
 #ifdef __APPLE__
 #include <mach-o/dyld.h> /* _NSGetExecutablePath */
@@ -263,6 +264,26 @@ int main(int argc, char *argv[]) {
     }
 
     bool debug_mode = (g_dap_port >= 0 || g_gdb_port >= 0);
+
+    /* Project-dir mode: if the argument is a directory, derive the dev ELF
+     * path (build/.elf for release, build/.dbg.elf for debug).  The dev ELF
+     * is produced by `blyt run`/`blyt debug` and is a valid ELF with all
+     * required sections — no changes to the cart loading path. */
+    char elf_path_buf[4096];
+    {
+        struct stat st;
+        if (stat(cart_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            const char *elf_name = debug_mode ? ".dbg.elf" : ".elf";
+            int n =
+                snprintf(elf_path_buf, sizeof(elf_path_buf), "%s/build/%s", cart_path, elf_name);
+            if (n <= 0 || (size_t)n >= sizeof(elf_path_buf)) {
+                fprintf(stderr, "blytplay: project path too long\n");
+                return 1;
+            }
+            cart_path = elf_path_buf;
+        }
+    }
+
     maybe_setenv_lib_dir(debug_mode);
 
     /* --trace is just the flag form of the BLYT_TRACE env var (same pattern

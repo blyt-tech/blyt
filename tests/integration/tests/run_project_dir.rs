@@ -1,6 +1,9 @@
 mod common;
 
-use common::{CartProject, blyt_bin, require_sdk, require_wasm, require_wasm_debug, sdk_dir};
+use common::{
+    CartProject, blyt_bin, build_dev_elf, require_sdk, require_wasm, require_wasm_debug,
+    run_cart_native, sdk_dir,
+};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -144,4 +147,31 @@ fn debug_accepts_project_directory() {
     let page = fetch_root_page(port);
     let _ = serve.kill();
     assert!(!page.is_empty(), "blyt debug served empty page at GET /");
+}
+
+/* ── blytplay native path ─────────────────────────────────────────────────── */
+
+/// `blytplay ./project` accepts a project directory, finds `build/.elf`, and
+/// runs it — identical output to `blytplay build/<name>.blyt`.
+///
+/// The dev ELF is built first via `blyt run` (which produces `build/.elf` as
+/// its first step before serving).  The test does not require the WASM runtime.
+#[test]
+fn blytplay_accepts_project_directory() {
+    require_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("native_dir_test");
+    CartProject::new()
+        .lua(
+            "function init() blyt32.debug.print('hello from project dir') end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    build_dev_elf(&project);
+
+    // Run blytplay with the project directory instead of a .blyt path.
+    run_cart_native(&project, "hello from project dir");
 }
