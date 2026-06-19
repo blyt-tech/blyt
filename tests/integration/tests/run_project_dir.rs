@@ -20,8 +20,8 @@ fn lua_quit_cart(tmp: &TempDir) -> std::path::PathBuf {
     project
 }
 
-/// Spawn `blyt <sub> <project_dir>` with the standard SDK env vars and return
-/// the running child process.
+/// Spawn `blyt <sub> <project_dir>` with the standard SDK env vars.  Both
+/// stdout and stderr are piped so failures can be diagnosed.
 fn spawn_blyt(sub: &str, project: &std::path::Path) -> std::process::Child {
     let sdk = sdk_dir();
     let mut cmd = std::process::Command::new(blyt_bin());
@@ -37,37 +37,45 @@ fn spawn_blyt(sub: &str, project: &std::path::Path) -> std::process::Child {
         cmd.env("BLYT_LUAC", &sdk_luac);
     }
     cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("blyt {sub} spawn: {e}"))
 }
 
-/// Read from `child`'s stdout until "http://127.0.0.1:PORT/" appears and
-/// return the port number.  Panics (after killing the child) if stdout closes
-/// before the banner is seen.
-fn read_port(child: &mut std::process::Child, sub: &str) -> u16 {
+/// Read from `child`'s stdout until "http://127.0.0.1:PORT/" appears; return
+/// the port number AND the still-open stdout handle (keep it alive to avoid
+/// SIGPIPE on the server's subsequent stdout writes).  Panics with server
+/// stderr if stdout closes before the banner appears.
+fn read_port(child: &mut std::process::Child, sub: &str) -> (u16, std::process::ChildStdout) {
     let mut stdout = child.stdout.take().unwrap();
     let mut banner = String::new();
-    loop {
+    let port = loop {
         let mut chunk = [0u8; 1024];
         let n = stdout.read(&mut chunk).expect("read stdout");
         if n == 0 {
-            let _ = child.kill();
-            panic!("blyt {sub} exited before announcing a port; banner:\n{banner}");
+            let mut stderr_out = String::new();
+            if let Some(mut e) = child.stderr.take() {
+                e.read_to_string(&mut stderr_out).ok();
+            }
+            panic!(
+                "blyt {sub} exited before announcing a port;\
+                 \nstdout so far:\n{banner}\
+                 \nstderr:\n{stderr_out}"
+            );
         }
         banner.push_str(&String::from_utf8_lossy(&chunk[..n]));
         if let Some(idx) = banner.find("http://127.0.0.1:") {
             let rest = &banner[idx + "http://127.0.0.1:".len()..];
             if let Some(end) = rest.find('/') {
-                return rest[..end].parse().expect("port parse");
+                break rest[..end].parse().expect("port parse");
             }
         }
-    }
+    };
+    (port, stdout)
 }
 
-/// Fetch the served HTML page at `GET /`; return the full response as a string.
-/// Uses `read_to_string` (same as `trace.rs`) to avoid platform RST differences
-/// that affect large binary transfers.
+/// Fetch `GET /` from the running server and return the response as a string.
+/// Mirrors the pattern in trace.rs which works reliably on Linux.
 fn fetch_root_page(port: u16) -> String {
     let mut conn = TcpStream::connect(("127.0.0.1", port))
         .unwrap_or_else(|e| panic!("connect to blyt server: {e}"));
@@ -91,7 +99,7 @@ fn run_accepts_project_directory() {
     let project = lua_quit_cart(&tmp);
 
     let mut serve = spawn_blyt("run", &project);
-    let port = read_port(&mut serve, "run");
+    let (port, _stdout) = read_port(&mut serve, "run");
 
     // The release dev ELF must exist and have ELF magic.
     let elf_path = project.join("build/.elf");
@@ -121,7 +129,7 @@ fn debug_accepts_project_directory() {
     let project = lua_quit_cart(&tmp);
 
     let mut serve = spawn_blyt("debug", &project);
-    let port = read_port(&mut serve, "debug");
+    let (port, _stdout) = read_port(&mut serve, "debug");
 
     // The debug dev ELF must exist and have ELF magic.
     let elf_path = project.join("build/.dbg.elf");
