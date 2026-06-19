@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tungstenite::Message;
 
-use crate::build::sdk_root_from_exe;
+use crate::build::{build_for_dev, sdk_root_from_exe};
 
 /* -------------------------------------------------------------------------
  * Error type
@@ -84,7 +84,21 @@ fn resolve_trace(flag: Option<&str>) -> String {
         .collect()
 }
 
+fn serve_cart_from_project_dir(
+    project_dir: &Path,
+    mode: Mode,
+    trace: Option<&str>,
+) -> Result<(), RunError> {
+    let elf_path = build_for_dev(project_dir, mode.is_debug(), false)
+        .map_err(|e| err(format!("build failed: {e}")))?;
+    serve_cart(&elf_path, mode, trace)
+}
+
 fn serve_cart(cart_path: &Path, mode: Mode, trace: Option<&str>) -> Result<(), RunError> {
+    if cart_path.is_dir() {
+        return serve_cart_from_project_dir(cart_path, mode, trace);
+    }
+
     let cart_path = cart_path
         .canonicalize()
         .map_err(|e| err(format!("cannot open cart '{}': {}", cart_path.display(), e)))?;

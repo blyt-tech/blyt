@@ -1160,12 +1160,71 @@ fn finalise_cart(
     Ok(())
 }
 
+/* -------------------------------------------------------------------------
+ * Dev ELF task — like AssembleCartTask but never strips (dev artifact)
+ * Output: build/.elf (release) / build/.dbg.elf (debug)
+ * Key "finalise_dev" keeps its fingerprint separate from "finalise" so the
+ * two tasks coexist in the same state directory without invalidating each other.
+ * ------------------------------------------------------------------------- */
+
+struct DevElfTask {
+    objcopy: String,
+    raw_elf: PathBuf,
+    cart_info_file: PathBuf,
+    output: PathBuf,
+    extra_sections: Vec<(String, PathBuf)>,
+}
+
+impl Task for DevElfTask {
+    fn key(&self) -> &str {
+        "finalise_dev"
+    }
+    fn label(&self) -> String {
+        "finalise dev ELF".to_string()
+    }
+    fn inputs(&self) -> Vec<TaskInput> {
+        let mut v = vec![
+            TaskInput::File(self.raw_elf.clone()),
+            TaskInput::File(self.cart_info_file.clone()),
+        ];
+        for (_, path) in &self.extra_sections {
+            v.push(TaskInput::File(path.clone()));
+        }
+        v.push(TaskInput::Value(self.objcopy.clone()));
+        v
+    }
+    fn outputs(&self) -> Vec<PathBuf> {
+        vec![self.output.clone()]
+    }
+    fn run(&self) -> Result<(), BuildError> {
+        let extra: Vec<(&str, &Path)> = self
+            .extra_sections
+            .iter()
+            .map(|(n, p)| (n.as_str(), p.as_path()))
+            .collect();
+        // always pass debug=true: never strip the dev ELF regardless of variant
+        finalise_cart(
+            &self.objcopy,
+            &self.raw_elf,
+            &self.cart_info_file,
+            &self.output,
+            &extra,
+            true,
+        )
+    }
+}
+
 fn default_output(project_dir: &Path, id: &str, debug: bool) -> PathBuf {
     let file = if debug {
         format!("{id}.dbg.blyt")
     } else {
         format!("{id}.blyt")
     };
+    project_dir.join("build").join(file)
+}
+
+fn dev_elf_output(project_dir: &Path, debug: bool) -> PathBuf {
+    let file = if debug { ".dbg.elf" } else { ".elf" };
     project_dir.join("build").join(file)
 }
 
@@ -1586,16 +1645,23 @@ fn discover_libraries(project_dir: &Path) -> Result<Vec<String>, BuildError> {
 }
 
 /* -------------------------------------------------------------------------
- * Public entry point: build a full cart
+ * Pre-build: compile + link tasks, shared by `run` and `build_for_dev`
  * ------------------------------------------------------------------------- */
 
-pub fn run(
-    project_dir: &Path,
-    output: Option<&Path>,
-    debug: bool,
-    force: bool,
-) -> Result<PathBuf, BuildError> {
-    let project_dir = &fs::canonicalize(project_dir)?;
+struct PreBuild {
+    tasks: Vec<Box<dyn Task>>,
+    state_dir: PathBuf,
+    raw_elf: PathBuf,
+    cart_info_file: PathBuf,
+    extra_sections: Vec<(String, PathBuf)>,
+    objcopy: String,
+    cart_id: String,
+    project_dir: PathBuf,
+}
+
+fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError> {
+    let project_dir = fs::canonicalize(project_dir_arg)?;
+    let project_dir = &project_dir;
     let cart_info = read_cart_info(project_dir)?;
 
     let clang = c::find_clang();
@@ -2152,17 +2218,9 @@ pub fn run(
         is_lua,
     }));
 
-    let output_path = output
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_output(project_dir, &cart_info.id, debug));
-    let lua_bytecode_path = if is_lua {
-        Some(build_dir.join("bytecode.luac"))
-    } else {
-        None
-    };
     let mut extra_sections: Vec<(String, PathBuf)> = Vec::new();
-    if let Some(ref p) = lua_bytecode_path {
-        extra_sections.push((".cart.lua".to_string(), p.clone()));
+    if is_lua {
+        extra_sections.push((".cart.lua".to_string(), build_dir.join("bytecode.luac")));
     }
     if buffers_present {
         extra_sections.push((
@@ -2170,21 +2228,67 @@ pub fn run(
             build_dir.join("cart.layouts.bin"),
         ));
     }
-    tasks.push(Box::new(AssembleCartTask {
-        objcopy: objcopy.clone(),
+
+    Ok(PreBuild {
+        tasks,
+        state_dir,
         raw_elf,
         cart_info_file,
-        output: output_path.clone(),
         extra_sections,
+        objcopy,
+        cart_id: cart_info.id,
+        project_dir: project_dir.to_path_buf(),
+    })
+}
+
+/* -------------------------------------------------------------------------
+ * Public entry point: build a full cart
+ * ------------------------------------------------------------------------- */
+
+pub fn run(
+    project_dir: &Path,
+    output: Option<&Path>,
+    debug: bool,
+    force: bool,
+) -> Result<PathBuf, BuildError> {
+    let mut pre = pre_build(project_dir, debug)?;
+    let output_path = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_output(&pre.project_dir, &pre.cart_id, debug));
+    pre.tasks.push(Box::new(AssembleCartTask {
+        objcopy: pre.objcopy.clone(),
+        raw_elf: pre.raw_elf.clone(),
+        cart_info_file: pre.cart_info_file.clone(),
+        output: output_path.clone(),
+        extra_sections: pre.extra_sections,
         debug,
     }));
-
-    run_tasks(&tasks, &state_dir, force)?;
-
-    write_editor_codegen(project_dir)?;
-
+    run_tasks(&pre.tasks, &pre.state_dir, force)?;
+    write_editor_codegen(&pre.project_dir)?;
     println!("built: {}", output_path.display());
     Ok(output_path)
+}
+
+/* -------------------------------------------------------------------------
+ * Public entry point: build a dev ELF for `blyt run ./dir` / `blyt debug
+ * ./dir` (issue #84).  Same compile+link tasks as `run()` but produces
+ * build/.elf (release) or build/.dbg.elf (debug) via DevElfTask instead of
+ * the distributable .blyt cart.  Never strips — dev artifact.
+ * ------------------------------------------------------------------------- */
+
+pub fn build_for_dev(project_dir: &Path, debug: bool, force: bool) -> Result<PathBuf, BuildError> {
+    let mut pre = pre_build(project_dir, debug)?;
+    let dev_elf = dev_elf_output(&pre.project_dir, debug);
+    pre.tasks.push(Box::new(DevElfTask {
+        objcopy: pre.objcopy.clone(),
+        raw_elf: pre.raw_elf.clone(),
+        cart_info_file: pre.cart_info_file.clone(),
+        output: dev_elf.clone(),
+        extra_sections: pre.extra_sections,
+    }));
+    run_tasks(&pre.tasks, &pre.state_dir, force)?;
+    println!("built: {}", dev_elf.display());
+    Ok(dev_elf)
 }
 
 /* -------------------------------------------------------------------------
@@ -2737,6 +2841,49 @@ mod tests {
         assert!(inputs.contains(&TaskInput::Value("llvm-objcopy".to_string())));
         assert!(inputs.contains(&TaskInput::Value("debug=false".to_string())));
         assert_eq!(task.outputs(), vec![out]);
+    }
+
+    // --- DevElfTask ---
+
+    #[test]
+    fn dev_elf_task_inputs_and_outputs() {
+        let elf = PathBuf::from("/build/cart.elf");
+        let info = PathBuf::from("/build/cart.info");
+        let luac = PathBuf::from("/build/cart.luac");
+        let out = PathBuf::from("/build/.elf");
+        let task = DevElfTask {
+            objcopy: "llvm-objcopy".to_string(),
+            raw_elf: elf.clone(),
+            cart_info_file: info.clone(),
+            output: out.clone(),
+            extra_sections: vec![(".cart.lua".to_string(), luac.clone())],
+        };
+        let inputs = task.inputs();
+        assert!(inputs.contains(&TaskInput::File(elf)));
+        assert!(inputs.contains(&TaskInput::File(info)));
+        assert!(inputs.contains(&TaskInput::File(luac)));
+        assert!(inputs.contains(&TaskInput::Value("llvm-objcopy".to_string())));
+        assert_eq!(task.outputs(), vec![out]);
+    }
+
+    #[test]
+    fn dev_elf_task_key_is_finalise_dev() {
+        let task = DevElfTask {
+            objcopy: "llvm-objcopy".to_string(),
+            raw_elf: PathBuf::from("/build/cart.elf"),
+            cart_info_file: PathBuf::from("/build/cart.info"),
+            output: PathBuf::from("/build/.elf"),
+            extra_sections: vec![],
+        };
+        assert_eq!(task.key(), "finalise_dev");
+        assert_ne!(task.key(), "finalise");
+    }
+
+    #[test]
+    fn dev_elf_output_paths() {
+        let p = PathBuf::from("/proj");
+        assert_eq!(dev_elf_output(&p, false), p.join("build/.elf"));
+        assert_eq!(dev_elf_output(&p, true), p.join("build/.dbg.elf"));
     }
 
     #[test]
