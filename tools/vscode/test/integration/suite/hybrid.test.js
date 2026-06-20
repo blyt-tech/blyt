@@ -76,11 +76,7 @@ describe('Hybrid Lua+C cart (native debug)', () => {
 		assert.ok(cOk, 'C breakpoint was hit');
 	});
 
-	/* The lldb proxy's .lua "verified" short-circuit is added by the
-	 * wasm-hybrid-debug-fix branch (Fix 2). On main the proxy forwards .lua
-	 * breakpoints to lldb (reported unverified), so this assertion fails. Change
-	 * `it.skip` back to `it` when that fix lands to re-enable the regression. */
-	it.skip('Lua breakpoint stops the cart and is verified by the lldb proxy (Fix 2)', async () => {
+	it('Lua breakpoint stops the cart and is verified by the lldb proxy (Fix 2)', async () => {
 		const wf = h.folder('hello-lua-c');
 		h.addBreakpoint(h.fileUri(wf, LUA), BP_LUA_ASSIGN_X);
 		await h.startNative(wf);

@@ -91,81 +91,55 @@ function setBreakpointsRequest(seq, source, lines) {
 /* Flush the microtask/immediate queue: _setBreakpoints is async. */
 const tick = () => new Promise((r) => setImmediate(r));
 
-/* The .lua short-circuit in BlytGdbDapProxy._setBreakpoints is added by the
- * wasm-hybrid-debug-fix branch (Fix 2). On main the proxy forwards .lua
- * breakpoints to lldb, so these assertions fail. Skip until that fix lands,
- * then remove this `skip` to re-enable the regression coverage. */
-const SKIP_FIX2 = {
-	skip: 'needs Fix 2 (.lua short-circuit); enable when wasm-hybrid-debug-fix lands',
-};
+test('.lua setBreakpoints is answered verified and not forwarded to lldb', async () => {
+	const { proxy, emitted } = makeProxy();
 
-test(
-	'.lua setBreakpoints is answered verified and not forwarded to lldb',
-	SKIP_FIX2,
-	async () => {
-		const { proxy, emitted } = makeProxy();
+	proxy.handleMessage(
+		setBreakpointsRequest(42, { path: '/proj/src/main.lua' }, [10, 20]),
+	);
+	await tick();
 
-		proxy.handleMessage(
-			setBreakpointsRequest(42, { path: '/proj/src/main.lua' }, [10, 20]),
-		);
-		await tick();
+	assert.strictEqual(
+		lldbStdinWrites.length,
+		0,
+		'.lua breakpoints must NOT be forwarded to lldb-dap',
+	);
+	assert.strictEqual(emitted.length, 1, 'exactly one response expected');
+	const resp = emitted[0];
+	assert.strictEqual(resp.type, 'response');
+	assert.strictEqual(resp.command, 'setBreakpoints');
+	assert.strictEqual(resp.success, true);
+	assert.strictEqual(resp.request_seq, 42, 'response echoes the request seq');
+	assert.deepStrictEqual(resp.body.breakpoints, [
+		{ id: 10, verified: true, line: 10 },
+		{ id: 20, verified: true, line: 20 },
+	]);
+});
 
-		assert.strictEqual(
-			lldbStdinWrites.length,
-			0,
-			'.lua breakpoints must NOT be forwarded to lldb-dap',
-		);
-		assert.strictEqual(emitted.length, 1, 'exactly one response expected');
-		const resp = emitted[0];
-		assert.strictEqual(resp.type, 'response');
-		assert.strictEqual(resp.command, 'setBreakpoints');
-		assert.strictEqual(resp.success, true);
-		assert.strictEqual(
-			resp.request_seq,
-			42,
-			'response echoes the request seq',
-		);
-		assert.deepStrictEqual(resp.body.breakpoints, [
-			{ id: 10, verified: true, line: 10 },
-			{ id: 20, verified: true, line: 20 },
-		]);
-	},
-);
+test('.lua short-circuit also triggers on source.name when path is absent', async () => {
+	const { proxy, emitted } = makeProxy();
 
-test(
-	'.lua short-circuit also triggers on source.name when path is absent',
-	SKIP_FIX2,
-	async () => {
-		const { proxy, emitted } = makeProxy();
+	proxy.handleMessage(setBreakpointsRequest(7, { name: 'main.lua' }, [3]));
+	await tick();
 
-		proxy.handleMessage(
-			setBreakpointsRequest(7, { name: 'main.lua' }, [3]),
-		);
-		await tick();
+	assert.strictEqual(lldbStdinWrites.length, 0);
+	assert.strictEqual(emitted.length, 1);
+	assert.strictEqual(emitted[0].success, true);
+	assert.deepStrictEqual(emitted[0].body.breakpoints, [
+		{ id: 3, verified: true, line: 3 },
+	]);
+});
 
-		assert.strictEqual(lldbStdinWrites.length, 0);
-		assert.strictEqual(emitted.length, 1);
-		assert.strictEqual(emitted[0].success, true);
-		assert.deepStrictEqual(emitted[0].body.breakpoints, [
-			{ id: 3, verified: true, line: 3 },
-		]);
-	},
-);
+test('.lua short-circuit with no breakpoints returns an empty verified set', async () => {
+	const { proxy, emitted } = makeProxy();
 
-test(
-	'.lua short-circuit with no breakpoints returns an empty verified set',
-	SKIP_FIX2,
-	async () => {
-		const { proxy, emitted } = makeProxy();
+	proxy.handleMessage(setBreakpointsRequest(1, { path: '/p/a.lua' }, []));
+	await tick();
 
-		proxy.handleMessage(setBreakpointsRequest(1, { path: '/p/a.lua' }, []));
-		await tick();
-
-		assert.strictEqual(lldbStdinWrites.length, 0);
-		assert.strictEqual(emitted.length, 1);
-		assert.deepStrictEqual(emitted[0].body.breakpoints, []);
-	},
-);
+	assert.strictEqual(lldbStdinWrites.length, 0);
+	assert.strictEqual(emitted.length, 1);
+	assert.deepStrictEqual(emitted[0].body.breakpoints, []);
+});
 
 test('non-.lua setBreakpoints is forwarded to lldb, not fabricated', async () => {
 	const { proxy, emitted } = makeProxy();
