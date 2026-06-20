@@ -1,0 +1,2 @@
+# Downloaded VS Code build used by @vscode/test-electron (test/integration).
+.vscode-test/
