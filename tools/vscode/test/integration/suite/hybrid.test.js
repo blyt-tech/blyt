@@ -23,7 +23,10 @@ describe('Hybrid Lua+C cart (native debug)', () => {
 
 	it('binds breakpoints in both Lua and C with the expected values', async () => {
 		const wf = h.folder('hello-lua-c');
-		const cBp = h.addBreakpoint(h.fileUri(wf, C), BP_C_LOG);
+		/* Both breakpoints are set before launch so the C one binds during
+		 * initial config — a C breakpoint set mid-run, while the cart is paused
+		 * in the Lua hook, is not reliably inserted by the GDB stub. */
+		h.addBreakpoint(h.fileUri(wf, C), BP_C_LOG);
 		h.addBreakpoint(h.fileUri(wf, LUA), BP_LUA_ASSIGN_X);
 		await h.startNative(wf);
 
@@ -33,29 +36,44 @@ describe('Hybrid Lua+C cart (native debug)', () => {
 		);
 		const lua = await h.waitForSession(h.byMode('lua'), 'lua session');
 
-		/* C side fires first, from on_new_state's greeting.log("init …"). */
-		const cStop = await h.waitStopped(native);
-		const cFrame = await h.topFrame(native, cStop.body.threadId);
-		assert.strictEqual(cFrame.line, BP_C_LOG);
-		assert.ok((cFrame.source?.path || '').endsWith('greeting.c'));
-		const cVars = await h.locals(native, cFrame.id);
-		assert.ok(
-			(cVars.s || '').includes('init player pos: 160, 120'),
-			`C local s holds the init string (got ${cVars.s})`,
-		);
-
-		/* Let the cart run on into update(), where the Lua breakpoint waits. */
-		h.removeBreakpoint(cBp);
-		await h.cont(native, cStop.body.threadId);
-
-		const luaStop = await h.waitStopped(lua);
-		const luaFrame = await h.topFrame(lua, luaStop.body.threadId);
-		assert.strictEqual(luaFrame.line, BP_LUA_ASSIGN_X);
-		assert.ok((luaFrame.source?.path || '').endsWith('main.lua'));
-		const luaVars = await h.locals(lua, luaFrame.id);
-		assert.strictEqual(luaVars.slot, '0');
-		assert.strictEqual(luaVars.x, '161');
-		assert.strictEqual(luaVars.y, '121');
+		/* The two sessions can stop in either order across platforms: the C
+		 * breakpoint may first trip in on_new_state's greeting.log or later in
+		 * update()'s. Handle whichever stops, continue it, and require both to
+		 * have hit with the expected location/values before finishing. */
+		let luaOk = false;
+		let cOk = false;
+		for (let i = 0; i < 8 && !(luaOk && cOk); i++) {
+			const { session, ev } = await h.waitAnyStopped(
+				[native, lua],
+				'Lua or C breakpoint',
+			);
+			if (session === lua) {
+				const f = await h.topFrame(lua, ev.body.threadId);
+				assert.strictEqual(f.line, BP_LUA_ASSIGN_X);
+				assert.ok((f.source?.path || '').endsWith('main.lua'));
+				const v = await h.locals(lua, f.id);
+				assert.strictEqual(v.slot, '0');
+				assert.strictEqual(v.x, '161');
+				assert.strictEqual(v.y, '121');
+				luaOk = true;
+				await h.cont(lua, ev.body.threadId);
+			} else {
+				const f = await h.topFrame(native, ev.body.threadId);
+				assert.strictEqual(f.line, BP_C_LOG);
+				assert.ok((f.source?.path || '').endsWith('greeting.c'));
+				const v = await h.locals(native, f.id);
+				/* "init player pos: 160, 120" or "update frame N player pos: …",
+				 * depending on which greeting.log first trips it. */
+				assert.ok(
+					(v.s || '').includes('player pos'),
+					`C local s holds a log string (got ${v.s})`,
+				);
+				cOk = true;
+				await h.cont(native, ev.body.threadId);
+			}
+		}
+		assert.ok(luaOk, 'Lua breakpoint was hit');
+		assert.ok(cOk, 'C breakpoint was hit');
 	});
 
 	/* The lldb proxy's .lua "verified" short-circuit is added by the

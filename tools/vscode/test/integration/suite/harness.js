@@ -165,8 +165,9 @@ function waitForSession(pred, label = 'session', timeoutMs = 60000) {
 
 const byMode = (mode) => (s) => s.configuration._blytMode === mode;
 
-/* Wait for the next 'stopped' event on a session (consumes one queued stop). */
-function waitStopped(session, timeoutMs = 90000) {
+/* Wait for the next 'stopped' event on a session (consumes one queued stop).
+ * `label` names what we're waiting for, surfaced in the timeout message. */
+function waitStopped(session, label = 'stopped event', timeoutMs = 90000) {
 	const rec = records.get(session.id);
 	if (!rec) return Promise.reject(new Error('no record for session'));
 	if (rec.stops.length) return Promise.resolve(rec.stops.shift());
@@ -174,9 +175,52 @@ function waitStopped(session, timeoutMs = 90000) {
 		const timer = setTimeout(() => {
 			const i = rec.stopWaiters.findIndex((w) => w.resolve === resolve);
 			if (i >= 0) rec.stopWaiters.splice(i, 1);
-			reject(new Error('timeout waiting for stopped event'));
+			reject(new Error(`timeout waiting for ${label}`));
 		}, timeoutMs);
 		rec.stopWaiters.push({ resolve, timer });
+	});
+}
+
+/* Wait for the next 'stopped' event on ANY of `sessions`, returning
+ * { session, ev } for whichever stops first. Used when two sessions (native +
+ * companion Lua) can stop in a platform-dependent order. */
+function waitAnyStopped(sessions, label = 'stopped event', timeoutMs = 90000) {
+	for (const s of sessions) {
+		const rec = records.get(s.id);
+		if (rec?.stops.length)
+			return Promise.resolve({ session: s, ev: rec.stops.shift() });
+	}
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const entries = [];
+		const cleanup = () => {
+			for (const { rec, waiter } of entries) {
+				const i = rec.stopWaiters.indexOf(waiter);
+				if (i >= 0) rec.stopWaiters.splice(i, 1);
+			}
+		};
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(new Error(`timeout waiting for ${label}`));
+		}, timeoutMs);
+		for (const s of sessions) {
+			const rec = records.get(s.id);
+			if (!rec) continue;
+			const waiter = {
+				timer: undefined,
+				resolve: (ev) => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					cleanup();
+					resolve({ session: s, ev });
+				},
+			};
+			entries.push({ rec, waiter });
+			rec.stopWaiters.push(waiter);
+		}
 	});
 }
 
@@ -242,6 +286,7 @@ module.exports = {
 	waitForSession,
 	byMode,
 	waitStopped,
+	waitAnyStopped,
 	topFrame,
 	locals,
 	cont,
