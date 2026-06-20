@@ -29,7 +29,7 @@ jobs:
             https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
             | sudo tee /etc/apt/sources.list.d/llvm-22.list
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libsdl2-dev \
+          sudo apt-get install -y cmake ninja-build libsdl2-dev xvfb \
             clang-22 lld-22 llvm-22 lldb-22 \
             qemu-system-misc gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
             libc6-dev-riscv64-cross libgcc-s1-riscv64-cross \
@@ -203,13 +203,33 @@ jobs:
           BLYT_QEMU_SSH_KEY: /tmp/blyt-qemu/id_ed25519
         run: cmake --build build --target test-integration
 
-      # VS Code extension unit tests (pure cart-detection helpers). Cheap:
-      # only needs js-yaml, run via node's built-in test runner.
+      # VS Code extension unit tests (cart-detection helpers + the lldb-proxy
+      # breakpoint logic). Cheap: run via node's built-in test runner. The
+      # npm install here also provides the devDeps the integration step needs.
       - name: VS Code extension tests
         run: |
           cd tools/vscode
           npm install
           npm test
+
+      # Cache the @vscode/test-electron download (a pinned VS Code build).
+      # Keyed on the version pinned in test/integration/runTests.js.
+      - name: Cache VS Code test build
+        uses: actions/cache@v4
+        with:
+          path: tools/vscode/.vscode-test
+          key: vscode-test-1.125.1
+
+      # End-to-end debugger tests that drive real blyt debug sessions through
+      # the extension in a headless VS Code (test/integration). Needs the SDK
+      # (built above) and a display: blytdebug opens an SDL2 window and Electron
+      # needs a renderer, so wrap the run in xvfb.
+      - name: VS Code debugger integration tests
+        env:
+          BLYT_SDK_DIR: ${{ github.workspace }}/build/sdk
+        run: |
+          cd tools/vscode
+          xvfb-run -a npm run test:integration
 
       # Build every example cart with the assembled SDK to validate that the
       # examples stay buildable. Runs last so it gates on a working SDK. The

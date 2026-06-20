@@ -1525,4 +1525,5 @@ module.exports._test = {
 	isHybridCart,
 	cartId,
 	detectAnyCart,
+	BlytGdbDapProxy,
 };

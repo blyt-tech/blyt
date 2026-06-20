@@ -8,7 +8,8 @@
     "vscode": "^1.80.0"
   },
   "scripts": {
-    "test": "node --test 'test/*.test.js'"
+    "test": "node --test 'test/*.test.js'",
+    "test:integration": "node test/integration/runTests.js"
   },
   "categories": [
     "Debuggers",
@@ -94,5 +95,10 @@
   },
   "dependencies": {
     "js-yaml": "^4.2.0"
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "^2.4.1",
+    "glob": "^11.0.0",
+    "mocha": "^11.0.0"
   }
 }
