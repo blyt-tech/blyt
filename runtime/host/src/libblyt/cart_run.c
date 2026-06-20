@@ -3077,6 +3077,102 @@ restore:
 }
 
 /* -------------------------------------------------------------------------
+ * Dev control channel host operations (issue #87)
+ *
+ * Each operation invokes guest lifecycle hooks (on_save_state / on_load_state)
+ * via blyt_session_begin_fn_call.  Those host-initiated calls clobber the
+ * emulator PC/registers, so we snapshot and restore them around each call —
+ * the same technique blyt_reset_every_frame_cycle uses — leaving the running
+ * game loop undisturbed.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    uint32_t pc;
+    uint32_t regs[32];
+    uint32_t fcsr;
+} blyt_emu_state_t;
+
+static void emu_state_save(blyt_session_t *s, blyt_emu_state_t *e) {
+    uint32_t i;
+    e->pc = s->rv->PC;
+    for (i = 0; i < 32; i++)
+        e->regs[i] = rv_get_reg(s->rv, i);
+    e->fcsr = s->rv->csr_fcsr;
+}
+
+static void emu_state_restore(blyt_session_t *s, const blyt_emu_state_t *e) {
+    uint32_t i;
+    s->ctx.ecall_trapped = false;
+    s->ctx.ecall_aborted = false;
+    s->rv->PC = e->pc;
+    for (i = 1; i < 32; i++)
+        rv_set_reg(s->rv, i, e->regs[i]);
+    s->rv->csr_fcsr = e->fcsr;
+    s->rv->halt = false;
+}
+
+/* Call a guest lifecycle hook to completion, preserving emulator state. */
+static void call_guest_hook(blyt_session_t *s, uint32_t fn, uint8_t nargs, const uint32_t *args) {
+    blyt_emu_state_t e;
+    if (fn == 0)
+        return;
+    emu_state_save(s, &e);
+    blyt_session_begin_fn_call(s, fn, nargs, args);
+    call_until_fn_done(s);
+    emu_state_restore(s, &e);
+}
+
+int blyt_session_save_state(blyt_session_t *s, uint32_t slot) {
+    if (!s)
+        return -1;
+    /* Flush transient state into buffers, then serialise to disk. */
+    call_guest_hook(s, s->fn_on_save_state, 0, NULL);
+    return blyt_save_write(&s->state_ctx, s->ctx.save_dir, s->ctx.cart_name, slot);
+}
+
+int blyt_session_load_state(blyt_session_t *s, uint32_t slot) {
+    int r;
+    if (!s)
+        return -1;
+    r = blyt_save_read(&s->state_ctx, s->ctx.save_dir, s->ctx.cart_name, slot);
+    if (r != 0)
+        return r;
+    /* Notify the cart (reason = BLYT_LOAD_EXPLICIT = 0). */
+    {
+        uint32_t args[3] = {0u, 0u, 0u};
+        call_guest_hook(s, s->fn_on_load_state, 3, args);
+    }
+    return 0;
+}
+
+blyt_state_snapshot_t *blyt_session_snapshot(blyt_session_t *s) {
+    if (!s)
+        return NULL;
+    call_guest_hook(s, s->fn_on_save_state, 0, NULL);
+    return blyt_state_ctx_snapshot(&s->state_ctx);
+}
+
+void blyt_session_snapshot_free(blyt_state_snapshot_t *snap) {
+    blyt_state_snapshot_free(snap);
+}
+
+void blyt_session_restore(blyt_session_t *s, blyt_state_snapshot_t *snap, uint32_t reason) {
+    uint32_t args[3];
+    if (!snap)
+        return;
+    if (!s) {
+        blyt_state_snapshot_free(snap);
+        return;
+    }
+    blyt_state_ctx_restore_snapshot(&s->state_ctx, snap);
+    blyt_state_snapshot_free(snap);
+    args[0] = reason;
+    args[1] = 0u;
+    args[2] = 0u;
+    call_guest_hook(s, s->fn_on_load_state, 3, args);
+}
+
+/* -------------------------------------------------------------------------
  * blyt_cart_run — blocking wrapper around the session API
  * ------------------------------------------------------------------------- */
 

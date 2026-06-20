@@ -62,12 +62,12 @@ impl Mode {
 
 /// Serve a release cart in the browser (no debugger).
 pub fn run(cart_path: &Path, trace: Option<&str>) -> Result<(), RunError> {
-    serve_cart(cart_path, Mode::Release, trace)
+    serve_cart(cart_path, Mode::Release, trace, false)
 }
 
 /// Serve a debug cart with the DAP/GDB debug runtime.
 pub fn debug(cart_path: &Path, trace: Option<&str>) -> Result<(), RunError> {
-    serve_cart(cart_path, Mode::Debug, trace)
+    serve_cart(cart_path, Mode::Debug, trace, false)
 }
 
 /// Resolve the BLYT_TRACE channel list for the served runtime: the --trace
@@ -91,10 +91,19 @@ fn serve_cart_from_project_dir(
 ) -> Result<(), RunError> {
     let elf_path = build_for_dev(project_dir, mode.is_debug(), false)
         .map_err(|e| err(format!("build failed: {e}")))?;
-    serve_cart(&elf_path, mode, trace)
+    // project_dir = true: the dev control channel (ADR-0045/issue #87) is
+    // always-on in project-dir mode so `blyt debug`'s file watcher, VS Code,
+    // and manual tooling can drive runtime lifecycle commands
+    // (reload/save/load/reset).
+    serve_cart(&elf_path, mode, trace, true)
 }
 
-fn serve_cart(cart_path: &Path, mode: Mode, trace: Option<&str>) -> Result<(), RunError> {
+fn serve_cart(
+    cart_path: &Path,
+    mode: Mode,
+    trace: Option<&str>,
+    project_dir: bool,
+) -> Result<(), RunError> {
     if cart_path.is_dir() {
         return serve_cart_from_project_dir(cart_path, mode, trace);
     }
@@ -148,6 +157,16 @@ fn serve_cart(cart_path: &Path, mode: Mode, trace: Option<&str>) -> Result<(), R
         (0, 0)
     };
 
+    // Dev control relay: WebSocket on PORT+5 (WASM runtime), raw newline-delimited
+    // JSON TCP on PORT+6 (external tool — `blyt debug` watcher, VS Code).  Unlike
+    // DAP/GDB this relay is always started in project-dir mode, independent of
+    // debug (the release player must support hot reload too — issue #87).
+    let (dev_ctrl_ws_port, dev_ctrl_tcp_port) = if project_dir {
+        start_dev_ctrl_relay(port.wrapping_add(5), port.wrapping_add(6))
+    } else {
+        (0, 0)
+    };
+
     let trace = resolve_trace(trace);
 
     println!("blyt run: serving on http://127.0.0.1:{port}/");
@@ -159,6 +178,10 @@ fn serve_cart(cart_path: &Path, mode: Mode, trace: Option<&str>) -> Result<(), R
     println!();
     println!("Open http://127.0.0.1:{port}/ in your browser.");
     println!("Press Ctrl+C to stop.");
+    if dev_ctrl_tcp_port != 0 {
+        println!();
+        println!("  Dev control:  127.0.0.1:{dev_ctrl_tcp_port}   (TCP — send JSON commands here)");
+    }
     if debug {
         println!();
         println!("  DAP debugger (Lua):    127.0.0.1:{dap_tcp_port}");
@@ -184,6 +207,7 @@ fn serve_cart(cart_path: &Path, mode: Mode, trace: Option<&str>) -> Result<(), R
         Arc::new(trace),
         dap_ws_port,
         gdb_ws_port,
+        dev_ctrl_ws_port,
     )
 }
 
@@ -599,6 +623,46 @@ mod tests {
         let frame = ws_client.read().unwrap();
         assert_eq!(frame.to_text().unwrap(), packet);
     }
+
+    #[test]
+    fn dev_ctrl_relay_session_bidirectional() {
+        // The dev control relay forwards newline-delimited JSON: TCP lines are
+        // re-framed as WebSocket frames and vice versa.
+        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws_port = ws_listener.local_addr().unwrap().port();
+        let ws_server_thread = std::thread::spawn(move || {
+            let (stream, _) = ws_listener.accept().unwrap();
+            tungstenite::accept(stream).unwrap()
+        });
+        let (mut ws_client, _) =
+            tungstenite::connect(format!("ws://127.0.0.1:{ws_port}/")).unwrap();
+        let ws_server = ws_server_thread.join().unwrap();
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        let tcp_client = TcpStream::connect(format!("127.0.0.1:{tcp_port}")).unwrap();
+        let (tcp_server, _) = tcp_listener.accept().unwrap();
+
+        std::thread::spawn(move || run_dev_ctrl_relay_session(ws_server, tcp_server));
+
+        // TCP → WS: external tool sends a command line; WASM receives a frame
+        // with the trailing newline stripped.
+        let cmd = r#"{"id":1,"cmd":"reset"}"#;
+        let mut tcp_write = tcp_client.try_clone().unwrap();
+        tcp_write.write_all(format!("{cmd}\n").as_bytes()).unwrap();
+        tcp_write.flush().unwrap();
+        let frame = ws_client.read().unwrap();
+        assert_eq!(frame.to_text().unwrap(), cmd);
+
+        // WS → TCP: runtime sends a response frame; external tool reads it as a
+        // newline-terminated JSON line.
+        let resp = r#"{"id":1,"status":"ok","cmd":"reset"}"#;
+        ws_client.send(Message::Text(resp.into())).unwrap();
+        let mut tcp_read = BufReader::new(tcp_client);
+        let mut line = String::new();
+        tcp_read.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), resp);
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -829,9 +893,180 @@ fn run_gdb_relay_session(mut ws: WsConn, tcp: TcpStream) {
 }
 
 /* -------------------------------------------------------------------------
+ * Dev control relay (issue #87, amends ADR-0045)
+ *
+ * Carries runtime lifecycle commands (reload, save_state, load_state, reset)
+ * between an external tool and the running runtime.  Unlike DAP/GDB this relay
+ * is always started in project-dir mode — the release player must support hot
+ * reload too, so it is not gated on debug.
+ *
+ * Two listeners:
+ *   ws_port  — WebSocket, for the WASM runtime (injected as {{BLYT_DEV_CTRL_PORT}})
+ *   tcp_port — raw newline-delimited JSON, for the external tool
+ *
+ * The protocol is single-line JSON terminated by '\n' (ADR-0045 amendment).
+ * WebSocket frames each carry one whole line; the TCP side is newline-framed.
+ * The relay forwards message bodies verbatim in both directions, converting
+ * only the framing (WS frame ↔ trailing '\n').
+ * ------------------------------------------------------------------------- */
+
+fn start_dev_ctrl_relay(ws_port: u16, tcp_port: u16) -> (u16, u16) {
+    let ws_listener = bind_relay(ws_port, "dev control relay (WebSocket)");
+    let tcp_listener = bind_relay(tcp_port, "dev control relay (TCP)");
+
+    let actual_ws = ws_listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(ws_port);
+    let actual_tcp = tcp_listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(tcp_port);
+
+    std::thread::spawn(move || {
+        run_dev_ctrl_relay_loop(ws_listener, tcp_listener);
+    });
+
+    (actual_ws, actual_tcp)
+}
+
+fn run_dev_ctrl_relay_loop(ws_listener: TcpListener, tcp_listener: TcpListener) {
+    use std::sync::mpsc;
+
+    loop {
+        let (ws_tx, ws_rx) = mpsc::channel();
+        let (tcp_tx, tcp_rx) = mpsc::channel::<TcpStream>();
+
+        let ws_listener2 = ws_listener.try_clone().expect("clone dev ctrl ws listener");
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = ws_listener2.accept() {
+                if let Ok(ws) = tungstenite::accept(stream) {
+                    let _ = ws_tx.send(ws);
+                }
+            }
+        });
+
+        let tcp_listener2 = tcp_listener
+            .try_clone()
+            .expect("clone dev ctrl tcp listener");
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = tcp_listener2.accept() {
+                let _ = tcp_tx.send(stream);
+            }
+        });
+
+        let ws = match ws_rx.recv() {
+            Ok(ws) => ws,
+            Err(_) => continue,
+        };
+        let tcp = match tcp_rx.recv() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        run_dev_ctrl_relay_session(ws, tcp);
+    }
+}
+
+fn run_dev_ctrl_relay_session(mut ws: WsConn, tcp: TcpStream) {
+    use std::io::ErrorKind::WouldBlock;
+    use std::sync::mpsc;
+
+    let (tcp_to_ws_tx, tcp_to_ws_rx) = mpsc::channel::<String>();
+    let (ws_to_tcp_tx, ws_to_tcp_rx) = mpsc::channel::<String>();
+
+    let tcp_write = match tcp.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let tcp_read = BufReader::new(tcp);
+
+    // Thread: newline-delimited TCP reader → sends each line (sans newline) to
+    // the WS I/O thread, which frames it as a single WebSocket text frame.
+    std::thread::spawn(move || {
+        let mut r = tcp_read;
+        loop {
+            let mut line = String::new();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches(['\r', '\n']);
+                    if trimmed.is_empty() {
+                        continue; // ignore blank keepalive lines
+                    }
+                    if tcp_to_ws_tx.send(trimmed.to_string()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Thread: owns the WebSocket; polls non-blocking to interleave reads and writes.
+    std::thread::spawn(move || {
+        ws.get_mut().set_nonblocking(true).ok();
+        let delay = std::time::Duration::from_micros(100);
+        'relay: loop {
+            loop {
+                match ws.read() {
+                    Ok(Message::Text(s)) => {
+                        if ws_to_tcp_tx.send(s.to_string()).is_err() {
+                            break 'relay;
+                        }
+                    }
+                    Ok(Message::Binary(b)) => {
+                        if let Ok(s) = String::from_utf8(b.into()) {
+                            if ws_to_tcp_tx.send(s).is_err() {
+                                break 'relay;
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) => break 'relay,
+                    Err(tungstenite::Error::Io(e)) if e.kind() == WouldBlock => break,
+                    Err(_) => break 'relay,
+                    _ => break,
+                }
+            }
+            loop {
+                match tcp_to_ws_rx.try_recv() {
+                    Ok(msg) => {
+                        if ws.send(Message::Text(msg.into())).is_err() {
+                            break 'relay;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break 'relay,
+                }
+            }
+            match tcp_to_ws_rx.recv_timeout(delay) {
+                Ok(msg) => {
+                    if ws.send(Message::Text(msg.into())).is_err() {
+                        break 'relay;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'relay,
+            }
+        }
+    });
+
+    // This thread: forward WS messages (runtime responses) to the TCP client,
+    // re-framing each as a newline-terminated JSON line.
+    let mut tcp_write = tcp_write;
+    for msg in ws_to_tcp_rx {
+        let line = format!("{msg}\n");
+        if tcp_write.write_all(line.as_bytes()).is_err() {
+            break;
+        }
+        let _ = tcp_write.flush();
+    }
+}
+
+/* -------------------------------------------------------------------------
  * HTTP server
  * ------------------------------------------------------------------------- */
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     listener: TcpListener,
     wasm_dir: Arc<PathBuf>,
@@ -840,6 +1075,7 @@ fn serve(
     trace: Arc<String>,
     dap_port: u16,
     gdb_port: u16,
+    dev_ctrl_port: u16,
 ) -> Result<(), RunError> {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -852,13 +1088,21 @@ fn serve(
         let trace = Arc::clone(&trace);
         std::thread::spawn(move || {
             handle_connection(
-                stream, &wasm_dir, &cart_path, &wasm_name, &trace, dap_port, gdb_port,
+                stream,
+                &wasm_dir,
+                &cart_path,
+                &wasm_name,
+                &trace,
+                dap_port,
+                gdb_port,
+                dev_ctrl_port,
             );
         });
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     mut stream: TcpStream,
     wasm_dir: &Path,
@@ -867,6 +1111,7 @@ fn handle_connection(
     trace: &str,
     dap_port: u16,
     gdb_port: u16,
+    dev_ctrl_port: u16,
 ) {
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf) {
@@ -913,6 +1158,7 @@ fn handle_connection(
                 let patched = html
                     .replace("{{BLYT_DAP_PORT}}", &dap_port.to_string())
                     .replace("{{BLYT_GDB_PORT}}", &gdb_port.to_string())
+                    .replace("{{BLYT_DEV_CTRL_PORT}}", &dev_ctrl_port.to_string())
                     .replace("{{BLYT_TRACE}}", trace);
                 respond(&mut stream, 200, content_type, patched.as_bytes());
             } else {

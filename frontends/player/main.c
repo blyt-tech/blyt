@@ -1,11 +1,17 @@
 #include <SDL.h>
+#include <arpa/inet.h> /* htons, ntohs */
+#include <errno.h>
+#include <fcntl.h> /* fcntl, O_NONBLOCK */
+#include <netinet/in.h> /* sockaddr_in */
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h> /* socket, bind, listen, accept */
 #include <sys/stat.h> /* stat, S_ISDIR */
-#include <unistd.h> /* setenv, readlink */
+#include <unistd.h> /* setenv, readlink, read, write, close, usleep */
 #ifdef __APPLE__
 #include <mach-o/dyld.h> /* _NSGetExecutablePath */
 #endif
@@ -32,6 +38,12 @@ void retro_get_system_av_info(struct retro_system_av_info *info);
 bool retro_load_game(const struct retro_game_info *game);
 void retro_unload_game(void);
 void retro_run(void);
+void retro_reset(void);
+
+/* Dev control channel operations (issue #87) — extensions on the libretro core. */
+bool blyt_libretro_save_state(uint32_t slot);
+bool blyt_libretro_load_state(uint32_t slot);
+bool blyt_libretro_reload(void);
 
 /* Used only by the SDL frontend (direct link) for loop termination and exit
  * status — not part of the standard libretro interface. */
@@ -149,6 +161,13 @@ static const char *g_trace = NULL; /* --trace: BLYT_TRACE channel list */
 static int g_quit_after = -1; /* -1 = disabled; >=0 = exit after N frames */
 static bool g_reset_every_frame =
     false; /* --reset-every-frame: run a save/clear/restore cycle after each frame */
+/* --dev-ctrl-port: dev control channel TCP port (issue #87).
+ * -1 = disabled, 0 = OS-assigned (actual port announced on stdout), >0 = fixed.
+ * The player listens on this port for newline-delimited JSON lifecycle commands
+ * (reload / save_state / load_state / reset) — the same role the browser runtime
+ * fills over the devtool's WebSocket relay.  `blyt debug`'s file watcher (the
+ * former `blyt watch`) connects here to drive hot reload. */
+static int g_dev_ctrl_port = -1;
 
 /* If BLYT_LIB_DIR is unset, try to infer it as <binary_dir>/../lib.
  * This lets blytplay/blytdebug work without any environment setup when
@@ -245,6 +264,8 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
             g_trace = argv[i] + 8;
         } else if (strcmp(argv[i], "--reset-every-frame") == 0) {
             g_reset_every_frame = true;
+        } else if (strcmp(argv[i], "--dev-ctrl-port") == 0 && i + 1 < argc) {
+            g_dev_ctrl_port = atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             cart = argv[i];
         } else {
@@ -253,6 +274,231 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
         }
     }
     return cart;
+}
+
+/* -------------------------------------------------------------------------
+ * Dev control channel server (issue #87)
+ *
+ * A non-blocking TCP listener polled from the main loop (no threads): accepts
+ * one client and reads newline-delimited JSON lifecycle commands, dispatching
+ * them between frames so all session mutation stays on the main thread.  This
+ * is the native counterpart to the browser runtime's WebSocket handler — the
+ * release player supports it too, so hot reload is not tied to the debugger.
+ * ------------------------------------------------------------------------- */
+
+static int g_dev_ctrl_listen_fd = -1;
+static int g_dev_ctrl_client_fd = -1;
+static char g_dev_ctrl_rx[4096];
+static size_t g_dev_ctrl_rx_len = 0;
+
+/* Minimal single-line JSON readers for the trusted command stream. */
+static const char *dev_ctrl_value(const char *json, const char *key) {
+    char pat[24];
+    int n = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (n < 0 || (size_t)n >= sizeof(pat))
+        return NULL;
+    const char *p = strstr(json, pat);
+    if (!p)
+        return NULL;
+    p += n;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != ':')
+        return NULL;
+    p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return p;
+}
+
+static long dev_ctrl_int(const char *json, const char *key, long fallback) {
+    const char *v = dev_ctrl_value(json, key);
+    if (!v)
+        return fallback;
+    char *end = NULL;
+    long r = strtol(v, &end, 10);
+    return (end == v) ? fallback : r;
+}
+
+static bool dev_ctrl_str(const char *json, const char *key, char *out, size_t outsz) {
+    const char *v = dev_ctrl_value(json, key);
+    if (!v || *v != '"')
+        return false;
+    v++;
+    size_t i = 0;
+    while (*v && *v != '"' && i + 1 < outsz)
+        out[i++] = *v++;
+    out[i] = '\0';
+    return *v == '"';
+}
+
+static void dev_ctrl_send(const char *json) {
+    if (g_dev_ctrl_client_fd < 0)
+        return;
+    char line[512];
+    int n = snprintf(line, sizeof(line), "%s\n", json);
+    if (n > 0) {
+        ssize_t w = write(g_dev_ctrl_client_fd, line, (size_t)n);
+        (void)w;
+    }
+}
+
+static void dev_ctrl_ok(long id, const char *cmd) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"id\":%ld,\"status\":\"ok\",\"cmd\":\"%s\"}", id, cmd);
+    dev_ctrl_send(buf);
+}
+
+static void dev_ctrl_err(long id, const char *cmd, const char *reason) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "{\"id\":%ld,\"status\":\"error\",\"cmd\":\"%s\",\"reason\":\"%s\"}",
+             id, cmd, reason);
+    dev_ctrl_send(buf);
+}
+
+static void dev_ctrl_dispatch(const char *json) {
+    long id = dev_ctrl_int(json, "id", 0);
+    char cmd[32];
+    if (!dev_ctrl_str(json, "cmd", cmd, sizeof(cmd))) {
+        dev_ctrl_err(id, "", "malformed command (missing cmd)");
+        return;
+    }
+
+    if (strcmp(cmd, "reset") == 0) {
+        retro_reset();
+        dev_ctrl_ok(id, cmd);
+    } else if (strcmp(cmd, "save_state") == 0) {
+        uint32_t slot = (uint32_t)dev_ctrl_int(json, "slot", 0);
+        if (blyt_libretro_save_state(slot))
+            dev_ctrl_ok(id, cmd);
+        else
+            dev_ctrl_err(id, cmd, "save_state failed");
+    } else if (strcmp(cmd, "load_state") == 0) {
+        uint32_t slot = (uint32_t)dev_ctrl_int(json, "slot", 0);
+        if (blyt_libretro_load_state(slot))
+            dev_ctrl_ok(id, cmd);
+        else
+            dev_ctrl_err(id, cmd, "load_state failed");
+    } else if (strcmp(cmd, "reload") == 0) {
+        if (blyt_libretro_reload())
+            dev_ctrl_ok(id, cmd);
+        else
+            dev_ctrl_err(id, cmd, "reload failed");
+    } else {
+        dev_ctrl_err(id, cmd, "unknown command");
+    }
+}
+
+/* Dispatch every complete line in the receive buffer; keep any trailing
+ * partial line. */
+static void dev_ctrl_process_buffer(void) {
+    size_t start = 0;
+    for (size_t i = 0; i < g_dev_ctrl_rx_len; i++) {
+        if (g_dev_ctrl_rx[i] != '\n')
+            continue;
+        g_dev_ctrl_rx[i] = '\0';
+        char *line = g_dev_ctrl_rx + start;
+        size_t ll = strlen(line);
+        if (ll && line[ll - 1] == '\r')
+            line[ll - 1] = '\0';
+        if (line[0])
+            dev_ctrl_dispatch(line);
+        start = i + 1;
+    }
+    if (start > 0) {
+        memmove(g_dev_ctrl_rx, g_dev_ctrl_rx + start, g_dev_ctrl_rx_len - start);
+        g_dev_ctrl_rx_len -= start;
+    }
+}
+
+static void dev_ctrl_set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* Bind the dev control listener and announce the actual port.  port==0 lets the
+ * OS assign one. */
+static void dev_ctrl_start(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("blytplay: dev-ctrl socket");
+        return;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("blytplay: dev-ctrl bind");
+        close(fd);
+        return;
+    }
+    if (listen(fd, 1) < 0) {
+        perror("blytplay: dev-ctrl listen");
+        close(fd);
+        return;
+    }
+    socklen_t alen = sizeof(addr);
+    int actual = port;
+    if (getsockname(fd, (struct sockaddr *)&addr, &alen) == 0)
+        actual = ntohs(addr.sin_port);
+    dev_ctrl_set_nonblocking(fd);
+    g_dev_ctrl_listen_fd = fd;
+    printf("Dev control: listening on 127.0.0.1:%d\n", actual);
+    fflush(stdout);
+}
+
+/* Accept a pending client and drain any available command bytes.  Called once
+ * per frame; never blocks. */
+static void dev_ctrl_poll(void) {
+    if (g_dev_ctrl_listen_fd < 0)
+        return;
+
+    if (g_dev_ctrl_client_fd < 0) {
+        int c = accept(g_dev_ctrl_listen_fd, NULL, NULL);
+        if (c < 0)
+            return; /* EWOULDBLOCK — no client yet */
+        dev_ctrl_set_nonblocking(c);
+        g_dev_ctrl_client_fd = c;
+        g_dev_ctrl_rx_len = 0;
+    }
+
+    for (;;) {
+        if (g_dev_ctrl_rx_len >= sizeof(g_dev_ctrl_rx) - 1)
+            g_dev_ctrl_rx_len = 0; /* overlong line — drop and resync */
+        ssize_t n = read(g_dev_ctrl_client_fd, g_dev_ctrl_rx + g_dev_ctrl_rx_len,
+                         sizeof(g_dev_ctrl_rx) - 1 - g_dev_ctrl_rx_len);
+        if (n > 0) {
+            g_dev_ctrl_rx_len += (size_t)n;
+            dev_ctrl_process_buffer();
+            continue;
+        }
+        if (n == 0) { /* client closed */
+            close(g_dev_ctrl_client_fd);
+            g_dev_ctrl_client_fd = -1;
+            return;
+        }
+        if (errno == EWOULDBLOCK || errno == EAGAIN)
+            return; /* no more data this frame */
+        if (errno == EINTR)
+            continue;
+        close(g_dev_ctrl_client_fd);
+        g_dev_ctrl_client_fd = -1;
+        return;
+    }
+}
+
+static void dev_ctrl_shutdown(void) {
+    if (g_dev_ctrl_client_fd >= 0)
+        close(g_dev_ctrl_client_fd);
+    if (g_dev_ctrl_listen_fd >= 0)
+        close(g_dev_ctrl_listen_fd);
+    g_dev_ctrl_client_fd = -1;
+    g_dev_ctrl_listen_fd = -1;
 }
 
 int main(int argc, char *argv[]) {
@@ -348,6 +594,12 @@ int main(int argc, char *argv[]) {
         blyt_libretro_gdb_continue_initial_halt();
 #endif
 
+    /* Dev control channel (issue #87): start the listener now that the cart is
+     * loaded and the session exists.  Non-blocking — the cart runs immediately
+     * whether or not a controller ever connects. */
+    if (g_dev_ctrl_port >= 0)
+        dev_ctrl_start(g_dev_ctrl_port);
+
     SDL_Window *win = NULL;
     if (!headless) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
@@ -377,6 +629,7 @@ int main(int argc, char *argv[]) {
     int frame_count = 0;
     while (!g_quit && !blyt_libretro_is_done()) {
         uint32_t t0 = g_sdl_ready ? SDL_GetTicks() : 0;
+        dev_ctrl_poll();
         retro_run();
         if (g_quit_after >= 0 && ++frame_count >= g_quit_after)
             g_quit = true;
@@ -386,8 +639,14 @@ int main(int argc, char *argv[]) {
             uint32_t elapsed = SDL_GetTicks() - t0;
             if (elapsed < frame_ms)
                 SDL_Delay(frame_ms - elapsed);
+        } else if (g_dev_ctrl_port >= 0) {
+            /* Pace headless dev control sessions to ~frame rate instead of
+             * busy-spinning while waiting for commands. */
+            usleep(frame_ms * 1000);
         }
     }
+
+    dev_ctrl_shutdown();
 
     if (win) {
         if (g_texture)

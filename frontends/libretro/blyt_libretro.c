@@ -52,6 +52,9 @@ static blyt_session_t *g_session = NULL;
 static bool g_cart_done = false;
 static blyt_cart_run_err_t g_run_err = BLYT_RUN_OK;
 static bool g_dap_active = false;
+/* Path the current cart was loaded from — used by the dev control hot reload
+ * (issue #87) to reopen the freshly rebuilt cart from disk. */
+static char *g_cart_path = NULL;
 
 /* XRGB8888 expansion buffer — filled by blyt_session_expand_frame() each
  * frame and passed to the frontend video callback. */
@@ -164,6 +167,10 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
         return false;
     }
 
+    /* Remember the path so the dev control hot reload can reopen it. */
+    free(g_cart_path);
+    g_cart_path = strdup(game->path);
+
     fprintf(stderr, "Blyt %s - %s (%s %s)\n", blyt_runtime_version(), blyt_cart_title(g_cart),
             blyt_cart_id(g_cart), blyt_cart_version(g_cart));
 
@@ -241,6 +248,8 @@ RETRO_API void retro_unload_game(void) {
     g_session = NULL;
     blyt_cart_close(g_cart);
     g_cart = NULL;
+    free(g_cart_path);
+    g_cart_path = NULL;
     g_cart_done = false;
     g_run_err = BLYT_RUN_OK;
 }
@@ -363,4 +372,69 @@ blyt_cart_run_err_t blyt_libretro_run_err(void) {
 void retro_reset_every_frame_cycle(void) {
     if (g_session)
         blyt_reset_every_frame_cycle(g_session);
+}
+
+/* -------------------------------------------------------------------------
+ * Dev control channel operations (issue #87)
+ *
+ * Driven by the SDL frontend's dev control server.  reset is the standard
+ * retro_reset(); save/load persist to disk slots; reload swaps in the freshly
+ * rebuilt cart from disk while preserving state buffers (ADR-0045).
+ * ------------------------------------------------------------------------- */
+
+bool blyt_libretro_save_state(uint32_t slot) {
+    return g_session && blyt_session_save_state(g_session, slot) == 0;
+}
+
+bool blyt_libretro_load_state(uint32_t slot) {
+    return g_session && blyt_session_load_state(g_session, slot) == 0;
+}
+
+bool blyt_libretro_reload(void) {
+    blyt_state_snapshot_t *snap;
+    blyt_cart_err_t err;
+
+    if (!g_session || !g_cart_path)
+        return false;
+
+    /* 1. Snapshot live state (flushing transient state via on_save_state). */
+    snap = blyt_session_snapshot(g_session);
+
+    /* 2. Tear down the old session and cart. */
+    blyt_session_destroy(g_session);
+    g_session = NULL;
+    blyt_cart_close(g_cart);
+    g_cart = NULL;
+
+    /* 3. Reopen the freshly rebuilt cart from disk and recreate the session. */
+    err = blyt_cart_open(g_cart_path, &g_cart);
+    if (err != BLYT_CART_OK) {
+        if (g_log_cb)
+            g_log_cb(RETRO_LOG_ERROR, "blyt: reload failed to open cart: %s\n",
+                     blyt_cart_err_str(err));
+        g_cart = NULL;
+        blyt_session_snapshot_free(snap);
+        g_cart_done = true;
+        return false;
+    }
+    g_session = blyt_session_create(g_cart, libretro_log);
+    if (!g_session) {
+        if (g_log_cb)
+            g_log_cb(RETRO_LOG_ERROR, "blyt: reload failed to recreate session\n");
+        blyt_cart_close(g_cart);
+        g_cart = NULL;
+        blyt_session_snapshot_free(snap);
+        g_cart_done = true;
+        return false;
+    }
+    g_cart_done = false;
+    g_run_err = BLYT_RUN_OK;
+
+    /* 4. Run the first frame so the new cart's init() executes and allocates
+     *    its state slots, then restore the snapshot over the fresh buffers and
+     *    notify the cart via on_load_state(HOT_RELOAD).  The discarded frame is
+     *    never presented. */
+    blyt_session_run_frame(g_session);
+    blyt_session_restore(g_session, snap, 3u /* BLYT_LOAD_HOT_RELOAD */);
+    return true;
 }

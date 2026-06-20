@@ -41,6 +41,10 @@
       /* Relay ports injected by `blyt run --debug`.  0 when debugging is not active. */
       window.blyt_dap_port = {{BLYT_DAP_PORT}};
       window.blyt_gdb_port = {{BLYT_GDB_PORT}};
+      /* Dev control relay port (issue #87) — injected in project-dir mode, 0
+       * otherwise.  Carries runtime lifecycle commands (reload/save/load/reset)
+       * over a WebSocket to the devtool's relay (PORT+5). */
+      window.blyt_dev_ctrl_port = {{BLYT_DEV_CTRL_PORT}};
       /* Trace channels injected by `blyt run/debug --trace` ("" when off).
        * module_pre.js copies __blyt_env_vars into the Emscripten ENV before C
        * startup, so the runtime's getenv("BLYT_TRACE") sees the channels.
@@ -51,6 +55,42 @@
         globalThis.__blyt_env_vars = Object.assign(globalThis.__blyt_env_vars || {}, {
           BLYT_TRACE: "{{BLYT_TRACE}}",
         });
+      }
+    </script>
+    <script>
+      /* Dev control channel (issue #87).  Opens a WebSocket to the devtool's
+       * relay and bridges newline-delimited JSON lifecycle commands to/from the
+       * C runtime:
+       *   inbound  command line → Module.ccall("blyt_dev_ctrl_command", …)
+       *   outbound response     → globalThis.blyt_dev_ctrl_send (called from C)
+       * Reload re-fetches the freshly rebuilt cart into MEMFS, then hands back
+       * to C via blyt_dev_ctrl_reload_fetched (ADR-0045 sequence). */
+      function blyt_dev_ctrl_connect(Module, port) {
+        var ws = new WebSocket("ws://127.0.0.1:" + port + "/");
+        ws.onmessage = function (e) {
+          Module.ccall("blyt_dev_ctrl_command", null, ["string"], [e.data]);
+        };
+        ws.onerror = function (e) {
+          console.error("[blyt] dev control socket error:", e);
+        };
+        globalThis.blyt_dev_ctrl_send = function (json) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(json);
+        };
+        globalThis.blyt_dev_ctrl_fetch_cart = function () {
+          fetch("cart.blyt")
+            .then(function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              return r.arrayBuffer();
+            })
+            .then(function (buf) {
+              FS.writeFile("/cart.blyt", new Uint8Array(buf));
+              Module.ccall("blyt_dev_ctrl_reload_fetched", null, ["int"], [1]);
+            })
+            .catch(function (e) {
+              console.error("[blyt] dev control reload fetch failed:", e);
+              Module.ccall("blyt_dev_ctrl_reload_fetched", null, ["int"], [0]);
+            });
+        };
       }
     </script>
     <script>
@@ -87,6 +127,9 @@
 
         onRuntimeInitialized: function () {
           /* main() has been called; loop is running via emscripten_set_main_loop */
+          if (window.blyt_dev_ctrl_port > 0) {
+            blyt_dev_ctrl_connect(Module, window.blyt_dev_ctrl_port);
+          }
         },
 
         print: function (text) {
