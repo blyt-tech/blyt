@@ -1161,6 +1161,12 @@ fn run_dev_ctrl_ws_client(mut ws: WsConn, hub: DevCtrlHub) {
  * single rebuild and a single reload signal.
  * ------------------------------------------------------------------------- */
 
+/// Content hash of the built dev ELF, or `None` if it cannot be read.  Used to
+/// suppress reloads when a rebuild leaves the cart bytes unchanged.
+fn elf_hash(path: &Path) -> Option<u64> {
+    fs::read(path).ok().map(|b| xxhash_rust::xxh3::xxh3_64(&b))
+}
+
 fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
     std::thread::spawn(move || {
         let (tx, rx) = mpsc::channel::<PathBuf>();
@@ -1204,6 +1210,17 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
             }
         }
 
+        // Track the built ELF's content so a reload is signalled only when the
+        // cart bytes actually change.  This keeps a burst of writes (or a
+        // no-op rebuild driven by events that arrive while a build is running)
+        // to a single reload, and suppresses reloads for edits that don't alter
+        // the compiled cart (e.g. a comment-only change).  Seeded from the
+        // initial build that already produced the dev ELF before serving.
+        let dev_elf = project_dir
+            .join("build")
+            .join(if debug { ".dbg.elf" } else { ".elf" });
+        let mut last_hash = elf_hash(&dev_elf);
+
         let settle = std::time::Duration::from_millis(150);
         let mut reload_id: u64 = 1;
         while let Ok(path) = rx.recv() {
@@ -1214,11 +1231,17 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
 
             println!("[build] rebuilding…");
             match build_for_dev(&project_dir, debug, false) {
-                Ok(_) => {
-                    let msg = format!("{{\"id\":{reload_id},\"cmd\":\"reload\"}}");
-                    let n = hub.broadcast(None, &msg);
-                    println!("[reload] signalled {n} runtime(s)");
-                    reload_id += 1;
+                Ok(elf) => {
+                    let new_hash = elf_hash(&elf);
+                    if new_hash.is_some() && new_hash != last_hash {
+                        last_hash = new_hash;
+                        let msg = format!("{{\"id\":{reload_id},\"cmd\":\"reload\"}}");
+                        let n = hub.broadcast(None, &msg);
+                        println!("[reload] signalled {n} runtime(s)");
+                        reload_id += 1;
+                    } else {
+                        println!("[reload] skipped (cart unchanged)");
+                    }
                 }
                 Err(e) => {
                     eprintln!("[build] ✗ {e}");
