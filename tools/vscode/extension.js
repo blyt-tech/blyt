@@ -815,6 +815,32 @@ class BlytGdbDapProxy {
 		const vsSeq = vsMsg.seq;
 		const source = vsMsg.arguments?.source ?? {};
 
+		/* Lua breakpoints are handled exclusively by the companion Lua DAP
+		 * session (started via vscode.debug.startDebugging for hybrid WASM
+		 * carts).  lldb-dap has no Lua runtime knowledge and always returns
+		 * "unverified" for .lua files, which causes VS Code to display them
+		 * with a yellow (unverified) gutter icon even though the companion
+		 * session verified them — making newly set Lua BPs appear ignored.
+		 * Short-circuit here: report all Lua BPs as verified so VS Code
+		 * shows the correct red gutter icon, without forwarding to lldb. */
+		const srcPath = source.path ?? source.name ?? '';
+		if (srcPath.endsWith('.lua')) {
+			const bps = (vsMsg.arguments?.breakpoints ?? []).map((bp) => ({
+				id: bp.line,
+				verified: true,
+				line: bp.line,
+			}));
+			this._emitter.fire({
+				type: 'response',
+				command: 'setBreakpoints',
+				success: true,
+				request_seq: vsSeq,
+				seq: ++this._vsSeq,
+				body: { breakpoints: bps },
+			});
+			return;
+		}
+
 		/* Normalize bare true/false to 1/0. */
 		const normBps = (vsMsg.arguments?.breakpoints ?? []).map((bp) => {
 			if (typeof bp.condition !== 'string') return bp;
@@ -1297,6 +1323,24 @@ function activate(context) {
 					output.appendLine(
 						`── WASM did not connect within 30 s — proceeding anyway`,
 					);
+				}
+
+				/* Hybrid cart (Lua+C) in WASM: start a companion Lua DAP session
+				 * so Lua breakpoints work.  We do this AFTER wasmReady so the
+				 * WASM's DAP WebSocket is already connected to the relay — when
+				 * VS Code connects TCP, both relay sides are immediately available
+				 * and configurationDone reaches the WASM without any race window.
+				 * Falls through to the lldb-dap setup below for the native side. */
+				if (isHybrid && dapPort) {
+					vscode.debug.startDebugging(folder, {
+						type: 'blyt',
+						request: 'launch',
+						name: 'Lua (blyt hybrid)',
+						_blytMode: 'lua',
+						_blytDapPort: dapPort,
+						sourceMap: sourceMapPairs(cwd).flat(),
+						_blytPreresolved: true,
+					});
 				}
 
 				const tempId = nextId++;
