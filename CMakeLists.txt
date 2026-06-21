@@ -1111,6 +1111,29 @@ add_custom_target(
   VERBATIM)
 add_dependencies(lint npm_ci)
 
+# ── fmt-fix
+# ───────────────────────────────────────────────────────────────────── Fix
+# counterpart to `lint`: runs all the auto-fixers in one shot so formatting
+# never has to be invoked directly. Same file globs as `lint`. Run before commit
+# to fix, then `lint` to verify: cmake --build build --target fmt-fix
+#
+# yamllint and luacheck are checkers with no auto-fix, so they have no
+# counterpart here — fix their findings manually and re-run `lint`.
+
+add_custom_target(
+  fmt-fix
+  COMMAND clang-format -i ${_LINT_C_FILES}
+  COMMAND cmake-format -i "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
+          "${CMAKE_SOURCE_DIR}/frontends/wasm/CMakeLists.txt"
+  COMMAND cargo fmt --all
+  COMMAND "${CMAKE_SOURCE_DIR}/node_modules/.bin/biome" check --write
+          "${CMAKE_SOURCE_DIR}"
+  COMMAND stylua ${_LINT_LUA_FILES}
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  COMMENT "Auto-fixing: clang-format, cmake-format, cargo fmt, biome, stylua"
+  VERBATIM)
+add_dependencies(fmt-fix npm_ci)
+
 # ── test-unit ─────────────────────────────────────────────────────────────────
 # Run C unit tests (ctest) and Rust devtool unit tests.  Does not require the
 # SDK — use after a plain `cmake --build build`.
