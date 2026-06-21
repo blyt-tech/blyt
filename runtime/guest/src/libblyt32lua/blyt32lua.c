@@ -467,6 +467,35 @@ void blyt_cart_on_save_state(void) {
     call_global("on_save_state");
 }
 void blyt_cart_on_load_state(blyt_load_info_t info) {
-    (void)info;
-    call_global("on_load_state");
+    if (!g_L)
+        return;
+    int msgh = 0;
+#ifdef BLYT_DAP
+    if (blyt_dap_active()) {
+        lua_pushcfunction(g_L, dap_error_handler);
+        msgh = lua_gettop(g_L);
+    }
+#endif
+    lua_getglobal(g_L, "on_load_state");
+    if (lua_isfunction(g_L, -1)) {
+        /* Marshal blyt_load_info_t into a single `info` table argument,
+         * mirroring the WASM host-Lua path (frontends/wasm/wasm_main.c).
+         * `buffers` is NULL until Phase 9, so only the scalar fields are
+         * exposed for now. */
+        lua_newtable(g_L);
+        lua_pushinteger(g_L, (lua_Integer)info.reason);
+        lua_setfield(g_L, -2, "reason");
+        lua_pushinteger(g_L, (lua_Integer)info.saved_cart_version);
+        lua_setfield(g_L, -2, "saved_cart_version");
+        if (lua_pcall(g_L, 1, 0, msgh) != LUA_OK) {
+            blyt_console_debug(lua_tostring(g_L, -1));
+            lua_pop(g_L, 1);
+        }
+    } else {
+        lua_pop(g_L, 1);
+    }
+#ifdef BLYT_DAP
+    if (msgh > 0)
+        lua_remove(g_L, msgh);
+#endif
 }

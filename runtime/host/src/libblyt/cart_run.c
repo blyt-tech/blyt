@@ -3008,13 +3008,16 @@ static blyt_cart_run_err_t call_until_fn_done(blyt_session_t *s) {
     return r;
 }
 
+/* Defined below alongside the other lifecycle-hook callers. */
+static void call_guest_on_load_state(blyt_session_t *s, uint32_t reason,
+                                     uint32_t saved_cart_version, uint32_t buffers);
+
 void blyt_reset_every_frame_cycle(blyt_session_t *s) {
     uint32_t saved_pc;
     uint32_t saved_regs[32];
     uint32_t saved_fcsr;
     blyt_state_snapshot_t *snap;
     blyt_cart_run_err_t r;
-    uint32_t args[3];
     uint32_t i;
 
     if (!s || s->fn_init == 0)
@@ -3056,14 +3059,7 @@ void blyt_reset_every_frame_cycle(blyt_session_t *s) {
     blyt_state_snapshot_free(snap);
 
     /* 6. Notify cart that state has been restored (BLYT_LOAD_HOT_RELOAD = 3). */
-    if (s->fn_on_load_state) {
-        args[0] = 3u;
-        args[1] = 0u;
-        args[2] = 0u;
-        blyt_session_begin_fn_call(s, s->fn_on_load_state, 3, args);
-        r = call_until_fn_done(s);
-        (void)r;
-    }
+    call_guest_on_load_state(s, 3u /* BLYT_LOAD_HOT_RELOAD */, 0u, 0u);
 
 restore:
     /* Restore emulator state so the game loop continues from where it left off. */
@@ -3122,6 +3118,38 @@ static void call_guest_hook(blyt_session_t *s, uint32_t fn, uint8_t nargs, const
     emu_state_restore(s, &e);
 }
 
+/* Call blyt_cart_on_load_state(blyt_load_info_t), preserving emulator state.
+ *
+ * blyt_load_info_t is 12 bytes — larger than 2*XLEN — so the RV32 psABI passes
+ * it *by reference*: the callee expects a0 to hold a pointer to the struct, not
+ * the three fields spread across a0/a1/a2.  Materialise the struct in scratch
+ * space just below the guest stack pointer and point a0 at it.  Setting sp to
+ * the struct's address keeps it above the callee's own frame (which grows
+ * downward from sp), so the hook reads it intact; emu_state_restore then puts
+ * sp — and every other register — back when the hook returns. */
+static void call_guest_on_load_state(blyt_session_t *s, uint32_t reason,
+                                     uint32_t saved_cart_version, uint32_t buffers) {
+    blyt_emu_state_t e;
+    if (s->fn_on_load_state == 0)
+        return;
+    emu_state_save(s, &e);
+
+    /* Field order must match blyt_load_info_t in runtime/guest/include/blyt.h:
+     *   { reason (u32), saved_cart_version (u32), buffers (ptr) }. */
+    const uint32_t info[3] = {reason, saved_cart_version, buffers};
+    uint32_t sp = rv_get_reg(s->rv, rv_reg_sp);
+    uint32_t scratch = (sp - (uint32_t)sizeof(info)) & ~(uint32_t)15; /* 16-byte aligned */
+    memory_t *mem = PRIV(s->rv)->mem;
+    if (GUEST_RAM_CONTAINS(mem, scratch, (uint32_t)sizeof(info))) {
+        memory_write(mem, scratch, (const uint8_t *)info, (uint32_t)sizeof(info));
+        rv_set_reg(s->rv, rv_reg_sp, scratch);
+        uint32_t args[1] = {scratch};
+        blyt_session_begin_fn_call(s, s->fn_on_load_state, 1, args);
+        call_until_fn_done(s);
+    }
+    emu_state_restore(s, &e);
+}
+
 int blyt_session_save_state(blyt_session_t *s, uint32_t slot) {
     if (!s)
         return -1;
@@ -3137,11 +3165,8 @@ int blyt_session_load_state(blyt_session_t *s, uint32_t slot) {
     r = blyt_save_read(&s->state_ctx, s->ctx.save_dir, s->ctx.cart_name, slot);
     if (r != 0)
         return r;
-    /* Notify the cart (reason = BLYT_LOAD_EXPLICIT = 0). */
-    {
-        uint32_t args[3] = {0u, 0u, 0u};
-        call_guest_hook(s, s->fn_on_load_state, 3, args);
-    }
+    /* Notify the cart (reason = BLYT_LOAD_SAVE_GAME = 0). */
+    call_guest_on_load_state(s, 0u, 0u, 0u);
     return 0;
 }
 
@@ -3157,7 +3182,6 @@ void blyt_session_snapshot_free(blyt_state_snapshot_t *snap) {
 }
 
 void blyt_session_restore(blyt_session_t *s, blyt_state_snapshot_t *snap, uint32_t reason) {
-    uint32_t args[3];
     if (!snap)
         return;
     if (!s) {
@@ -3166,10 +3190,7 @@ void blyt_session_restore(blyt_session_t *s, blyt_state_snapshot_t *snap, uint32
     }
     blyt_state_ctx_restore_snapshot(&s->state_ctx, snap);
     blyt_state_snapshot_free(snap);
-    args[0] = reason;
-    args[1] = 0u;
-    args[2] = 0u;
-    call_guest_hook(s, s->fn_on_load_state, 3, args);
+    call_guest_on_load_state(s, reason, 0u, 0u);
 }
 
 /* -------------------------------------------------------------------------
