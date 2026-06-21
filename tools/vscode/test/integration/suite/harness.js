@@ -35,6 +35,8 @@ function registerSession(session) {
 			bpResults: [],
 			/* request_seq -> source.path for in-flight setBreakpoints requests. */
 			bpReqSource: new Map(),
+			/* pending waitBreakpointBound() calls: { line, resolve, timer }. */
+			bpWaiters: [],
 		};
 		records.set(session.id, rec);
 	}
@@ -73,10 +75,23 @@ function install() {
 					) {
 						const source = rec.bpReqSource.get(m.request_seq) ?? '';
 						rec.bpReqSource.delete(m.request_seq);
-						rec.bpResults.push({
-							source,
-							breakpoints: m.body?.breakpoints ?? [],
-						});
+						const breakpoints = m.body?.breakpoints ?? [];
+						rec.bpResults.push({ source, breakpoints });
+						/* Resolve any waiters whose line is now bound (verified). */
+						for (const bp of breakpoints) {
+							if (!bp.verified) continue;
+							for (
+								let i = rec.bpWaiters.length - 1;
+								i >= 0;
+								i--
+							) {
+								if (rec.bpWaiters[i].line === bp.line) {
+									const w = rec.bpWaiters.splice(i, 1)[0];
+									clearTimeout(w.timer);
+									w.resolve();
+								}
+							}
+						}
 						return;
 					}
 					if (m.type !== 'event') return;
@@ -261,6 +276,32 @@ function breakpointResultsFor(session, suffix) {
 	return rec.bpResults.filter((r) => (r.source || '').endsWith(suffix));
 }
 
+/* Resolve once the adapter has reported a breakpoint at `line` as verified.
+ * Call after addBreakpoint() and before continuing — otherwise a dynamically
+ * added breakpoint can race the continue (the GDB stub inserts it against an
+ * already-running process and it never binds), which flakes on slower runners. */
+function waitBreakpointBound(session, line, timeoutMs = 30000) {
+	const rec = records.get(session.id);
+	if (!rec) return Promise.reject(new Error('no record for session'));
+	const bound = () =>
+		rec.bpResults.some((r) =>
+			r.breakpoints.some((b) => b.line === line && b.verified),
+		);
+	if (bound()) return Promise.resolve();
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			const i = rec.bpWaiters.findIndex((w) => w.resolve === resolve);
+			if (i >= 0) rec.bpWaiters.splice(i, 1);
+			reject(
+				new Error(
+					`timeout waiting for breakpoint at line ${line} to bind`,
+				),
+			);
+		}, timeoutMs);
+		rec.bpWaiters.push({ line, resolve, timer });
+	});
+}
+
 /* Stop everything and clear breakpoints between tests. */
 async function reset() {
 	try {
@@ -291,6 +332,7 @@ module.exports = {
 	locals,
 	cont,
 	breakpointResultsFor,
+	waitBreakpointBound,
 	reset,
 	assert,
 };

@@ -84,6 +84,9 @@ describe('Lua cart (native debug)', () => {
 		 * failed we'd never stop at BP_PRINT. */
 		h.removeBreakpoint(bpAssign);
 		h.addBreakpoint(uri, BP_PRINT);
+		/* Wait for the new breakpoint to bind before continuing, so the continue
+		 * can't race the insertion. */
+		await h.waitBreakpointBound(session, BP_PRINT);
 		await h.cont(session, stop1.body.threadId);
 
 		const stop2 = await h.waitStopped(session);

@@ -79,6 +79,9 @@ describe('C cart (native debug)', () => {
 
 		h.removeBreakpoint(bpSnprintf);
 		h.addBreakpoint(uri, BP_DEBUG);
+		/* Wait for lldb to actually bind the new breakpoint before continuing —
+		 * otherwise the continue races the insertion and it never fires. */
+		await h.waitBreakpointBound(session, BP_DEBUG);
 		await h.cont(session, stop1.body.threadId);
 
 		const stop2 = await h.waitStopped(session);
