@@ -41,6 +41,7 @@ void retro_run(void);
 void retro_reset(void);
 
 /* Dev control channel operations (issue #87) — extensions on the libretro core. */
+void blyt_libretro_reset(void);
 bool blyt_libretro_save_state(uint32_t slot);
 bool blyt_libretro_load_state(uint32_t slot);
 bool blyt_libretro_reload(void);
@@ -365,7 +366,10 @@ static void dev_ctrl_dispatch(const char *json) {
     }
 
     if (strcmp(cmd, "reset") == 0) {
-        retro_reset();
+        /* Boot the cart (run init) before acking so a save_state/load_state
+         * dispatched in the same poll pass sees real guest state, not a
+         * pre-init blank (issue #105). */
+        blyt_libretro_reset();
         dev_ctrl_ok(id, cmd);
     } else if (strcmp(cmd, "save_state") == 0) {
         uint32_t slot = (uint32_t)dev_ctrl_int(json, "slot", 0);
