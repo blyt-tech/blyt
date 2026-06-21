@@ -366,6 +366,44 @@ void blyt_session_gdb_continue_initial_halt(blyt_session_t *s);
  */
 void blyt_reset_every_frame_cycle(blyt_session_t *s);
 
+/* --- Dev control channel host operations (issue #87) ----------------------
+ *
+ * Drive runtime lifecycle from a frontend's dev control server without
+ * disturbing the running game loop: each call saves and restores emulator
+ * state around the guest calls it makes, so the next blyt_session_run_frame()
+ * continues from the same point.
+ */
+
+/* Opaque migratable snapshot of all state buffers (defined in state_buffer.h).
+ * C11 permits this redundant typedef alongside that header. */
+typedef struct blyt_state_snapshot blyt_state_snapshot_t;
+
+/*
+ * Persist state buffers to / restore them from disk save slot `slot`, driving
+ * the cart's on_save_state / on_load_state hooks.  Return 0 on success.
+ */
+int blyt_session_save_state(blyt_session_t *s, uint32_t slot);
+int blyt_session_load_state(blyt_session_t *s, uint32_t slot);
+
+/*
+ * Capture a snapshot of all state buffers after flushing transient state via
+ * on_save_state.  Returns NULL if the session has no state or on failure; the
+ * caller owns the result.  Used for hot reload, where the session is recreated
+ * from fresh code between snapshot and restore.
+ */
+blyt_state_snapshot_t *blyt_session_snapshot(blyt_session_t *s);
+
+/* Free a snapshot returned by blyt_session_snapshot without restoring it
+ * (e.g. when a reload aborts before the new session is ready). */
+void blyt_session_snapshot_free(blyt_state_snapshot_t *snap);
+
+/*
+ * Restore a snapshot into the session's state buffers and notify the cart via
+ * on_load_state(reason).  Takes ownership of `snap` (frees it).  `reason` uses
+ * the guest BLYT_LOAD_* values (3 = HOT_RELOAD).
+ */
+void blyt_session_restore(blyt_session_t *s, blyt_state_snapshot_t *snap, uint32_t reason);
+
 #ifdef __cplusplus
 }
 #endif

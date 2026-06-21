@@ -1000,24 +1000,33 @@ static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
  * restores the state buffer snapshot so state persists across the reset.
  * Called after draw() completes when BLYT_RESET_EVERY_FRAME=1.
  * ------------------------------------------------------------------------- */
-static void wasm_lua_reset_cycle(void) {
-    /* Step 1: flush live state to buffers */
-    lua_getglobal(g_lua, "on_save_state");
-    if (lua_isfunction(g_lua, -1)) {
-        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_save_state");
-        lua_pcall(g_lua, 0, 0, 0);
-        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_save_state");
-    } else {
-        lua_pop(g_lua, 1);
+/* Rebuild the Lua VM from g_lua_bytecode in place.
+ *   preserve_state — restore state buffers + replay on_load_state(HOT_RELOAD);
+ *                    otherwise zero state and run on_new_state() (cold boot).
+ *   ext_snap       — when non-NULL, a snapshot captured by the caller before a
+ *                    cart swap (reload); used instead of capturing internally.
+ *                    Ownership transfers to this function (it is freed here). */
+static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_snap) {
+    blyt_state_snapshot_t *snap = ext_snap;
+    blyt_state_ctx_t *sctx = active_state_ctx();
+
+    if (preserve_state && !snap) {
+        /* Step 1: flush live state to buffers */
+        lua_getglobal(g_lua, "on_save_state");
+        if (lua_isfunction(g_lua, -1)) {
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_save_state");
+            lua_pcall(g_lua, 0, 0, 0);
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_save_state");
+        } else {
+            lua_pop(g_lua, 1);
+        }
+
+        /* Step 2: snapshot state buffers */
+        if (sctx)
+            snap = blyt_state_ctx_snapshot(sctx);
     }
 
-    /* Step 2: snapshot state buffers */
-    blyt_state_snapshot_t *snap = NULL;
-    blyt_state_ctx_t *sctx = active_state_ctx();
-    if (sctx)
-        snap = blyt_state_ctx_snapshot(sctx);
-
-    /* Step 3: zero state buffers */
+    /* Step 3: zero state buffers (fresh baseline; restored below if preserving) */
     if (sctx)
         blyt_state_ctx_zero_data(sctx);
 
@@ -1041,7 +1050,7 @@ static void wasm_lua_reset_cycle(void) {
         if (snap)
             blyt_state_snapshot_free(snap);
         g_lua_fatal = true;
-        return;
+        return false;
     }
 
     /* Step 6: re-open stdlib subset */
@@ -1094,7 +1103,7 @@ static void wasm_lua_reset_cycle(void) {
         if (snap)
             blyt_state_snapshot_free(snap);
         g_lua_fatal = true;
-        return;
+        return false;
     }
 
     /* Step 10: re-inject lifecycle trampolines. Error if both Lua and native
@@ -1129,7 +1138,7 @@ static void wasm_lua_reset_cycle(void) {
                 if (snap)
                     blyt_state_snapshot_free(snap);
                 g_lua_fatal = true;
-                return;
+                return false;
             }
             maybe_inject_lifecycle_cb(g_lua, cbs[i].name, fn);
         }
@@ -1153,25 +1162,37 @@ static void wasm_lua_reset_cycle(void) {
         lua_pop(g_lua, 1);
     }
 
-    /* Step 13: restore state buffers from snapshot */
-    if (snap) {
-        blyt_state_ctx_restore_snapshot(active_state_ctx(), snap);
-        blyt_state_snapshot_free(snap);
-    }
+    if (preserve_state) {
+        /* Step 13: restore state buffers from snapshot */
+        if (snap) {
+            blyt_state_ctx_restore_snapshot(active_state_ctx(), snap);
+            blyt_state_snapshot_free(snap);
+        }
 
-    /* Step 14: notify cart that state was restored (reason=BLYT_LOAD_HOT_RELOAD=3) */
-    lua_getglobal(g_lua, "on_load_state");
-    if (lua_isfunction(g_lua, -1)) {
-        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_load_state");
-        lua_newtable(g_lua);
-        lua_pushinteger(g_lua, 3);
-        lua_setfield(g_lua, -2, "reason");
-        lua_pushinteger(g_lua, 0);
-        lua_setfield(g_lua, -2, "saved_cart_version");
-        lua_pcall(g_lua, 1, 0, 0);
-        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_load_state");
+        /* Step 14: notify cart that state was restored (reason=BLYT_LOAD_HOT_RELOAD=3) */
+        lua_getglobal(g_lua, "on_load_state");
+        if (lua_isfunction(g_lua, -1)) {
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_load_state");
+            lua_newtable(g_lua);
+            lua_pushinteger(g_lua, 3);
+            lua_setfield(g_lua, -2, "reason");
+            lua_pushinteger(g_lua, 0);
+            lua_setfield(g_lua, -2, "saved_cart_version");
+            lua_pcall(g_lua, 1, 0, 0);
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_load_state");
+        } else {
+            lua_pop(g_lua, 1);
+        }
     } else {
-        lua_pop(g_lua, 1);
+        /* Fresh reset (no state preserved): run on_new_state() like a cold boot. */
+        lua_getglobal(g_lua, "on_new_state");
+        if (lua_isfunction(g_lua, -1)) {
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_new_state");
+            lua_pcall(g_lua, 0, 0, 0);
+            blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_new_state");
+        } else {
+            lua_pop(g_lua, 1);
+        }
     }
 
     /* Step 15: create running coroutine for next frame */
@@ -1179,6 +1200,266 @@ static void wasm_lua_reset_cycle(void) {
     g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
     luaL_loadstring(g_lua_co, co_body_running);
     /* g_lua_phase stays LUA_PHASE_RUNNING — next frame calls update() directly */
+    return true;
+}
+
+/* --reset-every-frame stress cycle: rebuild the VM preserving state and replay
+ * on_load_state(HOT_RELOAD).  Thin wrapper over the shared rebuild path. */
+static void wasm_lua_reset_cycle(void) {
+    wasm_lua_rebuild(true, NULL);
+}
+
+/* -------------------------------------------------------------------------
+ * Dev control channel handler (issue #87, amends ADR-0045)
+ *
+ * The devtool relays single-line JSON lifecycle commands over a WebSocket; the
+ * page glue (shell.html) hands each inbound line to blyt_dev_ctrl_command and
+ * exposes globalThis.blyt_dev_ctrl_send for responses.  Commands:
+ *   {"id":N,"cmd":"reset"}                 cold reboot, state discarded
+ *   {"id":N,"cmd":"save_state","slot":S}   persist state to save slot S (default 0)
+ *   {"id":N,"cmd":"load_state","slot":S}   restore state from save slot S
+ *   {"id":N,"cmd":"reload"}                hot reload: refetch cart, preserve state
+ * Responses echo the id and cmd: {"id":N,"status":"ok","cmd":"…"} or
+ * {"id":N,"status":"error","cmd":"…","reason":"…"}.
+ *
+ * Scope: this WASM handler services the Lua runtime path (pure-Lua and
+ * Lua-with-layouts carts — what `blyt run ./dir` serves for the dev loop).
+ * WASM carts with native rv32 code get a structured error for now; the native
+ * player (frontends/player) drives those directly via its own dev control
+ * server against the live rv32 session.
+ * ------------------------------------------------------------------------- */
+
+/* clang-format off */
+EM_JS(void, blyt_js_dev_ctrl_send, (const char *json), {
+    if (typeof globalThis !== 'undefined' &&
+        typeof globalThis.blyt_dev_ctrl_send === 'function')
+        globalThis.blyt_dev_ctrl_send(UTF8ToString(json));
+});
+
+EM_JS(void, blyt_js_dev_ctrl_fetch_cart, (void), {
+    if (typeof globalThis !== 'undefined' &&
+        typeof globalThis.blyt_dev_ctrl_fetch_cart === 'function')
+        globalThis.blyt_dev_ctrl_fetch_cart();
+});
+/* clang-format on */
+
+/* Minimal single-line JSON readers for the trusted command stream from our own
+ * relay.  Not a general parser: keys are matched literally and values are
+ * scalars (integer or bare quoted string with no escapes). */
+static bool dev_ctrl_find_value(const char *json, const char *key, const char **out) {
+    char pat[24];
+    int n = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (n < 0 || (size_t)n >= sizeof(pat))
+        return false;
+    const char *p = strstr(json, pat);
+    if (!p)
+        return false;
+    p += n;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != ':')
+        return false;
+    p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    *out = p;
+    return true;
+}
+
+static long dev_ctrl_int(const char *json, const char *key, long fallback) {
+    const char *v;
+    if (!dev_ctrl_find_value(json, key, &v))
+        return fallback;
+    char *end = NULL;
+    long r = strtol(v, &end, 10);
+    return (end == v) ? fallback : r;
+}
+
+/* Copy a quoted JSON string value for `key` into out[outsz].  Returns false if
+ * the key is absent or its value is not a quoted string. */
+static bool dev_ctrl_str(const char *json, const char *key, char *out, size_t outsz) {
+    const char *v;
+    if (!dev_ctrl_find_value(json, key, &v) || *v != '"')
+        return false;
+    v++;
+    size_t i = 0;
+    while (*v && *v != '"' && i + 1 < outsz)
+        out[i++] = *v++;
+    out[i] = '\0';
+    return *v == '"';
+}
+
+static void dev_ctrl_respond_ok(long id, const char *cmd) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"id\":%ld,\"status\":\"ok\",\"cmd\":\"%s\"}", id, cmd);
+    blyt_js_dev_ctrl_send(buf);
+}
+
+static void dev_ctrl_respond_err(long id, const char *cmd, const char *reason) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "{\"id\":%ld,\"status\":\"error\",\"cmd\":\"%s\",\"reason\":\"%s\"}",
+             id, cmd, reason);
+    blyt_js_dev_ctrl_send(buf);
+}
+
+/* Pending reload request id, valid between blyt_dev_ctrl_command(reload) and
+ * the blyt_dev_ctrl_reload_fetched callback. -1 when no reload is in flight. */
+static long g_dev_ctrl_reload_id = -1;
+
+/* True when the handler can service state/lifecycle commands: a Lua VM with no
+ * rv32 session (the dev-loop sweet spot). */
+static bool dev_ctrl_lua_path(void) {
+    return g_lua != NULL && g_session == NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void blyt_dev_ctrl_command(const char *json) {
+    if (!json)
+        return;
+    long id = dev_ctrl_int(json, "id", 0);
+    char cmd[32];
+    if (!dev_ctrl_str(json, "cmd", cmd, sizeof(cmd))) {
+        dev_ctrl_respond_err(id, "", "malformed command (missing cmd)");
+        return;
+    }
+    blyt_tracef(BLYT_TRACE_LIFECYCLE, "dev_ctrl cmd=%s id=%ld", cmd, id);
+
+    if (strcmp(cmd, "reset") == 0) {
+        if (!dev_ctrl_lua_path()) {
+            dev_ctrl_respond_err(id, cmd, "reset not supported for carts with native code yet");
+            return;
+        }
+        if (wasm_lua_rebuild(false, NULL))
+            dev_ctrl_respond_ok(id, cmd);
+        else
+            dev_ctrl_respond_err(id, cmd, "reset failed");
+        return;
+    }
+
+    if (strcmp(cmd, "save_state") == 0) {
+        if (!dev_ctrl_lua_path()) {
+            dev_ctrl_respond_err(id, cmd,
+                                 "save_state not supported for carts with native code yet");
+            return;
+        }
+        uint32_t slot = (uint32_t)dev_ctrl_int(json, "slot", 0);
+        lua_getglobal(g_lua, "on_save_state");
+        if (lua_isfunction(g_lua, -1))
+            lua_pcall(g_lua, 0, 0, 0);
+        else
+            lua_pop(g_lua, 1);
+        blyt_state_ctx_t *ctx = active_state_ctx();
+        int r = ctx ? blyt_save_write(ctx, active_save_dir(), active_cart_name(), slot) : -1;
+        if (r == BLYT_RUN_OK)
+            dev_ctrl_respond_ok(id, cmd);
+        else
+            dev_ctrl_respond_err(id, cmd, "save_state failed");
+        return;
+    }
+
+    if (strcmp(cmd, "load_state") == 0) {
+        if (!dev_ctrl_lua_path()) {
+            dev_ctrl_respond_err(id, cmd,
+                                 "load_state not supported for carts with native code yet");
+            return;
+        }
+        uint32_t slot = (uint32_t)dev_ctrl_int(json, "slot", 0);
+        blyt_state_ctx_t *ctx = active_state_ctx();
+        int r = ctx ? blyt_save_read(ctx, active_save_dir(), active_cart_name(), slot) : -1;
+        if (r != BLYT_RUN_OK) {
+            dev_ctrl_respond_err(id, cmd, "load_state failed");
+            return;
+        }
+        lua_getglobal(g_lua, "on_load_state");
+        if (lua_isfunction(g_lua, -1)) {
+            lua_newtable(g_lua);
+            lua_pushinteger(g_lua, 0); /* reason = BLYT_LOAD_EXPLICIT */
+            lua_setfield(g_lua, -2, "reason");
+            lua_pushinteger(g_lua, 0);
+            lua_setfield(g_lua, -2, "saved_cart_version");
+            lua_pcall(g_lua, 1, 0, 0);
+        } else {
+            lua_pop(g_lua, 1);
+        }
+        dev_ctrl_respond_ok(id, cmd);
+        return;
+    }
+
+    if (strcmp(cmd, "reload") == 0) {
+        if (!dev_ctrl_lua_path()) {
+            dev_ctrl_respond_err(id, cmd, "reload not supported for carts with native code yet");
+            return;
+        }
+        if (g_dev_ctrl_reload_id >= 0) {
+            dev_ctrl_respond_err(id, cmd, "reload already in progress");
+            return;
+        }
+        /* Hand off to JS to refetch /cart.blyt into MEMFS, then continue in
+         * blyt_dev_ctrl_reload_fetched.  State is preserved across the swap. */
+        g_dev_ctrl_reload_id = id;
+        blyt_js_dev_ctrl_fetch_cart();
+        return;
+    }
+
+    dev_ctrl_respond_err(id, cmd, "unknown command");
+}
+
+/* Continue a reload after JS rewrote /cart.blyt in MEMFS (ADR-0045 sequence).
+ * ok==0 means the JS-side refetch failed. */
+EMSCRIPTEN_KEEPALIVE
+void blyt_dev_ctrl_reload_fetched(int ok) {
+    long id = g_dev_ctrl_reload_id;
+    g_dev_ctrl_reload_id = -1;
+    if (id < 0)
+        return;
+
+    if (!ok) {
+        dev_ctrl_respond_err(id, "reload", "cart refetch failed");
+        return;
+    }
+
+    /* Snapshot live state against the current layout before swapping carts. */
+    blyt_state_ctx_t *sctx = active_state_ctx();
+    blyt_state_snapshot_t *snap = NULL;
+    if (sctx) {
+        lua_getglobal(g_lua, "on_save_state");
+        if (lua_isfunction(g_lua, -1))
+            lua_pcall(g_lua, 0, 0, 0);
+        else
+            lua_pop(g_lua, 1);
+        snap = blyt_state_ctx_snapshot(sctx);
+    }
+
+    /* Reopen the cart from the freshly fetched bytes. */
+    blyt_cart_close(g_cart);
+    g_cart = NULL;
+    blyt_cart_err_t cerr = blyt_cart_open("/cart.blyt", &g_cart);
+    if (cerr != BLYT_CART_OK) {
+        if (snap)
+            blyt_state_snapshot_free(snap);
+        dev_ctrl_respond_err(id, "reload", blyt_cart_err_str(cerr));
+        g_lua_fatal = true;
+        return;
+    }
+
+    size_t bc_size = 0;
+    const void *bc = blyt_cart_find_section(g_cart, ".cart.lua", &bc_size);
+    if (!bc) {
+        if (snap)
+            blyt_state_snapshot_free(snap);
+        dev_ctrl_respond_err(id, "reload", "reloaded cart has no Lua section");
+        g_lua_fatal = true;
+        return;
+    }
+    g_lua_bytecode = bc;
+    g_lua_bytecode_size = bc_size;
+
+    /* Rebuild from the new bytecode, restoring the pre-swap snapshot and
+     * replaying on_load_state(HOT_RELOAD).  rebuild() takes ownership of snap. */
+    if (wasm_lua_rebuild(true, snap))
+        dev_ctrl_respond_ok(id, "reload");
+    else
+        dev_ctrl_respond_err(id, "reload", "rebuild failed");
 }
 
 /* -------------------------------------------------------------------------

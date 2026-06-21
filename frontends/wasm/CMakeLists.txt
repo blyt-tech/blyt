@@ -455,6 +455,11 @@ target_link_options(
   # Ensure the Emscripten FS API is available (cart is loaded via FS.writeFile
   # in shell.html before main() runs).
   "-sFORCE_FILESYSTEM=1"
+  # Runtime methods used by the page glue: addRunDependency/removeRunDependency
+  # gate the cart preload; ccall lets the dev control channel (issue #87) pass
+  # JSON command strings into the C handler; FS lets the reload flow rewrite
+  # /cart.blyt in MEMFS.
+  "-sEXPORTED_RUNTIME_METHODS=ccall,FS,addRunDependency,removeRunDependency"
   # Allow the runtime to exit cleanly when the cart finishes.
   "-sNO_EXIT_RUNTIME=0"
   # Custom HTML shell with canvas + cart preload logic.

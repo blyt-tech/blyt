@@ -2,8 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    blyt_bin, build_cart, find_wasm_dir, repo_root, require_playwright, require_wasm, sdk_dir,
-    write_c_cart_project,
+    CartProject, blyt_bin, build_cart, build_lua_cart, find_wasm_dir, repo_root, require_lua_sdk,
+    require_playwright, require_wasm, sdk_dir, write_c_cart_project,
 };
 use std::fs;
 use tempfile::TempDir;
@@ -258,6 +258,94 @@ void blyt_cart_draw(void)   {}
             script.to_str().unwrap(),
             html_path.to_str().unwrap(),
             golden_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+const DEV_CTRL_CONFIG: &str = "\
+records:
+  Game:
+    fields:
+      - { name: score, type: i32 }
+state_buffers:
+  game:
+    record: Game
+    count: 1
+";
+
+/// Dev control channel C handler (issue #87): drive reset / save_state /
+/// load_state / reload straight into blyt_dev_ctrl_command under Node.js and
+/// check the JSON responses.  Reload swaps to a second cart build (cart_v2) and
+/// must preserve the state buffer across the code swap.  The relay transport is
+/// unit-tested in devtool/src/run.rs; this covers the runtime handler.
+#[test]
+fn wasm_dev_control_lifecycle_commands() {
+    require_wasm();
+    require_lua_sdk();
+    let wasm_dir = find_wasm_dir();
+    assert!(
+        sdk_dir().join("bin/blyt-luac").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+
+    // cart_v1: fresh init sets score=7; on_new_state / on_load_state report it.
+    let project_v1 = tmp.path().join("dev_ctrl_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(
+            r#"
+local slot = -1
+function init()
+    slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].score = 7
+end
+function update() end
+function draw() end
+function on_new_state()
+    blyt.debug.print("v1 new score=" .. tostring(S.game[slot].score))
+end
+function on_load_state(info)
+    blyt.debug.print("v1 load score=" .. tostring(S.game[slot].score)
+        .. " reason=" .. tostring(info.reason))
+end
+"#,
+        )
+        .write(&project_v1);
+    let cart_v1 = build_lua_cart(&project_v1);
+
+    // cart_v2: same layout, fresh init sets score=100 — so a working reload
+    // (which preserves v1's score=7) is distinguishable from a fresh boot.
+    let project_v2 = tmp.path().join("dev_ctrl_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(
+            r#"
+local slot = -1
+function init()
+    slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].score = 100
+end
+function update() end
+function draw() end
+function on_load_state(info)
+    blyt.debug.print("v2 load score=" .. tostring(S.game[slot].score)
+        .. " reason=" .. tostring(info.reason))
+end
+"#,
+        )
+        .write(&project_v2);
+    let cart_v2 = build_lua_cart(&project_v2);
+
+    let driver = repo_root().join("tests/wasm/dev_ctrl_test.js");
+    Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart_v1.to_str().unwrap(),
+            cart_v2.to_str().unwrap(),
         ])
         .assert()
         .success();
