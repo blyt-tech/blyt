@@ -806,7 +806,11 @@ static int wasm_lua_save_read(lua_State *L) {
 static void wasm_register_s_proxy(lua_State *L) {
     static const char *type_names[] = {"i8", "u8", "i16", "u16", "i32", "u32", "f32", "bool"};
 
-    blyt_state_ctx_t *ctx = g_lua_state_ctx;
+    /* active_state_ctx() — not g_lua_state_ctx directly — so the S proxy is
+     * registered for HYBRID carts too (whose state ctx lives in g_session;
+     * g_lua_state_ctx is only set for pure-Lua carts).  Without this, hybrid
+     * carts get no `S` global and any S.* access errors. */
+    blyt_state_ctx_t *ctx = active_state_ctx();
     if (!ctx || ctx->n_buffers == 0)
         return;
 
