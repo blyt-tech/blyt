@@ -2,8 +2,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
+use notify::{RecursiveMode, Watcher};
 use tungstenite::Message;
 
 use crate::build::{build_for_dev, sdk_root_from_exe};
@@ -62,12 +64,12 @@ impl Mode {
 
 /// Serve a release cart in the browser (no debugger).
 pub fn run(cart_path: &Path, trace: Option<&str>) -> Result<(), RunError> {
-    serve_cart(cart_path, Mode::Release, trace, false)
+    serve_cart(cart_path, Mode::Release, trace, None)
 }
 
 /// Serve a debug cart with the DAP/GDB debug runtime.
 pub fn debug(cart_path: &Path, trace: Option<&str>) -> Result<(), RunError> {
-    serve_cart(cart_path, Mode::Debug, trace, false)
+    serve_cart(cart_path, Mode::Debug, trace, None)
 }
 
 /// Resolve the BLYT_TRACE channel list for the served runtime: the --trace
@@ -91,18 +93,23 @@ fn serve_cart_from_project_dir(
 ) -> Result<(), RunError> {
     let elf_path = build_for_dev(project_dir, mode.is_debug(), false)
         .map_err(|e| err(format!("build failed: {e}")))?;
-    // project_dir = true: the dev control channel (ADR-0045/issue #87) is
-    // always-on in project-dir mode so `blyt debug`'s file watcher, VS Code,
-    // and manual tooling can drive runtime lifecycle commands
-    // (reload/save/load/reset).
-    serve_cart(&elf_path, mode, trace, true)
+    // Canonicalise so the file watcher and the build/ exclusion match the
+    // absolute paths notify reports for fs events.
+    let project_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    // project_dir = Some: the dev control channel (ADR-0045/issue #87) is
+    // always-on in project-dir mode so the embedded file watcher (issue #88),
+    // VS Code, and manual tooling can drive runtime lifecycle commands
+    // (reload/save/load/reset).  Passing the source dir also enables hot reload.
+    serve_cart(&elf_path, mode, trace, Some(&project_dir))
 }
 
 fn serve_cart(
     cart_path: &Path,
     mode: Mode,
     trace: Option<&str>,
-    project_dir: bool,
+    project_dir: Option<&Path>,
 ) -> Result<(), RunError> {
     if cart_path.is_dir() {
         return serve_cart_from_project_dir(cart_path, mode, trace);
@@ -157,14 +164,18 @@ fn serve_cart(
         (0, 0)
     };
 
-    // Dev control relay: WebSocket on PORT+5 (WASM runtime), raw newline-delimited
-    // JSON TCP on PORT+6 (external tool — `blyt debug` watcher, VS Code).  Unlike
-    // DAP/GDB this relay is always started in project-dir mode, independent of
-    // debug (the release player must support hot reload too — issue #87).
-    let (dev_ctrl_ws_port, dev_ctrl_tcp_port) = if project_dir {
-        start_dev_ctrl_relay(port.wrapping_add(5), port.wrapping_add(6))
-    } else {
-        (0, 0)
+    // Dev control hub: WebSocket on PORT+5 (WASM runtime), raw newline-delimited
+    // JSON TCP on PORT+6 (external tools — blytplay, VS Code).  Unlike DAP/GDB
+    // this is always started in project-dir mode, independent of debug (the
+    // release player must support hot reload too — issue #87).  The TCP side is a
+    // broadcast hub accepting any number of clients so the file watcher can
+    // signal `reload` to all of them at once (issue #88).
+    let (dev_ctrl_ws_port, dev_ctrl_tcp_port, dev_ctrl_hub) = match project_dir {
+        Some(_) => {
+            let (ws, tcp, hub) = start_dev_ctrl_relay(port.wrapping_add(5), port.wrapping_add(6));
+            (ws, tcp, Some(hub))
+        }
+        None => (0, 0, None),
     };
 
     let trace = resolve_trace(trace);
@@ -182,6 +193,9 @@ fn serve_cart(
         println!();
         println!("  Dev control:  127.0.0.1:{dev_ctrl_tcp_port}   (TCP — send JSON commands here)");
     }
+    if project_dir.is_some() {
+        println!("  Watching:     src/, blyt.build.yaml, blyt.config.yaml, blyt.info.yaml");
+    }
     if debug {
         println!();
         println!("  DAP debugger (Lua):    127.0.0.1:{dap_tcp_port}");
@@ -197,6 +211,12 @@ fn serve_cart(
         {
             println!("  Source map:            {}", map.display());
         }
+    }
+
+    // Hot reload (issue #88): in project-dir mode, watch the sources and rebuild
+    // on change, broadcasting `reload` to every connected dev control client.
+    if let (Some(pdir), Some(hub)) = (project_dir, &dev_ctrl_hub) {
+        start_watcher(pdir.to_path_buf(), debug, hub.clone());
     }
 
     serve(
@@ -625,30 +645,24 @@ mod tests {
     }
 
     #[test]
-    fn dev_ctrl_relay_session_bidirectional() {
-        // The dev control relay forwards newline-delimited JSON: TCP lines are
-        // re-framed as WebSocket frames and vice versa.
-        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let ws_port = ws_listener.local_addr().unwrap().port();
-        let ws_server_thread = std::thread::spawn(move || {
-            let (stream, _) = ws_listener.accept().unwrap();
-            tungstenite::accept(stream).unwrap()
-        });
+    fn dev_ctrl_hub_broadcast_and_bidirectional() {
+        // The dev control hub is a full-mesh broadcast bus.  With one WS + one
+        // TCP client it behaves like the old 1:1 relay (each side hears the
+        // other); `hub.broadcast` additionally reaches every client at once.
+        let (ws_port, tcp_port, hub) = start_dev_ctrl_relay(0, 0);
+
         let (mut ws_client, _) =
             tungstenite::connect(format!("ws://127.0.0.1:{ws_port}/")).unwrap();
-        let ws_server = ws_server_thread.join().unwrap();
-
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let tcp_port = tcp_listener.local_addr().unwrap().port();
         let tcp_client = TcpStream::connect(format!("127.0.0.1:{tcp_port}")).unwrap();
-        let (tcp_server, _) = tcp_listener.accept().unwrap();
+        let mut tcp_write = tcp_client.try_clone().unwrap();
+        let mut tcp_read = BufReader::new(tcp_client);
 
-        std::thread::spawn(move || run_dev_ctrl_relay_session(ws_server, tcp_server));
+        // Let both client handlers register with the hub before we route.
+        std::thread::sleep(std::time::Duration::from_millis(150));
 
         // TCP → WS: external tool sends a command line; WASM receives a frame
         // with the trailing newline stripped.
         let cmd = r#"{"id":1,"cmd":"reset"}"#;
-        let mut tcp_write = tcp_client.try_clone().unwrap();
         tcp_write.write_all(format!("{cmd}\n").as_bytes()).unwrap();
         tcp_write.flush().unwrap();
         let frame = ws_client.read().unwrap();
@@ -658,10 +672,18 @@ mod tests {
         // newline-terminated JSON line.
         let resp = r#"{"id":1,"status":"ok","cmd":"reset"}"#;
         ws_client.send(Message::Text(resp.into())).unwrap();
-        let mut tcp_read = BufReader::new(tcp_client);
         let mut line = String::new();
         tcp_read.read_line(&mut line).unwrap();
         assert_eq!(line.trim_end(), resp);
+
+        // Devtool broadcast (the rebuild loop's reload): reaches every client.
+        let reload = r#"{"id":1,"cmd":"reload"}"#;
+        assert_eq!(hub.broadcast(None, reload), 2);
+        let frame = ws_client.read().unwrap();
+        assert_eq!(frame.to_text().unwrap(), reload);
+        let mut line = String::new();
+        tcp_read.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), reload);
     }
 }
 
@@ -893,24 +915,87 @@ fn run_gdb_relay_session(mut ws: WsConn, tcp: TcpStream) {
 }
 
 /* -------------------------------------------------------------------------
- * Dev control relay (issue #87, amends ADR-0045)
+ * Dev control hub (issue #87 + #88, amends ADR-0045)
  *
  * Carries runtime lifecycle commands (reload, save_state, load_state, reset)
- * between an external tool and the running runtime.  Unlike DAP/GDB this relay
- * is always started in project-dir mode — the release player must support hot
+ * between external tools and the running runtime(s).  Unlike DAP/GDB this is
+ * always started in project-dir mode — the release player must support hot
  * reload too, so it is not gated on debug.
  *
  * Two listeners:
  *   ws_port  — WebSocket, for the WASM runtime (injected as {{BLYT_DEV_CTRL_PORT}})
- *   tcp_port — raw newline-delimited JSON, for the external tool
+ *   tcp_port — raw newline-delimited JSON, for external tools (blytplay, VS Code)
  *
- * The protocol is single-line JSON terminated by '\n' (ADR-0045 amendment).
- * WebSocket frames each carry one whole line; the TCP side is newline-framed.
- * The relay forwards message bodies verbatim in both directions, converting
- * only the framing (WS frame ↔ trailing '\n').
+ * The protocol is single-line JSON terminated by '\n' (ADR-0045 amendment):
+ * each WebSocket frame carries one whole line; the TCP side is newline-framed.
+ *
+ * Topology is a full-mesh broadcast bus (issue #88): a message from any client
+ * — or from the devtool's rebuild loop via `broadcast` — is fanned out to every
+ * *other* client.  With one WS + one TCP client this is identical to the old
+ * 1:1 relay (#87); with many clients (blytplay + VS Code + the WASM page) the
+ * file watcher can signal `reload` to all of them at once.  JSON `id` tags let
+ * clients ignore lines that are not theirs.
  * ------------------------------------------------------------------------- */
 
-fn start_dev_ctrl_relay(ws_port: u16, tcp_port: u16) -> (u16, u16) {
+/// One connected dev-control client (a TCP connection or a WASM-page WebSocket).
+/// Its writer thread drains the receiving end of `tx`; each delivered string is
+/// one message body (the transport adds its own framing).
+struct DevCtrlClient {
+    id: u64,
+    tx: mpsc::Sender<String>,
+}
+
+/// Broadcast hub for the dev control channel.  Cheaply cloneable (shared state
+/// behind an `Arc`) so accept loops and the rebuild loop can all hold a handle.
+#[derive(Clone)]
+struct DevCtrlHub {
+    clients: Arc<Mutex<Vec<DevCtrlClient>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl DevCtrlHub {
+    fn new() -> Self {
+        DevCtrlHub {
+            clients: Arc::new(Mutex::new(Vec::new())),
+            next_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Register a new client; returns its id and the receiver its writer thread
+    /// must drain.  Dropping every clone of the returned receiver (i.e. the
+    /// client going away) lets the next `broadcast` prune it.
+    fn register(&self) -> (u64, mpsc::Receiver<String>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.clients.lock().unwrap().push(DevCtrlClient { id, tx });
+        (id, rx)
+    }
+
+    fn unregister(&self, id: u64) {
+        self.clients.lock().unwrap().retain(|c| c.id != id);
+    }
+
+    /// Send `msg` to every client except `except` (the originator).  Clients
+    /// whose writer channel has hung up are pruned.  Returns the number reached.
+    fn broadcast(&self, except: Option<u64>, msg: &str) -> usize {
+        let mut clients = self.clients.lock().unwrap();
+        let mut reached = 0;
+        clients.retain(|c| {
+            if Some(c.id) == except {
+                return true;
+            }
+            if c.tx.send(msg.to_string()).is_ok() {
+                reached += 1;
+                true
+            } else {
+                false // writer thread gone — prune
+            }
+        });
+        reached
+    }
+}
+
+fn start_dev_ctrl_relay(ws_port: u16, tcp_port: u16) -> (u16, u16, DevCtrlHub) {
     let ws_listener = bind_relay(ws_port, "dev control relay (WebSocket)");
     let tcp_listener = bind_relay(tcp_port, "dev control relay (TCP)");
 
@@ -923,143 +1008,225 @@ fn start_dev_ctrl_relay(ws_port: u16, tcp_port: u16) -> (u16, u16) {
         .map(|a| a.port())
         .unwrap_or(tcp_port);
 
+    let hub = DevCtrlHub::new();
+
+    // WebSocket accept loop: one client per WASM page.
+    let ws_hub = hub.clone();
     std::thread::spawn(move || {
-        run_dev_ctrl_relay_loop(ws_listener, tcp_listener);
+        for stream in ws_listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let Ok(ws) = tungstenite::accept(stream) else {
+                continue;
+            };
+            let hub = ws_hub.clone();
+            std::thread::spawn(move || run_dev_ctrl_ws_client(ws, hub));
+        }
     });
 
-    (actual_ws, actual_tcp)
+    // TCP accept loop: any number of external-tool clients.
+    let tcp_hub = hub.clone();
+    std::thread::spawn(move || {
+        for stream in tcp_listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let hub = tcp_hub.clone();
+            std::thread::spawn(move || run_dev_ctrl_tcp_client(stream, hub));
+        }
+    });
+
+    (actual_ws, actual_tcp, hub)
 }
 
-fn run_dev_ctrl_relay_loop(ws_listener: TcpListener, tcp_listener: TcpListener) {
-    use std::sync::mpsc;
+/// Service one TCP client: newline-delimited JSON in both directions.
+fn run_dev_ctrl_tcp_client(tcp: TcpStream, hub: DevCtrlHub) {
+    let (id, rx) = hub.register();
+
+    let write_half = match tcp.try_clone() {
+        Ok(s) => s,
+        Err(_) => {
+            hub.unregister(id);
+            return;
+        }
+    };
+
+    // Writer thread: drain this client's queue → newline-framed lines.
+    std::thread::spawn(move || {
+        let mut w = write_half;
+        for msg in rx {
+            let line = format!("{msg}\n");
+            if w.write_all(line.as_bytes()).is_err() {
+                break;
+            }
+            let _ = w.flush();
+        }
+    });
+
+    // Reader (this thread): each line is broadcast to every other client.
+    let mut r = BufReader::new(tcp);
+    loop {
+        let mut line = String::new();
+        match r.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed.is_empty() {
+                    continue; // ignore blank keepalive lines
+                }
+                hub.broadcast(Some(id), trimmed);
+            }
+        }
+    }
+    hub.unregister(id);
+}
+
+/// Service one WASM-page WebSocket client.  A single thread owns the socket and
+/// polls non-blocking so it can interleave inbound frames (→ broadcast) with
+/// outbound messages drained from this client's hub queue.
+fn run_dev_ctrl_ws_client(mut ws: WsConn, hub: DevCtrlHub) {
+    use std::io::ErrorKind::WouldBlock;
+
+    let (id, rx) = hub.register();
+    ws.get_mut().set_nonblocking(true).ok();
+    let delay = std::time::Duration::from_micros(100);
 
     loop {
-        let (ws_tx, ws_rx) = mpsc::channel();
-        let (tcp_tx, tcp_rx) = mpsc::channel::<TcpStream>();
-
-        let ws_listener2 = ws_listener.try_clone().expect("clone dev ctrl ws listener");
-        std::thread::spawn(move || {
-            if let Ok((stream, _)) = ws_listener2.accept() {
-                if let Ok(ws) = tungstenite::accept(stream) {
-                    let _ = ws_tx.send(ws);
+        // Drain inbound frames → broadcast to the other clients.
+        loop {
+            match ws.read() {
+                Ok(Message::Text(s)) => {
+                    hub.broadcast(Some(id), &s);
+                }
+                Ok(Message::Binary(b)) => {
+                    if let Ok(s) = String::from_utf8(b.into()) {
+                        hub.broadcast(Some(id), &s);
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    hub.unregister(id);
+                    return;
+                }
+                Err(tungstenite::Error::Io(e)) if e.kind() == WouldBlock => break,
+                Err(_) => {
+                    hub.unregister(id);
+                    return;
+                }
+                _ => break,
+            }
+        }
+        // Forward queued messages (from other clients / the rebuild loop).
+        match rx.recv_timeout(delay) {
+            Ok(msg) => {
+                if ws.send(Message::Text(msg.into())).is_err() {
+                    hub.unregister(id);
+                    return;
+                }
+                loop {
+                    match rx.try_recv() {
+                        Ok(msg) => {
+                            if ws.send(Message::Text(msg.into())).is_err() {
+                                hub.unregister(id);
+                                return;
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            hub.unregister(id);
+                            return;
+                        }
+                    }
                 }
             }
-        });
-
-        let tcp_listener2 = tcp_listener
-            .try_clone()
-            .expect("clone dev ctrl tcp listener");
-        std::thread::spawn(move || {
-            if let Ok((stream, _)) = tcp_listener2.accept() {
-                let _ = tcp_tx.send(stream);
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                hub.unregister(id);
+                return;
             }
-        });
-
-        let ws = match ws_rx.recv() {
-            Ok(ws) => ws,
-            Err(_) => continue,
-        };
-        let tcp = match tcp_rx.recv() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        run_dev_ctrl_relay_session(ws, tcp);
+        }
     }
 }
 
-fn run_dev_ctrl_relay_session(mut ws: WsConn, tcp: TcpStream) {
-    use std::io::ErrorKind::WouldBlock;
-    use std::sync::mpsc;
+/* -------------------------------------------------------------------------
+ * File watcher + incremental rebuild loop (issue #88)
+ *
+ * In project-dir mode, watch the cart's sources and rebuild the dev ELF in
+ * place on any change, then broadcast `reload` to every connected dev control
+ * client.  Watching is implicit in `blyt run`/`blyt debug ./dir` — there is no
+ * standalone `blyt watch` command (ADR-0044 amended).
+ *
+ * Scope: src/ (recursive) + blyt.build.yaml + blyt.config.yaml + blyt.info.yaml.
+ * build/ is never watched, so build outputs cannot re-trigger the watcher (a
+ * defensive path filter drops any stray build/ events as well).
+ *
+ * Debounce: block for the first event, then drain a short settle window so a
+ * save-storm (e.g. an editor writing several files at once) coalesces into a
+ * single rebuild and a single reload signal.
+ * ------------------------------------------------------------------------- */
 
-    let (tcp_to_ws_tx, tcp_to_ws_rx) = mpsc::channel::<String>();
-    let (ws_to_tcp_tx, ws_to_tcp_rx) = mpsc::channel::<String>();
-
-    let tcp_write = match tcp.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let tcp_read = BufReader::new(tcp);
-
-    // Thread: newline-delimited TCP reader → sends each line (sans newline) to
-    // the WS I/O thread, which frames it as a single WebSocket text frame.
+fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
     std::thread::spawn(move || {
-        let mut r = tcp_read;
-        loop {
-            let mut line = String::new();
-            match r.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
+        let (tx, rx) = mpsc::channel::<PathBuf>();
+
+        let build_dir = project_dir.join("build");
+        let handler = {
+            let tx = tx.clone();
+            let build_dir = build_dir.clone();
+            move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                for p in &event.paths {
+                    if p.starts_with(&build_dir) {
+                        continue; // build output must not re-trigger
+                    }
+                    let _ = tx.send(p.clone());
+                    break;
+                }
+            }
+        };
+
+        let mut watcher = match notify::recommended_watcher(handler) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[watch] could not start file watcher: {e}");
+                return;
+            }
+        };
+
+        let src = project_dir.join("src");
+        if src.is_dir() {
+            if let Err(e) = watcher.watch(&src, RecursiveMode::Recursive) {
+                eprintln!("[watch] cannot watch {}: {e}", src.display());
+            }
+        }
+        for manifest in ["blyt.build.yaml", "blyt.config.yaml", "blyt.info.yaml"] {
+            let p = project_dir.join(manifest);
+            if p.exists() {
+                if let Err(e) = watcher.watch(&p, RecursiveMode::NonRecursive) {
+                    eprintln!("[watch] cannot watch {}: {e}", p.display());
+                }
+            }
+        }
+
+        let settle = std::time::Duration::from_millis(150);
+        let mut reload_id: u64 = 1;
+        while let Ok(path) = rx.recv() {
+            let rel = path.strip_prefix(&project_dir).unwrap_or(&path);
+            println!("[watch] {} changed", rel.display());
+            // Coalesce the burst: keep draining until the watcher goes quiet.
+            while rx.recv_timeout(settle).is_ok() {}
+
+            println!("[build] rebuilding…");
+            match build_for_dev(&project_dir, debug, false) {
                 Ok(_) => {
-                    let trimmed = line.trim_end_matches(['\r', '\n']);
-                    if trimmed.is_empty() {
-                        continue; // ignore blank keepalive lines
-                    }
-                    if tcp_to_ws_tx.send(trimmed.to_string()).is_err() {
-                        break;
-                    }
+                    let msg = format!("{{\"id\":{reload_id},\"cmd\":\"reload\"}}");
+                    let n = hub.broadcast(None, &msg);
+                    println!("[reload] signalled {n} runtime(s)");
+                    reload_id += 1;
+                }
+                Err(e) => {
+                    eprintln!("[build] ✗ {e}");
+                    println!("[reload] skipped (build failed — cart still running)");
                 }
             }
         }
     });
-
-    // Thread: owns the WebSocket; polls non-blocking to interleave reads and writes.
-    std::thread::spawn(move || {
-        ws.get_mut().set_nonblocking(true).ok();
-        let delay = std::time::Duration::from_micros(100);
-        'relay: loop {
-            loop {
-                match ws.read() {
-                    Ok(Message::Text(s)) => {
-                        if ws_to_tcp_tx.send(s.to_string()).is_err() {
-                            break 'relay;
-                        }
-                    }
-                    Ok(Message::Binary(b)) => {
-                        if let Ok(s) = String::from_utf8(b.into()) {
-                            if ws_to_tcp_tx.send(s).is_err() {
-                                break 'relay;
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => break 'relay,
-                    Err(tungstenite::Error::Io(e)) if e.kind() == WouldBlock => break,
-                    Err(_) => break 'relay,
-                    _ => break,
-                }
-            }
-            loop {
-                match tcp_to_ws_rx.try_recv() {
-                    Ok(msg) => {
-                        if ws.send(Message::Text(msg.into())).is_err() {
-                            break 'relay;
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break 'relay,
-                }
-            }
-            match tcp_to_ws_rx.recv_timeout(delay) {
-                Ok(msg) => {
-                    if ws.send(Message::Text(msg.into())).is_err() {
-                        break 'relay;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break 'relay,
-            }
-        }
-    });
-
-    // This thread: forward WS messages (runtime responses) to the TCP client,
-    // re-framing each as a newline-terminated JSON line.
-    let mut tcp_write = tcp_write;
-    for msg in ws_to_tcp_rx {
-        let line = format!("{msg}\n");
-        if tcp_write.write_all(line.as_bytes()).is_err() {
-            break;
-        }
-        let _ = tcp_write.flush();
-    }
 }
 
 /* -------------------------------------------------------------------------
