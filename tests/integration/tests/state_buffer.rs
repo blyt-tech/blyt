@@ -700,6 +700,56 @@ void blyt_cart_draw(void) {}
     run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], "slots_ok");
 }
 
+/// Hybrid (Lua + C) cart accessing state buffers via the Lua `S` proxy on WASM.
+/// Regression for the `S` proxy not being registered for hybrid carts in the
+/// host-Lua fast path (wasm_register_s_proxy read g_lua_state_ctx directly,
+/// which is NULL for hybrid carts), so any S.* access errored and aborted the
+/// WASM main loop. The native leg always worked; only WASM was affected.
+#[test]
+fn wasm_hybrid_lua_state_buffer_round_trips() {
+    require_sdk();
+    require_wasm();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wsb_hybrid");
+
+    CartProject::new()
+        .config(CART_CONFIG)
+        // A C export makes this a hybrid cart (has .lua_exports), so it takes
+        // the g_session path where g_lua_state_ctx is NULL.
+        .c(r#"
+#include "blyt.h"
+
+BLYT_LUA_EXPORT_VOID(work_native) {
+    /* no-op: presence of a Lua export is what makes this a hybrid cart */
+}
+"#)
+        .lua(
+            r#"
+local slot = -1
+
+function init()
+    slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].score = 42
+end
+
+function update()
+    work_native()
+    blyt.debug.print("hybrid_score=" .. tostring(S.game[slot].score))
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_wasm(&cart, "hybrid_score=42");
+}
+
 // ── Free slot ──────────────────────────────────────────────────────────────
 
 /// blyt_buffer_free_slot recycles the slot for the next alloc.
