@@ -382,6 +382,23 @@ void retro_reset_every_frame_cycle(void) {
  * rebuilt cart from disk while preserving state buffers (ADR-0045).
  * ------------------------------------------------------------------------- */
 
+/* Dev control reset: recreate the session AND run the boot frame so init()
+ * executes immediately, leaving the cart in its post-init initial state — the
+ * same state a fresh load reaches before the first dev control command.
+ *
+ * retro_reset() alone defers init() to the next retro_run(), so a save_state or
+ * load_state issued right after reset (before the player loop services another
+ * frame) would observe a pre-init blank: no slots allocated, score zeroed.  The
+ * dev control poll loop drains every buffered command in one pass with no frame
+ * in between, so under load a reset+save_state pair races init() and the save
+ * captures empty state (issue #105).  Booting here closes that race.  This is
+ * the same explicit boot blyt_libretro_reload() runs after swapping the cart. */
+void blyt_libretro_reset(void) {
+    retro_reset();
+    if (g_session)
+        blyt_session_run_frame(g_session);
+}
+
 bool blyt_libretro_save_state(uint32_t slot) {
     return g_session && blyt_session_save_state(g_session, slot) == 0;
 }

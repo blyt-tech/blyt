@@ -210,6 +210,13 @@ fn dev_ctrl_cmd(stream: &mut TcpStream, reader: &mut impl BufRead, cmd: &str) ->
     line.trim_end().to_string()
 }
 
+/// Read one JSON response line.
+fn dev_ctrl_read(reader: &mut impl BufRead) -> String {
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read dev ctrl response");
+    line.trim_end().to_string()
+}
+
 /// The native player listens on the dev control port and services the full
 /// command set: reset / save_state / load_state / reload, with reload swapping
 /// in a freshly built cart while preserving the state buffer (ADR-0045).
@@ -248,20 +255,29 @@ fn native_dev_control_lifecycle_commands() {
         );
     };
 
-    check(
-        &dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":1,"cmd":"reset"}"#),
-        1,
-        "reset",
-    );
-    check(
-        &dev_ctrl_cmd(
-            &mut stream,
-            &mut reader,
-            r#"{"id":2,"cmd":"save_state","slot":1}"#,
-        ),
-        2,
-        "save_state",
-    );
+    // Pipeline reset + save_state in a single write so the player dispatches
+    // both in one poll pass with no frame in between — deterministically
+    // reproducing the issue-#105 race. `reset` recreates a fresh, pre-init
+    // session; unless reset itself boots the cart (runs init), the
+    // immediately-following save_state captures empty state (no slot allocated),
+    // so a later load_state reports score=0. Booting in reset means save_state
+    // serialises the real init() state (score=7).
+    stream
+        .write_all(
+            concat!(
+                "{\"id\":1,\"cmd\":\"reset\"}\n",
+                "{\"id\":2,\"cmd\":\"save_state\",\"slot\":1}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    stream.flush().unwrap();
+    check(&dev_ctrl_read(&mut reader), 1, "reset");
+    check(&dev_ctrl_read(&mut reader), 2, "save_state");
+
+    // load_state round-trips on its own: by now a frame has run, so the cart's
+    // `slot` upvalue is allocated and on_load_state reads slot 0 — reporting the
+    // score that save_state persisted (7 with the fix, 0 without it).
     check(
         &dev_ctrl_cmd(
             &mut stream,
@@ -293,6 +309,13 @@ fn native_dev_control_lifecycle_commands() {
     let _ = child.wait();
 
     let out = lines.lock().unwrap().join("\n");
+    // reset must boot the cart so the save_state pipelined with it captured
+    // init()'s state — load_state then reports the preserved score, not 0.
+    assert!(
+        out.contains("v1 load score=7"),
+        "reset+save_state race: save did not capture init() state \
+         (issue #105); player output:\n{out}"
+    );
     assert!(
         out.contains("v2 load score=7"),
         "reload did not preserve state across the code swap; player output:\n{out}"
