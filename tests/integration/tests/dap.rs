@@ -624,6 +624,61 @@ fn wasm_dap_exception_breakpoint() {
         .success();
 }
 
+/// WASM DAP: a Lua error during init() with NO exception breakpoint must be
+/// reported and exit the debug runtime cleanly — not abort at runtimeKeepalivePop
+/// (issue #102).  The buggy error path called both emscripten_cancel_main_loop()
+/// and emscripten_force_exit(), which double-counts the runtime keepalive and
+/// aborts the ASSERTIONS-on debug runtime.  Here we drive a normal session
+/// (configurationDone, no filter), let the cart error in init(), and assert the
+/// runtime reported the Lua error, did not abort, and the orchestrator exited 0.
+#[test]
+fn wasm_dap_init_error_reports_cleanly() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_init_error");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   nonexistent_global.field = 1\n\
+             end\n\
+             function update() blyt_quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+    let output = Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_EXPECT_INIT_ERROR", "1")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("attempt to index a nil value"),
+        "expected the Lua init error to be reported, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Aborted") && !combined.contains("Assertion failed"),
+        "debug runtime aborted instead of reporting the Lua error cleanly:\n{combined}"
+    );
+}
+
 /// SDL2 DAP: Lua breakpoint in a hybrid (Lua+C) cart — DAP only, no GDB.
 ///
 /// Builds a Lua+C hybrid cart (has both src/game/lua/ and src/game/c/) and

@@ -31,6 +31,12 @@ const CONDITIONAL_COND = process.env.BLYT_DAP_CONDITIONAL_COND || '';
 const CONDITIONAL_COND_EDIT = process.env.BLYT_DAP_CONDITIONAL_COND_EDIT || '';
 const TEST_RESTART = !!process.env.BLYT_DAP_TEST_RESTART;
 const EXCEPTION_FILTER = process.env.BLYT_DAP_EXCEPTION_FILTER || '';
+/* When set, the cart is expected to raise a Lua error during init() with no
+ * exception breakpoint configured.  The driver only completes configuration and
+ * lets the runtime run to its error; the orchestrator then asserts (on the
+ * runtime's console output) that the error was reported and the debug runtime
+ * exited cleanly rather than aborting at runtimeKeepalivePop (issue #102). */
+const EXPECT_INIT_ERROR = !!process.env.BLYT_DAP_EXPECT_INIT_ERROR;
 const EVALUATE_EXPR = process.env.BLYT_DAP_EVALUATE_EXPR || '';
 const EVALUATE_EXPECT = process.env.BLYT_DAP_EVALUATE_EXPECT || '';
 /* When set to the workspace dir, the launch request carries a sourceMap so the
@@ -234,6 +240,16 @@ async function run() {
 		? { sourceMap: ['/blyt/cart', CWD, '/blyt/src', CWD] }
 		: {};
 	await request('launch', launchArgs);
+
+	/* Init-error mode: no breakpoints, no exception filter.  Just finish
+	 * configuration and let the cart error during init().  The runtime must
+	 * report the error and exit cleanly (issue #102); the orchestrator awaits
+	 * the runtime's exit and checks its console output. */
+	if (EXPECT_INIT_ERROR) {
+		await request('configurationDone');
+		_closeConn();
+		return;
+	}
 
 	/* Exception-filter mode: skip regular BPs, just wait for an exception stop. */
 	if (EXCEPTION_FILTER) {

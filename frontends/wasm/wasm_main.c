@@ -1548,10 +1548,18 @@ static void wasm_lua_loop(void) {
 #endif
 
     if (g_lua_fatal) {
-        emscripten_cancel_main_loop();
         lua_cleanup();
+        /* Use exactly one keepalive mechanism here.  emscripten_cancel_main_loop()
+         * makes the in-flight tick stale, so checkIsRunning() pops the runtime
+         * keepalive once on return; emscripten_force_exit() instead clears the
+         * keepalive counter to zero.  Doing both pops twice and aborts the debug
+         * runtime at runtimeKeepalivePop (issue #102), so pick one:
+         *   error  -> force_exit(1): exit code 1, single keepalive account.
+         *   no err -> cancel: clean stop (exit code 0), as the done paths do. */
         if (g_lua_error)
             emscripten_force_exit(1);
+        else
+            emscripten_cancel_main_loop();
         return;
     }
 
@@ -1601,9 +1609,10 @@ static void wasm_lua_loop(void) {
 #endif
             blyt_js_error(msg ? msg : "Lua init error");
             g_lua_error = true;
-            emscripten_cancel_main_loop();
-            lua_cleanup();
-            emscripten_force_exit(1);
+            g_lua_fatal = true;
+            /* Tear down on the next tick via the g_lua_fatal branch, which keeps
+             * the keepalive accounting balanced (issue #102). */
+            blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
             return;
         }
         blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
@@ -1651,9 +1660,10 @@ static void wasm_lua_loop(void) {
 #endif
         blyt_js_error(msg ? msg : "Lua runtime error");
         g_lua_error = true;
-        emscripten_cancel_main_loop();
-        lua_cleanup();
-        emscripten_force_exit(1);
+        g_lua_fatal = true;
+        /* Tear down on the next tick via the g_lua_fatal branch, which keeps
+         * the keepalive accounting balanced (issue #102). */
+        blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H);
         return;
     }
 
