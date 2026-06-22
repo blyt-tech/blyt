@@ -2,9 +2,9 @@ mod common;
 
 use common::{
     CartProject, build_cart, build_lua_cart, require_cpp_sdk, require_libretro_core,
-    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, run_cart_libretro,
-    run_cart_libretro_with_flags, run_cart_native_with_env, run_cart_native_with_flags,
-    run_cart_wasm, run_cart_wasm_with_env,
+    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm,
+    run_cart_all_legs_reset_every_frame, run_cart_libretro, run_cart_libretro_with_flags,
+    run_cart_native_with_env, run_cart_native_with_flags, run_cart_wasm, run_cart_wasm_with_env,
 };
 use tempfile::TempDir;
 
@@ -1708,12 +1708,11 @@ function draw() end
     );
 }
 
-/// Regression for #98: the native (rv32 emulated) Lua lifecycle glue
-/// (blyt32lua.c) must marshal blyt_load_info_t into a Lua `info` table so that
-/// `on_load_state(info)` can read `info.reason` — previously it was called with
-/// no arguments and `info` was nil. The --reset-every-frame cycle restores
-/// state with reason BLYT_LOAD_HOT_RELOAD (3); a cart reading info.reason should
-/// observe that value rather than erroring on a nil table.
+/// Cart for the #98 regression: the Lua lifecycle glue must marshal
+/// blyt_load_info_t into a Lua `info` table so `on_load_state(info)` can read
+/// `info.reason` — previously native saw `info == nil`. The --reset-every-frame
+/// cycle restores state with reason BLYT_LOAD_HOT_RELOAD (3); the cart records
+/// the reason it observed and prints it at frame 10, then self-quits.
 const LUA_LOAD_INFO_CART: &str = r#"
 local frame = 0
 local last_reason = -1
@@ -1744,36 +1743,18 @@ end
 function draw() end
 "#;
 
+/// Regression for #98, across all three legs. The --reset-every-frame cycle
+/// restores with BLYT_LOAD_HOT_RELOAD (3) on native, WASM and libretro alike, so
+/// the same cart must observe `info.reason == 3` identically on every leg — the
+/// native/WASM divergence #98 reported (native saw `info == nil`) is gone. Driven
+/// through `run_cart_all_legs_reset_every_frame` so any future per-leg divergence
+/// fails by construction.
 #[test]
-fn lua_cart_native_on_load_state_receives_reason() {
-    require_sdk();
-    require_lua_sdk();
-
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("lua_load_info");
-
-    CartProject::new()
-        .config(GLOBALS_CONFIG)
-        .lua(LUA_LOAD_INFO_CART)
-        .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-    run_cart_native_with_flags(
-        &cart,
-        &["--reset-every-frame", "--quit-after", "10"],
-        "reason=3",
-    );
-}
-
-/// WASM parity for #98: the host-Lua reset cycle (wasm_main.c) likewise restores
-/// with reason BLYT_LOAD_HOT_RELOAD (3), so the same cart observes the same
-/// `info.reason` — confirming native and WASM no longer diverge.
-#[test]
-fn lua_cart_wasm_on_load_state_receives_reason() {
+fn lua_cart_on_load_state_receives_reason() {
     require_sdk();
     require_lua_sdk();
     require_wasm();
+    require_libretro_core();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("lua_load_info");
@@ -1785,7 +1766,7 @@ fn lua_cart_wasm_on_load_state_receives_reason() {
 
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
-    run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], "reason=3");
+    run_cart_all_legs_reset_every_frame(&cart, "reason=3");
 }
 
 // ── WASM Lua lifecycle ─────────────────────────────────────────────────────
@@ -2236,28 +2217,6 @@ function draw() end
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
     run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], "frame=3");
-}
-
-/// Libretro parity for #98: the embedded guest libblyt32lua marshals the load
-/// `info` table on the reset-every-frame cycle (reason BLYT_LOAD_HOT_RELOAD = 3)
-/// the same as the standalone player, so `on_load_state(info)` reads info.reason.
-#[test]
-fn libretro_lua_cart_on_load_state_receives_reason() {
-    require_sdk();
-    require_lua_sdk();
-    require_libretro_core();
-
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("libretro_lua_load_info");
-
-    CartProject::new()
-        .config(GLOBALS_CONFIG)
-        .lua(LUA_LOAD_INFO_CART)
-        .write(&project);
-
-    let cart = build_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], "reason=3");
 }
 
 // ── Packed entity refs (ADR-0096): generation counters + ref/ref_valid ─────

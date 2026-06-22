@@ -690,6 +690,31 @@ pub fn run_cart_libretro_expect_fail(cart: &std::path::Path) {
         .failure();
 }
 
+/// Run the same cart across all three legs (native / WASM / libretro) and assert
+/// `expected` appears in each leg's output.
+///
+/// Cross-platform behaviour must be identical — determinism across every target
+/// is the core contract — so a feature that diverges between legs fails here by
+/// construction, instead of relying on someone remembering to assert each leg
+/// separately. Callers must gate on `require_sdk()` + `require_wasm()` +
+/// `require_libretro_core()` first (plus `require_lua_sdk()` for Lua carts).
+pub fn run_cart_all_legs(cart: &std::path::Path, expected: &str) {
+    run_cart_native(cart, expected);
+    run_cart_wasm(cart, expected);
+    run_cart_libretro(cart, expected);
+}
+
+/// Like [`run_cart_all_legs`], but drives each leg's `--reset-every-frame`
+/// save/restore stress cycle, translating the per-leg knob (blytplay flag /
+/// `BLYT_RESET_EVERY_FRAME` env / driver flag). The cart must terminate itself
+/// (call `blyt.quit()` / `blyt_quit()`), as the WASM and libretro drivers do not
+/// pass a frame cap.
+pub fn run_cart_all_legs_reset_every_frame(cart: &std::path::Path, expected: &str) {
+    run_cart_native_with_flags(cart, &["--reset-every-frame"], expected);
+    run_cart_wasm_with_env(cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
+    run_cart_libretro_with_flags(cart, &["--reset-every-frame"], expected);
+}
+
 /// Path to the test_session_api binary produced by the CMake build.
 pub fn test_session_api() -> PathBuf {
     build_dir().join("test_session_api")
