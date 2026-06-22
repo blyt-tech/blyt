@@ -680,6 +680,31 @@ pub fn run_cart_libretro_with_flags(cart: &std::path::Path, flags: &[&str], expe
     );
 }
 
+/// Run a cart through the embedded libretro core with extra process environment
+/// variables (e.g. `BLYT_SAVE_DIR` for carts that do disk-backed
+/// `save_write`/`save_read`); assert `expected` appears in the output. The host
+/// runtime inside `test_libretro_core` reads the env, so these flow through to
+/// the embedded guest libs' save path.
+pub fn run_cart_libretro_with_env(
+    cart: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    expected: &str,
+) {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.assert().success().get_output().stderr.clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in libretro core output, got: {}",
+        expected,
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// Run a cart through the embedded libretro core; assert the driver exits
 /// with a non-zero status (load failure or runtime error).
 pub fn run_cart_libretro_expect_fail(cart: &std::path::Path) {
@@ -713,6 +738,20 @@ pub fn run_cart_all_legs_reset_every_frame(cart: &std::path::Path, expected: &st
     run_cart_native_with_flags(cart, &["--reset-every-frame"], expected);
     run_cart_wasm_with_env(cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
     run_cart_libretro_with_flags(cart, &["--reset-every-frame"], expected);
+}
+
+/// Like [`run_cart_all_legs`], but for carts that do disk-backed
+/// `save_write`/`save_read`: each leg is given a `BLYT_SAVE_DIR`. Native and
+/// libretro share a fresh host tempdir; WASM uses `/tmp` (the only path that
+/// exists in its Emscripten MEMFS by default — a host tempdir path would not).
+/// Each leg writes its save before reading it back within the same run, so the
+/// shared native/libretro dir is self-contained per leg.
+pub fn run_cart_all_legs_with_save_dir(cart: &std::path::Path, expected: &str) {
+    let save_dir = tempfile::TempDir::new().unwrap();
+    let sd = save_dir.path().to_str().unwrap();
+    run_cart_native_with_env(cart, &[("BLYT_SAVE_DIR", sd)], expected);
+    run_cart_wasm_with_env(cart, &[("BLYT_SAVE_DIR", "/tmp")], expected);
+    run_cart_libretro_with_env(cart, &[("BLYT_SAVE_DIR", sd)], expected);
 }
 
 /// Path to the test_session_api binary produced by the CMake build.

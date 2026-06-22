@@ -3,8 +3,9 @@ mod common;
 use common::{
     CartProject, build_cart, build_lua_cart, require_cpp_sdk, require_libretro_core,
     require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm,
-    run_cart_all_legs_reset_every_frame, run_cart_libretro, run_cart_libretro_with_flags,
-    run_cart_native_with_env, run_cart_native_with_flags, run_cart_wasm, run_cart_wasm_with_env,
+    run_cart_all_legs_reset_every_frame, run_cart_all_legs_with_save_dir, run_cart_libretro,
+    run_cart_libretro_with_flags, run_cart_native_with_env, run_cart_native_with_flags,
+    run_cart_wasm, run_cart_wasm_with_env,
 };
 use tempfile::TempDir;
 
@@ -1767,6 +1768,71 @@ fn lua_cart_on_load_state_receives_reason() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
     run_cart_all_legs_reset_every_frame(&cart, "reason=3");
+}
+
+/// Cart for Gap A of issue #110: the most common real load path — a cart that
+/// saves and loads *itself* via `blyt.save_read` — had zero coverage of the
+/// `info` it receives. In `update()` the cart writes score=42, saves, clobbers
+/// to 99, then reads slot 0 back. `blyt_save_read` fires `on_load_state` with
+/// `info{reason=SAVE_GAME(0), saved_cart_version=0}` (the current contract;
+/// real `saved_cart_version` wiring is Gap C). The cart prints what it observed
+/// AND the restored score, so the assertion proves the value was delivered and
+/// the buffer actually round-tripped — not merely that the callback fired.
+const LUA_SAVE_READ_INFO_CART: &str = r#"
+local slot = -1
+local got_reason = -1
+local got_version = -1
+
+function on_load_state(info)
+    got_reason = info.reason
+    got_version = info.saved_cart_version
+end
+
+function init()
+    slot = blyt.buf.alloc_slot(S.GAME)
+end
+
+function update()
+    S.game[slot].score = 42
+    blyt.save_write(0)
+    S.game[slot].score = 99
+    blyt.save_read(0)
+    blyt.debug.print(
+        "save_read reason="
+            .. got_reason
+            .. " version="
+            .. got_version
+            .. " score="
+            .. S.game[slot].score
+    )
+    blyt.quit()
+end
+
+function draw() end
+"#;
+
+/// Gap A (issue #110): cart-initiated `blyt.save_read` delivers `on_load_state`
+/// the correct `info` on every leg. The reason is SAVE_GAME (0) and
+/// `saved_cart_version` is 0 (current contract — Gap C wires the real version),
+/// identical across native / WASM / libretro, with the buffer restored to 42.
+#[test]
+fn lua_cart_save_read_delivers_load_info() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_save_read_info");
+
+    CartProject::new()
+        .config(CART_CONFIG)
+        .lua(LUA_SAVE_READ_INFO_CART)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+    run_cart_all_legs_with_save_dir(&cart, "save_read reason=0 version=0 score=42");
 }
 
 // ── WASM Lua lifecycle ─────────────────────────────────────────────────────

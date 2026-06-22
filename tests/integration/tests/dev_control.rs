@@ -128,8 +128,10 @@ state_buffers:
 ";
 
 /// Build a pure-Lua cart whose init() sets game.score to `score`, and whose
-/// on_load_state prints "<tag> load score=<n>".  Native on_load_state receives
-/// no info arg (Phase-9 glue), so the cart must not read one.
+/// on_load_state prints "<tag> load score=<n> reason=<r>".  The host marshals
+/// `blyt_load_info_t` through the guest ABI (PR #109), so the cart reads
+/// `info.reason` to prove the correct trigger reaches it: SAVE_GAME (0) for a
+/// dev-control `load_state`, HOT_RELOAD (3) for a `reload`.
 fn score_cart(tmp: &TempDir, name: &str, tag: &str, score: i32) -> std::path::PathBuf {
     let project = tmp.path().join(name);
     CartProject::new()
@@ -142,8 +144,9 @@ fn score_cart(tmp: &TempDir, name: &str, tag: &str, score: i32) -> std::path::Pa
              end\n\
              function update() end\n\
              function draw() end\n\
-             function on_load_state()\n\
-             \tblyt.debug.print('{tag} load score=' .. tostring(S.game[slot].score))\n\
+             function on_load_state(info)\n\
+             \tblyt.debug.print('{tag} load score=' .. tostring(S.game[slot].score)\n\
+             \t\t.. ' reason=' .. tostring(info.reason))\n\
              end\n"
         ))
         .write(&project);
@@ -311,13 +314,17 @@ fn native_dev_control_lifecycle_commands() {
     let out = lines.lock().unwrap().join("\n");
     // reset must boot the cart so the save_state pipelined with it captured
     // init()'s state — load_state then reports the preserved score, not 0.
+    // load_state delivers reason SAVE_GAME (0) through the guest ABI.
     assert!(
-        out.contains("v1 load score=7"),
+        out.contains("v1 load score=7 reason=0"),
         "reset+save_state race: save did not capture init() state \
-         (issue #105); player output:\n{out}"
+         (issue #105), or load_state did not deliver reason=SAVE_GAME(0); \
+         player output:\n{out}"
     );
+    // reload delivers reason HOT_RELOAD (3) and preserves v1's state into v2.
     assert!(
-        out.contains("v2 load score=7"),
-        "reload did not preserve state across the code swap; player output:\n{out}"
+        out.contains("v2 load score=7 reason=3"),
+        "reload did not preserve state across the code swap, or did not deliver \
+         reason=HOT_RELOAD(3); player output:\n{out}"
     );
 }
