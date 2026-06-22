@@ -131,6 +131,13 @@ function localizeCartPath(p, cwd) {
 	return p;
 }
 
+/* Map a release cart path (`<id>.blyt`) to its debug variant (`<id>.dbg.blyt`),
+ * the artifact `blyt build --debug` produces and that blytdebug / `blyt debug`
+ * load (ADR-0129).  Only a trailing `.blyt` is rewritten. */
+function debugCartPath(cart) {
+	return cart.replace(/\.blyt$/, '.dbg.blyt');
+}
+
 /* BLYT_TRACE channels for debug sessions, passed as a --trace parameter to
  * blytdebug / `blyt debug` so failures always carry a protocol/lifecycle
  * trace ('api' stays opt-in — high volume).  Empty disables tracing. */
@@ -1111,7 +1118,7 @@ function activate(context) {
 
 					/* F5: run with blytdebug and connect the IDE debugger. */
 					if (!(await build(cwd, true))) return undefined;
-					const debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
+					const debugCart = debugCartPath(cart);
 
 					/* Hybrid cart: spawn blytdebug with both --debug and --gdb, then
 					 * start a companion Lua DAP session programmatically.  The GDB
@@ -1237,7 +1244,7 @@ function activate(context) {
 				}
 
 				if (!(await build(cwd, true))) return undefined;
-				const debugCart = cart.replace(/\.blyt$/, '.dbg.blyt');
+				const debugCart = debugCartPath(cart);
 
 				output.appendLine(`\n── blyt debug ${debugCart}`);
 				let result;
@@ -1558,9 +1565,9 @@ function deactivate() {
 
 module.exports = { activate, deactivate };
 
-/* Pure cart-detection helpers exported for unit testing (see test/). These
- * have no VS Code dependency; test/cart-detection.test.js stubs the `vscode`
- * module so this file can be required under plain node. */
+/* Pure helpers exported for unit testing (see test/). These have no VS Code
+ * dependency beyond config reads, which the tests stub via the `vscode` module
+ * so this file can be required under plain node. */
 module.exports._test = {
 	findCartProject,
 	readBuildManifest,
@@ -1570,4 +1577,10 @@ module.exports._test = {
 	cartId,
 	detectAnyCart,
 	BlytGdbDapProxy,
+	sourceMapPairs,
+	sourceMapCommand,
+	localizeCartPath,
+	debugCartPath,
+	sdkDir,
+	traceChannels,
 };

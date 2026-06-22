@@ -52,7 +52,8 @@ framebuffer:
 xvfb-run -a npm run test:integration
 ```
 
-Wiring this into CI (a job that installs the SDK, then `xvfb-run`s the suite) is
-a follow-up; it is not yet part of `.github/workflows/ci.yml`.
+CI runs this suite: the `VS Code debugger integration tests` step in
+`.github/workflows/ci.yml` builds the SDK, then `xvfb-run`s
+`npm run test:integration`.
 
 [`@vscode/test-electron`]: https://github.com/microsoft/vscode-test
