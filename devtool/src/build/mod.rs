@@ -14,6 +14,7 @@ use std::process::Command;
 
 use crate::engine::{BuildError, Task, TaskInput, build_err, run_tasks};
 
+use crate::cart_config_generated::blyt::{CartConfig as FbCartConfig, CartConfigArgs};
 use crate::cart_info_generated::blyt::{CartInfo, CartInfoArgs};
 use crate::cart_layouts_generated::blyt::{
     BufferDecl, BufferDeclArgs, CartLayouts, CartLayoutsArgs, FieldDecl, FieldDeclArgs, RecordDecl,
@@ -164,6 +165,33 @@ fn cart_info_bytes(debug: bool, info: &InfoFields) -> Vec<u8> {
 
     let mut out = Vec::with_capacity(8 + body.len());
     out.extend_from_slice(b"CINF");
+    out.extend_from_slice(&0u16.to_le_bytes()); // format_major
+    out.extend_from_slice(&0u16.to_le_bytes()); // format_minor
+    out.extend_from_slice(body);
+    out
+}
+
+/* -------------------------------------------------------------------------
+ * .cart.config section data (ADR-0073, ADR-0125)
+ *
+ * Runtime-consumed cart configuration. Emitted for every cart so the host can
+ * read save_version (and, in future, fps) from a single well-known section.
+ * ------------------------------------------------------------------------- */
+
+fn cart_config_bytes(cfg: &CartConfig) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let config = FbCartConfig::create(
+        &mut fbb,
+        &CartConfigArgs {
+            fps: cfg.fps,
+            save_version: cfg.save_version,
+        },
+    );
+    fbb.finish(config, None);
+    let body = fbb.finished_data();
+
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(b"CCFG");
     out.extend_from_slice(&0u16.to_le_bytes()); // format_major
     out.extend_from_slice(&0u16.to_le_bytes()); // format_minor
     out.extend_from_slice(body);
@@ -1832,6 +1860,8 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     )?;
     let cart_info_file = build_dir.join("cart.info.bin");
     write_bytes_if_changed(&cart_info_file, &cart_info_bytes(debug, &cart_info))?;
+    let cart_config_file = build_dir.join("cart.config.bin");
+    write_bytes_if_changed(&cart_config_file, &cart_config_bytes(&cart_config))?;
     let entry_stub_src = build_dir.join("_blyt_entry.c");
     write_if_changed(&entry_stub_src, ENTRY_STUB_C)?;
     let interp_src = build_dir.join("_blyt_interp.c");
@@ -2219,6 +2249,8 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     }));
 
     let mut extra_sections: Vec<(String, PathBuf)> = Vec::new();
+    // .cart.config is emitted for every cart (carries save_version; ADR-0125).
+    extra_sections.push((".cart.config".to_string(), cart_config_file.clone()));
     if is_lua {
         extra_sections.push((".cart.lua".to_string(), build_dir.join("bytecode.luac")));
     }
@@ -2414,6 +2446,7 @@ pub fn build_single_lib(
 mod tests {
     use super::external::{tokenize_command, validate_compile_command_template};
     use super::*;
+    use crate::cart_config_generated::blyt::root_as_cart_config;
     use crate::cart_info_generated::blyt::root_as_cart_info;
     use tempfile::tempdir;
 
@@ -2449,6 +2482,29 @@ mod tests {
         assert_eq!(&b[0..4], b"CINF");
         assert_eq!(&b[4..6], &[0, 0], "format_major = 0");
         assert_eq!(&b[6..8], &[0, 0], "format_minor = 0");
+    }
+
+    #[test]
+    fn cart_config_save_version_round_trips() {
+        let cfg = CartConfig {
+            fps: 60,
+            save_version: 7,
+            ..Default::default()
+        };
+        let b = cart_config_bytes(&cfg);
+        assert_eq!(&b[0..4], b"CCFG");
+        assert_eq!(&b[4..6], &[0, 0], "format_major = 0");
+        assert_eq!(&b[6..8], &[0, 0], "format_minor = 0");
+        let config = root_as_cart_config(&b[8..]).expect("valid CartConfig");
+        assert_eq!(config.save_version(), 7);
+        assert_eq!(config.fps(), 60);
+    }
+
+    #[test]
+    fn cart_config_save_version_defaults_zero() {
+        let b = cart_config_bytes(&CartConfig::default());
+        let config = root_as_cart_config(&b[8..]).expect("valid CartConfig");
+        assert_eq!(config.save_version(), 0);
     }
 
     #[test]

@@ -283,6 +283,11 @@ static uint16_t s_gen[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS];
  * array is zero (BSS) but slot functions are not called before startup. */
 static uint32_t s_buf_count[NATIVE_MAX_BUF];
 
+/* The running cart's .cart.config save_version (ADR-0125), loaded at startup
+ * by load_cart_buf_counts().  Stamped into the save header on write and
+ * reported as blyt_load_info_t.saved_cart_version on read.  0 if undeclared. */
+static uint32_t s_save_version;
+
 static uint16_t native_gen(uint32_t bi, int32_t s) {
     return (uint16_t)(s_gen[bi][s] + 1u);
 }
@@ -426,6 +431,67 @@ static void load_cart_buf_counts(void) {
     if (strtab_off == 0 || strtab_size == 0 || (uint64_t)strtab_off + strtab_size > file_size)
         goto done;
     const char *strtab = (const char *)(m + strtab_off);
+
+    /* ── Parse .cart.config save_version (ADR-0125) ──
+     * Independent of .cart.layouts: every cart emits .cart.config, but a cart
+     * with no state buffers has no .cart.layouts.  Stamped into the save header
+     * on write, reported as saved_cart_version on read. */
+    {
+        static const char kConfig[] = ".cart.config";
+        uint32_t config_off = 0, config_size = 0;
+        for (uint16_t si = 0; si < e_shnum; si++) {
+            const uint8_t *shdr = shdrs + (uint32_t)si * 40u;
+            uint32_t sh_name;
+            blyt32_native_memcpy(&sh_name, shdr, 4);
+            if (sh_name >= strtab_size)
+                continue;
+            const char *sname = strtab + sh_name;
+            int match = 1;
+            for (unsigned int ci = 0; ci < sizeof(kConfig); ci++) {
+                if (sname[ci] != kConfig[ci]) {
+                    match = 0;
+                    break;
+                }
+            }
+            if (!match)
+                continue;
+            blyt32_native_memcpy(&config_off, shdr + 16, 4);
+            blyt32_native_memcpy(&config_size, shdr + 20, 4);
+            break;
+        }
+        /* Skip 8-byte CCFG preamble ("CCFG" + u16 major + u16 minor). */
+        if (config_off != 0 && config_size > 8u &&
+            (uint64_t)config_off + config_size <= file_size) {
+            const uint8_t *cfb = m + config_off + 8;
+            uint32_t cfb_size = config_size - 8u;
+            /* Inline FlatBuffer scalar read: CartConfig.save_version is field
+             * id 1 (vtable byte offset 6), a uint32; default 0 if absent. */
+            if (cfb_size >= 8u) {
+                uint32_t croot;
+                blyt32_native_memcpy(&croot, cfb, 4);
+                if (croot + 4u <= cfb_size) {
+                    const uint8_t *ctable = cfb + croot;
+                    int32_t cvsoff;
+                    blyt32_native_memcpy(&cvsoff, ctable, 4);
+                    uint32_t ctable_off = (uint32_t)(ctable - cfb);
+                    if (cvsoff > 0 && (uint32_t)cvsoff <= ctable_off) {
+                        const uint8_t *cvtable = ctable - (uint32_t)cvsoff;
+                        uint16_t cvtsize;
+                        blyt32_native_memcpy(&cvtsize, cvtable, 2);
+                        if (cvtsize >= 8u && (uint32_t)(cvtable - cfb) + cvtsize <= cfb_size) {
+                            uint16_t sv_foff;
+                            blyt32_native_memcpy(&sv_foff, cvtable + 6, 2);
+                            if (sv_foff != 0) {
+                                const uint8_t *sv_ptr = ctable + sv_foff;
+                                if (sv_ptr + 4u <= cfb + cfb_size)
+                                    blyt32_native_memcpy(&s_save_version, sv_ptr, 4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /* Find .cart.layouts section. */
     static const char kLayouts[] = ".cart.layouts";
@@ -890,8 +956,10 @@ blyt_result_t blyt_save_write(uint32_t slot) {
     if (fd < 0)
         return BLYT_ERR_IO;
 
-    /* Write header: magic + version (8 bytes) */
-    uint8_t hdr[8];
+    /* Write header: magic + format version + cart save_version (12 bytes).
+     * The cart save_version (ADR-0125) is reported back as
+     * blyt_load_info_t.saved_cart_version on read. */
+    uint8_t hdr[12];
     hdr[0] = NATIVE_SAVE_MAGIC_0;
     hdr[1] = NATIVE_SAVE_MAGIC_1;
     hdr[2] = NATIVE_SAVE_MAGIC_2;
@@ -900,7 +968,11 @@ blyt_result_t blyt_save_write(uint32_t slot) {
     hdr[5] = (uint8_t)((NATIVE_SAVE_VERSION >> 8) & 0xFFu);
     hdr[6] = (uint8_t)((NATIVE_SAVE_VERSION >> 16) & 0xFFu);
     hdr[7] = (uint8_t)((NATIVE_SAVE_VERSION >> 24) & 0xFFu);
-    if (write_all(fd, hdr, 8) < 0) {
+    hdr[8] = (uint8_t)(s_save_version & 0xFFu);
+    hdr[9] = (uint8_t)((s_save_version >> 8) & 0xFFu);
+    hdr[10] = (uint8_t)((s_save_version >> 16) & 0xFFu);
+    hdr[11] = (uint8_t)((s_save_version >> 24) & 0xFFu);
+    if (write_all(fd, hdr, sizeof(hdr)) < 0) {
         blyt_rs_close(fd);
         return BLYT_ERR_IO;
     }
@@ -941,9 +1013,9 @@ blyt_result_t blyt_save_read(uint32_t slot) {
     if (fd < 0)
         return BLYT_ERR_NOT_FOUND;
 
-    /* Read and verify header */
-    uint8_t hdr[8];
-    if (read_all(fd, hdr, 8) != 0) {
+    /* Read and verify header (magic + format version + cart save_version). */
+    uint8_t hdr[12];
+    if (read_all(fd, hdr, sizeof(hdr)) != 0) {
         blyt_rs_close(fd);
         return BLYT_ERR_IO;
     }
@@ -953,6 +1025,10 @@ blyt_result_t blyt_save_read(uint32_t slot) {
         blyt_rs_close(fd);
         return BLYT_ERR_IO;
     }
+
+    /* The save_version stamped by the cart that wrote this save (ADR-0125). */
+    uint32_t saved_version = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) |
+                             ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
 
     /* Read SOA data */
     if (read_all(fd, s_soa, sizeof(s_soa)) != 0) {
@@ -975,10 +1051,12 @@ blyt_result_t blyt_save_read(uint32_t slot) {
     blyt_rs_close(fd);
     blyt32_trace_call("save_read", (long)slot, 1, 0);
 
-    /* Notify the cart that state was loaded. */
+    /* Notify the cart that state was loaded, reporting the version that wrote
+     * the save (ADR-0087/0125). */
     blyt_load_info_t info;
     blyt32_native_memset(&info, 0, sizeof(info));
     info.reason = BLYT_LOAD_SAVE_GAME;
+    info.saved_cart_version = saved_version;
     blyt_cart_on_load_state(info);
 
     return BLYT_OK;

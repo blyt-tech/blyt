@@ -235,13 +235,16 @@ blyt_result_t blyt_save_write(uint32_t slot) {
 
 blyt_result_t blyt_save_read(uint32_t slot) {
     register long a0 __asm__("a0") = (long)(slot);
+    register long a1 __asm__("a1"); /* host returns the saved cart version here */
     register long a7 __asm__("a7") = ECALL_SAVE_READ;
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    __asm__ volatile("ecall" : "+r"(a0), "=r"(a1) : "r"(a7) : "memory");
     blyt_result_t result = (blyt_result_t)a0;
     if (result == BLYT_OK) {
         blyt_load_info_t info;
         info.reason = BLYT_LOAD_SAVE_GAME;
-        info.saved_cart_version = 0;
+        /* a1 carries the save_version of the cart that wrote the save, read
+         * from the .blys header by the host (ADR-0125/0087). */
+        info.saved_cart_version = (uint32_t)a1;
         info.buffers = 0;
         blyt_cart_on_load_state(info);
     }

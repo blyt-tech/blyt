@@ -731,6 +731,7 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
 
     int has_dwarf = 0; /* set when a .debug_* section is present (ADR-0129) */
     int cart_is_debug = 0; /* .cart.info `debug` flag (read below) */
+    uint32_t cart_save_version = 0; /* .cart.config `save_version` (ADR-0125) */
 
     for (uint16_t i = 0; i < eh->e_shnum; i++) {
         const Elf32_Shdr *sh = &shdrs[i];
@@ -966,12 +967,18 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         }
         memcpy(fb_aligned, fb, fb_size);
         int verify_result = blyt_CartConfig_verify_as_root(fb_aligned, fb_size);
-        free(fb_aligned);
-
         if (verify_result != flatcc_verify_ok) {
+            free(fb_aligned);
             err = BLYT_CART_ERR_BAD_CART_CONFIG;
             goto fail;
         }
+
+        /* Read save_version (ADR-0125): stamped into the save header at write
+         * time, reported back as blyt_load_info_t.saved_cart_version on load. */
+        blyt_CartConfig_table_t config = blyt_CartConfig_as_root(fb_aligned);
+        if (config)
+            cart_save_version = blyt_CartConfig_save_version(config);
+        free(fb_aligned);
     }
 
     /* -----------------------------------------------------------------------
@@ -1059,6 +1066,7 @@ success: {
     cart->map_size = map_size;
     cart->is_debug = cart_is_debug;
     cart->has_dwarf = has_dwarf;
+    cart->save_version = cart_save_version;
     cart->id = cart_id; /* ownership transferred; validated non-NULL above */
     cart->title = cart_title;
     cart->version = cart_version;
@@ -1292,6 +1300,10 @@ const char *blyt_cart_title(const blyt_cart_t *cart) {
 
 const char *blyt_cart_version(const blyt_cart_t *cart) {
     return cart ? cart->version : NULL;
+}
+
+uint32_t blyt_cart_save_version(const blyt_cart_t *cart) {
+    return cart ? cart->save_version : 0u;
 }
 
 const char *blyt_cart_err_str(blyt_cart_err_t err) {

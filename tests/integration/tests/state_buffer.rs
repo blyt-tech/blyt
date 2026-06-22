@@ -3,15 +3,55 @@ mod common;
 use common::{
     CartProject, build_cart, build_lua_cart, require_cpp_sdk, require_libretro_core,
     require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm,
-    run_cart_all_legs_reset_every_frame, run_cart_all_legs_with_save_dir, run_cart_libretro,
-    run_cart_libretro_with_flags, run_cart_native_with_env, run_cart_native_with_flags,
-    run_cart_wasm, run_cart_wasm_with_env,
+    run_cart_all_legs_reset_every_frame, run_cart_all_legs_with_save_dir,
+    run_cart_cross_version_all_legs, run_cart_libretro, run_cart_libretro_with_flags,
+    run_cart_native_with_env, run_cart_native_with_flags, run_cart_wasm, run_cart_wasm_with_env,
 };
 use tempfile::TempDir;
 
 // ── Config helpers ─────────────────────────────────────────────────────────
 
 const CART_CONFIG: &str = "\
+records:
+  Game:
+    fields:
+      - { name: score, type: i32 }
+state_buffers:
+  game:
+    record: Game
+    count: 1
+";
+
+/// Same schema as CART_CONFIG, but declares a non-zero save_version so the
+/// runtime stamps it into the save header and reports it back on load (Gap C).
+const SAVE_VERSION_7_CONFIG: &str = "\
+save_version: 7
+records:
+  Game:
+    fields:
+      - { name: score, type: i32 }
+state_buffers:
+  game:
+    record: Game
+    count: 1
+";
+
+/// Cross-version round trip (issue #112): a writer cart and a reader cart that
+/// share an identical state-buffer schema but declare different save_versions.
+/// The reader must observe the *writer's* version on load.
+const SAVE_VERSION_1_CONFIG: &str = "\
+save_version: 1
+records:
+  Game:
+    fields:
+      - { name: score, type: i32 }
+state_buffers:
+  game:
+    record: Game
+    count: 1
+";
+const SAVE_VERSION_2_CONFIG: &str = "\
+save_version: 2
 records:
   Game:
     fields:
@@ -1774,10 +1814,11 @@ fn lua_cart_on_load_state_receives_reason() {
 /// saves and loads *itself* via `blyt.save_read` — had zero coverage of the
 /// `info` it receives. In `update()` the cart writes score=42, saves, clobbers
 /// to 99, then reads slot 0 back. `blyt_save_read` fires `on_load_state` with
-/// `info{reason=SAVE_GAME(0), saved_cart_version=0}` (the current contract;
-/// real `saved_cart_version` wiring is Gap C). The cart prints what it observed
-/// AND the restored score, so the assertion proves the value was delivered and
-/// the buffer actually round-tripped — not merely that the callback fired.
+/// `info{reason=SAVE_GAME(0), saved_cart_version=<the cart's declared
+/// save_version>}` (Gap C, issue #112: the version is read from the save
+/// header the cart itself just wrote). The cart prints what it observed AND the
+/// restored score, so the assertion proves the value was delivered and the
+/// buffer actually round-tripped — not merely that the callback fired.
 const LUA_SAVE_READ_INFO_CART: &str = r#"
 local slot = -1
 local got_reason = -1
@@ -1811,10 +1852,11 @@ end
 function draw() end
 "#;
 
-/// Gap A (issue #110): cart-initiated `blyt.save_read` delivers `on_load_state`
-/// the correct `info` on every leg. The reason is SAVE_GAME (0) and
-/// `saved_cart_version` is 0 (current contract — Gap C wires the real version),
-/// identical across native / WASM / libretro, with the buffer restored to 42.
+/// Gap A (issue #110) + Gap C (issue #112): cart-initiated `blyt.save_read`
+/// delivers `on_load_state` the correct `info` on every leg. The reason is
+/// SAVE_GAME (0) and `saved_cart_version` is the cart's declared `save_version`
+/// (7 here, read back from the save header the cart just wrote), identical
+/// across native / WASM / libretro, with the buffer restored to 42.
 #[test]
 fn lua_cart_save_read_delivers_load_info() {
     require_sdk();
@@ -1826,13 +1868,92 @@ fn lua_cart_save_read_delivers_load_info() {
     let project = tmp.path().join("lua_save_read_info");
 
     CartProject::new()
-        .config(CART_CONFIG)
+        .config(SAVE_VERSION_7_CONFIG)
         .lua(LUA_SAVE_READ_INFO_CART)
         .write(&project);
 
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
-    run_cart_all_legs_with_save_dir(&cart, "save_read reason=0 version=0 score=42");
+    run_cart_all_legs_with_save_dir(&cart, "save_read reason=0 version=7 score=42");
+}
+
+/// Writer for the cross-version round trip: declares save_version=1, writes
+/// score=42 to slot 0, then quits.
+const LUA_CROSS_VERSION_WRITER: &str = r#"
+function init() end
+
+function update()
+    local slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].score = 42
+    blyt.save_write(0)
+    blyt.debug.print("writer save_version=1 wrote score=42")
+    blyt.quit()
+end
+
+function draw() end
+"#;
+
+/// Reader for the cross-version round trip: declares save_version=2, loads the
+/// save the writer produced, and reports the version it observed. It must see
+/// the *writer's* version (1), proving the value comes from the save header,
+/// not the reader's own manifest (2).
+const LUA_CROSS_VERSION_READER: &str = r#"
+local got_version = -1
+
+function on_load_state(info)
+    got_version = info.saved_cart_version
+end
+
+function update()
+    blyt.save_read(0)
+    blyt.debug.print(
+        "reader save_version=2 saw version=" .. got_version .. " score=" .. S.game[0].score
+    )
+    blyt.quit()
+end
+
+function init() end
+
+function draw() end
+"#;
+
+/// Gap C (issue #112): a v1 cart writes a save; a v2 cart reads it and observes
+/// `saved_cart_version == 1` (the version that *wrote* the save), identical
+/// across native / WASM / libretro. This is the load-info value's reason for
+/// existing — it lets a cart migrate saves written by an older version.
+#[test]
+fn lua_cross_version_save_read_reports_writer_version() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    // Same leaf name → same cart id "xver" (the save path is keyed by id), in
+    // separate parent dirs so the two projects do not collide on disk.
+    let writer_dir = tmp.path().join("w").join("xver");
+    let reader_dir = tmp.path().join("r").join("xver");
+
+    CartProject::new()
+        .config(SAVE_VERSION_1_CONFIG)
+        .lua(LUA_CROSS_VERSION_WRITER)
+        .write(&writer_dir);
+    CartProject::new()
+        .config(SAVE_VERSION_2_CONFIG)
+        .lua(LUA_CROSS_VERSION_READER)
+        .write(&reader_dir);
+
+    let writer = build_lua_cart(&writer_dir);
+    let reader = build_lua_cart(&reader_dir);
+    assert!(writer.exists() && reader.exists());
+
+    run_cart_cross_version_all_legs(
+        &writer,
+        &reader,
+        "xver",
+        "writer save_version=1 wrote score=42",
+        "reader save_version=2 saw version=1 score=42",
+    );
 }
 
 // ── WASM Lua lifecycle ─────────────────────────────────────────────────────

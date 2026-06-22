@@ -1,4 +1,5 @@
 mod build;
+mod cart_config_generated;
 mod cart_info_generated;
 mod cart_layouts_generated;
 mod config;

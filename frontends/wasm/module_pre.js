@@ -31,6 +31,20 @@ var Module = (() => {
 			FS.writeFile('/cart.blyt', globalThis.__blyt_cart_data);
 		});
 	}
+	/* Seed files into MEMFS before the cart runs (e.g. a pre-existing .blys save
+	 * so a reader cart can load a save written by a *different* cart process —
+	 * MEMFS does not persist across the per-process WASM runs).  Each entry is
+	 * { path: string, data: Uint8Array }; parent directories are created. */
+	if (typeof globalThis !== 'undefined' && globalThis.__blyt_seed_files) {
+		base.preRun.unshift(() => {
+			var files = globalThis.__blyt_seed_files;
+			for (let i = 0; i < files.length; i++) {
+				const slash = files[i].path.lastIndexOf('/');
+				if (slash > 0) FS.mkdirTree(files[i].path.slice(0, slash));
+				FS.writeFile(files[i].path, files[i].data);
+			}
+		});
+	}
 	/* ENV injection: run_cart.js sets __blyt_env_vars to forward C getenv() keys
 	 * (e.g. BLYT_SAVE_DIR) into the Emscripten C environment.  The preRun hook
 	 * runs after the module-local ENV object is assigned but before C startup

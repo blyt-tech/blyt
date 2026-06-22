@@ -769,7 +769,8 @@ static int wasm_lua_save_write(lua_State *L) {
     int r = -1;
     blyt_state_ctx_t *ctx = active_state_ctx();
     if (ctx)
-        r = blyt_save_write(ctx, active_save_dir(), active_cart_name(), slot);
+        r = blyt_save_write(ctx, active_save_dir(), active_cart_name(), slot,
+                            blyt_cart_save_version(g_cart));
     lua_pushinteger(L, r);
     return 1;
 }
@@ -777,18 +778,19 @@ static int wasm_lua_save_write(lua_State *L) {
 static int wasm_lua_save_read(lua_State *L) {
     uint32_t slot = (uint32_t)luaL_checkinteger(L, 1);
     int r = -1;
+    uint32_t saved_version = 0;
     blyt_state_ctx_t *ctx = active_state_ctx();
     if (ctx)
-        r = blyt_save_read(ctx, active_save_dir(), active_cart_name(), slot);
+        r = blyt_save_read(ctx, active_save_dir(), active_cart_name(), slot, &saved_version);
     lua_pushinteger(L, r);
     if (r == BLYT_RUN_OK) {
         lua_getglobal(L, "on_load_state");
         if (lua_isfunction(L, -1)) {
             blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_load_state");
             lua_newtable(L);
-            lua_pushinteger(L, 0); /* reason=BLYT_LOAD_EXPLICIT */
+            lua_pushinteger(L, 0); /* reason=BLYT_LOAD_SAVE_GAME */
             lua_setfield(L, -2, "reason");
-            lua_pushinteger(L, 0);
+            lua_pushinteger(L, (lua_Integer)saved_version);
             lua_setfield(L, -2, "saved_cart_version");
             lua_pcall(L, 1, 0, 0);
             blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_load_state");
@@ -1349,7 +1351,9 @@ void blyt_dev_ctrl_command(const char *json) {
         else
             lua_pop(g_lua, 1);
         blyt_state_ctx_t *ctx = active_state_ctx();
-        int r = ctx ? blyt_save_write(ctx, active_save_dir(), active_cart_name(), slot) : -1;
+        int r = ctx ? blyt_save_write(ctx, active_save_dir(), active_cart_name(), slot,
+                                      blyt_cart_save_version(g_cart))
+                    : -1;
         if (r == BLYT_RUN_OK)
             dev_ctrl_respond_ok(id, cmd);
         else
@@ -1365,7 +1369,10 @@ void blyt_dev_ctrl_command(const char *json) {
         }
         uint32_t slot = (uint32_t)dev_ctrl_int(json, "slot", 0);
         blyt_state_ctx_t *ctx = active_state_ctx();
-        int r = ctx ? blyt_save_read(ctx, active_save_dir(), active_cart_name(), slot) : -1;
+        uint32_t saved_version = 0;
+        int r =
+            ctx ? blyt_save_read(ctx, active_save_dir(), active_cart_name(), slot, &saved_version)
+                : -1;
         if (r != BLYT_RUN_OK) {
             dev_ctrl_respond_err(id, cmd, "load_state failed");
             return;
@@ -1373,9 +1380,9 @@ void blyt_dev_ctrl_command(const char *json) {
         lua_getglobal(g_lua, "on_load_state");
         if (lua_isfunction(g_lua, -1)) {
             lua_newtable(g_lua);
-            lua_pushinteger(g_lua, 0); /* reason = BLYT_LOAD_EXPLICIT */
+            lua_pushinteger(g_lua, 0); /* reason = BLYT_LOAD_SAVE_GAME */
             lua_setfield(g_lua, -2, "reason");
-            lua_pushinteger(g_lua, 0);
+            lua_pushinteger(g_lua, (lua_Integer)saved_version);
             lua_setfield(g_lua, -2, "saved_cart_version");
             lua_pcall(g_lua, 1, 0, 0);
         } else {

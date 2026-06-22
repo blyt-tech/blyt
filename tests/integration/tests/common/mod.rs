@@ -650,6 +650,55 @@ pub fn run_cart_wasm_with_env(cart: &std::path::Path, extra_env: &[(&str, &str)]
     );
 }
 
+/// Like [`run_cart_wasm_with_env`], but also seeds files into the WASM MEMFS
+/// before the cart runs: each `(memfs_path, host_path)` reads the host file and
+/// writes it to `memfs_path` (parent dirs created).  Needed for cross-process
+/// save sharing — a save written by one cart process is not visible to another
+/// (each WASM run has a private MEMFS), so the writer's byte-identical `.blys`
+/// is seeded into the reader's MEMFS.
+pub fn run_cart_wasm_with_env_and_seed(
+    cart: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    seed_files: &[(&str, &std::path::Path)],
+    expected: &str,
+) {
+    use assert_cmd::Command;
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+    let wasm_dir = find_wasm_dir();
+    // Minimal JSON encoding (no serde_json), matching run_cart_wasm_with_env.
+    let json_obj = |pairs: Vec<String>| format!("{{{}}}", pairs.join(","));
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let env_json = json_obj(
+        extra_env
+            .iter()
+            .map(|(k, v)| format!("\"{}\":\"{}\"", esc(k), esc(v)))
+            .collect(),
+    );
+    let seed_json = json_obj(
+        seed_files
+            .iter()
+            .map(|(memfs, host)| format!("\"{}\":\"{}\"", esc(memfs), esc(host.to_str().unwrap())))
+            .collect(),
+    );
+    let mut cmd = Command::new("node");
+    // 4th arg = frame0OutPath (empty); 5th = env JSON; 6th = seed-files JSON.
+    cmd.args([
+        driver.to_str().unwrap(),
+        wasm_dir.to_str().unwrap(),
+        cart.to_str().unwrap(),
+        "",
+        &env_json,
+        &seed_json,
+    ]);
+    let output = cmd.assert().success().get_output().stdout.clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in wasm output, got: {}",
+        expected,
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// Run a cart through the embedded libretro core (test_libretro_core dlopens
 /// blyt_libretro.so); assert `expected` appears in the output.  This is the
 /// third leg of the native/wasm test pairs: it exercises the core's EMBEDDED
@@ -752,6 +801,51 @@ pub fn run_cart_all_legs_with_save_dir(cart: &std::path::Path, expected: &str) {
     run_cart_native_with_env(cart, &[("BLYT_SAVE_DIR", sd)], expected);
     run_cart_wasm_with_env(cart, &[("BLYT_SAVE_DIR", "/tmp")], expected);
     run_cart_libretro_with_env(cart, &[("BLYT_SAVE_DIR", sd)], expected);
+}
+
+/// Cross-version save round trip (issue #112): a `writer` cart (declaring one
+/// `save_version`) writes a save; a `reader` cart (declaring a *different*
+/// `save_version`) loads it and must observe the **writer's** version — the
+/// value comes from the save header, not the reader's own manifest. `writer`
+/// and `reader` must share a cart `id` (the save path is keyed by id) and an
+/// identical state-buffer schema (so the load is accepted).
+///
+/// `writer_expected` is asserted on the writer run; `reader_expected` on every
+/// reader leg. native(blytplay) + libretro share a real host save dir, so the
+/// writer's `<sd>/<id>/slot_0.blys` is read back directly. WASM's per-process
+/// MEMFS can't see another process's save, so that byte-identical file is
+/// seeded into the WASM reader's MEMFS at `/tmp/<id>/slot_0.blys`.
+pub fn run_cart_cross_version_all_legs(
+    writer: &std::path::Path,
+    reader: &std::path::Path,
+    cart_id: &str,
+    writer_expected: &str,
+    reader_expected: &str,
+) {
+    let save_dir = tempfile::TempDir::new().unwrap();
+    let sd = save_dir.path().to_str().unwrap();
+
+    // Writer runs once (blytplay) to produce <sd>/<id>/slot_0.blys.
+    run_cart_native_with_env(writer, &[("BLYT_SAVE_DIR", sd)], writer_expected);
+    let blys = save_dir.path().join(cart_id).join("slot_0.blys");
+    assert!(
+        blys.exists(),
+        "writer did not produce a save at {}",
+        blys.display()
+    );
+
+    // native(blytplay) + libretro read the writer's save from the shared dir.
+    run_cart_native_with_env(reader, &[("BLYT_SAVE_DIR", sd)], reader_expected);
+    run_cart_libretro_with_env(reader, &[("BLYT_SAVE_DIR", sd)], reader_expected);
+
+    // WASM: seed the writer's .blys into the reader process's MEMFS.
+    let memfs_path = format!("/tmp/{cart_id}/slot_0.blys");
+    run_cart_wasm_with_env_and_seed(
+        reader,
+        &[("BLYT_SAVE_DIR", "/tmp")],
+        &[(memfs_path.as_str(), blys.as_path())],
+        reader_expected,
+    );
 }
 
 /// Path to the test_session_api binary produced by the CMake build.

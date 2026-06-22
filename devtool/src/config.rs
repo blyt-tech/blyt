@@ -13,12 +13,18 @@ use std::path::Path;
 #[serde(deny_unknown_fields)]
 pub struct CartConfig {
     /// Target frames per second (default: 60).
-    /// TODO: emit the .cart.config FlatBuffer section (schemas/cart_config.fbs)
-    /// so this reaches the host; until then the value is parsed but unused and
-    /// carts always run at the fixed 60 Hz timestep.
+    /// TODO: the host still hardcodes the 60 Hz timestep; this value reaches the
+    /// host via .cart.config but is not yet consumed for frame pacing.
     #[serde(default = "default_fps")]
     #[allow(dead_code)]
     pub fps: u8,
+
+    /// Cart save-format version (ADR-0125): a monotonic integer the runtime
+    /// stamps into the .blys save header at write time and reports back as
+    /// `blyt_load_info_t.saved_cart_version` on load (ADR-0087). 0 means
+    /// undeclared. Packed into .cart.config (CartConfig.save_version).
+    #[serde(default)]
+    pub save_version: u32,
 
     /// Named record type declarations (flat POD structs).
     #[serde(default)]
@@ -352,6 +358,18 @@ state_buffers:
     record: Character
     count: 1
 ";
+
+    #[test]
+    fn save_version_defaults_to_zero_when_absent() {
+        let cfg = parse("fps: 60\n").unwrap();
+        assert_eq!(cfg.save_version, 0);
+    }
+
+    #[test]
+    fn save_version_parses_when_declared() {
+        let cfg = parse("save_version: 7\n").unwrap();
+        assert_eq!(cfg.save_version, 7);
+    }
 
     #[test]
     fn ref_field_parses_as_u32_with_target() {

@@ -660,7 +660,8 @@ function draw() end
         let sb_project = tmp.path().join("sb_metal");
         CartProject::new()
             .config(
-                "records:\n  Game:\n    fields:\n      - { name: score, type: i32 }\n\
+                "save_version: 9\n\
+                 records:\n  Game:\n    fields:\n      - { name: score, type: i32 }\n\
                  state_buffers:\n  game:\n    record: Game\n    count: 1\n",
             )
             .c(r#"
@@ -673,6 +674,15 @@ static int g_phase = 0;
 void blyt_cart_init(void) {
     blyt_buffer_alloc_slot(S_GAME, &g_slot);
     blyt_console_debug("sb-init");
+}
+/* save_read fires on_load_state with the version that wrote the save, read
+ * from the .blys header (ADR-0125/0087) — here the cart's own save_version 9. */
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    if (info.saved_cart_version == 9) {
+        blyt_console_debug("version-ok");
+    } else {
+        blyt_console_debug("version-fail");
+    }
 }
 void blyt_cart_update(void) {
     if (g_phase == 0) {
@@ -729,6 +739,11 @@ void blyt_cart_draw(void) {}
         assert!(
             output.contains("score-ok"),
             "expected 'score-ok' in output (save/load round-trip)\noutput: {output}"
+        );
+        assert!(
+            output.contains("version-ok"),
+            "expected 'version-ok' (saved_cart_version 9 from .cart.config stamped \
+             into and read back from the native save header; issue #112)\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
     }

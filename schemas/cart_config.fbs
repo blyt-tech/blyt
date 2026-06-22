@@ -5,6 +5,12 @@ namespace blyt;
 
 table CartConfig {
     fps: uint8 = 60;
+    // Cart save-format version (ADR-0125): a monotonic integer the runtime
+    // stamps into the .blys save header at write time, then reports back as
+    // blyt_load_info_t.saved_cart_version on load so the cart can migrate
+    // (ADR-0087). 0 means undeclared. Appended field (FlatBuffers: never
+    // reorder the fields above).
+    save_version: uint32 = 0;
 }
 
 root_type CartConfig;

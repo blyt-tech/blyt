@@ -28,10 +28,15 @@ var frame0OutPath = process.argv[4] || null;
 /* Optional 5th argument: JSON object of env vars to inject into the C
  * environment via globalThis.__blyt_env_vars (read by module_pre.js). */
 var envVarsJson = process.argv[5] || null;
+/* Optional 6th argument: JSON object mapping a MEMFS path to a host file path;
+ * each host file is read and seeded into MEMFS before the cart runs (e.g. a
+ * pre-existing .blys save written by another cart process). */
+var seedFilesJson = process.argv[6] || null;
 
 if (!wasmDir || !cartPath) {
 	process.stderr.write(
-		'usage: run_cart.js <wasm_dir> <cart_path> [<frame0_output> [<env_json>]]\n',
+		'usage: run_cart.js <wasm_dir> <cart_path> ' +
+			'[<frame0_output> [<env_json> [<seed_files_json>]]]\n',
 	);
 	process.exit(1);
 }
@@ -59,6 +64,18 @@ if (envVarsJson) {
 		global.__blyt_env_vars = JSON.parse(envVarsJson);
 	} catch (e) {
 		process.stderr.write(`run_cart.js: invalid env JSON: ${e.message}\n`);
+		process.exit(1);
+	}
+}
+if (seedFilesJson) {
+	try {
+		const seedMap = JSON.parse(seedFilesJson);
+		global.__blyt_seed_files = Object.keys(seedMap).map((memfsPath) => ({
+			path: memfsPath,
+			data: new Uint8Array(nodefs.readFileSync(seedMap[memfsPath])),
+		}));
+	} catch (e) {
+		process.stderr.write(`run_cart.js: cannot seed files: ${e.message}\n`);
 		process.exit(1);
 	}
 }
