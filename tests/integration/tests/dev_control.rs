@@ -117,6 +117,7 @@ fn run_announces_dev_control_port() {
 /* ── native player ────────────────────────────────────────────────────────── */
 
 const DEV_CTRL_CONFIG: &str = "\
+save_version: 5
 records:
   Game:
     fields:
@@ -128,10 +129,12 @@ state_buffers:
 ";
 
 /// Build a pure-Lua cart whose init() sets game.score to `score`, and whose
-/// on_load_state prints "<tag> load score=<n> reason=<r>".  The host marshals
-/// `blyt_load_info_t` through the guest ABI (PR #109), so the cart reads
-/// `info.reason` to prove the correct trigger reaches it: SAVE_GAME (0) for a
-/// dev-control `load_state`, HOT_RELOAD (3) for a `reload`.
+/// on_load_state prints "<tag> load score=<n> reason=<r> version=<v>".  The host
+/// marshals `blyt_load_info_t` through the guest ABI (PR #109), so the cart
+/// reads `info.reason` to prove the correct trigger reaches it: SAVE_GAME (0)
+/// for a dev-control `load_state`, HOT_RELOAD (3) for a `reload`.  It also reads
+/// `info.saved_cart_version` (issue #112): the cart's declared save_version (5)
+/// for a load_state (read from the save header), 0 for a non-SAVE_GAME reload.
 fn score_cart(tmp: &TempDir, name: &str, tag: &str, score: i32) -> std::path::PathBuf {
     let project = tmp.path().join(name);
     CartProject::new()
@@ -146,7 +149,8 @@ fn score_cart(tmp: &TempDir, name: &str, tag: &str, score: i32) -> std::path::Pa
              function draw() end\n\
              function on_load_state(info)\n\
              \tblyt.debug.print('{tag} load score=' .. tostring(S.game[slot].score)\n\
-             \t\t.. ' reason=' .. tostring(info.reason))\n\
+             \t\t.. ' reason=' .. tostring(info.reason)\n\
+             \t\t.. ' version=' .. tostring(info.saved_cart_version))\n\
              end\n"
         ))
         .write(&project);
@@ -315,16 +319,19 @@ fn native_dev_control_lifecycle_commands() {
     // reset must boot the cart so the save_state pipelined with it captured
     // init()'s state — load_state then reports the preserved score, not 0.
     // load_state delivers reason SAVE_GAME (0) through the guest ABI.
+    // load_state reports the cart's save_version (5), read from the save header
+    // the save_state wrote (issue #112).
     assert!(
-        out.contains("v1 load score=7 reason=0"),
+        out.contains("v1 load score=7 reason=0 version=5"),
         "reset+save_state race: save did not capture init() state \
-         (issue #105), or load_state did not deliver reason=SAVE_GAME(0); \
-         player output:\n{out}"
+         (issue #105), or load_state did not deliver reason=SAVE_GAME(0) / \
+         the saved version (5; issue #112); player output:\n{out}"
     );
-    // reload delivers reason HOT_RELOAD (3) and preserves v1's state into v2.
+    // reload delivers reason HOT_RELOAD (3) and preserves v1's state into v2;
+    // a non-SAVE_GAME reason reports version 0 (ADR-0087).
     assert!(
-        out.contains("v2 load score=7 reason=3"),
+        out.contains("v2 load score=7 reason=3 version=0"),
         "reload did not preserve state across the code swap, or did not deliver \
-         reason=HOT_RELOAD(3); player output:\n{out}"
+         reason=HOT_RELOAD(3) / version=0; player output:\n{out}"
     );
 }

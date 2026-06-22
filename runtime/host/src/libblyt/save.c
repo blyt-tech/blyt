@@ -97,7 +97,7 @@ static uint64_t read_u64le(const uint8_t *p) {
 }
 
 int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir, const char *cart_name,
-                    uint32_t slot) {
+                    uint32_t slot, uint32_t save_version) {
     if (!save_dir || !cart_name)
         return -1;
 
@@ -112,15 +112,16 @@ int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir, const char *c
     if (!f)
         return -1;
 
-    /* File header: 16 bytes */
-    uint8_t hdr[16];
+    /* File header: 20 bytes (minor 1; ADR-0125) */
+    uint8_t hdr[20];
     memcpy(hdr, BLYS_MAGIC, 4);
     write_u16le(hdr + 4, BLYS_FORMAT_VERSION_MAJOR);
     write_u16le(hdr + 6, BLYS_FORMAT_VERSION_MINOR);
     /* Use schema_hash from first buffer (all buffers share the same schema_hash). */
     uint64_t schema_hash = state->n_buffers > 0 ? state->buffers[0].schema_hash : 0;
     write_u64le(hdr + 8, schema_hash);
-    if (fwrite(hdr, 1, 16, f) != 16) {
+    write_u32le(hdr + 16, save_version); /* writing cart's save_version */
+    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
         fclose(f);
         return -1;
     }
@@ -190,7 +191,9 @@ int blyt_save_write(blyt_state_ctx_t *state, const char *save_dir, const char *c
 }
 
 int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir, const char *cart_name,
-                   uint32_t slot) {
+                   uint32_t slot, uint32_t *out_save_version) {
+    if (out_save_version)
+        *out_save_version = 0;
     if (!save_dir || !cart_name)
         return -1;
 
@@ -202,7 +205,7 @@ int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir, const char *ca
     if (!f)
         return -1;
 
-    /* Read header */
+    /* Read the 16-byte base header (magic, format major/minor, schema_hash). */
     uint8_t hdr[16];
     if (fread(hdr, 1, 16, f) != 16) {
         fclose(f);
@@ -212,6 +215,19 @@ int blyt_save_read(blyt_state_ctx_t *state, const char *save_dir, const char *ca
     if (memcmp(hdr, BLYS_MAGIC, 4) != 0) {
         fclose(f);
         return -1;
+    }
+
+    /* minor ≥ 1 (ADR-0125): a uint32 save_version follows at offset 16; minor 0
+     * saves end the header at 16 bytes and report save_version 0. */
+    uint16_t format_minor = (uint16_t)(hdr[6] | ((uint16_t)hdr[7] << 8));
+    if (format_minor >= 1) {
+        uint8_t sv[4];
+        if (fread(sv, 1, 4, f) != 4) {
+            fclose(f);
+            return -1;
+        }
+        if (out_save_version)
+            *out_save_version = read_u32le(sv);
     }
 
     uint64_t saved_hash = read_u64le(hdr + 8);

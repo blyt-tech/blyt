@@ -167,6 +167,9 @@ typedef struct {
     char *save_dir;
     /* Cart name derived from the cart path (used as save subdirectory). */
     char cart_name[64];
+    /* .cart.config save_version (ADR-0125): stamped into the save header on
+     * write; reported to on_load_state from the *save header* on read. */
+    uint32_t save_version;
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -1563,7 +1566,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
         int r = -1;
         if (g_run_ctx && g_run_ctx->state_ctx && g_run_ctx->save_dir) {
             r = blyt_save_write(g_run_ctx->state_ctx, g_run_ctx->save_dir, g_run_ctx->cart_name,
-                                slot_n);
+                                slot_n, g_run_ctx->save_version);
         }
         blyt_tracef(BLYT_TRACE_API, "save_write(slot=%u) -> %d", slot_n, r);
         rv_set_reg(rv, rv_reg_a0, r == 0 ? 0u : 3u); /* BLYT_ERR_IO=3 */
@@ -1572,17 +1575,21 @@ static void blyt_ecall_handler(riscv_t *rv) {
     }
 
     case BLYT_ECALL_SAVE_READ: {
-        /* a0=slot (uint32_t); guest stub calls on_load_state after we return. */
+        /* a0=slot (uint32_t); guest stub calls on_load_state after we return,
+         * using the saved cart version we return in a1 (ADR-0125/0087). */
         uint32_t slot_n = rv_get_reg(rv, rv_reg_a0);
         int r = -1;
+        uint32_t saved_version = 0;
         if (g_run_ctx && g_run_ctx->state_ctx && g_run_ctx->save_dir) {
             r = blyt_save_read(g_run_ctx->state_ctx, g_run_ctx->save_dir, g_run_ctx->cart_name,
-                               slot_n);
+                               slot_n, &saved_version);
         }
         /* r==0 → BLYT_OK=0, r==-1 → BLYT_ERR_IO=3, r==-2 → BLYT_ERR_SCHEMA_MISMATCH=5 */
         uint32_t result = (r == 0) ? 0u : (r == -2) ? 5u : 3u;
-        blyt_tracef(BLYT_TRACE_API, "save_read(slot=%u) -> %u", slot_n, result);
+        blyt_tracef(BLYT_TRACE_API, "save_read(slot=%u) -> %u (saved_version=%u)", slot_n, result,
+                    saved_version);
         rv_set_reg(rv, rv_reg_a0, result);
+        rv_set_reg(rv, rv_reg_a1, saved_version);
         rv->PC += 4;
         return;
     }
@@ -2365,6 +2372,9 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     /* The manifest id names the save file subdirectory (validated at load
      * time: ≤63 bytes, so it always fits cart_name[64]). */
     snprintf(s->ctx.cart_name, sizeof(s->ctx.cart_name), "%s", cart->id);
+
+    /* save_version stamped into the save header on write (ADR-0125). */
+    s->ctx.save_version = cart->save_version;
 
     /* Resolve save directory: BLYT_SAVE_DIR env var or ~/.local/share/blyt */
     {
@@ -3155,18 +3165,21 @@ int blyt_session_save_state(blyt_session_t *s, uint32_t slot) {
         return -1;
     /* Flush transient state into buffers, then serialise to disk. */
     call_guest_hook(s, s->fn_on_save_state, 0, NULL);
-    return blyt_save_write(&s->state_ctx, s->ctx.save_dir, s->ctx.cart_name, slot);
+    return blyt_save_write(&s->state_ctx, s->ctx.save_dir, s->ctx.cart_name, slot,
+                           s->ctx.save_version);
 }
 
 int blyt_session_load_state(blyt_session_t *s, uint32_t slot) {
     int r;
+    uint32_t saved_version = 0;
     if (!s)
         return -1;
-    r = blyt_save_read(&s->state_ctx, s->ctx.save_dir, s->ctx.cart_name, slot);
+    r = blyt_save_read(&s->state_ctx, s->ctx.save_dir, s->ctx.cart_name, slot, &saved_version);
     if (r != 0)
         return r;
-    /* Notify the cart (reason = BLYT_LOAD_SAVE_GAME = 0). */
-    call_guest_on_load_state(s, 0u, 0u, 0u);
+    /* Notify the cart (reason = BLYT_LOAD_SAVE_GAME = 0) with the version that
+     * wrote the save, read from the save header (ADR-0087/0125). */
+    call_guest_on_load_state(s, 0u, saved_version, 0u);
     return 0;
 }
 

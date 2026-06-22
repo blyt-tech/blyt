@@ -84,6 +84,10 @@ const char *blyt_cart_id(const blyt_cart_t *cart);
 const char *blyt_cart_title(const blyt_cart_t *cart);
 const char *blyt_cart_version(const blyt_cart_t *cart);
 
+/* .cart.config `save_version` (ADR-0125): the integer stamped into the .blys
+ * save header at write time. 0 when undeclared. */
+uint32_t blyt_cart_save_version(const blyt_cart_t *cart);
+
 /* Runtime version string (from version.txt, baked in at build time). */
 const char *blyt_runtime_version(void);
 
