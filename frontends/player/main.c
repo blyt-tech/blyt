@@ -45,6 +45,7 @@ void blyt_libretro_reset(void);
 bool blyt_libretro_save_state(uint32_t slot);
 bool blyt_libretro_load_state(uint32_t slot);
 bool blyt_libretro_reload(void);
+bool blyt_libretro_update_assets(void);
 
 /* Used only by the SDL frontend (direct link) for loop termination and exit
  * status — not part of the standard libretro interface. */
@@ -388,6 +389,14 @@ static void dev_ctrl_dispatch(const char *json) {
             dev_ctrl_ok(id, cmd);
         else
             dev_ctrl_err(id, cmd, "reload failed");
+    } else if (strcmp(cmd, "update_assets") == 0) {
+        /* Hot-swap edited assets between frames; no VM restart (issue #91).
+         * The `assets` id list is informational here — the runtime re-reads the
+         * whole resource-id-index, which already reflects the new content. */
+        if (blyt_libretro_update_assets())
+            dev_ctrl_ok(id, cmd);
+        else
+            dev_ctrl_err(id, cmd, "update_assets failed");
     } else {
         dev_ctrl_err(id, cmd, "unknown command");
     }

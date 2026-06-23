@@ -107,6 +107,8 @@ pub struct CartProject {
     rust_lib_names: Vec<String>,
     /// Contents of blyt.config.yaml (state buffers, fps, etc.)
     config_yaml: Option<String>,
+    /// (relative_path_within_assets, content) pairs for assets/ (issue #91).
+    asset_files: Vec<(String, String)>,
 }
 
 impl CartProject {
@@ -119,7 +121,15 @@ impl CartProject {
             lua_files: Vec::new(),
             lib_files: Vec::new(),
             rust_lib_names: Vec::new(),
+            asset_files: Vec::new(),
         }
+    }
+
+    /// Add `content` as `assets/<rel_path>` (issue #91). The packer derives the
+    /// resource name from the path and emits an R_<NAME> constant.
+    pub fn asset(mut self, rel_path: &str, content: &str) -> Self {
+        self.asset_files.push((rel_path.into(), content.into()));
+        self
     }
 
     /// Add `source` as `src/game/c/main.c`.
@@ -295,6 +305,12 @@ impl CartProject {
 
         if let Some(ref yaml) = self.config_yaml {
             fs::write(dir.join("blyt.config.yaml"), yaml).unwrap();
+        }
+
+        for (rel_path, content) in &self.asset_files {
+            let dest = dir.join("assets").join(rel_path);
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(dest, content).unwrap();
         }
     }
 }

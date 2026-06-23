@@ -60,6 +60,13 @@
  * For REF_VALID: a1=buf_h, a2=ref; returns 1/0 in a0. */
 #define BLYT_ECALL_BUF_OP 50
 
+/* Resource API (ADR-0040, ADR-0088, issue #91).
+ * RESOURCE_TEXT_GET: a0=handle (in) / guest ptr to UTF-8 bytes (out, 0 if the
+ *   handle is invalid); a1=out_len ptr (host writes the byte length there).
+ *   The bytes are copied into a per-frame guest scratch region; the returned
+ *   pointer is valid for the current frame only. */
+#define BLYT_ECALL_RESOURCE_TEXT_GET 60
+
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1

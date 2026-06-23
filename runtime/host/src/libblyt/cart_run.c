@@ -14,6 +14,7 @@
 #include "blyt_trace.h"
 #include "cart_load.h"
 #include "ecall.h"
+#include "resource.h"
 #include "save.h"
 #include "state_buffer.h"
 #ifdef BLYT_DAP
@@ -73,6 +74,14 @@
  * below the runtime library region (128 MiB). */
 #define BLYT_ARENA_BASE 0x04000000u /* 64 MiB */
 #define BLYT_ARENA_SIZE (16u * 1024u * 1024u) /* 16 MiB */
+
+/* Resource scratch region (issue #91): host copies resource bytes here and
+ * returns a guest pointer into it from blyt_resource_text_get.  Sits in the
+ * free gap between the arena (ends at 80 MiB) and the library base (128 MiB).
+ * A per-frame bump allocator; reset at each frame boundary so a pointer stays
+ * valid for the whole frame it was fetched in. */
+#define BLYT_RESOURCE_SCRATCH_BASE 0x06000000u /* 96 MiB */
+#define BLYT_RESOURCE_SCRATCH_SIZE (16u * 1024u * 1024u) /* 16 MiB */
 
 /* Maximum exported symbols tracked across all loaded runtime libraries. */
 #define MAX_SYMS 2048
@@ -170,6 +179,11 @@ typedef struct {
     /* .cart.config save_version (ADR-0125): stamped into the save header on
      * write; reported to on_load_state from the *save header* on read. */
     uint32_t save_version;
+    /* Resource table (issue #91) and the per-frame bump offset into the guest
+     * resource scratch region.  scratch_off resets each frame so a pointer
+     * returned by blyt_resource_text_get stays valid for that whole frame. */
+    blyt_resource_table_t resources;
+    uint32_t resource_scratch_off;
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -1213,6 +1227,51 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 
+    case BLYT_ECALL_RESOURCE_TEXT_GET: {
+        /* a0=handle (in) -> guest ptr (out, 0 if invalid); a1=out_len ptr. */
+        uint32_t handle = rv_get_reg(rv, rv_reg_a0);
+        uint32_t out_len_vaddr = rv_get_reg(rv, rv_reg_a1);
+        vm_attr_t *attr = PRIV(rv);
+        memory_t *mem = attr->mem;
+
+        const blyt_resource_entry_t *e =
+            g_run_ctx ? blyt_resource_table_find(&g_run_ctx->resources, handle) : NULL;
+        blyt_tracef(BLYT_TRACE_API, "resource_text_get(handle=%u) -> %s len=%zu", handle,
+                    e ? "ok" : "NULL", e ? e->len : (size_t)0);
+
+        if (!e) {
+            rv_set_reg(rv, rv_reg_a0, 0);
+            rv->PC += 4;
+            return;
+        }
+
+        /* Bump-allocate room in the guest scratch region (NUL-terminated for
+         * cart convenience; the returned length is authoritative).  Wrap to the
+         * start if a single fetch would overflow the region. */
+        uint32_t off = g_run_ctx->resource_scratch_off;
+        uint32_t need = (uint32_t)e->len + 1u;
+        if (need > BLYT_RESOURCE_SCRATCH_SIZE) {
+            rv_set_reg(rv, rv_reg_a0, 0); /* resource larger than scratch region */
+            rv->PC += 4;
+            return;
+        }
+        if (off + need > BLYT_RESOURCE_SCRATCH_SIZE)
+            off = 0;
+        uint32_t gptr = BLYT_RESOURCE_SCRATCH_BASE + off;
+        memory_write(mem, gptr, e->data, (uint32_t)e->len);
+        uint8_t nul = 0;
+        memory_write(mem, gptr + (uint32_t)e->len, &nul, 1);
+        g_run_ctx->resource_scratch_off = off + need;
+
+        if (out_len_vaddr) {
+            uint32_t l = (uint32_t)e->len; /* size_t is 4 bytes on ilp32 */
+            memory_write(mem, out_len_vaddr, (const uint8_t *)&l, 4);
+        }
+        rv_set_reg(rv, rv_reg_a0, gptr);
+        rv->PC += 4;
+        return;
+    }
+
     case BLYT_ECALL_FRAME_DONE: {
         blyt_tracef(BLYT_TRACE_API, "frame_done()");
         rv->PC += 4;
@@ -2243,6 +2302,37 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
  * Session API — public entry points
  * ------------------------------------------------------------------------- */
 
+/* Populate ctx->resources for a session (issue #91).  A packed cart carries
+ * .cart.resource.<id> sections; a dev (project-dir) build has none, so read the
+ * staging directory that sits alongside the dev ELF (the cart path's directory).
+ * BLYT_RESOURCE_DIR overrides the location (e.g. the WASM dev path). */
+static void load_session_resources(blyt_run_ctx_t *ctx, const blyt_cart_t *cart) {
+    if (blyt_resource_table_load_from_cart(&ctx->resources, cart) != 0)
+        return; /* packed cart: resources come from embedded sections */
+
+    const char *res_dir = getenv("BLYT_RESOURCE_DIR");
+    char dir_buf[4096];
+    if (!res_dir && cart->path) {
+        snprintf(dir_buf, sizeof(dir_buf), "%s", cart->path);
+        char *slash = strrchr(dir_buf, '/');
+        if (slash) {
+            *slash = '\0';
+            res_dir = dir_buf;
+        }
+    }
+    if (res_dir)
+        blyt_resource_table_load_from_index(&ctx->resources, res_dir);
+}
+
+bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart) {
+    if (!session)
+        return false;
+    /* load_from_cart / load_from_index each clear the table first, so this both
+     * drops superseded entries and re-reads the current ones. */
+    load_session_resources(&session->ctx, cart);
+    return true;
+}
+
 /* Returns addr if it is in cart-native address space (bias=0, < GUEST_LIB_BASE),
  * else 0.  Used by the WASM frontend to decide whether to dispatch lifecycle
  * callbacks via the RV32 session or fall back to the Lua global. */
@@ -2376,6 +2466,11 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     /* save_version stamped into the save header on write (ADR-0125). */
     s->ctx.save_version = cart->save_version;
 
+    /* Resource table (issue #91); see load_session_resources. */
+    blyt_resource_table_init(&s->ctx.resources);
+    s->ctx.resource_scratch_off = 0;
+    load_session_resources(&s->ctx, cart);
+
     /* Resolve save directory: BLYT_SAVE_DIR env var or ~/.local/share/blyt */
     {
         const char *env_dir = getenv("BLYT_SAVE_DIR");
@@ -2475,6 +2570,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     g_run_ctx = &session->ctx;
     session->ctx.frame_done = false;
     session->ctx.fn_return_done = false;
+    /* Reset the resource scratch bump allocator: pointers from
+     * blyt_resource_text_get are valid only for the frame they were fetched in
+     * (issue #91). */
+    session->ctx.resource_scratch_off = 0;
 
     /* BLYT_TRACE frame channel: open a frame unless this run_frame call is
      * driving a host-initiated fn call (begin_fn_call) or resuming a frame
@@ -2760,6 +2859,7 @@ void blyt_session_destroy(blyt_session_t *session) {
     blyt_session_gdb_shutdown(session);
 #endif
     blyt_state_ctx_destroy(&session->state_ctx);
+    blyt_resource_table_clear(&session->ctx.resources);
     free(session->ctx.save_dir);
     rv_delete(session->rv);
     free(session);

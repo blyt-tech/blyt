@@ -1,3 +1,4 @@
+mod assets;
 mod c;
 mod cpp;
 mod external;
@@ -1682,6 +1683,10 @@ struct PreBuild {
     raw_elf: PathBuf,
     cart_info_file: PathBuf,
     extra_sections: Vec<(String, PathBuf)>,
+    /// `.cart.resource.<id>` sections embedded only into the packed `.blyt`
+    /// (release Phase 2). The dev ELF omits these and the runtime reads the
+    /// staging directory instead (ADR-0088).
+    resource_sections: Vec<(String, PathBuf)>,
     objcopy: String,
     cart_id: String,
     project_dir: PathBuf,
@@ -1868,6 +1873,22 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     write_if_changed(&interp_src, INTERP_STUB_C)?;
 
     let mut tasks: Vec<Box<dyn Task>> = Vec::new();
+
+    // Asset pipeline Phase 1 (issue #91): scan assets/, stage content-addressed
+    // resource files, write the resource-id-index, and emit cart_resources.{h,lua}.
+    let top_build = project_dir.join("build");
+    let scanned_assets = assets::scan_assets(project_dir, &top_build)?;
+    let assets::AssetBuild {
+        tasks: asset_tasks,
+        resource_sections,
+        any: has_assets,
+    } = assets::plan_assets(
+        &scanned_assets,
+        &top_build,
+        &build_dir.join("blyt/c"),
+        &build_dir.join("blyt/lua"),
+    );
+    tasks.extend(asset_tasks);
 
     if needs_c && buffers_present {
         tasks.push(Box::new(GenerateCHeaderTask {
@@ -2056,7 +2077,9 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     }
 
     let mut c_include_paths: Vec<PathBuf> = lib_include_paths;
-    if buffers_present {
+    // build/blyt/c holds both cart_state.h (state buffers) and cart_resources.h
+    // (assets); add it to the include path if either is generated.
+    if buffers_present || has_assets {
         c_include_paths.push(build_dir.join("blyt/c"));
     }
 
@@ -2267,6 +2290,7 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
         raw_elf,
         cart_info_file,
         extra_sections,
+        resource_sections,
         objcopy,
         cart_id: cart_info.id,
         project_dir: project_dir.to_path_buf(),
@@ -2287,12 +2311,15 @@ pub fn run(
     let output_path = output
         .map(PathBuf::from)
         .unwrap_or_else(|| default_output(&pre.project_dir, &pre.cart_id, debug));
+    // Phase 2: embed assets as .cart.resource.<id> sections into the packed cart.
+    let mut packed_sections = pre.extra_sections;
+    packed_sections.extend(pre.resource_sections);
     pre.tasks.push(Box::new(AssembleCartTask {
         objcopy: pre.objcopy.clone(),
         raw_elf: pre.raw_elf.clone(),
         cart_info_file: pre.cart_info_file.clone(),
         output: output_path.clone(),
-        extra_sections: pre.extra_sections,
+        extra_sections: packed_sections,
         debug,
     }));
     run_tasks(&pre.tasks, &pre.state_dir, force)?;

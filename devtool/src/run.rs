@@ -494,6 +494,69 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn idx(pairs: &[(u32, &str)]) -> Vec<(u32, String)> {
+        pairs.iter().map(|(id, p)| (*id, p.to_string())).collect()
+    }
+
+    #[test]
+    fn resource_name_parses_from_staging_path() {
+        assert_eq!(
+            resource_name_of("resources/greeting-62cedeea5c679bca.data"),
+            "greeting"
+        );
+        assert_eq!(
+            resource_name_of("resources/hero_idle-deadbeefdeadbeef.data"),
+            "hero_idle"
+        );
+    }
+
+    #[test]
+    fn dispatch_content_edit_is_hot_swap_only() {
+        let old = idx(&[(1, "resources/greeting-aaaa.data")]);
+        let new = idx(&[(1, "resources/greeting-bbbb.data")]);
+        // Same id+name, new fingerprint, no code change → update_assets only.
+        assert_eq!(dispatch_signals(&old, &new, false), (false, vec![1]));
+    }
+
+    #[test]
+    fn dispatch_code_and_asset_change_updates_then_reloads() {
+        let old = idx(&[(1, "resources/greeting-aaaa.data")]);
+        let new = idx(&[(1, "resources/greeting-bbbb.data")]);
+        // Code changed too → update_assets first, then reload.
+        assert_eq!(dispatch_signals(&old, &new, true), (true, vec![1]));
+    }
+
+    #[test]
+    fn dispatch_resource_set_change_forces_reload() {
+        let old = idx(&[(1, "resources/greeting-aaaa.data")]);
+        // Asset added → id/name set changed → full reload, no update_assets.
+        let new = idx(&[
+            (1, "resources/greeting-aaaa.data"),
+            (2, "resources/farewell-cccc.data"),
+        ]);
+        assert_eq!(dispatch_signals(&old, &new, false), (true, vec![]));
+    }
+
+    #[test]
+    fn dispatch_rename_forces_reload() {
+        let old = idx(&[(1, "resources/greeting-aaaa.data")]);
+        // Same id, different name → reload (the generated R_ constant changed).
+        let new = idx(&[(1, "resources/welcome-aaaa.data")]);
+        assert_eq!(dispatch_signals(&old, &new, false), (true, vec![]));
+    }
+
+    #[test]
+    fn dispatch_code_only_change_reloads() {
+        let same = idx(&[(1, "resources/greeting-aaaa.data")]);
+        assert_eq!(dispatch_signals(&same, &same, true), (true, vec![]));
+    }
+
+    #[test]
+    fn dispatch_nothing_changed() {
+        let same = idx(&[(1, "resources/greeting-aaaa.data")]);
+        assert_eq!(dispatch_signals(&same, &same, false), (false, vec![]));
+    }
+
     #[test]
     fn resolve_trace_prefers_flag_and_sanitises() {
         assert_eq!(resolve_trace(Some("api,frame")), "api,frame");
@@ -1167,6 +1230,85 @@ fn elf_hash(path: &Path) -> Option<u64> {
     fs::read(path).ok().map(|b| xxhash_rust::xxh3::xxh3_64(&b))
 }
 
+/// Parse `build/resource-id-index` into `(id, rel_path)` pairs (issue #91).
+/// Returns an empty vec when the index is absent (no assets).
+fn read_resource_index(build_dir: &Path) -> Vec<(u32, String)> {
+    let Ok(content) = fs::read_to_string(build_dir.join("resource-id-index")) else {
+        return Vec::new();
+    };
+    let mut v: Vec<(u32, String)> = content
+        .lines()
+        .filter_map(|line| {
+            let (id_s, rel) = line.split_once(' ')?;
+            Some((id_s.parse::<u32>().ok()?, rel.trim().to_string()))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Resource name embedded in a staging path `resources/<name>-<fp>.data`.
+fn resource_name_of(rel: &str) -> &str {
+    let stem = rel.strip_prefix("resources/").unwrap_or(rel);
+    let stem = stem.strip_suffix(".data").unwrap_or(stem);
+    match stem.rfind('-') {
+        Some(i) => &stem[..i],
+        None => stem,
+    }
+}
+
+/// Decide what dev-control signal(s) a rebuild requires by diffing the old/new
+/// resource-id-index against whether the cart code changed (ADR-0088, issue #91).
+///
+/// Returns `(reload, update_asset_ids)`:
+///   - resource IDs/names changed (asset add/remove/rename) → full reload;
+///   - else code changed + assets changed → update_assets then reload;
+///   - else code changed → reload;
+///   - else assets changed → update_assets only (hot-swap).
+fn dispatch_signals(
+    old_index: &[(u32, String)],
+    new_index: &[(u32, String)],
+    code_changed: bool,
+) -> (bool, Vec<u32>) {
+    let pairs = |idx: &[(u32, String)]| -> Vec<(u32, String)> {
+        idx.iter()
+            .map(|(id, rel)| (*id, resource_name_of(rel).to_string()))
+            .collect()
+    };
+    let resource_ids_changed = pairs(old_index) != pairs(new_index);
+
+    if resource_ids_changed {
+        return (true, Vec::new());
+    }
+
+    // Same id/name set: an asset changed iff its content-addressed path moved.
+    let mut assets_changed: Vec<u32> = Vec::new();
+    for (id, rel) in new_index {
+        if let Some((_, old_rel)) = old_index.iter().find(|(oid, _)| oid == id) {
+            if old_rel != rel {
+                assets_changed.push(*id);
+            }
+        }
+    }
+
+    match (code_changed, assets_changed.is_empty()) {
+        (true, _) => (true, assets_changed), // reload; update_assets first if any
+        (false, false) => (false, assets_changed), // hot-swap only
+        (false, true) => (false, Vec::new()), // nothing changed
+    }
+}
+
+/// Content-addressed staging files (`.data` + `.meta`) referenced by `index`,
+/// absolute under `build_dir`.
+fn staged_files(build_dir: &Path, index: &[(u32, String)]) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for (_, rel) in index {
+        v.push(build_dir.join(rel));
+        v.push(build_dir.join(rel).with_extension("meta"));
+    }
+    v
+}
+
 fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
     std::thread::spawn(move || {
         let (tx, rx) = mpsc::channel::<PathBuf>();
@@ -1201,6 +1343,13 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
                 eprintln!("[watch] cannot watch {}: {e}", src.display());
             }
         }
+        // Watch assets/ so edits hot-swap via update_assets (issue #91, amends #88).
+        let assets = project_dir.join("assets");
+        if assets.is_dir() {
+            if let Err(e) = watcher.watch(&assets, RecursiveMode::Recursive) {
+                eprintln!("[watch] cannot watch {}: {e}", assets.display());
+            }
+        }
         for manifest in ["blyt.build.yaml", "blyt.config.yaml", "blyt.info.yaml"] {
             let p = project_dir.join(manifest);
             if p.exists() {
@@ -1220,9 +1369,14 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
             .join("build")
             .join(if debug { ".dbg.elf" } else { ".elf" });
         let mut last_hash = elf_hash(&dev_elf);
+        let mut last_index = read_resource_index(&build_dir);
+        // Superseded staging files awaiting GC: deleted one rebuild later, by
+        // which point the runtime has acked the swap and released any pinned
+        // bytes from the in-flight frame (ADR-0088 GC, issue #91).
+        let mut pending_gc: Vec<PathBuf> = Vec::new();
 
         let settle = std::time::Duration::from_millis(150);
-        let mut reload_id: u64 = 1;
+        let mut msg_id: u64 = 1;
         while let Ok(path) = rx.recv() {
             let rel = path.strip_prefix(&project_dir).unwrap_or(&path);
             println!("[watch] {} changed", rel.display());
@@ -1233,15 +1387,53 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
             match build_for_dev(&project_dir, debug, false) {
                 Ok(elf) => {
                     let new_hash = elf_hash(&elf);
-                    if new_hash.is_some() && new_hash != last_hash {
+                    let code_changed = new_hash.is_some() && new_hash != last_hash;
+                    if code_changed {
                         last_hash = new_hash;
-                        let msg = format!("{{\"id\":{reload_id},\"cmd\":\"reload\"}}");
+                    }
+                    let new_index = read_resource_index(&build_dir);
+                    let (reload, update_ids) =
+                        dispatch_signals(&last_index, &new_index, code_changed);
+
+                    // update_assets first (table updated before any VM restart).
+                    if !update_ids.is_empty() {
+                        let ids = update_ids
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let msg = format!(
+                            "{{\"id\":{msg_id},\"cmd\":\"update_assets\",\"assets\":[{ids}]}}"
+                        );
+                        let n = hub.broadcast(None, &msg);
+                        println!("[assets] update_assets {update_ids:?} → {n} runtime(s)");
+                        msg_id += 1;
+                    }
+                    if reload {
+                        let msg = format!("{{\"id\":{msg_id},\"cmd\":\"reload\"}}");
                         let n = hub.broadcast(None, &msg);
                         println!("[reload] signalled {n} runtime(s)");
-                        reload_id += 1;
-                    } else {
+                        msg_id += 1;
+                    }
+                    if !reload && update_ids.is_empty() {
                         println!("[reload] skipped (cart unchanged)");
                     }
+
+                    // GC: drop last round's superseded files now that the runtime
+                    // has had a full cycle to consume the swap, then stage this
+                    // round's superseded files for the next round.
+                    for f in pending_gc.drain(..) {
+                        let _ = fs::remove_file(&f);
+                    }
+                    let new_set: std::collections::HashSet<&String> =
+                        new_index.iter().map(|(_, rel)| rel).collect();
+                    let superseded: Vec<(u32, String)> = last_index
+                        .iter()
+                        .filter(|(_, rel)| !new_set.contains(rel))
+                        .cloned()
+                        .collect();
+                    pending_gc = staged_files(&build_dir, &superseded);
+                    last_index = new_index;
                 }
                 Err(e) => {
                     eprintln!("[build] ✗ {e}");
@@ -1311,6 +1503,23 @@ fn handle_connection(
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
     let path = request_path(request);
 
+    // Resource serving for WASM dev mode (issue #91): GET /resource/<id> returns
+    // the bytes of the content-addressed staging file the resource-id-index maps
+    // <id> to.  The staging dir is the dev ELF's directory (<project>/build).
+    if let Some(id_str) = path.strip_prefix("/resource/") {
+        let build_dir = cart_path.parent().unwrap_or(Path::new("."));
+        match id_str
+            .parse::<u32>()
+            .ok()
+            .and_then(|id| resolve_resource_file(build_dir, id))
+            .and_then(|p| fs::read(&p).ok())
+        {
+            Some(bytes) => respond(&mut stream, 200, "application/octet-stream", &bytes),
+            None => respond(&mut stream, 404, "text/plain", b"resource not found"),
+        }
+        return;
+    }
+
     // The emscripten .html references <name>.js, which fetches <name>.wasm, so
     // the served paths are variant-specific (blytplay.* vs blytdebug.*).
     let js_path = format!("/{wasm_name}.js");
@@ -1357,6 +1566,15 @@ fn handle_connection(
         }
         Err(_) => respond(&mut stream, 404, "text/plain", b"File Not Found"),
     }
+}
+
+/// Resolve resource id → absolute content-addressed staging file via the
+/// resource-id-index under `build_dir` (issue #91).
+fn resolve_resource_file(build_dir: &Path, id: u32) -> Option<PathBuf> {
+    read_resource_index(build_dir)
+        .into_iter()
+        .find(|(rid, _)| *rid == id)
+        .map(|(_, rel)| build_dir.join(rel))
 }
 
 fn request_path(request: &str) -> &str {

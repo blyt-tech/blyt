@@ -455,3 +455,12 @@ bool blyt_libretro_reload(void) {
     blyt_session_restore(g_session, snap, 3u /* BLYT_LOAD_HOT_RELOAD */);
     return true;
 }
+
+/* Hot-swap edited assets without a VM restart (issue #91): re-read the resource
+ * table from the (already rebuilt) staging directory.  Applied between frames by
+ * the dev-control `update_assets` command; the next frame sees the new bytes. */
+bool blyt_libretro_update_assets(void) {
+    if (!g_session)
+        return false;
+    return blyt_session_reload_resources(g_session, g_cart);
+}

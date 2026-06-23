@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -99,6 +100,23 @@ static inline int32_t blyt_buffer_ref_slot(blyt_entity_ref_t ref) {
  * ------------------------------------------------------------------------- */
 blyt_result_t blyt_save_write(uint32_t slot);
 blyt_result_t blyt_save_read(uint32_t slot);
+
+/* -------------------------------------------------------------------------
+ * Resources (ADR-0040, ADR-0088, issue #91)
+ *
+ * Cart code never uses string paths at runtime: the packer assigns each asset
+ * an integer resource handle and emits R_<NAME> constants in the generated
+ * cart_resources.h.  The runtime resolves handle -> data internally (a bundled
+ * ELF section in a packed cart, or the staging directory in dev mode).
+ * ------------------------------------------------------------------------- */
+typedef uint32_t blyt_resource_h;
+#define BLYT_RESOURCE_INVALID ((blyt_resource_h)0)
+
+/* Load a text resource by handle.  Returns a pointer to its UTF-8 bytes and
+ * writes the byte length to *len.  The pointer is valid for the current frame
+ * only (it may be evicted afterwards); copy out anything you need to keep.
+ * Returns NULL (and leaves *len untouched) if the handle is invalid. */
+const char *blyt_resource_text_get(blyt_resource_h handle, size_t *len);
 
 /* -------------------------------------------------------------------------
  * Cart lifecycle types for save/load callbacks (ADR-0087 amendment)

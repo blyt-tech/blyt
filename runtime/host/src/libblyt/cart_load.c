@@ -100,6 +100,9 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_save_write",
     "blyt_save_read",
 
+    /* blyt resource API (ADR-0040, ADR-0088, issue #91) */
+    "blyt_resource_text_get",
+
     /* libblytc.so — allocator (ADR-0120) */
     "malloc",
     "free",
