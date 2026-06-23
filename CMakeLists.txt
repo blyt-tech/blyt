@@ -1094,6 +1094,22 @@ add_custom_command(
 add_custom_target(wasm_test_deps
                   DEPENDS "${CMAKE_BINARY_DIR}/npm-install-wasm-tests.stamp")
 
+# VS Code extension dependencies. tools/vscode ships its own package.json and a
+# gitignored node_modules; the extension's unit tests (node --test) and a manual
+# debug session both need it installed, and a fresh worktree has neither.
+add_custom_command(
+  OUTPUT "${CMAKE_BINARY_DIR}/npm-install-vscode-ext.stamp"
+  COMMAND npm install
+  COMMAND "${CMAKE_COMMAND}" -E touch
+          "${CMAKE_BINARY_DIR}/npm-install-vscode-ext.stamp"
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/tools/vscode"
+  DEPENDS "${CMAKE_SOURCE_DIR}/tools/vscode/package-lock.json"
+          "${CMAKE_SOURCE_DIR}/tools/vscode/package.json"
+  COMMENT "Installing VS Code extension dependencies (npm install)"
+  VERBATIM)
+add_custom_target(vscode_ext_deps
+                  DEPENDS "${CMAKE_BINARY_DIR}/npm-install-vscode-ext.stamp")
+
 add_custom_target(
   lint
   COMMAND clang-format --dry-run --Werror ${_LINT_C_FILES}
@@ -1181,6 +1197,37 @@ add_custom_target(
   USES_TERMINAL VERBATIM
   COMMENT "Running Rust integration tests (cargo nextest -p integration)")
 add_dependencies(test-integration sdk)
+
+# ── test-prereqs ──────────────────────────────────────────────────────────────
+# Build/install everything the test suites need, so a fresh worktree does not
+# silently skip (or fail) the wasm, native-QEMU, or VS Code legs. Aggregates the
+# existing prerequisite targets in one shot:
+#
+# cmake-format: off
+#   sdk                 players, guest libs, devtool  (most tests)
+#   npm_ci              root node_modules             (biome, gdb/dap .mjs drivers)
+#   wasm_test_deps      tests/wasm npm + Playwright   (browser legs)
+#   vscode_ext_deps     tools/vscode npm install      (VS Code extension tests)
+#   blyt_native_riscv64 build-riscv64/blyt_native     (QEMU native gate)
+# cmake-format: on
+#
+# This target assumes the build is already configured; a brand-new worktree
+# needs `cmake -B build -G Ninja` first. It does not run the tests — it only
+# makes them runnable. blyt_native_riscv64 builds via Docker on macOS, so the
+# blyt-testing image must exist (cheap if it does; ~15 min to build the image
+# the first time).
+#
+# Usage: cmake --build build --target test-prereqs
+#
+add_custom_target(test-prereqs)
+add_dependencies(test-prereqs sdk npm_ci wasm_test_deps vscode_ext_deps)
+# blyt_native_riscv64 is a host-only convenience target that *invokes* the
+# riscv64 cross build; it is not defined in the cross-compile tree itself (its
+# definition is guarded by `NOT CMAKE_CROSSCOMPILING`), so only depend on it
+# where it exists.
+if(TARGET blyt_native_riscv64)
+  add_dependencies(test-prereqs blyt_native_riscv64)
+endif()
 
 # ── test-linux-docker ─────────────────────────────────────────────────────────
 # Run integration tests inside a Linux Docker container that mirrors the GitHub
