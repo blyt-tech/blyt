@@ -56,6 +56,68 @@
           BLYT_TRACE: "{{BLYT_TRACE}}",
         });
       }
+      /* Point the host's dev-mode resource loader at the MEMFS dir the preload
+       * below materialises (issue #118).  Set synchronously here so module_pre's
+       * ENV hook copies it into the C environment before startup.  Harmless for
+       * packed carts: embedded .cart.resource sections win and the dir is unused. */
+      globalThis.__blyt_env_vars = Object.assign(globalThis.__blyt_env_vars || {}, {
+        BLYT_RESOURCE_DIR: "/blyt_resources",
+      });
+</script>
+    <script>
+      /* Materialise the content-addressed resource staging dir into MEMFS (issue
+       * #118), mirroring the native layout the host reads via BLYT_RESOURCE_DIR:
+       *   /blyt_resources/resource-id-index
+       *   /blyt_resources/resources/<name>-<fp>.data
+       * Fetches the index, then any referenced file not already present (content
+       * hash = immutable, so a present file is the right version), prunes
+       * superseded files no longer referenced, and writes the refreshed index.
+       * Returns false when there is no index (e.g. a packed cart) so callers can
+       * treat dev resources as absent.  Shared by the initial preload and the
+       * update_assets refetch. */
+      const BLYT_RESOURCE_DIR = "/blyt_resources";
+      async function blyt_materialise_resources() {
+        const r = await fetch("resource-id-index");
+        if (!r.ok) return false;
+        const indexText = await r.text();
+        const rels = [];
+        for (const line of indexText.split("\n")) {
+          const sp = line.indexOf(" ");
+          if (sp < 0) continue;
+          const rel = line.slice(sp + 1).trim();
+          if (rel) rels.push(rel);
+        }
+        FS.mkdirTree(BLYT_RESOURCE_DIR + "/resources");
+        for (const rel of rels) {
+          const dst = BLYT_RESOURCE_DIR + "/" + rel;
+          let have = false;
+          try {
+            FS.stat(dst);
+            have = true;
+          } catch (e) {
+            /* not present */
+          }
+          if (!have) {
+            const fr = await fetch(rel);
+            if (!fr.ok) throw new Error("fetch " + rel + " -> HTTP " + fr.status);
+            FS.writeFile(dst, new Uint8Array(await fr.arrayBuffer()));
+          }
+        }
+        /* Prune superseded staging files the refreshed index no longer references
+         * (mirrors the devtool's on-disk GC; safe because the host copies bytes
+         * into its own buffers on reload). */
+        const keep = new Set(rels.map((x) => x.replace(/^resources\//, "")));
+        try {
+          for (const name of FS.readdir(BLYT_RESOURCE_DIR + "/resources")) {
+            if (name === "." || name === "..") continue;
+            if (!keep.has(name)) FS.unlink(BLYT_RESOURCE_DIR + "/resources/" + name);
+          }
+        } catch (e) {
+          /* dir absent — nothing to prune */
+        }
+        FS.writeFile(BLYT_RESOURCE_DIR + "/resource-id-index", indexText);
+        return true;
+      }
     </script>
     <script>
       /* Dev control channel (issue #87).  Opens a WebSocket to the devtool's
@@ -91,6 +153,18 @@
               Module.ccall("blyt_dev_ctrl_reload_fetched", null, ["int"], [0]);
             });
         };
+        /* update_assets (issue #118): refresh the MEMFS resource staging dir,
+         * then hand back to C to reload the host resource table. */
+        globalThis.blyt_dev_ctrl_fetch_resources = function () {
+          blyt_materialise_resources()
+            .then(function (ok) {
+              Module.ccall("blyt_dev_ctrl_assets_fetched", null, ["int"], [ok ? 1 : 0]);
+            })
+            .catch(function (e) {
+              console.error("[blyt] dev control resource refetch failed:", e);
+              Module.ccall("blyt_dev_ctrl_assets_fetched", null, ["int"], [0]);
+            });
+        };
       }
     </script>
     <script>
@@ -121,6 +195,20 @@
                   "Cart load failed: " + e;
                 console.error("[blyt] cart load failed:", e);
                 Module.removeRunDependency("blyt-cart");
+              });
+          },
+          /* Preload the content-addressed resource staging dir into MEMFS before
+           * main() so the host's dev-mode resource loader (BLYT_RESOURCE_DIR) sees
+           * it at session creation (issue #118).  404-tolerant: a packed cart has
+           * no index, so this no-ops and embedded sections are used instead. */
+          function () {
+            Module.addRunDependency("blyt-resources");
+            blyt_materialise_resources()
+              .catch(function (e) {
+                console.error("[blyt] resource preload failed:", e);
+              })
+              .finally(function () {
+                Module.removeRunDependency("blyt-resources");
               });
           },
         ],

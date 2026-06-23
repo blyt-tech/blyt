@@ -499,6 +499,26 @@ mod tests {
     }
 
     #[test]
+    fn safe_resource_rel_accepts_content_addressed_names() {
+        // The names the browser actually fetches (from the resource-id-index).
+        assert!(is_safe_resource_rel("greeting-62cedeea5c679bca.data"));
+        assert!(is_safe_resource_rel("hero_idle-deadbeefdeadbeef.data"));
+        // Nested is allowed as long as no component traverses.
+        assert!(is_safe_resource_rel("sprites/hero-aaaa.data"));
+    }
+
+    #[test]
+    fn safe_resource_rel_rejects_traversal_and_empties() {
+        assert!(!is_safe_resource_rel(""));
+        assert!(!is_safe_resource_rel(".."));
+        assert!(!is_safe_resource_rel("../secret"));
+        assert!(!is_safe_resource_rel("a/../../etc/passwd"));
+        assert!(!is_safe_resource_rel("a/./b"));
+        assert!(!is_safe_resource_rel("a//b")); // empty component
+        assert!(!is_safe_resource_rel("/etc/passwd")); // leading slash → empty first component
+    }
+
+    #[test]
     fn resource_name_parses_from_staging_path() {
         assert_eq!(
             resource_name_of("resources/greeting-62cedeea5c679bca.data"),
@@ -1503,9 +1523,39 @@ fn handle_connection(
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
     let path = request_path(request);
 
-    // Resource serving for WASM dev mode (issue #91): GET /resource/<id> returns
-    // the bytes of the content-addressed staging file the resource-id-index maps
-    // <id> to.  The staging dir is the dev ELF's directory (<project>/build).
+    // Resource serving for WASM dev mode (issue #91/#118).  The browser mirrors
+    // the native staging layout into MEMFS: it fetches the resource-id-index, then
+    // each content-addressed file the index references, and points the host at the
+    // materialised dir via BLYT_RESOURCE_DIR.  The staging dir is the dev ELF's
+    // directory (<project>/build).
+    //
+    // Two load-path routes (issue #118):
+    //   GET /resource-id-index             — the index, verbatim.
+    //   GET /resources/<name>-<fp>.data    — a content-addressed staging file.
+    // The file is addressed by content hash, so it is immutable: the browser
+    // always reads the exact version the index it parsed enumerated, with no
+    // version race.  (GET /resource/<id> below stays for curl/debug only — it
+    // re-resolves id -> *current* version per request, which is exactly the race
+    // the content-addressed path avoids, so it must not be the load path.)
+    if path == "/resource-id-index" {
+        let build_dir = cart_path.parent().unwrap_or(Path::new("."));
+        match fs::read(build_dir.join("resource-id-index")) {
+            Ok(bytes) => respond(&mut stream, 200, "text/plain", &bytes),
+            Err(_) => respond(&mut stream, 404, "text/plain", b"no resource index"),
+        }
+        return;
+    }
+    if let Some(rel) = path.strip_prefix("/resources/") {
+        let build_dir = cart_path.parent().unwrap_or(Path::new("."));
+        match is_safe_resource_rel(rel)
+            .then(|| fs::read(build_dir.join("resources").join(rel)).ok())
+            .flatten()
+        {
+            Some(bytes) => respond(&mut stream, 200, "application/octet-stream", &bytes),
+            None => respond(&mut stream, 404, "text/plain", b"resource not found"),
+        }
+        return;
+    }
     if let Some(id_str) = path.strip_prefix("/resource/") {
         let build_dir = cart_path.parent().unwrap_or(Path::new("."));
         match id_str
@@ -1566,6 +1616,18 @@ fn handle_connection(
         }
         Err(_) => respond(&mut stream, 404, "text/plain", b"File Not Found"),
     }
+}
+
+/// True if `rel` (the part after `/resources/`) is safe to read from
+/// `<build_dir>/resources/` (issue #118): non-empty, no empty components, and no
+/// `.`/`..` traversal.  The browser only ever requests content-addressed
+/// filenames the resource-id-index enumerated; this guards the route from being
+/// abused to read elsewhere under build_dir.
+fn is_safe_resource_rel(rel: &str) -> bool {
+    !rel.is_empty()
+        && rel
+            .split('/')
+            .all(|c| !c.is_empty() && c != ".." && c != ".")
 }
 
 /// Resolve resource id → absolute content-addressed staging file via the

@@ -1221,14 +1221,18 @@ static void wasm_lua_reset_cycle(void) {
  *   {"id":N,"cmd":"save_state","slot":S}   persist state to save slot S (default 0)
  *   {"id":N,"cmd":"load_state","slot":S}   restore state from save slot S
  *   {"id":N,"cmd":"reload"}                hot reload: refetch cart, preserve state
+ *   {"id":N,"cmd":"update_assets","assets":[…]}  hot-swap edited resources, no restart
  * Responses echo the id and cmd: {"id":N,"status":"ok","cmd":"…"} or
  * {"id":N,"status":"error","cmd":"…","reason":"…"}.
  *
- * Scope: this WASM handler services the Lua runtime path (pure-Lua and
- * Lua-with-layouts carts — what `blyt run ./dir` serves for the dev loop).
- * WASM carts with native rv32 code get a structured error for now; the native
- * player (frontends/player) drives those directly via its own dev control
- * server against the live rv32 session.
+ * Scope: reset/save_state/load_state/reload service the Lua runtime path
+ * (pure-Lua and Lua-with-layouts carts — what `blyt run ./dir` serves for the
+ * dev loop); WASM carts with native rv32 code get a structured error for those,
+ * and the native player (frontends/player) drives them via its own dev control
+ * server against the live rv32 session.  update_assets is the exception: it
+ * reloads the rv32 session's resource table, so it works for session-backed
+ * (C/hybrid) carts and returns a structured error for pure-Lua carts, which have
+ * no resource access yet (#120).
  * ------------------------------------------------------------------------- */
 
 /* clang-format off */
@@ -1242,6 +1246,15 @@ EM_JS(void, blyt_js_dev_ctrl_fetch_cart, (void), {
     if (typeof globalThis !== 'undefined' &&
         typeof globalThis.blyt_dev_ctrl_fetch_cart === 'function')
         globalThis.blyt_dev_ctrl_fetch_cart();
+});
+
+/* update_assets (issue #118): ask the page to refetch the content-addressed
+ * resource staging dir into MEMFS (refresh the index + any missing file, prune
+ * superseded ones), then continue in blyt_dev_ctrl_assets_fetched. */
+EM_JS(void, blyt_js_dev_ctrl_fetch_resources, (void), {
+    if (typeof globalThis !== 'undefined' &&
+        typeof globalThis.blyt_dev_ctrl_fetch_resources === 'function')
+        globalThis.blyt_dev_ctrl_fetch_resources();
 });
 /* clang-format on */
 
@@ -1307,6 +1320,10 @@ static void dev_ctrl_respond_err(long id, const char *cmd, const char *reason) {
 /* Pending reload request id, valid between blyt_dev_ctrl_command(reload) and
  * the blyt_dev_ctrl_reload_fetched callback. -1 when no reload is in flight. */
 static long g_dev_ctrl_reload_id = -1;
+
+/* Pending update_assets request id, valid between blyt_dev_ctrl_command and the
+ * blyt_dev_ctrl_assets_fetched callback. -1 when no update_assets is in flight. */
+static long g_dev_ctrl_assets_id = -1;
 
 /* True when the handler can service state/lifecycle commands: a Lua VM with no
  * rv32 session (the dev-loop sweet spot). */
@@ -1408,7 +1425,50 @@ void blyt_dev_ctrl_command(const char *json) {
         return;
     }
 
+    if (strcmp(cmd, "update_assets") == 0) {
+        /* Hot-swap edited resources between frames; no VM restart (issue #118).
+         * Reloading the resource table operates on the emulated rv32 session's
+         * resources, so it is language-agnostic but needs a session: pure-Lua
+         * fast-path carts (g_session == NULL) have no resource access yet (#120).
+         * The `assets` id list is informational — the browser refetches the whole
+         * content-addressed staging dir and the host re-reads the index. */
+        if (!g_session) {
+            dev_ctrl_respond_err(
+                id, cmd, "update_assets not supported for pure-Lua carts (no resource access yet)");
+            return;
+        }
+        if (g_dev_ctrl_assets_id >= 0) {
+            dev_ctrl_respond_err(id, cmd, "update_assets already in progress");
+            return;
+        }
+        /* Hand off to JS to refresh the MEMFS staging dir, then continue in
+         * blyt_dev_ctrl_assets_fetched. */
+        g_dev_ctrl_assets_id = id;
+        blyt_js_dev_ctrl_fetch_resources();
+        return;
+    }
+
     dev_ctrl_respond_err(id, cmd, "unknown command");
+}
+
+/* Continue an update_assets after JS refreshed the resource staging dir in MEMFS
+ * (issue #118).  ok==0 means the JS-side refetch failed.  Reloading the table
+ * re-reads the (now updated) resource-id-index from BLYT_RESOURCE_DIR; the next
+ * frame's blyt_resource_text_get sees the new bytes. */
+EMSCRIPTEN_KEEPALIVE
+void blyt_dev_ctrl_assets_fetched(int ok) {
+    long id = g_dev_ctrl_assets_id;
+    g_dev_ctrl_assets_id = -1;
+    if (id < 0)
+        return;
+    if (!ok) {
+        dev_ctrl_respond_err(id, "update_assets", "resource refetch failed");
+        return;
+    }
+    if (g_session && blyt_session_reload_resources(g_session, g_cart))
+        dev_ctrl_respond_ok(id, "update_assets");
+    else
+        dev_ctrl_respond_err(id, "update_assets", "reload_resources failed");
 }
 
 /* Continue a reload after JS rewrote /cart.blyt in MEMFS (ADR-0045 sequence).
