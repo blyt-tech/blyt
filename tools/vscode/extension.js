@@ -17,7 +17,24 @@ const pendingProcs = new Map();
 const sessionProcs = new Map();
 const pendingUrls = new Map();
 const sessionUrls = new Map();
+/* Auxiliary process for a session, keyed by the same lifecycle as pendingProcs.
+ * Used by player-dev run mode (#90), where the session owns TWO processes: the
+ * tracked player (sessionProcs) and the devtool serving the dev control hub +
+ * file watcher (here).  Killed alongside the session proc on termination. */
+const pendingAuxProcs = new Map();
+const sessionAuxProcs = new Map();
 let nextId = 0;
+
+/* Kill and forget the auxiliary (devtool) process for a session, if any. */
+function killAuxProc(sessionId) {
+	const aux = sessionAuxProcs.get(sessionId);
+	if (aux) {
+		sessionAuxProcs.delete(sessionId);
+		try {
+			aux.kill();
+		} catch (_) {}
+	}
+}
 let g_gamePanel = null; /* custom WebviewPanel for the cart, or null */
 
 /* ── Cart game panel ──────────────────────────────────────────────────────── */
@@ -312,14 +329,16 @@ function buildCart(cwd, output, debug = false) {
 
 /* ── Start blyt debug ─────────────────────────────────────────────────────── */
 
-/* Spawns `blyt debug <cartPath>` (ADR-0129) and resolves once the process
- * prints both the HTTP and DAP ports.  All stdout/stderr is forwarded to
- * `output`.  The announce text is unchanged from the old `blyt run --debug`,
- * so the port regexes below still match. */
-function startBlytRun(cartPath, cwd, output) {
+/* Spawns `blyt debug <projectDir>` (project-dir dev mode, #84/#88) and resolves
+ * once the process prints the HTTP and DAP ports.  `blyt debug ./dir` builds the
+ * cart internally before announcing the HTTP port, so the extension's existing
+ * port-wait is the initial-build barrier — no explicit buildCart() pre-step.
+ * Also captures the dev-control port (#87) from the banner for the reload wiring.
+ * All stdout/stderr is forwarded to `output`. */
+function startDevtool(projectDir, cwd, output) {
 	const blyt = findBlyt();
 	if (!blyt) return Promise.reject(new Error('blyt SDK not configured'));
-	const args = ['debug', cartPath];
+	const args = ['debug', projectDir];
 	const trace = traceChannels();
 	/* Trace lands in the BROWSER dev console for this flow: the WASM runtime's
 	 * stderr goes to printErr in the page, not to this process. */
@@ -333,6 +352,7 @@ function startBlytRun(cartPath, cwd, output) {
 		let buf = '';
 		let httpPort = 0;
 		let gdbPort = 0;
+		let devCtrlPort = 0;
 		let resolved = false;
 
 		function check(data) {
@@ -342,6 +362,11 @@ function startBlytRun(cartPath, cwd, output) {
 			if (!httpPort) {
 				const m = buf.match(/serving on http:\/\/127\.0\.0\.1:(\d+)/);
 				if (m) httpPort = parseInt(m[1], 10);
+			}
+
+			if (!devCtrlPort) {
+				const d = buf.match(/Dev control:\s+127\.0\.0\.1:(\d+)/);
+				if (d) devCtrlPort = parseInt(d[1], 10);
 			}
 
 			if (!gdbPort) {
@@ -363,6 +388,7 @@ function startBlytRun(cartPath, cwd, output) {
 					httpPort,
 					dapPort: parseInt(m[1], 10),
 					gdbPort,
+					devCtrlPort,
 				});
 			}
 		}
@@ -393,6 +419,63 @@ function startBlytRun(cartPath, cwd, output) {
 			if (!resolved) {
 				proc.kill();
 				reject(new Error('blyt debug did not start within 15 s'));
+			}
+		}, 15000);
+	});
+}
+
+/* Spawns `blyt run <projectDir>` (release project-dir dev mode) for player-dev
+ * run sessions (#90, option 2).  The devtool builds build/.elf, then runs the
+ * dev control hub + file watcher; the player dials the announced dev control
+ * port so a watcher-driven rebuild hot-reloads the native window.  Resolves once
+ * that port is announced (the initial build has finished by then, so build/.elf
+ * exists for the player to load).  No DAP/GDB — those are debug-only.  All
+ * stdout/stderr is forwarded to `output`. */
+function startDevtoolRun(projectDir, cwd, output) {
+	const blyt = findBlyt();
+	if (!blyt) return Promise.reject(new Error('blyt SDK not configured'));
+	const trace = traceChannels();
+	const args = ['run', projectDir];
+	if (trace) args.push(`--trace=${trace}`);
+	return new Promise((resolve, reject) => {
+		const proc = cp.spawn(blyt, args, {
+			cwd,
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+		let buf = '';
+		let httpPort = 0;
+		let resolved = false;
+		function check(data) {
+			buf += data.toString();
+			output.append(data.toString());
+			if (!httpPort) {
+				const m = buf.match(/serving on http:\/\/127\.0\.0\.1:(\d+)/);
+				if (m) httpPort = parseInt(m[1], 10);
+			}
+			const d = buf.match(/Dev control:\s+127\.0\.0\.1:(\d+)/);
+			if (d && !resolved) {
+				resolved = true;
+				resolve({ proc, httpPort, devCtrlPort: parseInt(d[1], 10) });
+			}
+		}
+		proc.stdout.on('data', check);
+		proc.stderr.on('data', (d) => output.append(d.toString()));
+		proc.on('error', (err) => {
+			if (!resolved)
+				reject(new Error(`Could not start blyt: ${err.message}`));
+		});
+		proc.on('exit', (code) => {
+			if (!resolved)
+				reject(
+					new Error(
+						`blyt run exited (code ${code}) before announcing the dev control port`,
+					),
+				);
+		});
+		setTimeout(() => {
+			if (!resolved) {
+				proc.kill();
+				reject(new Error('blyt run did not start within 15 s'));
 			}
 		}, 15000);
 	});
@@ -1018,14 +1101,17 @@ function activate(context) {
 				pendingProcs.delete(cfg._blytTempId);
 				const url = pendingUrls.get(cfg._blytTempId);
 				pendingUrls.delete(cfg._blytTempId);
+				const auxProc = pendingAuxProcs.get(cfg._blytTempId);
+				pendingAuxProcs.delete(cfg._blytTempId);
 				if (proc) sessionProcs.set(session.id, proc);
 				if (url) sessionUrls.set(session.id, url);
+				if (auxProc) sessionAuxProcs.set(session.id, auxProc);
 				if (cfg._blytMode === 'lua')
 					return new vscode.DebugAdapterServer(
 						cfg._blytDapPort,
 						'127.0.0.1',
 					);
-				if (cfg._blytMode === 'native')
+				if (cfg._blytMode === 'gdb')
 					return new vscode.DebugAdapterInlineImplementation(
 						new BlytGdbDapProxy(findLldbDap()),
 					);
@@ -1070,6 +1156,22 @@ function activate(context) {
 				if (!target) return undefined;
 				const { cart, cwd, isLua, isHybrid } = target;
 
+				/* Mode taxonomy (#90):
+				 *   (default)    WASM dev — project-dir launch, browser panel,
+				 *                live reload.
+				 *   player       native dev — project-dir launch, SDL2 window,
+				 *                live reload (run mode); debug is direct-connect.
+				 *   cart         WASM — build then serve a prebuilt cart file,
+				 *                no watcher / no reload.
+				 *   player-cart  native — build then run a prebuilt cart file in
+				 *                an SDL2 window, no watcher / no reload.
+				 * nativeWindow → SDL2 (player*); explicitCart → prebuilt cart
+				 * file, no project-dir watcher (cart / player-cart). */
+				const nativeWindow =
+					config.mode === 'player' || config.mode === 'player-cart';
+				const explicitCart =
+					config.mode === 'cart' || config.mode === 'player-cart';
+
 				/* Build-only modes: compile the cart, then cancel the launch. */
 				if (config.mode === 'build' || config.mode === 'build-debug') {
 					const isDbg = config.mode === 'build-debug';
@@ -1081,18 +1183,87 @@ function activate(context) {
 					return undefined;
 				}
 
-				/* Native mode: blytplay (Ctrl+F5) or blytdebug (F5) in an SDL2 window.
-				 * Mirrors the WASM path but spawns native binaries directly — no HTTP
-				 * server, no webview panel, no WebSocket relay. */
-				if (config.mode === 'native') {
+				/* Native (SDL2 window) modes — player (project-dir dev, with
+				 * live reload in run mode) and player-cart (prebuilt cart file, no
+				 * watcher).  No HTTP server, no webview panel.  Debug is
+				 * direct-connect (lldb-dap → GDB) for both; reload is suppressed
+				 * during a native debug session (the seamless reload-while-debugging
+				 * version is the #119 follow-up). */
+				if (nativeWindow) {
 					if (config.noDebug) {
-						/* Ctrl+F5: run with blytplay (release, no debugger). */
-						if (!fs.existsSync(cart) && !(await build(cwd, false)))
-							return undefined;
+						/* player-cart Ctrl+F5: run the prebuilt cart file in an SDL2
+						 * window — no devtool, no watcher, no reload. */
+						if (explicitCart) {
+							const blytplayCart = findSdkBin('blytplay');
+							if (!blytplayCart) return undefined;
+							if (
+								!fs.existsSync(cart) &&
+								!(await build(cwd, false))
+							)
+								return undefined;
+							output.appendLine(`\n── blytplay ${cart}`);
+							const cartProc = cp.spawn(blytplayCart, [cart], {
+								cwd,
+								stdio: ['ignore', 'pipe', 'pipe'],
+							});
+							cartProc.stdout.on('data', (d) =>
+								output.append(d.toString()),
+							);
+							cartProc.stderr.on('data', (d) =>
+								output.append(d.toString()),
+							);
+							cartProc.on('error', (err) =>
+								vscode.window.showErrorMessage(
+									`Blyt: ${err.message}`,
+								),
+							);
+							const cartTempId = await trackProc(cartProc, null);
+							return {
+								...config,
+								cart,
+								_blytMode: 'run',
+								_blytTempId: cartTempId,
+							};
+						}
+
+						/* player Ctrl+F5 (dev): start the devtool on the project
+						 * dir (it builds build/.elf, then runs the dev control hub +
+						 * file watcher), then run blytplay dialing that hub so a
+						 * watcher-driven rebuild hot-reloads the SDL2 window — the
+						 * native counterpart to WASM-dev live reload (#90, option 2).
+						 * A player session is native-only: no browser panel.  Two
+						 * processes (devtool + player) are tracked so the stop button
+						 * tears both down. */
 						const blytplay = findSdkBin('blytplay');
 						if (!blytplay) return undefined;
-						output.appendLine(`\n── blytplay ${cart}`);
-						const proc = cp.spawn(blytplay, [cart], {
+						output.appendLine(`\n── blyt run ${cwd}`);
+						let serveResult;
+						try {
+							serveResult = await startDevtoolRun(
+								cwd,
+								cwd,
+								output,
+							);
+						} catch (e) {
+							vscode.window.showErrorMessage(
+								`Blyt: ${e.message}`,
+							);
+							return undefined;
+						}
+						const { proc: devtoolProc, devCtrlPort } = serveResult;
+						/* Pass the project dir (not the .blyt): the player derives
+						 * build/.elf and reload reopens that same devtool-rebuilt
+						 * ELF. */
+						const playerArgs = [cwd];
+						if (devCtrlPort)
+							playerArgs.unshift(
+								'--dev-ctrl-connect',
+								String(devCtrlPort),
+							);
+						output.appendLine(
+							`\n── blytplay ${playerArgs.join(' ')}`,
+						);
+						const proc = cp.spawn(blytplay, playerArgs, {
 							cwd,
 							stdio: ['ignore', 'pipe', 'pipe'],
 						});
@@ -1108,9 +1279,9 @@ function activate(context) {
 							),
 						);
 						const tempId = await trackProc(proc, null);
+						pendingAuxProcs.set(tempId, devtoolProc);
 						return {
 							...config,
-							cart,
 							_blytMode: 'run',
 							_blytTempId: tempId,
 						};
@@ -1162,7 +1333,7 @@ function activate(context) {
 						});
 						return {
 							...config,
-							_blytMode: 'native',
+							_blytMode: 'gdb',
 							program: debugCart,
 							stopOnEntry: false,
 							launchCommands: [
@@ -1208,7 +1379,7 @@ function activate(context) {
 					pendingProcs.set(nativeTempId, nativeProc);
 					return {
 						...config,
-						_blytMode: 'native',
+						_blytMode: 'gdb',
 						program: debugCart,
 						stopOnEntry: false,
 						launchCommands: [
@@ -1219,14 +1390,48 @@ function activate(context) {
 					};
 				}
 
-				/* Run Without Debugging (Ctrl+F5): plain `blyt run`, no relay. */
+				/* WASM Run Without Debugging (Ctrl+F5). */
 				if (config.noDebug) {
-					if (!fs.existsSync(cart) && !(await build(cwd, false)))
-						return undefined;
-					output.appendLine(`\n── blyt run ${cart}`);
+					if (explicitCart) {
+						/* cart mode: serve the prebuilt cart file — no watcher, no
+						 * reload. */
+						if (!fs.existsSync(cart) && !(await build(cwd, false)))
+							return undefined;
+						output.appendLine(`\n── blyt run ${cart}`);
+						let result;
+						try {
+							result = await startBlytRunSimple(
+								cart,
+								cwd,
+								output,
+							);
+						} catch (e) {
+							vscode.window.showErrorMessage(
+								`Blyt: ${e.message}`,
+							);
+							return undefined;
+						}
+						const tempId = await trackProc(
+							result.proc,
+							result.httpPort,
+						);
+						return {
+							...config,
+							cart,
+							_blytMode: 'run',
+							_blytTempId: tempId,
+						};
+					}
+
+					/* WASM dev (default): serve the project dir — `blyt run` builds
+					 * build/.elf, then runs the dev control hub + file watcher.  The
+					 * browser page connects to the hub and reloads itself on a
+					 * watcher-driven rebuild, so live reload works without a debug
+					 * session. */
+					output.appendLine(`\n── blyt run ${cwd}`);
 					let result;
 					try {
-						result = await startBlytRunSimple(cart, cwd, output);
+						result = await startDevtoolRun(cwd, cwd, output);
 					} catch (e) {
 						vscode.window.showErrorMessage(`Blyt: ${e.message}`);
 						return undefined;
@@ -1237,19 +1442,32 @@ function activate(context) {
 					);
 					return {
 						...config,
-						cart,
 						_blytMode: 'run',
 						_blytTempId: tempId,
 					};
 				}
 
-				if (!(await build(cwd, true))) return undefined;
+				/* WASM debug (F5).
+				 *   default (project dir): `blyt debug <dir>` builds build/.dbg.elf
+				 *     internally, then serves with the dev control hub + watcher, so
+				 *     a reload hot-swaps the cart while the DAP session stays live
+				 *     (#90; the port-wait below is the build barrier).
+				 *   cart (prebuilt file): build --debug here, then `blyt debug
+				 *     <file>` serves with no watcher / no reload. */
+				let launchArg = cwd;
+				if (explicitCart) {
+					if (!(await build(cwd, true))) return undefined;
+					launchArg = debugCartPath(cart);
+				}
+				/* The debug cart ELF lldb-dap loads for symbols (native/hybrid
+				 * `program`).  In project-dir mode `blyt debug` builds it
+				 * internally; debugCartPath derives that path from the detected
+				 * release cart either way. */
 				const debugCart = debugCartPath(cart);
-
-				output.appendLine(`\n── blyt debug ${debugCart}`);
+				output.appendLine(`\n── blyt debug ${launchArg}`);
 				let result;
 				try {
-					result = await startBlytRun(debugCart, cwd, output);
+					result = await startDevtool(launchArg, cwd, output);
 				} catch (e) {
 					vscode.window.showErrorMessage(`Blyt: ${e.message}`);
 					return undefined;
@@ -1367,7 +1585,7 @@ function activate(context) {
 				 * breakpoints and frames back to the files on disk. */
 				return {
 					...config,
-					_blytMode: 'native',
+					_blytMode: 'gdb',
 					program: debugCart,
 					stopOnEntry: false,
 					launchCommands: [
@@ -1518,6 +1736,9 @@ function activate(context) {
 				sessionProcs.delete(session.id);
 				output.appendLine('── blyt process stopped');
 			}
+			/* Player-dev run mode (#90) also owns the devtool serving the dev
+			 * control hub + file watcher — tear it down with the session. */
+			killAuxProc(session.id);
 			sessionUrls.delete(session.id);
 		}),
 	);
@@ -1557,6 +1778,8 @@ function activate(context) {
 function deactivate() {
 	for (const p of pendingProcs.values()) p.kill();
 	for (const p of sessionProcs.values()) p.kill();
+	for (const p of pendingAuxProcs.values()) p.kill();
+	for (const p of sessionAuxProcs.values()) p.kill();
 	if (g_gamePanel) {
 		g_gamePanel.dispose();
 		g_gamePanel = null;

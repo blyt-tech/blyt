@@ -1201,6 +1201,16 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     g_lua_co = lua_newthread(g_lua);
     g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
     luaL_loadstring(g_lua_co, co_body_running);
+#ifdef BLYT_DAP
+    /* Re-arm the DAP master hook on the freshly built running coroutine so
+     * breakpoints keep firing after a hot reload (issue #90): the debug session
+     * is uninterrupted (ADR-0045 DAP continuity), but the hook lives on the
+     * coroutine we just replaced — without reinstalling it, the reloaded cart
+     * would run with debugging silently dead.  Mirrors the INIT→RUNNING
+     * transition and initial-start paths. */
+    if (fc_master_hook_cfg.dap_enabled)
+        fc_consolelua_master_hook_install(g_lua_co);
+#endif
     /* g_lua_phase stays LUA_PHASE_RUNNING — next frame calls update() directly */
     return true;
 }

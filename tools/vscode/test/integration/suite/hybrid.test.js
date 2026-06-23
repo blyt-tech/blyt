@@ -31,8 +31,8 @@ describe('Hybrid Lua+C cart (native debug)', () => {
 		await h.startNative(wf);
 
 		const native = await h.waitForSession(
-			h.byMode('native'),
-			'native session',
+			h.byMode('gdb'),
+			'gdb (native) session',
 		);
 		const lua = await h.waitForSession(h.byMode('lua'), 'lua session');
 
@@ -82,8 +82,8 @@ describe('Hybrid Lua+C cart (native debug)', () => {
 		await h.startNative(wf);
 
 		const native = await h.waitForSession(
-			h.byMode('native'),
-			'native session',
+			h.byMode('gdb'),
+			'gdb (native) session',
 		);
 		const lua = await h.waitForSession(h.byMode('lua'), 'lua session');
 

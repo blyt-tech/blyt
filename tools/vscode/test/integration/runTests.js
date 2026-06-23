@@ -37,6 +37,7 @@ const VSCODE_VERSION = '1.125.1';
 const CARTS = [
 	{ dir: 'hello', spec: 'lua.test.js' },
 	{ dir: 'hello-c', spec: 'c.test.js' },
+	{ dir: 'hello-c', spec: 'wasm.test.js' },
 	{ dir: 'hello-lua-c', spec: 'hybrid.test.js' },
 ];
 

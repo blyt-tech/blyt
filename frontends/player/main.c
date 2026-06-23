@@ -167,9 +167,19 @@ static bool g_reset_every_frame =
  * -1 = disabled, 0 = OS-assigned (actual port announced on stdout), >0 = fixed.
  * The player listens on this port for newline-delimited JSON lifecycle commands
  * (reload / save_state / load_state / reset) — the same role the browser runtime
- * fills over the devtool's WebSocket relay.  `blyt debug`'s file watcher (the
- * former `blyt watch`) connects here to drive hot reload. */
+ * fills over the devtool's WebSocket relay.  A tool that already owns the port
+ * (e.g. a test harness) connects here to drive hot reload. */
 static int g_dev_ctrl_port = -1;
+
+/* --dev-ctrl-connect: dial an existing dev control hub instead of listening
+ * (issue #90, "option 2" reload wiring).  -1 = disabled, >0 = the devtool's dev
+ * control TCP port.  In project-dir dev mode the devtool (`blyt run`/`blyt
+ * debug ./dir`) owns the broadcast hub and its file watcher; the player dials in
+ * as one more client so a watcher-driven `reload` reaches the native window the
+ * same way it reaches the browser page.  The devtool is unchanged — only the
+ * player learns to connect outward.  Speaks the identical newline-delimited JSON
+ * protocol as the listen path, so the two share all dispatch machinery. */
+static int g_dev_ctrl_connect_port = -1;
 
 /* If BLYT_LIB_DIR is unset, try to infer it as <binary_dir>/../lib.
  * This lets blytplay/blytdebug work without any environment setup when
@@ -268,6 +278,8 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
             g_reset_every_frame = true;
         } else if (strcmp(argv[i], "--dev-ctrl-port") == 0 && i + 1 < argc) {
             g_dev_ctrl_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--dev-ctrl-connect") == 0 && i + 1 < argc) {
+            g_dev_ctrl_connect_port = atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             cart = argv[i];
         } else {
@@ -465,13 +477,44 @@ static void dev_ctrl_start(int port) {
     fflush(stdout);
 }
 
-/* Accept a pending client and drain any available command bytes.  Called once
- * per frame; never blocks. */
-static void dev_ctrl_poll(void) {
-    if (g_dev_ctrl_listen_fd < 0)
-        return;
+/* Dial an existing dev control hub and adopt the connection as our client fd
+ * (issue #90).  The devtool's hub is already listening by the time the player
+ * starts (VS Code waits for the "Dev control:" banner before launching the
+ * player), but a few short retries absorb any startup race.  On success the
+ * usual non-blocking read/dispatch loop in dev_ctrl_poll() takes over. */
+static void dev_ctrl_connect(int port) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
 
-    if (g_dev_ctrl_client_fd < 0) {
+    for (int attempt = 0; attempt < 20; attempt++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            perror("blytplay: dev-ctrl socket");
+            return;
+        }
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            dev_ctrl_set_nonblocking(fd);
+            g_dev_ctrl_client_fd = fd;
+            g_dev_ctrl_rx_len = 0;
+            printf("Dev control: connected to 127.0.0.1:%d\n", port);
+            fflush(stdout);
+            return;
+        }
+        close(fd);
+        usleep(100 * 1000); /* 100 ms between attempts */
+    }
+    fprintf(stderr, "blytplay: dev-ctrl could not connect to 127.0.0.1:%d\n", port);
+}
+
+/* Accept a pending client (listen mode) or service the dialed connection
+ * (connect mode), draining any available command bytes.  Called once per frame;
+ * never blocks. */
+static void dev_ctrl_poll(void) {
+    /* Listen mode: accept the next client if the listener is up and idle. */
+    if (g_dev_ctrl_listen_fd >= 0 && g_dev_ctrl_client_fd < 0) {
         int c = accept(g_dev_ctrl_listen_fd, NULL, NULL);
         if (c < 0)
             return; /* EWOULDBLOCK — no client yet */
@@ -479,6 +522,12 @@ static void dev_ctrl_poll(void) {
         g_dev_ctrl_client_fd = c;
         g_dev_ctrl_rx_len = 0;
     }
+
+    /* No client (connect mode not yet dialed, or listener idle): nothing to do.
+     * The connect path closes the fd on hub EOF and does not re-dial — the
+     * devtool hub lives for the whole session, so a drop means it is gone. */
+    if (g_dev_ctrl_client_fd < 0)
+        return;
 
     for (;;) {
         if (g_dev_ctrl_rx_len >= sizeof(g_dev_ctrl_rx) - 1)
@@ -607,10 +656,14 @@ int main(int argc, char *argv[]) {
         blyt_libretro_gdb_continue_initial_halt();
 #endif
 
-    /* Dev control channel (issue #87): start the listener now that the cart is
-     * loaded and the session exists.  Non-blocking — the cart runs immediately
-     * whether or not a controller ever connects. */
-    if (g_dev_ctrl_port >= 0)
+    /* Dev control channel (issue #87): start the listener — or dial the devtool
+     * hub (issue #90, option 2) — now that the cart is loaded and the session
+     * exists.  Non-blocking in either case — the cart runs immediately whether
+     * or not a controller is present.  The two modes are mutually exclusive;
+     * --dev-ctrl-connect wins if both are somehow set. */
+    if (g_dev_ctrl_connect_port >= 0)
+        dev_ctrl_connect(g_dev_ctrl_connect_port);
+    else if (g_dev_ctrl_port >= 0)
         dev_ctrl_start(g_dev_ctrl_port);
 
     SDL_Window *win = NULL;
@@ -652,7 +705,7 @@ int main(int argc, char *argv[]) {
             uint32_t elapsed = SDL_GetTicks() - t0;
             if (elapsed < frame_ms)
                 SDL_Delay(frame_ms - elapsed);
-        } else if (g_dev_ctrl_port >= 0) {
+        } else if (g_dev_ctrl_port >= 0 || g_dev_ctrl_connect_port >= 0) {
             /* Pace headless dev control sessions to ~frame rate instead of
              * busy-spinning while waiting for commands. */
             usleep(frame_ms * 1000);

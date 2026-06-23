@@ -22,8 +22,8 @@ describe('C cart (native debug)', () => {
 		await h.startNative(wf);
 
 		const session = await h.waitForSession(
-			h.byMode('native'),
-			'native session',
+			h.byMode('gdb'),
+			'gdb (native) session',
 		);
 		const stop = await h.waitStopped(session);
 		assert.strictEqual(stop.body.reason, 'breakpoint');
@@ -45,8 +45,8 @@ describe('C cart (native debug)', () => {
 		await h.startNative(wf);
 
 		const session = await h.waitForSession(
-			h.byMode('native'),
-			'native session',
+			h.byMode('gdb'),
+			'gdb (native) session',
 		);
 
 		const stop1 = await h.waitStopped(session);
@@ -67,8 +67,8 @@ describe('C cart (native debug)', () => {
 		await h.startNative(wf);
 
 		const session = await h.waitForSession(
-			h.byMode('native'),
-			'native session',
+			h.byMode('gdb'),
+			'gdb (native) session',
 		);
 
 		const stop1 = await h.waitStopped(session);
