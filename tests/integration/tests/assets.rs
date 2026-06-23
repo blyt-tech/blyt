@@ -11,13 +11,39 @@
 mod common;
 
 use common::{
-    CartProject, blytplay, build_cart, build_dev_elf, require_libretro_core, require_sdk,
-    require_wasm, run_cart_all_legs,
+    CartProject, blyt_bin, blytplay, build_cart, build_dev_elf, find_wasm_dir, repo_root,
+    require_libretro_core, require_playwright, require_sdk, require_wasm, run_cart_all_legs,
+    sdk_dir,
 };
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// C cart that re-reads and prints R_GREETING every frame, so a test can observe
+/// a hot-swap take effect on the frame after the swap.  Never quits — the driver
+/// stops it.
+const PER_FRAME_LOADER_C: &str = r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <string.h>
+
+static void print_greeting(void) {
+    size_t len = 0;
+    const char *t = blyt_resource_text_get(R_GREETING, &len);
+    if (t) {
+        char buf[256];
+        size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+        memcpy(buf, t, n);
+        buf[n] = '\0';
+        blyt_console_debug(buf);
+    }
+}
+
+void blyt_cart_init(void) { print_greeting(); }
+void blyt_cart_update(void) { print_greeting(); }
+void blyt_cart_draw(void) {}
+"#;
 
 /// Minimal C cart that loads R_GREETING and prints its bytes verbatim.
 const LOADER_C: &str = r#"
@@ -253,4 +279,111 @@ fn read_line(sock: &mut TcpStream, timeout: Duration) -> String {
         }
     }
     acc
+}
+
+/// WASM dev-mode hot-swap (issue #118): the full browser path.  `blyt run` serves
+/// the project; headless Chromium loads the real shell.html, which preloads the
+/// content-addressed resource staging dir into MEMFS over HTTP and points the
+/// host at it via BLYT_RESOURCE_DIR.  Editing the asset drives the *live* watcher
+/// → update_assets broadcast → shell.html refetch → reload_resources chain; the
+/// swapped bytes must reach the cart with no VM restart.
+#[test]
+fn text_asset_wasm_dev_mode_hot_swap() {
+    require_sdk();
+    require_wasm();
+    require_playwright();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("assets_wasm_hotswap");
+    CartProject::new()
+        .c(PER_FRAME_LOADER_C)
+        .asset("greeting.txt", "VERSION_ONE")
+        .write(&project);
+
+    // Build once up front for a clean failure if the project doesn't compile
+    // (the server rebuilds internally, but this surfaces build errors directly).
+    build_dev_elf(&project);
+
+    let sdk = sdk_dir();
+    use std::process::{Command as StdCommand, Stdio};
+    let mut child = StdCommand::new(blyt_bin())
+        .args(["run", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_CLANG", sdk.join("bin/blyt-clang"))
+        .env("BLYT_WASM_DIR", find_wasm_dir())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn blyt run");
+
+    // Read the server's stdout on a background thread so we can find its port.
+    let mut stdout = child.stdout.take().unwrap();
+    use std::sync::{Arc, Mutex};
+    let buf = Arc::new(Mutex::new(String::new()));
+    let buf_t = buf.clone();
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf_t
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&chunk[..n])),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let url = wait_for_serving_url(&buf, Duration::from_secs(30));
+
+    let driver = repo_root().join("tests/wasm/dev_asset_hotswap_test.mjs");
+    let asset = project.join("assets/greeting.txt");
+    let status = std::process::Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            &url,
+            asset.to_str().unwrap(),
+            "VERSION_ONE",
+            "VERSION_TWO",
+        ])
+        .status()
+        .expect("run dev_asset_hotswap_test.mjs");
+
+    let _ = child.kill();
+    let _ = reader.join();
+    assert!(
+        status.success(),
+        "dev_asset_hotswap_test.mjs failed; blyt run output:\n{}",
+        buf.lock().unwrap()
+    );
+}
+
+/// Parse the `blyt run: serving on http://127.0.0.1:<port>/` banner into a URL.
+fn wait_for_serving_url(
+    buf: &std::sync::Arc<std::sync::Mutex<String>>,
+    timeout: Duration,
+) -> String {
+    const MARKER: &str = "serving on http://";
+    let start = std::time::Instant::now();
+    loop {
+        {
+            let s = buf.lock().unwrap();
+            if let Some(idx) = s.find(MARKER) {
+                let tail = &s[idx + MARKER.len()..];
+                let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+                let hostport = tail[..end].trim_end_matches('/');
+                if hostport.contains(':') {
+                    return format!("http://{hostport}/");
+                }
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "timed out waiting for blyt run serving URL; output: {}",
+                buf.lock().unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
