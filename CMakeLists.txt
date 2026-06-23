@@ -1220,8 +1220,14 @@ add_dependencies(test-integration sdk)
 # Usage: cmake --build build --target test-prereqs
 #
 add_custom_target(test-prereqs)
-add_dependencies(test-prereqs sdk npm_ci wasm_test_deps vscode_ext_deps
-                 blyt_native_riscv64)
+add_dependencies(test-prereqs sdk npm_ci wasm_test_deps vscode_ext_deps)
+# blyt_native_riscv64 is a host-only convenience target that *invokes* the
+# riscv64 cross build; it is not defined in the cross-compile tree itself (its
+# definition is guarded by `NOT CMAKE_CROSSCOMPILING`), so only depend on it
+# where it exists.
+if(TARGET blyt_native_riscv64)
+  add_dependencies(test-prereqs blyt_native_riscv64)
+endif()
 
 # ── test-linux-docker ─────────────────────────────────────────────────────────
 # Run integration tests inside a Linux Docker container that mirrors the GitHub
