@@ -6,6 +6,7 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -183,6 +184,13 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session);
 
 /* Destroy a session and free all emulator resources. */
 void blyt_session_destroy(blyt_session_t *session);
+
+/* Reload the session's resource table from its source (issue #91): the cart's
+ * embedded sections, or — for a dev project-dir build — the staging directory
+ * alongside the dev ELF.  Used by the `update_assets` dev-control command to
+ * hot-swap edited assets between frames without a VM restart.  Returns true on
+ * success.  `cart` must be the cart the session was created from. */
+bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart);
 
 /* --- Frame output -------------------------------------------------------- */
 

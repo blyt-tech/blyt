@@ -424,6 +424,7 @@ add_library(
   libblyt STATIC
   runtime/host/src/libblyt/cart_load.c
   runtime/host/src/libblyt/cart_run.c
+  runtime/host/src/libblyt/resource.c
   runtime/host/src/libblyt/state_buffer.c
   runtime/host/src/libblyt/save.c
   runtime/host/src/libblyt/testcard.c
@@ -531,6 +532,7 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     libblyt_debug STATIC
     runtime/host/src/libblyt/cart_load.c
     runtime/host/src/libblyt/cart_run.c
+    runtime/host/src/libblyt/resource.c
     runtime/host/src/libblyt/state_buffer.c
     runtime/host/src/libblyt/save.c
     runtime/host/src/libblyt/testcard.c
