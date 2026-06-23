@@ -312,14 +312,16 @@ function buildCart(cwd, output, debug = false) {
 
 /* ── Start blyt debug ─────────────────────────────────────────────────────── */
 
-/* Spawns `blyt debug <cartPath>` (ADR-0129) and resolves once the process
- * prints both the HTTP and DAP ports.  All stdout/stderr is forwarded to
- * `output`.  The announce text is unchanged from the old `blyt run --debug`,
- * so the port regexes below still match. */
-function startBlytRun(cartPath, cwd, output) {
+/* Spawns `blyt debug <projectDir>` (project-dir dev mode, #84/#88) and resolves
+ * once the process prints the HTTP and DAP ports.  `blyt debug ./dir` builds the
+ * cart internally before announcing the HTTP port, so the extension's existing
+ * port-wait is the initial-build barrier — no explicit buildCart() pre-step.
+ * Also captures the dev-control port (#87) from the banner for the reload wiring.
+ * All stdout/stderr is forwarded to `output`. */
+function startDevtool(projectDir, cwd, output) {
 	const blyt = findBlyt();
 	if (!blyt) return Promise.reject(new Error('blyt SDK not configured'));
-	const args = ['debug', cartPath];
+	const args = ['debug', projectDir];
 	const trace = traceChannels();
 	/* Trace lands in the BROWSER dev console for this flow: the WASM runtime's
 	 * stderr goes to printErr in the page, not to this process. */
@@ -333,6 +335,7 @@ function startBlytRun(cartPath, cwd, output) {
 		let buf = '';
 		let httpPort = 0;
 		let gdbPort = 0;
+		let devCtrlPort = 0;
 		let resolved = false;
 
 		function check(data) {
@@ -342,6 +345,11 @@ function startBlytRun(cartPath, cwd, output) {
 			if (!httpPort) {
 				const m = buf.match(/serving on http:\/\/127\.0\.0\.1:(\d+)/);
 				if (m) httpPort = parseInt(m[1], 10);
+			}
+
+			if (!devCtrlPort) {
+				const d = buf.match(/Dev control:\s+127\.0\.0\.1:(\d+)/);
+				if (d) devCtrlPort = parseInt(d[1], 10);
 			}
 
 			if (!gdbPort) {
@@ -363,6 +371,7 @@ function startBlytRun(cartPath, cwd, output) {
 					httpPort,
 					dapPort: parseInt(m[1], 10),
 					gdbPort,
+					devCtrlPort,
 				});
 			}
 		}
@@ -1025,7 +1034,7 @@ function activate(context) {
 						cfg._blytDapPort,
 						'127.0.0.1',
 					);
-				if (cfg._blytMode === 'native')
+				if (cfg._blytMode === 'gdb')
 					return new vscode.DebugAdapterInlineImplementation(
 						new BlytGdbDapProxy(findLldbDap()),
 					);
@@ -1081,10 +1090,12 @@ function activate(context) {
 					return undefined;
 				}
 
-				/* Native mode: blytplay (Ctrl+F5) or blytdebug (F5) in an SDL2 window.
-				 * Mirrors the WASM path but spawns native binaries directly — no HTTP
-				 * server, no webview panel, no WebSocket relay. */
-				if (config.mode === 'native') {
+				/* Player mode: blytplay (Ctrl+F5) or blytdebug (F5) in an SDL2 window.
+				 * Spawns the player directly — no HTTP server, no webview panel, no
+				 * WebSocket relay.  (Project-dir launch + run-mode reload + the
+				 * devtool-alongside orchestration land in a later #90 slice; debug
+				 * stays direct-connect.) */
+				if (config.mode === 'player') {
 					if (config.noDebug) {
 						/* Ctrl+F5: run with blytplay (release, no debugger). */
 						if (!fs.existsSync(cart) && !(await build(cwd, false)))
@@ -1162,7 +1173,7 @@ function activate(context) {
 						});
 						return {
 							...config,
-							_blytMode: 'native',
+							_blytMode: 'gdb',
 							program: debugCart,
 							stopOnEntry: false,
 							launchCommands: [
@@ -1208,7 +1219,7 @@ function activate(context) {
 					pendingProcs.set(nativeTempId, nativeProc);
 					return {
 						...config,
-						_blytMode: 'native',
+						_blytMode: 'gdb',
 						program: debugCart,
 						stopOnEntry: false,
 						launchCommands: [
@@ -1243,18 +1254,20 @@ function activate(context) {
 					};
 				}
 
-				if (!(await build(cwd, true))) return undefined;
-				const debugCart = debugCartPath(cart);
-
-				output.appendLine(`\n── blyt debug ${debugCart}`);
+				/* WASM dev mode (default): pass the project dir — `blyt debug`
+				 * builds the cart internally and only announces the HTTP port
+				 * after the initial build, so no explicit buildCart() pre-step is
+				 * needed (the port-wait below is the build barrier). */
+				output.appendLine(`\n── blyt debug ${cwd}`);
 				let result;
 				try {
-					result = await startBlytRun(debugCart, cwd, output);
+					result = await startDevtool(cwd, cwd, output);
 				} catch (e) {
 					vscode.window.showErrorMessage(`Blyt: ${e.message}`);
 					return undefined;
 				}
-				const { proc, httpPort, dapPort, gdbPort } = result;
+				const { proc, httpPort, dapPort, gdbPort, devCtrlPort } = result;
+				void devCtrlPort; /* wired for reload in a later slice */
 
 				/* Lua cart: connect VS Code's DAP client straight to the relay. */
 				if (isLua) {
@@ -1367,7 +1380,7 @@ function activate(context) {
 				 * breakpoints and frames back to the files on disk. */
 				return {
 					...config,
-					_blytMode: 'native',
+					_blytMode: 'gdb',
 					program: debugCart,
 					stopOnEntry: false,
 					launchCommands: [

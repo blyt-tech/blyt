@@ -67,11 +67,13 @@
               "mode": {
                 "type": "string",
                 "enum": [
-                  "native",
+                  "player",
+                  "cart",
+                  "player-cart",
                   "build",
                   "build-debug"
                 ],
-                "description": "Run mode. Omit for WASM (default): cart opens in a VS Code panel. native: cart opens in an external SDL2 window (Ctrl+F5 = blytplay, F5 = blytdebug). build/build-debug: compile without launching."
+                "description": "Run mode. Omit for WASM dev (default): project-dir launch with live reload, cart in a VS Code panel. player: native dev — project-dir launch in an external SDL2 window (Ctrl+F5 = blytplay, F5 = blytdebug). cart: WASM, explicit build then serve a prebuilt cart, no watching. player-cart: native, explicit build then external window, no watching. build/build-debug: compile without launching."
               }
             }
           }
