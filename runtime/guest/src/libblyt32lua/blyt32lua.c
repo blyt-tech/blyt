@@ -499,3 +499,36 @@ void blyt_cart_on_load_state(blyt_load_info_t info) {
         lua_remove(g_L, msgh);
 #endif
 }
+
+/* Dev-only asset hot-swap hook (issue #122).  The host marshals the changed
+ * resource ids into guest memory and calls this; we present them to the cart as
+ * a 1-based integer array `ids` passed to the global on_assets_reloaded(ids). */
+void blyt_cart_on_assets_reloaded(const uint32_t *ids, size_t n) {
+    if (!g_L)
+        return;
+    int msgh = 0;
+#ifdef BLYT_DAP
+    if (blyt_dap_active()) {
+        lua_pushcfunction(g_L, dap_error_handler);
+        msgh = lua_gettop(g_L);
+    }
+#endif
+    lua_getglobal(g_L, "on_assets_reloaded");
+    if (lua_isfunction(g_L, -1)) {
+        lua_createtable(g_L, (int)n, 0);
+        for (size_t i = 0; i < n; i++) {
+            lua_pushinteger(g_L, (lua_Integer)ids[i]);
+            lua_seti(g_L, -2, (lua_Integer)(i + 1));
+        }
+        if (lua_pcall(g_L, 1, 0, msgh) != LUA_OK) {
+            blyt_console_debug(lua_tostring(g_L, -1));
+            lua_pop(g_L, 1);
+        }
+    } else {
+        lua_pop(g_L, 1);
+    }
+#ifdef BLYT_DAP
+    if (msgh > 0)
+        lua_remove(g_L, msgh);
+#endif
+}

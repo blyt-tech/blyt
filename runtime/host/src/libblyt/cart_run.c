@@ -273,6 +273,7 @@ struct blyt_session {
     uint32_t fn_draw;
     uint32_t fn_on_quit;
     uint32_t fn_cleanup;
+    uint32_t fn_on_assets_reloaded; /* dev-only asset hot-swap hook (issue #122) */
     /* blyt_is_quit_requested() from libblytcommon.so: called by the WASM
      * frontend after each lifecycle trampoline to propagate blyt_quit(). */
     uint32_t fn_is_quit_requested;
@@ -2291,6 +2292,7 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
         s->fn_draw = symtab_lookup(all_syms, "blyt_cart_draw");
         s->fn_on_quit = symtab_lookup(all_syms, "blyt_cart_on_quit");
         s->fn_cleanup = symtab_lookup(all_syms, "blyt_cart_cleanup");
+        s->fn_on_assets_reloaded = symtab_lookup(all_syms, "blyt_cart_on_assets_reloaded");
         s->fn_is_quit_requested = symtab_lookup(all_syms, "blyt_is_quit_requested");
     }
 
@@ -2546,6 +2548,8 @@ static const char *session_fn_name(const blyt_session_t *s, uint32_t addr) {
         return "on_quit";
     if (addr == s->fn_cleanup)
         return "cleanup";
+    if (addr == s->fn_on_assets_reloaded)
+        return "on_assets_reloaded";
     if (addr == s->fn_is_quit_requested)
         return "is_quit_requested";
     return NULL;
@@ -3255,6 +3259,37 @@ static void call_guest_on_load_state(blyt_session_t *s, uint32_t reason,
         rv_set_reg(s->rv, rv_reg_sp, scratch);
         uint32_t args[1] = {scratch};
         blyt_session_begin_fn_call(s, s->fn_on_load_state, 1, args);
+        call_until_fn_done(s);
+    }
+    emu_state_restore(s, &e);
+}
+
+/* Call blyt_cart_on_assets_reloaded(const uint32_t *ids, size_t n) — the
+ * dev-only asset hot-swap hook (issue #122) — preserving emulator state.
+ *
+ * Unlike blyt_load_info_t, the id array is variable-length, so we materialise
+ * it in scratch space just below the guest stack pointer (16-byte aligned) and
+ * pass a0 = pointer, a1 = count, mirroring the by-reference technique in
+ * call_guest_on_load_state.  Setting sp to the array's address keeps it above
+ * the callee's own frame; emu_state_restore puts sp and every other register
+ * back when the hook returns.  No-op when the cart defines no hook (fn == 0),
+ * the id set is empty, or the array does not fit in guest RAM. */
+void blyt_session_notify_assets_reloaded(blyt_session_t *s, const uint32_t *ids, size_t n) {
+    blyt_emu_state_t e;
+    if (!s || s->fn_on_assets_reloaded == 0 || n == 0 || ids == NULL)
+        return;
+    uint32_t bytes = (uint32_t)(n * sizeof(uint32_t));
+    if (bytes / sizeof(uint32_t) != n) /* overflow guard */
+        return;
+    emu_state_save(s, &e);
+    uint32_t sp = rv_get_reg(s->rv, rv_reg_sp);
+    uint32_t scratch = (sp - bytes) & ~(uint32_t)15; /* 16-byte aligned */
+    memory_t *mem = PRIV(s->rv)->mem;
+    if (GUEST_RAM_CONTAINS(mem, scratch, bytes)) {
+        memory_write(mem, scratch, (const uint8_t *)ids, bytes);
+        rv_set_reg(s->rv, rv_reg_sp, scratch);
+        uint32_t args[2] = {scratch, (uint32_t)n};
+        blyt_session_begin_fn_call(s, s->fn_on_assets_reloaded, 2, args);
         call_until_fn_done(s);
     }
     emu_state_restore(s, &e);

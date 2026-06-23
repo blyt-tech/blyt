@@ -76,6 +76,13 @@ __attribute__((weak)) void blyt_cart_on_quit(void) {
 __attribute__((weak)) void blyt_cart_cleanup(void) {
 }
 
+/* Dev-only asset hot-swap hook (issue #122).  Weak no-op so carts override only
+ * if they cache/derive from resources; never fires in a shipped cart. */
+__attribute__((weak)) void blyt_cart_on_assets_reloaded(const uint32_t *ids, size_t n) {
+    (void)ids;
+    (void)n;
+}
+
 /* -------------------------------------------------------------------------
  * blyt_main — runtime-owned lifecycle driver (ADR-0087)
  *

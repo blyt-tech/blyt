@@ -157,6 +157,13 @@ void blyt_cart_on_load_state(blyt_load_info_t info);
 void blyt_cart_on_quit(void);
 void blyt_cart_cleanup(void);
 
+/* Dev-only (issue #122): the runtime calls this after a dev-mode asset hot-swap
+ * (`update_assets`, no VM restart) with the changed resource ids, so a cart that
+ * derived/cached something from a resource can re-derive only the affected ones.
+ * `ids` points to `n` resource handles (blyt_resource_h); order is unspecified.
+ * Never fires in a shipped cart.  Weak no-op default in libblytcommon. */
+void blyt_cart_on_assets_reloaded(const uint32_t *ids, size_t n);
+
 /* -------------------------------------------------------------------------
  * Cart signals to the runtime (ADR-0087)
  * ------------------------------------------------------------------------- */
