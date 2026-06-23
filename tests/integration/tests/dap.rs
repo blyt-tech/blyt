@@ -953,3 +953,77 @@ fn sdl_dap_multifile_nonfirst_file_breakpoint_binds() {
         .assert()
         .success();
 }
+
+/// WASM-dev reload-while-debugging (issue #90, slice 4): a hot reload in a debug
+/// session must be *uninterrupted* — the same DAP connection keeps working
+/// across the cart swap (ADR-0045 "DAP server continuity").  Builds two cart
+/// versions sharing a layout (breakpoint at the draw() line, which runs every
+/// frame), stops at it, clears + continues, hot-reloads v1→v2 straight into the
+/// runtime, then re-arms the breakpoint and asserts the reloaded cart stops
+/// again on the same connection.  reload_dap_test.mjs returns non-zero if the
+/// session was torn down (the re-armed setBreakpoints / stopped would time out).
+#[test]
+fn wasm_dap_reload_keeps_session() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    const RELOAD_DAP_CONFIG: &str = "\
+save_version: 5
+records:
+  Game:
+    fields:
+      - { name: score, type: i32 }
+state_buffers:
+  game:
+    record: Game
+    count: 1
+";
+
+    // v1/v2 share line numbers so the breakpoint at the draw() line (8) binds in
+    // both; only init()'s score differs, so a state-preserving reload is
+    // observable.  on_load_state prints the HOT_RELOAD reason the driver checks.
+    let cart_lua = |tag: &str, score: i32| {
+        format!(
+            "local slot = -1\n\
+             function init()\n\
+             \x20   slot = blyt.buf.alloc_slot(S.GAME)\n\
+             \x20   S.game[slot].score = {score}\n\
+             end\n\
+             function update() end\n\
+             function draw()\n\
+             \x20   local s = S.game[slot].score\n\
+             end\n\
+             function on_load_state(info)\n\
+             \x20   blyt.debug.print('{tag} load reason=' .. tostring(info.reason))\n\
+             end\n"
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let p1 = tmp.path().join("reload_dap_v1");
+    CartProject::new()
+        .config(RELOAD_DAP_CONFIG)
+        .lua(&cart_lua("v1", 7))
+        .write(&p1);
+    let cart_v1 = build_lua_cart(&p1);
+
+    let p2 = tmp.path().join("reload_dap_v2");
+    CartProject::new()
+        .config(RELOAD_DAP_CONFIG)
+        .lua(&cart_lua("v2", 100))
+        .write(&p2);
+    let cart_v2 = build_lua_cart(&p2);
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/reload_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart_v1.to_str().unwrap(),
+            cart_v2.to_str().unwrap(),
+            "8",
+        ])
+        .assert()
+        .success();
+}

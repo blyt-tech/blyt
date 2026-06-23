@@ -142,17 +142,36 @@ function removeBreakpoint(bp) {
 	vscode.debug.removeBreakpoints([bp]);
 }
 
-/* Launch a native-mode debug session for the given folder. No explicit `cart`:
- * with one cart per window, the extension auto-detects it (the real F5 path).
- * The extension resolves cart type itself: pure-Lua -> one 'lua' session;
- * pure-native -> one 'native' session; hybrid -> 'native' + companion 'lua'. */
+/* Launch a player-mode (native SDL2 window) debug session for the given folder.
+ * No explicit `cart`: with one cart per window, the extension auto-detects it
+ * (the real F5 path).  The extension resolves cart type itself and tags the
+ * session via `_blytMode`: pure-Lua -> one 'lua' session; pure-native -> one
+ * 'gdb' session; hybrid -> 'gdb' + companion 'lua'.  (`mode: 'player'` is the
+ * #90 rename of the former `native`; `_blytMode: 'gdb'` the rename of the former
+ * `native`.) */
 async function startNative(wf) {
 	install();
 	const ok = await vscode.debug.startDebugging(wf, {
 		type: 'blyt',
 		request: 'launch',
 		name: `blyt:${path.basename(wf.uri.fsPath)}`,
-		mode: 'native',
+		mode: 'player',
+	});
+	if (!ok) throw new Error('vscode.debug.startDebugging returned false');
+}
+
+/* Launch a default WASM-mode debug session (no `mode`): `blyt debug <dir>`
+ * serves the cart in a webview panel with the DAP/GDB relays.  Same cart-type
+ * resolution and `_blytMode` tags as startNative (pure-native → 'gdb', Lua →
+ * 'lua', hybrid → 'gdb' + 'lua') — the difference is the transport (browser
+ * relay vs direct).  Regression coverage for the #90 WASM-debug path, including
+ * the native `program` return (the `debugCart` ReferenceError). */
+async function startWasm(wf) {
+	install();
+	const ok = await vscode.debug.startDebugging(wf, {
+		type: 'blyt',
+		request: 'launch',
+		name: `blyt-wasm:${path.basename(wf.uri.fsPath)}`,
 	});
 	if (!ok) throw new Error('vscode.debug.startDebugging returned false');
 }
@@ -324,6 +343,7 @@ module.exports = {
 	addBreakpoint,
 	removeBreakpoint,
 	startNative,
+	startWasm,
 	waitForSession,
 	byMode,
 	waitStopped,

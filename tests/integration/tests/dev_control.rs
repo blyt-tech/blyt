@@ -16,9 +16,10 @@ use common::{
     sdk_dir,
 };
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Minimal Lua cart that runs forever (so the server stays up while we probe).
@@ -333,5 +334,235 @@ fn native_dev_control_lifecycle_commands() {
         out.contains("v2 load score=7 reason=3 version=0"),
         "reload did not preserve state across the code swap, or did not deliver \
          reason=HOT_RELOAD(3) / version=0; player output:\n{out}"
+    );
+}
+
+/* ── native player as an outbound dev-control client (issue #90, option 2) ──── */
+
+/// Spawn the player in dial-out mode (`--dev-ctrl-connect <port>`), draining its
+/// stdout on a background thread.  Returns the child and a shared buffer of all
+/// stdout lines.  Unlike the listen-mode helper there is no port to parse back —
+/// the player dials the hub the caller already owns.
+fn spawn_player_dialing(
+    cart: &std::path::Path,
+    hub_port: u16,
+    save_dir: &std::path::Path,
+) -> (std::process::Child, Arc<Mutex<Vec<String>>>) {
+    let mut child = std::process::Command::new(blytplay())
+        .args([
+            "--headless",
+            "--dev-ctrl-connect",
+            &hub_port.to_string(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_SAVE_DIR", save_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("blytplay spawn");
+
+    let stdout = child.stdout.take().unwrap();
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let lines_w = Arc::clone(&lines);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => lines_w.lock().unwrap().push(line.trim_end().to_string()),
+            }
+        }
+    });
+    (child, lines)
+}
+
+/// The native player dials a dev control hub (rather than listening) and
+/// services the full command set over the dialed connection — the "option 2"
+/// reload wiring for player-dev mode (issue #90).  The test owns the hub: it
+/// binds a TCP listener, the player connects outward, and the test drives the
+/// same reset / save_state / load_state / reload protocol it would receive from
+/// the devtool's broadcast hub.  Proves the dial-out transport carries every
+/// command and that a code-swapping reload preserves state, exactly as the
+/// listen path does.
+#[test]
+fn native_dev_control_connect_lifecycle() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+
+    let v1 = score_cart(&tmp, "connect_dc_v1", "v1", 7);
+    let v2 = score_cart(&tmp, "connect_dc_v2", "v2", 100);
+
+    let work = tmp.path().join("cart.blyt");
+    std::fs::copy(&v1, &work).unwrap();
+
+    // Stand up the hub side: an OS-assigned TCP port the player will dial.
+    let hub = TcpListener::bind("127.0.0.1:0").expect("bind hub");
+    let hub_port = hub.local_addr().unwrap().port();
+
+    let (mut child, lines) = spawn_player_dialing(&work, hub_port, save_dir.path());
+
+    // Accept the player's outbound connection (option 2: the player dials us).
+    hub.set_nonblocking(false).unwrap();
+    let (stream, _) = hub.accept().expect("player did not dial the hub");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut stream = stream;
+    let read_half = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(read_half);
+
+    let check = |resp: &str, id: i64, cmd: &str| {
+        assert_eq!(
+            resp,
+            format!("{{\"id\":{id},\"status\":\"ok\",\"cmd\":\"{cmd}\"}}"),
+            "unexpected response"
+        );
+    };
+
+    // reset + save_state pipelined in one write (boots the cart in reset so the
+    // save captures init() state — same contract as the listen path).
+    stream
+        .write_all(
+            concat!(
+                "{\"id\":1,\"cmd\":\"reset\"}\n",
+                "{\"id\":2,\"cmd\":\"save_state\",\"slot\":1}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    stream.flush().unwrap();
+    check(&dev_ctrl_read(&mut reader), 1, "reset");
+    check(&dev_ctrl_read(&mut reader), 2, "save_state");
+
+    check(
+        &dev_ctrl_cmd(
+            &mut stream,
+            &mut reader,
+            r#"{"id":3,"cmd":"load_state","slot":1}"#,
+        ),
+        3,
+        "load_state",
+    );
+
+    // Code-swap then reload over the dialed connection.
+    std::fs::copy(&v2, &work).unwrap();
+    check(
+        &dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":4,"cmd":"reload"}"#),
+        4,
+        "reload",
+    );
+
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let out = lines.lock().unwrap().join("\n");
+    assert!(
+        out.contains("v1 load score=7 reason=0 version=5"),
+        "dial-out load_state did not deliver the saved init() state / reason / \
+         version; player output:\n{out}"
+    );
+    assert!(
+        out.contains("v2 load score=7 reason=3 version=0"),
+        "dial-out reload did not preserve state across the code swap or deliver \
+         reason=HOT_RELOAD(3); player output:\n{out}"
+    );
+}
+
+/// End-to-end "option 2": the real devtool owns the hub and file watcher; the
+/// player dials in and a watcher-driven rebuild reloads the *native* player the
+/// same way it reloads the browser page.  Starts `blyt run ./project`, dials its
+/// dev control port with `blytplay --dev-ctrl-connect` pointed at the *same*
+/// project dir (so the player loads the devtool-rebuilt `build/.elf`), edits a
+/// source file, and asserts the player's `on_load_state` fires with
+/// reason=HOT_RELOAD(3) — i.e. the broadcast reached the dialed player.
+#[test]
+fn player_dials_devtool_hub_and_reloads() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+
+    // A project whose on_load_state announces the reload reason.  `blyt run`
+    // builds build/.elf in place; the player loads that same ELF and reloads it.
+    let project = tmp.path().join("dial_reload");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(
+            "local slot = -1\n\
+             function init()\n\
+             \tslot = blyt.buf.alloc_slot(S.GAME)\n\
+             \tS.game[slot].score = 7\n\
+             end\n\
+             function update() end\n\
+             function draw() local _ = 1 end\n\
+             function on_load_state(info)\n\
+             \tblyt.debug.print('reloaded reason=' .. tostring(info.reason))\n\
+             end\n",
+        )
+        .write(&project);
+
+    // Start the devtool (release project-dir mode → hub + watcher + initial
+    // build of build/.elf).  Reuse the banner reader to get the dev ctrl port;
+    // by the time it prints, build/.elf exists for the player to load.
+    let mut serve = spawn_blyt_run(&project);
+    let (port, _stdout) = read_dev_ctrl_port(&mut serve);
+    assert!(port != 0, "devtool dev control port must be a real port");
+
+    // The player dials the hub and runs on the same project dir (loads build/.elf).
+    let save_dir = TempDir::new().unwrap();
+    let (mut child, lines) = spawn_player_dialing(&project, port, save_dir.path());
+
+    // Give the player time to dial in, load build/.elf, and run a few frames.
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Edit a watched source file → devtool rebuilds → broadcasts reload → the
+    // dialed player reopens build/.elf and runs on_load_state(HOT_RELOAD).
+    let main_lua = project.join("src/game/lua/main.lua");
+    std::fs::write(
+        &main_lua,
+        "local slot = -1\n\
+         function init()\n\
+         \tslot = blyt.buf.alloc_slot(S.GAME)\n\
+         \tS.game[slot].score = 7\n\
+         end\n\
+         function update() end\n\
+         function draw() local _ = 2 end\n\
+         function on_load_state(info)\n\
+         \tblyt.debug.print('reloaded reason=' .. tostring(info.reason))\n\
+         end\n",
+    )
+    .unwrap();
+
+    // Poll the player's stdout for the reload up to a generous window.
+    let mut seen = false;
+    for _ in 0..50 {
+        if lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("reloaded reason=3"))
+        {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = serve.kill();
+    let _ = serve.wait(); /* reap the devtool so it doesn't linger as a zombie */
+
+    let out = lines.lock().unwrap().join("\n");
+    assert!(
+        seen,
+        "watcher-driven reload did not reach the dialed player (expected \
+         on_load_state reason=HOT_RELOAD(3)); player output:\n{out}"
     );
 }
