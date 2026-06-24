@@ -270,3 +270,81 @@ void blyt_cart_draw(void)   {}
         String::from_utf8_lossy(&out)
     );
 }
+
+/// In-VM cart-as-library module swap (issue #127, spike-W β / gate G1): create a
+/// session on v1, run a few frames, then swap the cart code to v2 IN PLACE via
+/// blyt_session_swap_cart — without recreating the VM/session.  Proves the core
+/// contract a fresh-load reload cannot: the VM instance persists across the swap
+/// (blyt_session_vm_id unchanged) and the v2 code boots and runs.  State
+/// preservation across the swap is covered end-to-end by the player/libretro leg
+/// in dev_control.rs::native_dev_control_lifecycle_commands.
+#[test]
+fn session_api_cart_swap() {
+    assert!(
+        sdk_dir().join("bin/blyt-clang").exists(),
+        "SDK not assembled — run `cmake --build build --target sdk` first"
+    );
+    assert!(
+        test_session_api().exists(),
+        "test_session_api not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+
+    // v1 and v2 print distinct init markers and never quit, so the harness can
+    // run a bounded number of frames and confirm v2's code went live after the
+    // swap (its marker appears) while v1's was active before it.
+    let project_v1 = tmp.path().join("swap_v1");
+    write_c_cart_project(
+        &project_v1,
+        r#"
+#include "blyt.h"
+void blyt_cart_init(void)   { blyt_console_debug("swap-v1-init"); }
+void blyt_cart_update(void) {}
+void blyt_cart_draw(void)   {}
+"#,
+    );
+    let v1 = build_cart(&project_v1);
+    assert!(v1.exists(), "v1 cart not found at {}", v1.display());
+
+    let project_v2 = tmp.path().join("swap_v2");
+    write_c_cart_project(
+        &project_v2,
+        r#"
+#include "blyt.h"
+void blyt_cart_init(void)   { blyt_console_debug("swap-v2-init"); }
+void blyt_cart_update(void) {}
+void blyt_cart_draw(void)   {}
+"#,
+    );
+    let v2 = build_cart(&project_v2);
+    assert!(v2.exists(), "v2 cart not found at {}", v2.display());
+
+    let out = Command::new(test_session_api())
+        .args([
+            "swap",
+            v1.to_str().unwrap(),
+            v2.to_str().unwrap(),
+            sdk_dir().join("lib").to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+
+    assert!(
+        out.contains("swap-v1-init"),
+        "v1 init never ran before the swap; output: {out}"
+    );
+    assert!(
+        out.contains("swap-v2-init"),
+        "v2 code did not boot after the in-place swap (stale block cache or \
+         unresolved entry point?); output: {out}"
+    );
+    assert!(
+        out.contains("swap-ok"),
+        "swap did not complete with the VM persisted; output: {out}"
+    );
+}
