@@ -626,6 +626,57 @@ async function testReloadRebind() {
 	});
 }
 
+/* Issue #119 (acceptance criterion 3): N consecutive reloads leave exactly ONE
+ * breakpoint location — no stale accumulation.  Drives a sequence of reloads
+ * (BLYT_RELOAD_CARTS, comma-separated cart paths) and lets each settle; the Rust
+ * harness asserts on the GDB-RSP trace that the final armed cart breakpoint set
+ * is a single location.  Auto-continues each reload-stop. */
+async function testReloadN() {
+	const devCtrlPort = parseInt(process.env.BLYT_DEV_CTRL_PORT || '0', 10);
+	const carts = (process.env.BLYT_RELOAD_CARTS || '')
+		.split(',')
+		.filter(Boolean);
+	if (!devCtrlPort || carts.length === 0)
+		throw new Error(
+			'reload-n needs BLYT_DEV_CTRL_PORT and BLYT_RELOAD_CARTS',
+		);
+
+	await runDap(async ({ send, onEvent }) => {
+		await send('initialize', { adapterID: 'lldb-dap' });
+		onEvent('stopped', (ev) => {
+			send('continue', { threadId: ev.body?.threadId ?? 1 }).catch(
+				() => {},
+			);
+		});
+		const launchP = send('launch', {
+			program: programPath,
+			stopOnEntry: false,
+			launchCommands: [
+				sourceMapCommand(),
+				`gdb-remote 127.0.0.1:${gdbPort}`,
+			],
+		});
+		await send('setBreakpoints', {
+			source: { path: `/blyt/cart/${sourceFile}` },
+			breakpoints: [{ line: breakLine }],
+		});
+		await send('configurationDone');
+		await launchP;
+		await new Promise((r) => setTimeout(r, 500));
+
+		for (let i = 0; i < carts.length; i++) {
+			const reply = await devCtrl(devCtrlPort, {
+				id: i + 1,
+				cmd: 'reload',
+				path: carts[i],
+			});
+			console.log(`reload ${i + 1}/${carts.length} → ${reply}`);
+			await new Promise((r) => setTimeout(r, 1200));
+		}
+		console.log('reload-n: driver done');
+	});
+}
+
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
 const tests = {
@@ -633,6 +684,7 @@ const tests = {
 	'source-breakpoint': testSourceBreakpoint,
 	'attach-bind': testAttachBind,
 	'reload-rebind': testReloadRebind,
+	'reload-n': testReloadN,
 	'auto-start': testAutoStart,
 	'stack-trace': testStackTrace,
 	variables: testVariables,
