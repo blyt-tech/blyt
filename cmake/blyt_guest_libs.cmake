@@ -288,6 +288,25 @@ foreach(_var release debug)
 endforeach()
 set(LIBBLYTCOMMON_OUT "${SDK_LIB}/libblytcommon.so")
 
+# ── blyt-debug-stub.elf — lldb-dap `program` stub (issue #119) ───────────────
+# A minimal riscv32 ET_DYN ELF that lldb-dap loads as its `program` so the cart
+# is never the main executable (and so stays a cleanly unloadable/reloadable
+# shared library across a hot reload — Spike W §5d/§5e).  Debug-only; never run.
+blyt_guest_so(
+  "${SDK_LIB_DEBUG}/blyt-debug-stub.elf"
+  FALSE
+  "Linking blyt-debug-stub.elf (lldb-dap program stub, issue #119)"
+  ARGS
+  -O0
+  -g
+  "${CMAKE_SOURCE_DIR}/runtime/guest/src/debug-stub/blyt_debug_stub.c"
+  -o
+  "${SDK_LIB_DEBUG}/blyt-debug-stub.elf"
+  -Wl,-soname,blyt-debug-stub.elf
+  DEPENDS
+  "${CMAKE_SOURCE_DIR}/runtime/guest/src/debug-stub/blyt_debug_stub.c")
+add_custom_target(blyt_debug_stub ALL DEPENDS "${SDK_LIB_DEBUG}/blyt-debug-stub.elf")
+
 # ── musl bits/ generation (configure time) ──────────────────────────────────
 set(MUSL_DIR "${musl_SOURCE_DIR}")
 set(LIBBLYTC_BITS_DIR "${CMAKE_BINARY_DIR}/libblytc/bits")

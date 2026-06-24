@@ -255,6 +255,11 @@ struct blyt_session {
     blyt_gdb_lib_t gdb_libs[MAX_GDB_LIBS];
     fc_gdb_library_t gdb_libs_ffi[MAX_GDB_LIBS]; /* stable pointers into gdb_libs */
     int gdb_nlibs;
+    /* Index of the cart's OWN library entry in gdb_libs (issue #119), or -1.
+     * The cart is presented purely as a shared library (never the main exe), so
+     * blyt_session_swap_cart can re-report it at a fresh base + unique path on a
+     * debug reload and lldb re-reads its DWARF.  See blyt_session_gdb_notify_cart_reloaded. */
+    int gdb_cart_lib_idx;
     char gdb_exec_path[4096]; /* cart path for qXfer:exec-file:read */
     /* Software breakpoints: saved original words. */
     blyt_gdb_bp_t gdb_bps[MAX_GDB_BREAKS];
@@ -2168,6 +2173,50 @@ static void record_cart_image_layout(blyt_session_t *s, const blyt_cart_t *cart,
     }
 }
 
+#ifdef BLYT_GDB
+/* Register (or, on a swap, re-report) the cart's OWN entry in the GDB
+ * qXfer:libraries-svr4 list (issue #119).  The cart is presented purely as a
+ * shared library — never the main executable — so lldb can cleanly unload and
+ * reload it.  `reported_path` is the path lldb reads DWARF from (cart->path at
+ * attach; a unique checksum path per debug reload so lldb treats the rebuilt
+ * cart as a fresh module and re-reads its DWARF, Spike W §5b/§5e).  `base` is
+ * the cart's guest load base (0 at attach; a fresh base per reload).  Returns
+ * the entry index, or -1 if the table is full / no path. */
+static int register_cart_gdb_library(blyt_session_t *s, const blyt_cart_t *cart, uint32_t base,
+                                     const char *reported_path) {
+    const char *path = (reported_path && reported_path[0]) ? reported_path : cart->path;
+    if (!path)
+        return -1;
+    if (s->gdb_cart_lib_idx < 0) {
+        if (s->gdb_nlibs >= MAX_GDB_LIBS)
+            return -1;
+        s->gdb_cart_lib_idx = s->gdb_nlibs++;
+    }
+    int idx = s->gdb_cart_lib_idx;
+    blyt_gdb_lib_t *gl = &s->gdb_libs[idx];
+    strncpy(gl->path, path, sizeof(gl->path) - 1);
+    gl->path[sizeof(gl->path) - 1] = '\0';
+    gl->l_addr = base;
+    /* l_ld = base + PT_DYNAMIC.p_vaddr (lldb reads the dynamic section here). */
+    gl->l_ld = 0;
+    const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
+    for (uint16_t pi = 0; pi < eh->e_phnum; pi++) {
+        size_t off = (size_t)eh->e_phoff + (size_t)pi * eh->e_phentsize;
+        if (off + sizeof(Elf32_Phdr) > cart->map_size)
+            break;
+        const Elf32_Phdr *ph = (const Elf32_Phdr *)((const uint8_t *)cart->map + off);
+        if (ph->p_type == PT_DYNAMIC) {
+            gl->l_ld = base + ph->p_vaddr;
+            break;
+        }
+    }
+    s->gdb_libs_ffi[idx].path = gl->path;
+    s->gdb_libs_ffi[idx].l_addr = gl->l_addr;
+    s->gdb_libs_ffi[idx].l_ld = gl->l_ld;
+    return idx;
+}
+#endif /* BLYT_GDB */
+
 /* Cache the cart's lifecycle entry-point guest addresses (0 = not defined). */
 static void resolve_cart_entry_points(blyt_session_t *s, const blyt_symtab_t *all) {
     s->fn_on_save_state = symtab_lookup(all, "blyt_cart_on_save_state");
@@ -2674,6 +2723,9 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     blyt_session_t *s = calloc(1, sizeof(*s));
     if (!s)
         return NULL;
+#ifdef BLYT_GDB
+    s->gdb_cart_lib_idx = -1; /* set when the cart is registered as a library */
+#endif
 
     {
         uint32_t lua_mask = blyt_cart_lua_lifecycle_mask(cart);
@@ -2765,10 +2817,14 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     blyt_testcard_init_palette(s->palette);
 
 #ifdef BLYT_GDB
-    if (cart->path) {
-        strncpy(s->gdb_exec_path, cart->path, sizeof(s->gdb_exec_path) - 1);
-        s->gdb_exec_path[sizeof(s->gdb_exec_path) - 1] = '\0';
-    }
+    /* Present the cart purely as a shared library, NOT as the main executable
+     * (issue #119, Spike W §5d/§5e): lldb-dap's `program` is a stub ELF, so the
+     * cart's main-exe copy (which Unix can never unload) never exists and a hot
+     * reload leaves no stale duplicate breakpoint location.  Leave the exec-file
+     * empty and announce the cart in the svr4 library list at attach so
+     * breakpoints bind (with an address) before init() runs. */
+    s->gdb_exec_path[0] = '\0';
+    register_cart_gdb_library(s, cart, 0u, NULL);
     /* Register cpu_ops with the stub so it can read/write registers/memory
      * and set/clear software breakpoints via ebreak patches. */
     fc_gdb_stub_set_cpu_ops(&gdb_cpu_ops);

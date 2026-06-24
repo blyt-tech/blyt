@@ -201,16 +201,19 @@ async function main() {
 		const stopReason = await t.recv();
 		console.log(`[gdb_test] ? → ${stopReason}`);
 
-		/* Optional: exec-file query (validates qXfer:exec-file:read). */
+		/* Optional: exec-file query (validates qXfer:exec-file:read).
+		 * Issue #119: the cart is presented purely as a shared library, never as
+		 * the main executable, so the exec-file is EMPTY (the response is the
+		 * bare end-of-data marker `l`). */
 		if (process.env.BLYT_GDB_EXEC_FILE_CHECK) {
 			const execFile = await t.exchange('qXfer:exec-file:read::0,4000');
-			if (!execFile?.startsWith('l') || execFile.length < 2) {
+			if (execFile !== 'l') {
 				process.stderr.write(
-					`[gdb_test] FAIL: exec-file response: ${execFile}\n`,
+					`[gdb_test] FAIL: expected empty exec-file (cart is a library, #119), got: ${execFile}\n`,
 				);
 				process.exit(1);
 			}
-			console.log(`PASS: exec-file = ${execFile.slice(1).trim()}`);
+			console.log('PASS: exec-file empty (cart presented as a library)');
 		}
 
 		/* Optional: library list query (validates qXfer:libraries-svr4:read). */

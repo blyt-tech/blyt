@@ -123,6 +123,13 @@ fn run_lldb_dap_test_env(
         ])
         .env("BLYT_GDB_BREAK_LINE", BREAK_LINE.to_string())
         .env("BLYT_SOURCE_FILE", "src/game/c/main.c")
+        // lldb-dap `program` = the stub ELF, never the cart (issue #119): the
+        // cart is presented purely as a shared library so it stays cleanly
+        // unloadable/reloadable across a hot reload.
+        .env(
+            "BLYT_STUB_PROGRAM",
+            repo_root().join("build/sdk/lib/debug/blyt-debug-stub.elf"),
+        )
         .envs(extra_env.iter().map(|(k, v)| (*k, v.as_str())))
         .timeout(Duration::from_secs(30))
         .assert();
@@ -187,6 +194,33 @@ fn sdl_native_lldb_dap_source_breakpoint() {
     require_symbol_addr(&cart, "blyt_lldb_test_fn");
 
     run_lldb_dap_test("source-breakpoint", &project, &cart);
+}
+
+/// LLDB-DAP (issue #119, acceptance criterion 2): a breakpoint set before
+/// launch is BOUND with a concrete address at attach — before init() runs — not
+/// left pending until the first reload.
+///
+/// With the cart presented purely as a shared library (lldb-dap `program` = the
+/// stub ELF), this proves the cart-library is announced at attach so lldb reads
+/// the svr4 list and resolves cart breakpoints up front. The driver asserts the
+/// `setBreakpoints` response (sent before `configurationDone`) reports the
+/// breakpoint verified with an `instructionReference`.
+///
+/// Requires: blytplay with BLYT_GDB=ON, SDK, lldb-dap, `readelf` for DWARF.
+#[test]
+fn sdl_native_lldb_dap_breakpoint_bound_at_attach() {
+    require_sdk();
+    require_gdb();
+    require_lldb_dap();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lldb_attach_bind");
+    CartProject::new().c(LLDB_TEST_C).write(&project);
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists());
+    require_symbol_addr(&cart, "blyt_lldb_test_fn");
+
+    run_lldb_dap_test("attach-bind", &project, &cart);
 }
 
 /// LLDB-DAP: stopOnEntry:false — cart auto-continues; first stop is a breakpoint.

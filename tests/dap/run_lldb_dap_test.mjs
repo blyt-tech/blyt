@@ -49,6 +49,12 @@ if (!lldbDapPath || !gdbPort || !cartPath || !projectCwd) {
 const breakLine = parseInt(process.env.BLYT_GDB_BREAK_LINE || '5', 10);
 const sourceFile = process.env.BLYT_SOURCE_FILE || 'main.c';
 
+/* lldb-dap's `program` (issue #119): a stub ELF, NOT the cart, so the cart is
+ * presented purely as a shared library (the runtime's svr4 list) and never as
+ * the main executable — cleanly unloadable/reloadable across a hot reload.
+ * Falls back to the cart when no stub is provided (legacy/standalone runs). */
+const programPath = process.env.BLYT_STUB_PROGRAM || cartPath;
+
 /* The canonical source path + line to break at for the sdk-source-breakpoint
  * test (a path inside the SDK-shipped source, e.g. /blyt/sdk/src/...). */
 const sdkBreakFile = process.env.BLYT_SDK_BREAK_FILE || '';
@@ -204,7 +210,7 @@ async function testSourceBreakpoint() {
 		await send('initialize', { adapterID: 'lldb-dap' });
 
 		const launchArgs = {
-			program: cartPath,
+			program: programPath,
 			stopOnEntry: true,
 			launchCommands: [
 				sourceMapCommand(),
@@ -241,6 +247,48 @@ async function testSourceBreakpoint() {
 	});
 }
 
+/* Issue #119 (acceptance criterion 2): a breakpoint set before launch must be
+ * BOUND (verified, with a concrete address) at attach — i.e. before init()
+ * runs — not left pending until the first reload.  With the cart presented
+ * purely as a shared library, this proves the cart-library is announced at
+ * attach (the runtime's `library:` initial stop reply) so lldb fetches the svr4
+ * list and resolves cart breakpoints up front. */
+async function testAttachBind() {
+	await runDap(async ({ send }) => {
+		await send('initialize', { adapterID: 'lldb-dap' });
+		const launchP = send('launch', {
+			program: programPath,
+			stopOnEntry: true,
+			launchCommands: [
+				sourceMapCommand(),
+				`gdb-remote 127.0.0.1:${gdbPort}`,
+			],
+		});
+		/* setBreakpoints BEFORE configurationDone (before the cart runs). */
+		const sb = await send('setBreakpoints', {
+			source: { path: `/blyt/cart/${sourceFile}` },
+			breakpoints: [{ line: breakLine }],
+		});
+		const bp = sb.body?.breakpoints?.[0];
+		console.log(`attach-bind breakpoint: ${JSON.stringify(bp)}`);
+		if (!bp?.verified) {
+			throw new Error(
+				`breakpoint not verified at attach (got ${JSON.stringify(bp)})`,
+			);
+		}
+		if (!bp.instructionReference) {
+			throw new Error(
+				`breakpoint verified but not bound to an address at attach (pending): ${JSON.stringify(bp)}`,
+			);
+		}
+		await send('configurationDone');
+		await launchP;
+		console.log(
+			`PASS: breakpoint bound at attach → ${bp.instructionReference} (line ${bp.line})`,
+		);
+	});
+}
+
 async function testAutoStart() {
 	/* Verifies stopOnEntry:false — the process starts running immediately
 	 * after gdb-remote connects and the first stopped event is a breakpoint,
@@ -249,7 +297,7 @@ async function testAutoStart() {
 		await send('initialize', { adapterID: 'lldb-dap' });
 
 		const launchArgs = {
-			program: cartPath,
+			program: programPath,
 			stopOnEntry: false,
 			launchCommands: [
 				sourceMapCommand(),
@@ -284,7 +332,7 @@ async function testStackTrace() {
 	await runDap(async ({ send, waitEvent }) => {
 		await send('initialize', { adapterID: 'lldb-dap' });
 		const launchArgs = {
-			program: cartPath,
+			program: programPath,
 			stopOnEntry: true,
 			launchCommands: [
 				sourceMapCommand(),
@@ -324,7 +372,7 @@ async function testVariables() {
 	await runDap(async ({ send, waitEvent }) => {
 		await send('initialize', { adapterID: 'lldb-dap' });
 		const launchArgs = {
-			program: cartPath,
+			program: programPath,
 			stopOnEntry: true,
 			launchCommands: [
 				sourceMapCommand(),
@@ -381,7 +429,7 @@ async function testSourceMap() {
 	await runDap(async ({ send, waitEvent }) => {
 		await send('initialize', { adapterID: 'lldb-dap' });
 		const launchArgs = {
-			program: cartPath,
+			program: programPath,
 			stopOnEntry: true,
 			launchCommands: [
 				sourceMapCommand(),
@@ -441,7 +489,7 @@ async function testSdkSourceBreakpoint() {
 	await runDap(async ({ send, waitEvent }) => {
 		await send('initialize', { adapterID: 'lldb-dap' });
 		const launchP = send('launch', {
-			program: cartPath,
+			program: programPath,
 			stopOnEntry: true,
 			launchCommands: [
 				sourceMapCommand(),
@@ -492,6 +540,7 @@ async function testSdkSourceBreakpoint() {
 const tests = {
 	initialize: testInitialize,
 	'source-breakpoint': testSourceBreakpoint,
+	'attach-bind': testAttachBind,
 	'auto-start': testAutoStart,
 	'stack-trace': testStackTrace,
 	variables: testVariables,

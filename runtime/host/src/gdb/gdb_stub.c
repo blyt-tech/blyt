@@ -118,22 +118,30 @@ static void send_response(const char *payload) {
 /* Build a T05 stop reply with all 33 register values inline.
  * LLDB caches these and skips individual p-register round trips on stops,
  * which eliminates ~33 WebSocket exchanges per conditional breakpoint hit. */
-static void send_stop_with_regs(void) {
+/* `reason` is the stop-reason field (e.g. "swbreak:;" or "library:;"), inserted
+ * right after "T05" and before "thread:01;". */
+static void send_stop_with_regs_reason(const char *reason) {
     if (!g_gdb.ops.read_regs) {
-        send_response("T05swbreak:;thread:01;");
+        char small[64];
+        snprintf(small, sizeof small, "T05%sthread:01;", reason);
+        send_response(small);
         return;
     }
     uint8_t regs[33 * 4];
     g_gdb.ops.read_regs(regs);
     /* 22 chars header + 33 × 12 ("xx:xxxxxxxx;") + NUL = ~420 bytes */
     char buf[512];
-    int n = snprintf(buf, sizeof buf, "T05swbreak:;thread:01;");
+    int n = snprintf(buf, sizeof buf, "T05%sthread:01;", reason);
     for (int i = 0; i < 33; i++) {
         const uint8_t *r = regs + i * 4;
         n += snprintf(buf + n, (int)sizeof(buf) - n, "%02x:%02x%02x%02x%02x;", i, r[0], r[1], r[2],
                       r[3]);
     }
     send_response(buf);
+}
+
+static void send_stop_with_regs(void) {
+    send_stop_with_regs_reason("swbreak:;");
 }
 
 static void clear_all_breakpoints(void) {
@@ -398,8 +406,18 @@ static void handle_packet(const char *pkt) {
     } else if (strncmp(pkt, "qXfer:features:read:", 20) == 0) {
         handle_qXfer_features(pkt + 20, out, sizeof out);
     } else if (pkt[0] == '?' && pkt[1] == '\0') {
-        /* Include register values so lldb skips individual p-register queries. */
-        send_stop_with_regs();
+        /* Include register values so lldb skips individual p-register queries.
+         * On the initial attach stop, carry the `library:` reason when a cart
+         * library is present (issue #119): lldb-dap's `program` is a stub ELF
+         * with no loader rendezvous, so nothing would otherwise prompt lldb to
+         * read qXfer:libraries-svr4 — and the cart (a shared library) would stay
+         * unknown, leaving breakpoints pending until the first reload.  The
+         * `library:` reason makes lldb fetch the svr4 list at attach so cart
+         * breakpoints bind (with an address) before init() runs. */
+        if (g_gdb.initial_halt && g_gdb.layout.n_libraries > 0)
+            send_stop_with_regs_reason("library:;");
+        else
+            send_stop_with_regs();
         return;
     } else if (pkt[0] == 'c' && (pkt[1] == '\0' || pkt[1] == ';')) {
         /* Legacy continue — treat identically to vCont;c. */
