@@ -125,7 +125,7 @@ pub(crate) fn find_sdk_include() -> Result<PathBuf, BuildError> {
     ))
 }
 
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
