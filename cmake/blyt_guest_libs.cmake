@@ -269,7 +269,8 @@ endfunction()
 # frontends/native/src/libblytcommon/blytcommon.c (issue #128).
 set(LIBBLYTCOMMON_SRC
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
-    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blytcommon_emu.c")
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blytcommon_emu.c"
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/resources.c")
 foreach(_var release debug)
   blyt_set_variant(${_var})
   blyt_guest_so_objs(
@@ -560,6 +561,7 @@ foreach(_var release debug)
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blytcommon_emu.c"
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/resources.c"
     ${LIBBLYTC_SRCS}
     ${SF_ALL}
     ${SF_RISCV}
@@ -843,6 +845,7 @@ if(BLYT_BUILD_NATIVE)
     libblytcommon-native
     SRCS
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/resources.c"
     "${LIBBLYTCOMMON_NATIVE_DIR}/blytcommon.c"
     "${SHARED_DIR}/blyt_fp_canon.c"
     "${SHARED_DIR}/blyt_elf_section.c"

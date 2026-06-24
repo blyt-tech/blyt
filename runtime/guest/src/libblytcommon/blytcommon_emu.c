@@ -21,6 +21,10 @@
 /* ECALL numbers (must match runtime/host/src/libblyt/ecall.h). */
 #define ECALL_CONSOLE_DEBUG 1
 #define ECALL_FRAME_DONE 2
+#define ECALL_RESOURCE_PIN 61
+#define ECALL_RESOURCE_UNPIN 62
+#define ECALL_RESOURCE_LOAD 63
+#define ECALL_RESOURCE_RELEASE 64
 
 static unsigned int blytcommon_strlen(const char *s) {
     const char *p = s;
@@ -66,4 +70,43 @@ __attribute__((noreturn)) void blyt_exit(int code) {
  * code runs; on the emulated path the host owns that setup, so there is nothing
  * to do here. */
 void blyt_runtime_startup(void) {
+}
+
+/* ── Resource lifecycle ECALL stubs (ADR-0027, #123) ────────────────────────
+ *
+ * Emulated-path stubs: the host services pin/unpin/load/release over the ECALL
+ * boundary (runtime/host/src/libblyt/cart_run.c) against its resource table.
+ * The native libblytcommon variant overrides these with real implementations.
+ * The blyt_resource_text_get convenience is portable (resources.c) and built on
+ * top of pin/unpin, so it is not duplicated here. */
+
+blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size) {
+    register long a0 __asm__("a0") = (long)id;
+    register long a1 __asm__("a1") = (long)out_ptr;
+    register long a2 __asm__("a2") = (long)out_size;
+    register long a7 __asm__("a7") = ECALL_RESOURCE_PIN;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return (blyt_result_t)a0;
+}
+
+blyt_result_t blyt_resource_unpin(blyt_resource_id_t id) {
+    register long a0 __asm__("a0") = (long)id;
+    register long a7 __asm__("a7") = ECALL_RESOURCE_UNPIN;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return (blyt_result_t)a0;
+}
+
+blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_handle) {
+    register long a0 __asm__("a0") = (long)id;
+    register long a1 __asm__("a1") = (long)out_handle;
+    register long a7 __asm__("a7") = ECALL_RESOURCE_LOAD;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    return (blyt_result_t)a0;
+}
+
+blyt_result_t blyt_resource_release(blyt_resource_h handle) {
+    register long a0 __asm__("a0") = (long)handle;
+    register long a7 __asm__("a7") = ECALL_RESOURCE_RELEASE;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return (blyt_result_t)a0;
 }

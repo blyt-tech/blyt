@@ -102,21 +102,57 @@ blyt_result_t blyt_save_write(uint32_t slot);
 blyt_result_t blyt_save_read(uint32_t slot);
 
 /* -------------------------------------------------------------------------
- * Resources (ADR-0040, ADR-0088, issue #91)
+ * Resources (ADR-0027, ADR-0040, ADR-0088, issues #91/#123)
  *
  * Cart code never uses string paths at runtime: the packer assigns each asset
- * an integer resource handle and emits R_<NAME> constants in the generated
- * cart_resources.h.  The runtime resolves handle -> data internally (a bundled
- * ELF section in a packed cart, or the staging directory in dev mode).
+ * an integer resource id and emits R_<NAME> constants in the generated
+ * cart_resources.h.  The runtime resolves id -> bytes internally (a bundled ELF
+ * section in a packed cart, or the staging directory in dev mode).
+ *
+ * Two lifecycle layers (ADR-0027):
+ *   - pin/unpin — a within-frame raw-access window.  pin copies the bytes into
+ *     a runtime scratch region and hands back a pointer + size; the pointer is
+ *     valid for the *current frame only* (the runtime force-releases any pin at
+ *     the frame boundary, because dev-mode asset hot-reload may move the bytes
+ *     between frames).  Copy out anything you need to keep.  Refcounted: each
+ *     pin needs one unpin.
+ *   - load/release — residency/caching hints.  load returns a handle (stable
+ *     across frames); release tells the runtime the cart is done with it.
  * ------------------------------------------------------------------------- */
+
+/* Packer-assigned integer resource id (the R_<NAME> constants). */
+typedef uint32_t blyt_resource_id_t;
+
+/* Opaque load handle returned by blyt_resource_load (encodes id + load epoch). */
 typedef uint32_t blyt_resource_h;
 #define BLYT_RESOURCE_INVALID ((blyt_resource_h)0)
 
-/* Load a text resource by handle.  Returns a pointer to its UTF-8 bytes and
- * writes the byte length to *len.  The pointer is valid for the current frame
- * only (it may be evicted afterwards); copy out anything you need to keep.
- * Returns NULL (and leaves *len untouched) if the handle is invalid. */
-const char *blyt_resource_text_get(blyt_resource_h handle, size_t *len);
+/* pin: copy the resource's bytes into the runtime scratch region; write the
+ * frame-scoped pointer to *out_ptr and the byte length to *out_size, and
+ * increment the pin count.  Returns BLYT_OK, or BLYT_ERR_NOT_FOUND for an
+ * unknown id (with *out_ptr set to NULL). */
+blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size);
+
+/* unpin: drop a pin taken by blyt_resource_pin.  The pointer it returned is
+ * invalid afterwards.  Returns BLYT_ERR_INVALID_ARG if nothing was pinned. */
+blyt_result_t blyt_resource_unpin(blyt_resource_id_t id);
+
+/* load: mark a resource resident and obtain a handle.  Idempotent (re-loading a
+ * resident resource returns the same handle).  Returns BLYT_ERR_NOT_FOUND for an
+ * unknown id (with *out_handle set to BLYT_RESOURCE_INVALID). */
+blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_handle);
+
+/* release: advisory — tell the runtime the cart no longer needs this handle.
+ * Returns BLYT_ERR_INVALID_ARG if the handle is stale (already released, or from
+ * a previous load epoch). */
+blyt_result_t blyt_resource_release(blyt_resource_h handle);
+
+/* text_get: convenience over pin -> copy -> unpin.  Returns a freshly allocated,
+ * NUL-terminated copy of the resource's bytes (the caller owns it and must
+ * free() it) and writes the byte length to *len.  Unlike a pinned pointer this
+ * copy outlives the frame.  Returns NULL (leaving *len untouched) on an unknown
+ * id or allocation failure.  Not its own ECALL — a guest-side helper. */
+char *blyt_resource_text_get(blyt_resource_id_t id, size_t *len);
 
 /* -------------------------------------------------------------------------
  * Cart lifecycle types for save/load callbacks (ADR-0087 amendment)

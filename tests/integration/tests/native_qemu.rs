@@ -1107,5 +1107,82 @@ void blyt_cart_draw(void) {}
         println!("  PASS: BLYS saves are portable across host and native");
     }
 
+    // ── Gate 12: resource lifecycle on metal (#123) ──────────────────
+    //
+    // The only coverage of the native libblytcommon resource path: a packed
+    // cart's embedded `.cart.resource.<id>` section reaches the cart through
+    // load/pin/unpin/release, served by a direct pointer into the retained cart
+    // mmap (no host).  One deterministic line encodes every result so the metal
+    // output can be matched against the emulated legs' (assets.rs): pin delivers
+    // the exact bytes+length, load returns OK with a non-zero handle, the first
+    // release succeeds, and the stale second release is rejected (INVALID_ARG=1).
+    println!("Gate 12: resource lifecycle on metal...");
+    {
+        let res_project = tmp.path().join("res_metal");
+        CartProject::new()
+            .asset("greeting.txt", "Hello from metal!")
+            .c(r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+#include <string.h>
+
+void blyt_cart_init(void) {
+    blyt_resource_h h = BLYT_RESOURCE_INVALID;
+    blyt_result_t lr = blyt_resource_load(R_GREETING, &h);
+
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_result_t pr = blyt_resource_pin(R_GREETING, &ptr, &size);
+    char g[64];
+    size_t n = size < sizeof(g) - 1 ? size : sizeof(g) - 1;
+    if (ptr) memcpy(g, ptr, n);
+    g[ptr ? n : 0] = '\0';
+    blyt_resource_unpin(R_GREETING);
+
+    blyt_result_t r1 = blyt_resource_release(h);
+    blyt_result_t r2 = blyt_resource_release(h);
+
+    char line[256];
+    snprintf(line, sizeof(line),
+             "R[%s] load=%d h=%d pin=%d bytes=%d rel1=%d rel2=%d",
+             g, (int)lr, (int)(h != BLYT_RESOURCE_INVALID), (int)pr,
+             (int)size, (int)r1, (int)r2);
+    blyt_console_debug(line);
+}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#)
+            .write(&res_project);
+        let res_cart = build_cart(&res_project);
+        assert!(
+            res_cart.exists(),
+            "res_metal.blyt not built: {}",
+            res_cart.display()
+        );
+        assert!(
+            qemu.scp_to(&res_cart, "/tmp/blyt_gate/"),
+            "scp res_metal.blyt failed"
+        );
+
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/res_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "res_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("R[Hello from metal!] load=0 h=1 pin=0 bytes=17 rel1=0 rel2=1"),
+            "expected the resource-lifecycle line on metal (pin delivers exact bytes; \
+             load ok with non-zero handle; valid then stale release)\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    }
+
     println!("Gate tests passed.");
 }

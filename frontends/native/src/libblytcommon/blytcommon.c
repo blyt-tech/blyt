@@ -31,6 +31,7 @@
 #include "blyt_fp_canon.h" /* runtime/shared: blyt_canon_f32/f64 (ADR-0010) */
 #include "blyt_gen.h" /* runtime/shared: blyt_gen_next (ADR-0096) */
 #include "blyt_native_trace.h"
+#include "blyt_resource_lifecycle.h" /* runtime/shared: load/pin refcount state (#123) */
 #include "seccomp_restricted.h"
 
 /* getenv is declared in blyt_native_trace.h (provided by ld-blyt.so.1). */
@@ -650,8 +651,190 @@ done:;
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
 }
 
+/* ── Resource lifecycle (ADR-0027, #123) ─────────────────────────────────────
+ *
+ * Native bare-metal serves resources from the cart's own packed ELF: the cart
+ * file is mmap'd read-only at startup (before the seccomp filter, like
+ * load_cart_buf_counts) and retained, so pin can hand back a direct pointer
+ * into that mapping — no per-frame copy, no syscall.  Per-id refcounts use the
+ * shared state machine (runtime/shared) so native and the host cannot drift.
+ * Only embedded `.cart.resource.<id>` sections are served; the dev-mode staging
+ * directory is an emulated-path-only concern. */
+
+#define NATIVE_MAX_RES 64
+static const uint8_t *s_cart_map; /* retained read-only cart mapping, or NULL */
+static uint32_t s_cart_size;
+static struct {
+    uint32_t id;
+    const uint8_t *data; /* points into s_cart_map */
+    uint32_t len;
+    blyt_rl_state_t rl;
+    uint8_t used;
+} s_res[NATIVE_MAX_RES];
+
+/* mmap the cart ELF read-only and RETAIN it (no munmap): pin returns pointers
+ * into this mapping for the cart's lifetime.  Must run before the restricted
+ * seccomp filter (mmap/statx are blocked afterwards). */
+static void resources_init(void) {
+    const char *path = getenv("BLYT_CART_PATH");
+    if (!path || !path[0])
+        return;
+    int fd = blyt_rs_openat(NATIVE_AT_FDCWD, path, NATIVE_O_RDONLY, 0);
+    if (fd < 0)
+        return;
+
+    char stx[256];
+    blyt32_native_memset(stx, 0, sizeof(stx));
+    {
+        register long a0 __asm__("a0") = NATIVE_AT_FDCWD;
+        register const char *a1 __asm__("a1") = path;
+        register long a2 __asm__("a2") = 0; /* AT_STATX_SYNC_AS_STAT */
+        register long a3 __asm__("a3") = 0x200; /* STATX_SIZE */
+        register char *a4 __asm__("a4") = stx;
+        register long a7 __asm__("a7") = 291; /* SYS_statx */
+        __asm__ volatile("ecall"
+                         : "+r"(a0)
+                         : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)
+                         : "memory");
+        if (a0 != 0) {
+            blyt_rs_close(fd);
+            return;
+        }
+    }
+    uint32_t file_size;
+    blyt32_native_memcpy(&file_size, stx + 40, 4);
+    if (file_size < 52u) {
+        blyt_rs_close(fd);
+        return;
+    }
+
+    void *map;
+    {
+        register long a0 __asm__("a0") = 0; /* addr = NULL */
+        register long a1 __asm__("a1") = file_size;
+        register long a2 __asm__("a2") = 1; /* PROT_READ */
+        register long a3 __asm__("a3") = 2; /* MAP_PRIVATE */
+        register long a4 __asm__("a4") = fd;
+        register long a5 __asm__("a5") = 0; /* offset = 0 */
+        register long a7 __asm__("a7") = 222; /* SYS_mmap */
+        __asm__ volatile("ecall"
+                         : "+r"(a0)
+                         : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
+                         : "memory");
+        map = (void *)a0;
+    }
+    blyt_rs_close(fd);
+    if ((uint32_t)(unsigned long)map >= 0xFFFFF000u)
+        return; /* mmap error */
+    s_cart_map = (const uint8_t *)map;
+    s_cart_size = file_size;
+}
+
+/* Build ".cart.resource.<id>" into buf (cap >= 32). */
+static const char *res_section_name(char *buf, uint32_t id) {
+    static const char pfx[] = ".cart.resource.";
+    unsigned int i = 0;
+    for (; pfx[i]; i++)
+        buf[i] = pfx[i];
+    char num[12];
+    int ni = 0;
+    uint32_t n = id;
+    do {
+        num[ni++] = (char)('0' + (int)(n % 10u));
+        n /= 10u;
+    } while (n);
+    for (int j = ni - 1; j >= 0; j--)
+        buf[i++] = num[j];
+    buf[i] = '\0';
+    return buf;
+}
+
+static int res_find(uint32_t id) {
+    for (int i = 0; i < NATIVE_MAX_RES; i++)
+        if (s_res[i].used && s_res[i].id == id)
+            return i;
+    return -1;
+}
+
+/* Find an existing entry or lazily create one by locating the cart's
+ * `.cart.resource.<id>` section.  Returns the index or -1 if absent / full. */
+static int res_get(uint32_t id) {
+    int i = res_find(id);
+    if (i >= 0)
+        return i;
+    if (!s_cart_map)
+        return -1;
+    char name[40];
+    uint32_t off = 0, size = 0;
+    if (!blyt_elf32_find_section(s_cart_map, s_cart_size, res_section_name(name, id), &off, &size))
+        return -1;
+    for (int j = 0; j < NATIVE_MAX_RES; j++) {
+        if (!s_res[j].used) {
+            s_res[j].used = 1;
+            s_res[j].id = id;
+            s_res[j].data = s_cart_map + off;
+            s_res[j].len = size;
+            s_res[j].rl = (blyt_rl_state_t){0};
+            return j;
+        }
+    }
+    return -1; /* table full */
+}
+
+blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size) {
+    int i = res_get(id);
+    if (i < 0) {
+        if (out_ptr)
+            *out_ptr = 0;
+        return BLYT_ERR_NOT_FOUND;
+    }
+    blyt_rl_pin(&s_res[i].rl);
+    if (out_ptr)
+        *out_ptr = s_res[i].data; /* direct pointer into the retained mmap */
+    if (out_size)
+        *out_size = s_res[i].len;
+    return BLYT_OK;
+}
+
+blyt_result_t blyt_resource_unpin(blyt_resource_id_t id) {
+    int i = res_find(id);
+    if (i < 0)
+        return BLYT_ERR_NOT_FOUND;
+    return blyt_rl_unpin(&s_res[i].rl) ? BLYT_OK : BLYT_ERR_INVALID_ARG;
+}
+
+blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_handle) {
+    int i = res_get(id);
+    if (i < 0) {
+        if (out_handle)
+            *out_handle = BLYT_RESOURCE_INVALID;
+        return BLYT_ERR_NOT_FOUND;
+    }
+    blyt_resource_h h = blyt_rl_load(&s_res[i].rl, id);
+    if (out_handle)
+        *out_handle = h;
+    return BLYT_OK;
+}
+
+blyt_result_t blyt_resource_release(blyt_resource_h handle) {
+    if (!handle)
+        return BLYT_ERR_INVALID_ARG;
+    int i = res_find(handle & 0xFFFFu);
+    if (i < 0)
+        return BLYT_ERR_INVALID_ARG;
+    return blyt_rl_release(&s_res[i].rl, handle) ? BLYT_OK : BLYT_ERR_INVALID_ARG;
+}
+
+/* Frame-boundary force-release: drop every pin (ADR-0027 frame-scope). */
+static void resources_force_release_pins(void) {
+    for (int i = 0; i < NATIVE_MAX_RES; i++)
+        if (s_res[i].used)
+            blyt_rl_force_release_pins(&s_res[i].rl);
+}
+
 void blyt_runtime_startup(void) {
     load_cart_buf_counts(); /* must precede restricted filter (uses statx/mmap) */
+    resources_init(); /* same: retains a cart mmap before the filter (#123) */
     if (blyt_install_restricted_filter() != 0) {
         static const char msg[] = "libblytcommon: FATAL: seccomp install failed\n";
         blyt_rs_write(2, msg, sizeof(msg) - 1);
@@ -709,6 +892,9 @@ void blyt_frame_done(void) {
      * The memory clobber prevents the compiler from reordering FP operations
      * across this boundary. */
     __asm__ volatile("csrw fcsr, zero" ::: "memory");
+    /* Force-release any resource pins still held: a pin is valid only within the
+     * frame it was taken (ADR-0027 frame-scope amendment, #123). */
+    resources_force_release_pins();
     if (blyt32_trace_api_enabled()) {
         static const char msg[] = "[blyt:api] frame_done()\n";
         blyt32_trace_write(msg, sizeof(msg) - 1);
