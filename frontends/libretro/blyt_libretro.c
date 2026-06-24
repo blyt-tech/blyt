@@ -414,43 +414,49 @@ bool blyt_libretro_reload(void) {
     if (!g_session || !g_cart_path)
         return false;
 
+    /* In-VM cart-as-library module swap (issue #127, spike-W β / gate G1): swap
+     * the cart's code IN PLACE rather than destroying and recreating the session.
+     * The rv32 VM, libblyt32/libblyt32lua and the per-session debug state all
+     * stay alive — sidestepping the rv32emu single-VM-per-process global-state
+     * hazard a session recreate crosses (issue #44) — and the dev-control/debug
+     * connection survives the reload.  State is preserved across the swap exactly
+     * as before (snapshot → swap → boot → restore(HOT_RELOAD)). */
+
     /* 1. Snapshot live state (flushing transient state via on_save_state). */
     snap = blyt_session_snapshot(g_session);
 
-    /* 2. Tear down the old session and cart. */
-    blyt_session_destroy(g_session);
-    g_session = NULL;
-    blyt_cart_close(g_cart);
-    g_cart = NULL;
-
-    /* 3. Reopen the freshly rebuilt cart from disk and recreate the session. */
-    err = blyt_cart_open(g_cart_path, &g_cart);
+    /* 2. Open the freshly rebuilt cart from disk. */
+    blyt_cart_t *new_cart = NULL;
+    err = blyt_cart_open(g_cart_path, &new_cart);
     if (err != BLYT_CART_OK) {
         if (g_log_cb)
             g_log_cb(RETRO_LOG_ERROR, "blyt: reload failed to open cart: %s\n",
                      blyt_cart_err_str(err));
-        g_cart = NULL;
         blyt_session_snapshot_free(snap);
-        g_cart_done = true;
-        return false;
+        return false; /* old session keeps running the old code */
     }
-    g_session = blyt_session_create(g_cart, libretro_log);
-    if (!g_session) {
+
+    /* 3. Swap the cart image into the live session (same base, run-mode — the
+     *    GDB solib reload event lives in the debug layer, #119). */
+    if (!blyt_session_swap_cart(g_session, new_cart, 0u, NULL)) {
         if (g_log_cb)
-            g_log_cb(RETRO_LOG_ERROR, "blyt: reload failed to recreate session\n");
-        blyt_cart_close(g_cart);
-        g_cart = NULL;
+            g_log_cb(RETRO_LOG_ERROR, "blyt: reload failed to swap cart module\n");
+        blyt_cart_close(new_cart);
         blyt_session_snapshot_free(snap);
-        g_cart_done = true;
-        return false;
+        return false; /* old session keeps running the old code */
     }
+
+    /* 4. The session now reads its sections/resources from the new cart; retire
+     *    the old handle and keep the new one as the session's cart. */
+    blyt_cart_close(g_cart);
+    g_cart = new_cart;
     g_cart_done = false;
     g_run_err = BLYT_RUN_OK;
 
-    /* 4. Run the first frame so the new cart's init() executes and allocates
-     *    its state slots, then restore the snapshot over the fresh buffers and
-     *    notify the cart via on_load_state(HOT_RELOAD).  The discarded frame is
-     *    never presented. */
+    /* 5. Run the first frame so the new cart's init() executes and allocates its
+     *    state slots, then restore the snapshot over the fresh buffers and notify
+     *    the cart via on_load_state(HOT_RELOAD).  The discarded frame is never
+     *    presented. */
     blyt_session_run_frame(g_session);
     blyt_session_restore(g_session, snap, 3u /* BLYT_LOAD_HOT_RELOAD */);
     return true;

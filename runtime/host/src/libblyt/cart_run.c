@@ -206,6 +206,10 @@ typedef struct {
     uint32_t original_word;
 } blyt_gdb_bp_t;
 
+/* Combined symbol table (defined below); the session retains the runtime-lib
+ * subset so a cart can be re-linked against the persistent libs on a hot swap. */
+struct blyt_symtab;
+
 struct blyt_session {
     riscv_t *rv;
     /* vm_attr_t must outlive rv: rv_create stores &attr in rv->data (rv->priv),
@@ -257,12 +261,25 @@ struct blyt_session {
     int gdb_nbp;
 #endif
 
-    /* Cart BSS regions (recorded at create time for blyt_reset_every_frame_cycle). */
+    /* Cart BSS regions (recorded at load time for blyt_reset_every_frame_cycle). */
     struct {
         uint32_t start; /* guest vaddr = p_vaddr + p_filesz */
         uint32_t size; /* = p_memsz - p_filesz */
     } cart_bss[MAX_BSS_REGIONS];
     int n_cart_bss;
+
+    /* Cart image placement (issue #127).  cart_base is the guest load base of
+     * the cart image (0 for the native bias today); cart_span is the highest
+     * mapped offset (max p_vaddr + p_memsz) so [cart_base, cart_base + cart_span)
+     * is the cart's region.  Both are updated by blyt_session_swap_cart and used
+     * by session_cart_fn to tell cart-native code from runtime-lib code. */
+    uint32_t cart_base;
+    uint32_t cart_span;
+
+    /* Runtime-lib symbol table retained from the initial dynlink: the cart's
+     * own symbols are seeded fresh on top of these to re-link a swapped cart
+     * against the persistent libs (issue #127) without reloading them. */
+    struct blyt_symtab *lib_syms;
 
     /* Cached guest addresses of cart lifecycle callbacks (0 = not found). */
     uint32_t fn_on_save_state;
@@ -1703,7 +1720,7 @@ typedef struct {
     uint32_t guest_addr;
 } blyt_sym_t;
 
-typedef struct {
+typedef struct blyt_symtab {
     blyt_sym_t syms[MAX_SYMS];
     int count;
 } blyt_symtab_t;
@@ -1714,6 +1731,14 @@ static uint32_t symtab_lookup(const blyt_symtab_t *st, const char *name) {
             return st->syms[i].guest_addr;
     }
     return 0;
+}
+
+/* Append src's entries onto dst (first-match precedence: dst's existing entries,
+ * e.g. the cart's own symbols, win on lookup).  Used to layer the retained
+ * runtime-lib symbols under a freshly-seeded cart on a hot swap (issue #127). */
+static void append_symtab(blyt_symtab_t *dst, const blyt_symtab_t *src) {
+    for (int i = 0; i < src->count && dst->count < MAX_SYMS; i++)
+        dst->syms[dst->count++] = src->syms[i];
 }
 
 /* -------------------------------------------------------------------------
@@ -2056,6 +2081,91 @@ static bool open_lib(const char *lib_dir, const char *lib_name, const uint8_t **
 }
 
 /* -------------------------------------------------------------------------
+ * Cart-image bookkeeping shared by initial load and hot swap (issue #127)
+ * ------------------------------------------------------------------------- */
+
+/* Record the cart's image placement: base, span (highest mapped offset) and BSS
+ * regions, used by session_cart_fn and blyt_reset_every_frame_cycle.  Resets the
+ * BSS list so it is correct for the (possibly new) cart on a swap. */
+static void record_cart_image_layout(blyt_session_t *s, const blyt_cart_t *cart,
+                                     uint32_t load_base) {
+    const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
+    s->cart_base = load_base;
+    s->cart_span = 0;
+    s->n_cart_bss = 0;
+    for (uint16_t pi = 0; pi < eh->e_phnum; pi++) {
+        size_t off = (size_t)eh->e_phoff + (size_t)pi * eh->e_phentsize;
+        if (off + sizeof(Elf32_Phdr) > cart->map_size)
+            break;
+        const Elf32_Phdr *ph = (const Elf32_Phdr *)((const uint8_t *)cart->map + off);
+        if (ph->p_type != PT_LOAD)
+            continue;
+        uint32_t end = ph->p_vaddr + ph->p_memsz;
+        if (end > s->cart_span)
+            s->cart_span = end;
+        if (ph->p_memsz > ph->p_filesz && s->n_cart_bss < MAX_BSS_REGIONS) {
+            s->cart_bss[s->n_cart_bss].start = load_base + ph->p_vaddr + ph->p_filesz;
+            s->cart_bss[s->n_cart_bss].size = ph->p_memsz - ph->p_filesz;
+            s->n_cart_bss++;
+        }
+    }
+}
+
+/* Cache the cart's lifecycle entry-point guest addresses (0 = not defined). */
+static void resolve_cart_entry_points(blyt_session_t *s, const blyt_symtab_t *all) {
+    s->fn_on_save_state = symtab_lookup(all, "blyt_cart_on_save_state");
+    s->fn_init = symtab_lookup(all, "blyt_cart_init");
+    s->fn_on_load_state = symtab_lookup(all, "blyt_cart_on_load_state");
+    s->fn_on_new_state = symtab_lookup(all, "blyt_cart_on_new_state");
+    s->fn_update = symtab_lookup(all, "blyt_cart_update");
+    s->fn_draw = symtab_lookup(all, "blyt_cart_draw");
+    s->fn_on_quit = symtab_lookup(all, "blyt_cart_on_quit");
+    s->fn_cleanup = symtab_lookup(all, "blyt_cart_cleanup");
+    s->fn_on_assets_reloaded = symtab_lookup(all, "blyt_cart_on_assets_reloaded");
+    s->fn_is_quit_requested = symtab_lookup(all, "blyt_is_quit_requested");
+}
+
+#if defined(BLYT_LUA) && defined(__EMSCRIPTEN__)
+/* Resolve .lua_exports for WASM hybrid trampolines.  The section contains one
+ * blyt_lua_export_entry_t per BLYT_LUA_EXPORT_* macro; cache the resolved guest
+ * addresses so run_lua_cart() can register host-side trampolines without
+ * re-parsing the ELF.  Resets the table so it is correct after a swap. */
+static void resolve_cart_lua_exports(blyt_session_t *s, const blyt_cart_t *cart,
+                                     const blyt_symtab_t *all) {
+    s->lua_nexports = 0;
+    size_t esz = 0;
+    const blyt_lua_export_entry_t *ent =
+        (const blyt_lua_export_entry_t *)blyt_cart_find_section(cart, ".lua_exports", &esz);
+    if (!ent)
+        return;
+    int n = (int)(esz / sizeof(*ent));
+    for (int i = 0; i < n && s->lua_nexports < 32; i++) {
+        uint32_t addr = symtab_lookup(all, ent[i].fn_sym);
+        if (!addr)
+            continue;
+        /* ADR-0130: bridged exports are invoked through their wrapper (wrap_sym)
+         * instead of typed argument conversion.  A bridged entry with an
+         * unresolvable wrapper is skipped. */
+        uint8_t flags = ent[i]._pad[0];
+        uint32_t wrap_addr = 0;
+        if (flags & BLYT_LUA_EXPORT_FLAG_BRIDGED) {
+            wrap_addr = symtab_lookup(all, ent[i].wrap_sym);
+            if (!wrap_addr)
+                continue;
+        }
+        s->lua_exports[s->lua_nexports].fn_guest_addr = addr;
+        s->lua_exports[s->lua_nexports].wrap_guest_addr = wrap_addr;
+        s->lua_exports[s->lua_nexports].flags = flags;
+        memcpy(s->lua_exports[s->lua_nexports].lua_name, ent[i].lua_name, 32);
+        s->lua_exports[s->lua_nexports].nargs = ent[i].nargs;
+        memcpy(s->lua_exports[s->lua_nexports].arg_types, ent[i].arg_types, 4);
+        s->lua_exports[s->lua_nexports].ret_type = ent[i].ret_type;
+        s->lua_nexports++;
+    }
+}
+#endif
+
+/* -------------------------------------------------------------------------
  * Top-level dynamic loader
  * ------------------------------------------------------------------------- */
 
@@ -2076,6 +2186,19 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
     blyt_symtab_t *all_syms = calloc(1, sizeof(*all_syms));
     if (!all_syms)
         return BLYT_RUN_ERR_EMU;
+
+    /* Retain the runtime-lib symbols on the session so a hot swap can re-link a
+     * new cart against the persistent libs without reloading them (issue #127).
+     * Allocated once per session; freed in blyt_session_destroy. */
+    if (!s->lib_syms) {
+        s->lib_syms = calloc(1, sizeof(*s->lib_syms));
+        if (!s->lib_syms) {
+            free(all_syms);
+            return BLYT_RUN_ERR_EMU;
+        }
+    } else {
+        s->lib_syms->count = 0;
+    }
 
     /* Seed cart symbols first so cart's strong definitions win over library stubs. */
     {
@@ -2161,7 +2284,9 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
         }
 
         apply_lib_rela(&lib, mem);
-        build_symtab(&lib, all_syms);
+        /* Build into the retained lib-only table; the cart's symbols are layered
+         * on top (below) so the cart still wins on lookup (issue #127). */
+        build_symtab(&lib, s->lib_syms);
         libs[nlibs++] = lib;
 
 #ifdef BLYT_GDB
@@ -2223,6 +2348,10 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
         };
         apply_lib_rela(&cart_lib, mem);
 
+        /* Layer the retained runtime-lib symbols under the cart's (seeded above),
+         * giving the combined table dynlink resolves against (issue #127). */
+        append_symtab(all_syms, s->lib_syms);
+
         for (int i = 0; i < nlibs; i++) {
             resolve_elf_plt(libs[i].map, libs[i].size, mem, libs[i].bias, all_syms);
         }
@@ -2246,55 +2375,12 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
     }
 
 #if defined(BLYT_LUA) && defined(__EMSCRIPTEN__)
-    /* Resolve .lua_exports for WASM hybrid trampolines.  The section contains
-     * one blyt_lua_export_entry_t per BLYT_LUA_EXPORT_* macro invocation;
-     * we cache the resolved guest addresses so run_lua_cart() can register
-     * host-side trampolines without re-parsing the ELF section at runtime. */
-    if (ok) {
-        size_t esz = 0;
-        const blyt_lua_export_entry_t *ent =
-            (const blyt_lua_export_entry_t *)blyt_cart_find_section(cart, ".lua_exports", &esz);
-        if (ent) {
-            int n = (int)(esz / sizeof(*ent));
-            for (int i = 0; i < n && s->lua_nexports < 32; i++) {
-                uint32_t addr = symtab_lookup(all_syms, ent[i].fn_sym);
-                if (!addr)
-                    continue;
-                /* ADR-0130: bridged exports are invoked through their wrapper
-                 * (wrap_sym) instead of typed argument conversion.  A bridged
-                 * entry with an unresolvable wrapper is skipped. */
-                uint8_t flags = ent[i]._pad[0];
-                uint32_t wrap_addr = 0;
-                if (flags & BLYT_LUA_EXPORT_FLAG_BRIDGED) {
-                    wrap_addr = symtab_lookup(all_syms, ent[i].wrap_sym);
-                    if (!wrap_addr)
-                        continue;
-                }
-                s->lua_exports[s->lua_nexports].fn_guest_addr = addr;
-                s->lua_exports[s->lua_nexports].wrap_guest_addr = wrap_addr;
-                s->lua_exports[s->lua_nexports].flags = flags;
-                memcpy(s->lua_exports[s->lua_nexports].lua_name, ent[i].lua_name, 32);
-                s->lua_exports[s->lua_nexports].nargs = ent[i].nargs;
-                memcpy(s->lua_exports[s->lua_nexports].arg_types, ent[i].arg_types, 4);
-                s->lua_exports[s->lua_nexports].ret_type = ent[i].ret_type;
-                s->lua_nexports++;
-            }
-        }
-    }
+    if (ok)
+        resolve_cart_lua_exports(s, cart, all_syms);
 #endif
 
-    if (ok) {
-        s->fn_on_save_state = symtab_lookup(all_syms, "blyt_cart_on_save_state");
-        s->fn_init = symtab_lookup(all_syms, "blyt_cart_init");
-        s->fn_on_load_state = symtab_lookup(all_syms, "blyt_cart_on_load_state");
-        s->fn_on_new_state = symtab_lookup(all_syms, "blyt_cart_on_new_state");
-        s->fn_update = symtab_lookup(all_syms, "blyt_cart_update");
-        s->fn_draw = symtab_lookup(all_syms, "blyt_cart_draw");
-        s->fn_on_quit = symtab_lookup(all_syms, "blyt_cart_on_quit");
-        s->fn_cleanup = symtab_lookup(all_syms, "blyt_cart_cleanup");
-        s->fn_on_assets_reloaded = symtab_lookup(all_syms, "blyt_cart_on_assets_reloaded");
-        s->fn_is_quit_requested = symtab_lookup(all_syms, "blyt_is_quit_requested");
-    }
+    if (ok)
+        resolve_cart_entry_points(s, all_syms);
 
     free(all_syms);
     return ok ? BLYT_RUN_OK : BLYT_RUN_ERR_EMU;
@@ -2335,29 +2421,166 @@ bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart) {
     return true;
 }
 
-/* Returns addr if it is in cart-native address space (bias=0, < GUEST_LIB_BASE),
+/* Returns addr if it lies in the cart's own image [cart_base, cart_base+span),
  * else 0.  Used by the WASM frontend to decide whether to dispatch lifecycle
- * callbacks via the RV32 session or fall back to the Lua global. */
-static uint32_t session_cart_fn(uint32_t addr) {
-    return (addr && addr < GUEST_LIB_BASE) ? addr : 0;
+ * callbacks via the RV32 session or fall back to the Lua global.  Tracking the
+ * cart's actual placement (rather than assuming bias 0 / < GUEST_LIB_BASE) keeps
+ * this correct after blyt_session_swap_cart re-maps the cart at a fresh base
+ * (issue #127; #119 uses a non-zero base). */
+static uint32_t session_cart_fn(const blyt_session_t *s, uint32_t addr) {
+    return (addr && addr >= s->cart_base && addr < s->cart_base + s->cart_span) ? addr : 0;
 }
 uint32_t blyt_session_cart_fn_init(blyt_session_t *s) {
-    return session_cart_fn(s->fn_init);
+    return session_cart_fn(s, s->fn_init);
 }
 uint32_t blyt_session_cart_fn_on_new_state(blyt_session_t *s) {
-    return session_cart_fn(s->fn_on_new_state);
+    return session_cart_fn(s, s->fn_on_new_state);
 }
 uint32_t blyt_session_cart_fn_update(blyt_session_t *s) {
-    return session_cart_fn(s->fn_update);
+    return session_cart_fn(s, s->fn_update);
 }
 uint32_t blyt_session_cart_fn_draw(blyt_session_t *s) {
-    return session_cart_fn(s->fn_draw);
+    return session_cart_fn(s, s->fn_draw);
 }
 uint32_t blyt_session_cart_fn_on_quit(blyt_session_t *s) {
-    return session_cart_fn(s->fn_on_quit);
+    return session_cart_fn(s, s->fn_on_quit);
 }
 uint32_t blyt_session_cart_fn_cleanup(blyt_session_t *s) {
-    return session_cart_fn(s->fn_cleanup);
+    return session_cart_fn(s, s->fn_cleanup);
+}
+
+const void *blyt_session_vm_id(const blyt_session_t *s) {
+    return s ? (const void *)s->rv : NULL;
+}
+
+/* Swap the running cart's code in place WITHOUT recreating the VM (issue #127,
+ * spike-W β / gate G1).  The rv32 VM, the runtime libs (libblyt32/…) mapped at
+ * GUEST_LIB_BASE, and all per-session debug/GDB state persist; only the cart
+ * image is replaced.  See blyt_runtime.h for the contract.  State restore is the
+ * caller's job (blyt_session_snapshot before / blyt_session_restore after). */
+bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint32_t load_base,
+                            const char *reported_path) {
+    if (!s || !s->rv || !new_cart || !new_cart->map || !s->lib_syms)
+        return false;
+
+    riscv_t *rv = s->rv;
+    vm_attr_t *attr = PRIV(rv);
+    memory_t *mem = attr->mem;
+
+    /* Remember the old image placement so its uncovered bytes can be zeroed for
+     * hygiene once the new image is successfully mapped (below). */
+    uint32_t old_base = s->cart_base;
+    uint32_t old_span = s->cart_span;
+
+    /* 1. Map the new cart's PT_LOAD segments at load_base and apply its own
+     *    R_RISCV_RELATIVE/R_RISCV_32 relocations (as dynlink does for the cart).
+     *    On a malformed image this fails before anything is overwritten, leaving
+     *    the session running the old code. */
+    blyt_lib_t cart_lib = {
+        .map = (const uint8_t *)new_cart->map,
+        .size = new_cart->map_size,
+        .bias = load_base,
+        .mmapped = false,
+    };
+    if (!map_lib_segments(&cart_lib, mem))
+        return false;
+    apply_lib_rela(&cart_lib, mem);
+
+    /* 2. Re-link against the persistent runtime libs: seed the new cart's symbols
+     *    (so they win) then layer the retained lib symbols, and resolve the
+     *    cart's PLT/GOT.  The libs never moved, so their symbol addresses (held
+     *    in s->lib_syms) are still valid. */
+    blyt_symtab_t *all = calloc(1, sizeof(*all));
+    if (!all)
+        return false;
+    build_symtab(&cart_lib, all);
+    append_symtab(all, s->lib_syms);
+    resolve_elf_plt(new_cart->map, new_cart->map_size, mem, load_base, all);
+
+    /* 3. Re-stamp the libblytc.so arena globals (ADR-0120) so the reloaded cart
+     *    starts from a clean arena base/size. */
+    uint32_t sym_base = symtab_lookup(all, "blytc_arena_base");
+    uint32_t sym_size = symtab_lookup(all, "blytc_arena_size");
+    if (sym_base != 0 && sym_size != 0) {
+        uint8_t v[4];
+        write_u32_le(v, BLYT_ARENA_BASE);
+        memory_write(mem, sym_base, v, 4);
+        write_u32_le(v, BLYT_ARENA_SIZE);
+        memory_write(mem, sym_size, v, 4);
+    }
+
+    /* 4. Re-resolve the cart's lifecycle entry points (and WASM hybrid exports)
+     *    and re-record its image layout / BSS regions. */
+    resolve_cart_entry_points(s, all);
+#if defined(BLYT_LUA) && defined(__EMSCRIPTEN__)
+    resolve_cart_lua_exports(s, new_cart, all);
+#endif
+    free(all);
+    record_cart_image_layout(s, new_cart, load_base);
+
+    /* 5. Zero any bytes of the OLD image the new one doesn't cover, so stale code
+     *    or data from a larger previous build cannot survive (memory hygiene; the
+     *    cart region sits below the runtime libs and the trampolines, so this
+     *    never touches them).  Same base: zero only the tail past the new span;
+     *    a different base (the debug layer's fresh-base reload, #119): the whole
+     *    old region is uncovered. */
+    if (old_span) {
+        if (old_base == s->cart_base) {
+            if (old_span > s->cart_span)
+                memory_fill(mem, old_base + s->cart_span, old_span - s->cart_span, 0);
+        } else {
+            memory_fill(mem, old_base, old_span, 0);
+        }
+    }
+
+    /* 6. Re-initialise the cart-derived session state from the new cart: state
+     *    buffer layouts, resource table, manifest id and save version.  The
+     *    caller's snapshot was taken from the old state_ctx before this call;
+     *    blyt_session_restore copies it back over the fresh buffers afterwards. */
+    blyt_state_ctx_destroy(&s->state_ctx);
+    blyt_state_ctx_init(new_cart, &s->state_ctx);
+    s->ctx.state_ctx = &s->state_ctx;
+    blyt_resource_table_clear(&s->ctx.resources);
+    s->ctx.resource_scratch_off = 0;
+    load_session_resources(&s->ctx, new_cart);
+    snprintf(s->ctx.cart_name, sizeof(s->ctx.cart_name), "%s", new_cart->id);
+    s->ctx.save_version = new_cart->save_version;
+
+#ifdef BLYT_GDB
+    /* Keep the GDB exec-file path coherent (run-mode only — the solib reload
+     * event and fresh checksum-path reporting are the debug layer's job, #119).
+     * reported_path overrides when given so #119 can announce a unique path. */
+    {
+        const char *p = (reported_path && reported_path[0]) ? reported_path : new_cart->path;
+        if (p) {
+            strncpy(s->gdb_exec_path, p, sizeof(s->gdb_exec_path) - 1);
+            s->gdb_exec_path[sizeof(s->gdb_exec_path) - 1] = '\0';
+        }
+    }
+#else
+    (void)reported_path;
+#endif
+
+    /* 7. Discard translated code from the OLD image — the block map keys blocks
+     *    by guest PC, so blocks at the cart's addresses now hold stale (old)
+     *    instructions and MUST be flushed, then re-boot the new cart from its
+     *    entry (clearing regs/stack) so the next run_frame runs its init(). */
+    block_map_clear(rv);
+    rv_block_chain_reset();
+    const Elf32_Ehdr *neh = (const Elf32_Ehdr *)new_cart->map;
+    rv_reset(rv, load_base + neh->e_entry);
+    rv_set_reg(rv, rv_reg_ra, BLYT_TRAMPOLINE_EXIT_ADDR);
+
+    /* 8. Clear per-frame / ecall control flags so the next run_frame starts a
+     *    clean frame on the new code. */
+    s->ctx.ecall_trapped = false;
+    s->ctx.ecall_aborted = false;
+    s->ctx.frame_done = false;
+    s->ctx.fn_return_done = false;
+    s->cart_has_drawn = false;
+    rv->halt = false;
+
+    return true;
 }
 
 blyt_state_ctx_t *blyt_session_state_ctx(blyt_session_t *s) {
@@ -2441,21 +2664,9 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
         return NULL;
     }
 
-    /* Record cart BSS regions for blyt_reset_every_frame_cycle guest BSS zeroing. */
-    {
-        const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
-        for (uint16_t pi = 0; pi < eh->e_phnum && s->n_cart_bss < MAX_BSS_REGIONS; pi++) {
-            size_t off = (size_t)eh->e_phoff + (size_t)pi * eh->e_phentsize;
-            if (off + sizeof(Elf32_Phdr) > cart->map_size)
-                break;
-            const Elf32_Phdr *ph = (const Elf32_Phdr *)((const uint8_t *)cart->map + off);
-            if (ph->p_type != PT_LOAD || ph->p_memsz <= ph->p_filesz)
-                continue;
-            s->cart_bss[s->n_cart_bss].start = ph->p_vaddr + ph->p_filesz;
-            s->cart_bss[s->n_cart_bss].size = ph->p_memsz - ph->p_filesz;
-            s->n_cart_bss++;
-        }
-    }
+    /* Record cart image placement + BSS regions (the cart loads at bias 0 as the
+     * rv32emu main program; blyt_session_swap_cart re-records on a hot swap). */
+    record_cart_image_layout(s, cart, 0u);
 
     /* Initialise state buffer context from .cart.layouts (if present). */
     blyt_state_ctx_init(cart, &s->state_ctx);
@@ -2865,6 +3076,7 @@ void blyt_session_destroy(blyt_session_t *session) {
     blyt_state_ctx_destroy(&session->state_ctx);
     blyt_resource_table_clear(&session->ctx.resources);
     free(session->ctx.save_dir);
+    free(session->lib_syms);
     rv_delete(session->rv);
     free(session);
 }

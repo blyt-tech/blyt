@@ -192,6 +192,39 @@ void blyt_session_destroy(blyt_session_t *session);
  * success.  `cart` must be the cart the session was created from. */
 bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart);
 
+/* Swap the running cart's code in place WITHOUT recreating the VM/session
+ * (issue #127, spike-W β / gate G1 — the foundation for native hot reload).
+ *
+ * Unloads the current cart image and loads `new_cart` at guest base `load_base`,
+ * re-links it against the persistent runtime libs (libblyt32/libblyt32lua/…),
+ * re-resolves the cart's lifecycle entry points, and re-boots the cart so the
+ * next blyt_session_run_frame() runs the new code's init().  The rv32 VM,
+ * libblyt32 state, GDB state, palette, save dir and frame counter all PERSIST —
+ * blyt_session_vm_id() is unchanged across the swap, proving the VM was reused
+ * rather than recreated (which would cross the rv32emu single-VM-per-process
+ * global-state hazard, issue #44).
+ *
+ * `load_base` is the guest base for the new image; pass 0 for the cart's native
+ * bias (as today).  `reported_path`, when non-NULL, overrides the path recorded
+ * for the GDB layout (NULL = new_cart->path); callers driving a run-mode reload
+ * pass NULL.  load_base + reported_path are parameterised so the debug layer
+ * (issue #119) can re-map at a fresh checksum path per reload without touching
+ * the loader; a run-mode reload reloads at the same base with neither.
+ *
+ * State restore is the CALLER's job: snapshot via blyt_session_snapshot() before
+ * the swap, then blyt_session_restore(reason=BLYT_LOAD_HOT_RELOAD) after the
+ * post-swap boot frame — exactly as a fresh-load reload does, but in place.
+ *
+ * Returns true on success; on failure the session is left running the old code.
+ */
+bool blyt_session_swap_cart(blyt_session_t *session, const blyt_cart_t *new_cart,
+                            uint32_t load_base, const char *reported_path);
+
+/* Opaque identity of the underlying rv32 VM.  Stable for the life of a session
+ * and across blyt_session_swap_cart (which reuses the VM); a freshly created
+ * session has a different id.  For tests/introspection only. */
+const void *blyt_session_vm_id(const blyt_session_t *session);
+
 /* Notify the cart that hot-swapped assets changed (issue #122), after a
  * blyt_session_reload_resources() on the dev-mode `update_assets` path.  Invokes
  * the cart's optional blyt_cart_on_assets_reloaded(ids, n) — or, for a Lua cart,
