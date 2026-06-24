@@ -10,18 +10,12 @@
  *
  * Save files: $BLYT_SAVE_DIR/<cart_name>/slot_<N>.blys
  * Format: 20-byte header (minor 1) + one CART section per buffer.
+ *
+ * The on-disk byte layout (magic, header, CART sections) lives in
+ * runtime/shared/blyt_blys.{c,h} — the single definition shared with the native
+ * bare-metal save path (#129).  save.c only adapts the host's state context and
+ * FILE* I/O to it.
  * ------------------------------------------------------------------------- */
-
-/* Save file magic */
-#define BLYS_MAGIC "BLYS"
-#define BLYS_FORMAT_VERSION_MAJOR UINT16_C(1)
-/* minor 1 (ADR-0125): header carries the writing cart's save_version (uint32 LE)
- * at offset 16, so the header is 20 bytes. minor 0 saves have a 16-byte header
- * and are reported with save_version 0. */
-#define BLYS_FORMAT_VERSION_MINOR UINT16_C(1)
-
-/* Section type tag in the chunked body */
-#define BLYS_SECT_CART "CART"
 
 typedef struct blyt_session blyt_session_t;
 

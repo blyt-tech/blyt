@@ -846,6 +846,7 @@ if(BLYT_BUILD_NATIVE)
     "${LIBBLYTCOMMON_NATIVE_DIR}/blytcommon.c"
     "${SHARED_DIR}/blyt_fp_canon.c"
     "${SHARED_DIR}/blyt_elf_section.c"
+    "${SHARED_DIR}/blyt_blys.c"
     CFLAGS
     -O0
     -I
