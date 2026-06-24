@@ -457,17 +457,23 @@ static bool reload_impl(const char *open_path, uint32_t load_base, const char *r
     g_cart_done = false;
     g_run_err = BLYT_RUN_OK;
 
-    /* 5. Run the first frame so the new cart's init() executes and allocates its
-     *    state slots, then restore the snapshot over the fresh buffers and notify
-     *    the cart via on_load_state(HOT_RELOAD).  The discarded frame is never
-     *    presented. */
-    blyt_session_run_frame(g_session);
-    blyt_session_restore(g_session, snap, 3u /* BLYT_LOAD_HOT_RELOAD */);
-
-    /* 6. Debug mode (issue #119): tell the debugger the cart was reloaded so it
-     *    re-reads the new DWARF and rebinds breakpoints to the new addresses. */
+    /* 5. Debug mode (issue #119): rebind the debugger BEFORE running init() so a
+     *    breakpoint in init() (native or, for hybrid carts, Lua) binds to the new
+     *    code and fires when init() runs below — the reload-time equivalent of
+     *    the startup both-armed-before-init() gate (Spike W §5f).  The cart sits
+     *    at its entry (post rv_reset, not yet run); the two-phase solib swap
+     *    re-reads the new DWARF and rebinds, and the companion Lua DAP session's
+     *    source-line breakpoints persist host-side across the swap, so both views
+     *    are armed before init() executes.  No-op without an attached debugger. */
     if (fire_solib)
         blyt_session_gdb_notify_cart_reloaded(g_session, new_cart, load_base, reported_path);
+
+    /* 6. Run the first frame so the new cart's init() executes and allocates its
+     *    state slots (stopping at any init() breakpoint armed above), then
+     *    restore the snapshot over the fresh buffers and notify the cart via
+     *    on_load_state(HOT_RELOAD).  The discarded frame is never presented. */
+    blyt_session_run_frame(g_session);
+    blyt_session_restore(g_session, snap, 3u /* BLYT_LOAD_HOT_RELOAD */);
     return true;
 }
 
