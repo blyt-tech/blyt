@@ -2,8 +2,9 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytdebug, build_debug_cart, lldb_dap_bin, repo_root, require_gdb,
-    require_lldb_dap, require_rust_riscv_target, require_sdk, require_symbol_addr,
+    CartProject, blytdebug, build_debug_cart, build_debug_lua_cart, lldb_dap_bin, repo_root,
+    require_gdb, require_lldb_dap, require_lua_sdk, require_rust_riscv_target, require_sdk,
+    require_symbol_addr,
 };
 use std::time::Duration;
 use tempfile::TempDir;
@@ -720,4 +721,224 @@ fn sdl_native_lldb_dap_n_reloads_single_location() {
          rebind to a reloaded cart.\n--- trace ---\n{trace}",
         cart_armed[0]
     );
+}
+
+/* ── Hybrid reload-while-debugging (issue #119, criteria 4 + 5) ──────────── */
+
+/// Hybrid (Lua + C) cart whose Lua-exported native function `blyt_native_init_work`
+/// sits at a *shiftable* address (`pad` grows `blyt_pad_fn`, kept alive by a tail
+/// call so the linker retains it before the exported function).  Lua `init()`
+/// calls the native function, so a breakpoint inside it FIRES during init() — on
+/// both first launch and after a reload.  Line numbers are stable so the native
+/// source breakpoint (line 6, the `local_val` assignment) stays valid v1→v2.
+fn reload_hybrid_c(pad: &str) -> String {
+    format!(
+        "#include \"blyt.h\"\n\
+         #include <stdint.h>\n\
+         volatile uint32_t g_counter = 0;\n\
+         void blyt_pad_fn(void) {{ {pad} }}\n\
+         BLYT_LUA_EXPORT_VOID(blyt_native_init_work) {{\n\
+         \x20\x20\x20\x20volatile uint32_t local_val = 0xdeadbeef;\n\
+         \x20\x20\x20\x20g_counter = local_val + 1;\n\
+         \x20\x20\x20\x20blyt_pad_fn();\n\
+         }}\n"
+    )
+}
+
+/// Lua side of the hybrid reload cart: `init()` calls the native function at
+/// line 3 (the Lua breakpoint; the native breakpoint fires inside that call).
+/// No `blyt.quit()` — the cart idles in `update()` so it stays alive to service
+/// the dev-control reload and re-run `init()`.
+const RELOAD_HYBRID_LUA: &str = "\
+function init()\n\
+    local x = 0\n\
+    blyt_native_init_work()\n\
+end\n\
+function update() end\n\
+function draw()   end\n";
+
+/// Spawn `blytdebug --debug 0 --gdb 0 --dev-ctrl-port 0 --headless <cart>` and
+/// return the child, its DAP (Lua), GDB (native) and dev-control ports, and a
+/// buffer accumulating its BLYT_TRACE stderr.
+fn spawn_blytdebug_hybrid_ports(
+    cart: &std::path::Path,
+) -> (
+    std::process::Child,
+    u16,
+    u16,
+    u16,
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    let mut proc = std::process::Command::new(blytdebug())
+        .args([
+            "--debug",
+            "0",
+            "--gdb",
+            "0",
+            "--dev-ctrl-port",
+            "0",
+            "--headless",
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_TRACE", "gdb,dap,lifecycle,frame")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("blytdebug spawn");
+
+    let dbg_stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let mut se = proc.stderr.take().unwrap();
+        let buf = dbg_stderr.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = se.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        });
+    }
+
+    use std::io::{BufRead, BufReader};
+    let stdout = proc.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let port_after = |line: &str, marker: &str| -> Option<u16> {
+            let i = line.find(marker)?;
+            let rest = &line[i + marker.len()..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end].parse::<u16>().ok()
+        };
+        let (mut dap, mut gdb, mut dev) = (None, None, None);
+        let mut sent = false;
+        // Keep draining stdout for the whole run: the cart/runtime may print
+        // after the ports are announced, and if this reader stops the stdout
+        // pipe fills and blocks blytdebug mid-init() (the cart never reaches
+        // its breakpoints).
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sent {
+                continue;
+            }
+            if let Some(p) = port_after(&line, "DAP listening on port ") {
+                dap = Some(p);
+            }
+            if let Some(p) = port_after(&line, "GDB listening on port ") {
+                gdb = Some(p);
+            }
+            if let Some(p) = port_after(&line, "Dev control: listening on 127.0.0.1:") {
+                dev = Some(p);
+            }
+            if let (Some(a), Some(g), Some(d)) = (dap, gdb, dev) {
+                let _ = tx.send((a, g, d));
+                sent = true;
+            }
+        }
+    });
+    let (dap_port, gdb_port, dev_port) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("blytdebug did not announce DAP, GDB and dev-control ports");
+    (proc, gdb_port, dap_port, dev_port, dbg_stderr)
+}
+
+/// LLDB-DAP (issue #119, acceptance criteria 4 + 5): in a single HYBRID debug
+/// session — native lldb-dap + companion Lua DAP, both live at once — a
+/// breakpoint in `init()` on BOTH the Lua and native sides fires again after a
+/// hot reload, and neither client is torn down across the reload.
+///
+/// Builds two hybrid carts whose native `init()`-called function sits at
+/// different addresses, starts the dual-client session against v1 (both init()
+/// breakpoints fire at startup), drives the REAL dev-control `reload` to v2, and
+/// asserts both init() breakpoints fire AGAIN after the reload (proving the
+/// post-reload gate armed both views before init() ran) while both DAP
+/// connections stay responsive (the session/connection persists).
+///
+/// The native view auto-continues lldb's library-change (exception/SIGTRAP)
+/// stops from the two-phase solib swap, mirroring the extension's reload-window
+/// behaviour.
+///
+/// Requires: blytdebug with BLYT_DAP=ON and BLYT_GDB=ON, Lua SDK, lldb-dap.
+#[test]
+fn sdl_hybrid_lldb_dap_reload_fires_both_init_breakpoints() {
+    require_sdk();
+    require_lua_sdk();
+    require_gdb();
+    require_lldb_dap();
+
+    const NATIVE_BREAK_LINE: u32 = 6;
+    const NATIVE_SOURCE_FILE: &str = "src/game/c/main.c";
+    // Lua line 3 is the native call site (proven to fire in run_sdl_hybrid_test).
+    const LUA_BREAK_LINE: u32 = 3;
+
+    let tmp = TempDir::new().unwrap();
+    let v1_pad = "g_counter += 1;".to_string();
+    let v2_pad = (0..60)
+        .map(|i| format!("g_counter += {i};"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let v1_dir = tmp.path().join("v1");
+    let v2_dir = tmp.path().join("v2");
+    CartProject::new()
+        .c(&reload_hybrid_c(&v1_pad))
+        .lua(RELOAD_HYBRID_LUA)
+        .write(&v1_dir);
+    CartProject::new()
+        .c(&reload_hybrid_c(&v2_pad))
+        .lua(RELOAD_HYBRID_LUA)
+        .write(&v2_dir);
+    let v1_cart = build_debug_lua_cart(&v1_dir);
+    let v2_cart = build_debug_lua_cart(&v2_dir);
+
+    let a1 = require_symbol_addr(&v1_cart, "blyt_native_init_work");
+    let a2 = require_symbol_addr(&v2_cart, "blyt_native_init_work");
+    assert_ne!(
+        a1, a2,
+        "test setup broken: the native fn did not move v1→v2"
+    );
+
+    let (mut proc, gdb_port, dap_port, dev_port, dbg_stderr) =
+        spawn_blytdebug_hybrid_ports(&v1_cart);
+
+    let lldb_dap = lldb_dap_bin().expect("lldb-dap not found");
+    let driver = repo_root().join("tests/dap/run_sdl_hybrid_reload_test.mjs");
+    let result = Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            lldb_dap.to_str().unwrap(),
+            &gdb_port.to_string(),
+            &dap_port.to_string(),
+            &dev_port.to_string(),
+            v1_cart.to_str().unwrap(),
+            v1_dir.to_str().unwrap(),
+            v2_cart.to_str().unwrap(),
+        ])
+        .env("BLYT_NATIVE_BREAK_LINE", NATIVE_BREAK_LINE.to_string())
+        .env("BLYT_NATIVE_SOURCE_FILE", NATIVE_SOURCE_FILE)
+        .env("BLYT_LUA_BREAK_LINE", LUA_BREAK_LINE.to_string())
+        .env("BLYT_LUA_SOURCE", "/blyt/cart/src/game/lua/main.lua")
+        .env(
+            "BLYT_STUB_PROGRAM",
+            repo_root().join("build/sdk/lib/debug/blyt-debug-stub.elf"),
+        )
+        .timeout(Duration::from_secs(90))
+        .assert();
+
+    let out = result.get_output().clone();
+    std::thread::sleep(Duration::from_millis(300));
+    let trace = String::from_utf8_lossy(&dbg_stderr.lock().unwrap()).to_string();
+    let _ = proc.kill();
+
+    if let Err(e) = result.try_success() {
+        eprintln!(
+            "--- driver stdout ---\n{}\n--- driver stderr ---\n{}\n--- blytdebug stderr ---\n{trace}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        panic!("{e}");
+    }
 }
