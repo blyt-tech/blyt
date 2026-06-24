@@ -45,7 +45,7 @@ void blyt_libretro_reset(void);
 bool blyt_libretro_save_state(uint32_t slot);
 bool blyt_libretro_load_state(uint32_t slot);
 bool blyt_libretro_reload(void);
-bool blyt_libretro_update_assets(void);
+bool blyt_libretro_update_assets(const uint32_t *ids, size_t n);
 
 /* Used only by the SDL frontend (direct link) for loop termination and exit
  * status — not part of the standard libretro interface. */
@@ -346,6 +346,29 @@ static bool dev_ctrl_str(const char *json, const char *key, char *out, size_t ou
     return *v == '"';
 }
 
+/* Parse a JSON array of integers ("key":[1,2,3]) into out[0..cap), returning the
+ * count parsed.  Used for the `assets` id list of the update_assets command. */
+static size_t dev_ctrl_int_array(const char *json, const char *key, uint32_t *out, size_t cap) {
+    const char *v = dev_ctrl_value(json, key);
+    if (!v || *v != '[')
+        return 0;
+    v++;
+    size_t cnt = 0;
+    while (*v && *v != ']' && cnt < cap) {
+        while (*v == ' ' || *v == '\t' || *v == ',')
+            v++;
+        if (*v == ']' || *v == '\0')
+            break;
+        char *end = NULL;
+        long r = strtol(v, &end, 10);
+        if (end == v)
+            break;
+        out[cnt++] = (uint32_t)r;
+        v = end;
+    }
+    return cnt;
+}
+
 static void dev_ctrl_send(const char *json) {
     if (g_dev_ctrl_client_fd < 0)
         return;
@@ -403,9 +426,12 @@ static void dev_ctrl_dispatch(const char *json) {
             dev_ctrl_err(id, cmd, "reload failed");
     } else if (strcmp(cmd, "update_assets") == 0) {
         /* Hot-swap edited assets between frames; no VM restart (issue #91).
-         * The `assets` id list is informational here — the runtime re-reads the
-         * whole resource-id-index, which already reflects the new content. */
-        if (blyt_libretro_update_assets())
+         * The runtime re-reads the whole resource-id-index (which already
+         * reflects the new content), then hands the changed `assets` ids to the
+         * cart's on_assets_reloaded hook (issue #122). */
+        uint32_t ids[64];
+        size_t n = dev_ctrl_int_array(json, "assets", ids, sizeof(ids) / sizeof(ids[0]));
+        if (blyt_libretro_update_assets(ids, n))
             dev_ctrl_ok(id, cmd);
         else
             dev_ctrl_err(id, cmd, "update_assets failed");

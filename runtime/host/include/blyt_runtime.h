@@ -192,6 +192,17 @@ void blyt_session_destroy(blyt_session_t *session);
  * success.  `cart` must be the cart the session was created from. */
 bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart);
 
+/* Notify the cart that hot-swapped assets changed (issue #122), after a
+ * blyt_session_reload_resources() on the dev-mode `update_assets` path.  Invokes
+ * the cart's optional blyt_cart_on_assets_reloaded(ids, n) — or, for a Lua cart,
+ * the global on_assets_reloaded(ids) — with the changed resource ids, so a cart
+ * that derived something from a resource (parsed/cached at load) can re-derive
+ * only the affected ones instead of having to re-read every frame.  Dev-only:
+ * only ever reached via update_assets (no VM restart); a code reload re-runs
+ * init and never fires this.  No-op when the cart defines no callback or n==0.
+ * Preserves emulator PC/registers, like the other host-initiated hooks. */
+void blyt_session_notify_assets_reloaded(blyt_session_t *session, const uint32_t *ids, size_t n);
+
 /* --- Frame output -------------------------------------------------------- */
 
 /* Dimensions of the framebuffer. */

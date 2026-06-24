@@ -458,9 +458,15 @@ bool blyt_libretro_reload(void) {
 
 /* Hot-swap edited assets without a VM restart (issue #91): re-read the resource
  * table from the (already rebuilt) staging directory.  Applied between frames by
- * the dev-control `update_assets` command; the next frame sees the new bytes. */
-bool blyt_libretro_update_assets(void) {
+ * the dev-control `update_assets` command; the next frame sees the new bytes.
+ * `ids`/`n` are the changed resource ids: after the table swap the cart's
+ * optional on_assets_reloaded hook is invoked with them (issue #122) so a cart
+ * that cached/derived from a resource can re-derive only the affected ones. */
+bool blyt_libretro_update_assets(const uint32_t *ids, size_t n) {
     if (!g_session)
         return false;
-    return blyt_session_reload_resources(g_session, g_cart);
+    if (!blyt_session_reload_resources(g_session, g_cart))
+        return false;
+    blyt_session_notify_assets_reloaded(g_session, ids, n);
+    return true;
 }

@@ -84,13 +84,50 @@ static int16_t input_state(unsigned p, unsigned d, unsigned i, unsigned id) {
 
 int main(int argc, char *argv[]) {
     bool reset_every_frame = false;
+    /* Dev-mode asset hot-swap trigger (issue #122): at frame `update_assets_after`
+     * point BLYT_RESOURCE_DIR at `resource_dir_v2` (if given) and drive the core's
+     * blyt_libretro_update_assets() with `asset_ids`, simulating the update_assets
+     * dev-control command a dev frontend would send.  -1 = no trigger. */
+    long update_assets_after = -1;
+    const char *resource_dir_v2 = NULL;
+    uint32_t asset_ids[64];
+    size_t asset_n = 0;
+    /* Run exactly this many frames then exit 0, for hot-swap tests whose cart
+     * intentionally never quits (it is observed via its per-frame output).
+     * -1 = run until the cart quits / MAX_FRAMES (the default). */
+    long run_frames = -1;
     int argi = 1;
-    if (argi < argc && strcmp(argv[argi], "--reset-every-frame") == 0) {
-        reset_every_frame = true;
-        argi++;
+    while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
+        if (strcmp(argv[argi], "--reset-every-frame") == 0) {
+            reset_every_frame = true;
+            argi++;
+        } else if (strcmp(argv[argi], "--run-frames") == 0 && argi + 1 < argc) {
+            run_frames = strtol(argv[argi + 1], NULL, 10);
+            argi += 2;
+        } else if (strcmp(argv[argi], "--update-assets-after") == 0 && argi + 1 < argc) {
+            update_assets_after = strtol(argv[argi + 1], NULL, 10);
+            argi += 2;
+        } else if (strcmp(argv[argi], "--resource-dir-v2") == 0 && argi + 1 < argc) {
+            resource_dir_v2 = argv[argi + 1];
+            argi += 2;
+        } else if (strcmp(argv[argi], "--asset-ids") == 0 && argi + 1 < argc) {
+            const char *s = argv[argi + 1];
+            while (*s && asset_n < sizeof(asset_ids) / sizeof(asset_ids[0])) {
+                char *e = NULL;
+                long r = strtol(s, &e, 10);
+                if (e == s)
+                    break;
+                asset_ids[asset_n++] = (uint32_t)r;
+                s = (*e == ',') ? e + 1 : e;
+            }
+            argi += 2;
+        } else {
+            break;
+        }
     }
     if (argc - argi < 2) {
         fprintf(stderr, "usage: test_libretro_core [--reset-every-frame] "
+                        "[--update-assets-after N --resource-dir-v2 DIR --asset-ids a,b,c] "
                         "<blyt_libretro.so> <cart.blyt>\n");
         return 1;
     }
@@ -145,6 +182,18 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* blyt_libretro_update_assets: blyt-private dev-mode asset hot-swap (#122). */
+    bool (*p_update_assets)(const uint32_t *, size_t) = NULL;
+    if (update_assets_after >= 0) {
+        p_update_assets =
+            (bool (*)(const uint32_t *, size_t))dlsym(lib, "blyt_libretro_update_assets");
+        if (!p_update_assets) {
+            fprintf(stderr, "dlsym(blyt_libretro_update_assets): %s\n", dlerror());
+            dlclose(lib);
+            return 1;
+        }
+    }
+
     p_retro_set_environment(env_cb);
     p_retro_set_video_refresh(video_refresh);
     p_retro_set_audio_sample(audio_sample);
@@ -163,9 +212,21 @@ int main(int argc, char *argv[]) {
 
     int rc = 1;
     for (int frame = 0; frame < MAX_FRAMES; frame++) {
+        /* Fire the asset hot-swap before this frame's retro_run so the cart's
+         * on_assets_reloaded runs and the same frame already prints v2 (#122). */
+        if (p_update_assets && frame == update_assets_after) {
+            if (resource_dir_v2)
+                setenv("BLYT_RESOURCE_DIR", resource_dir_v2, 1);
+            if (!p_update_assets(asset_ids, asset_n))
+                fprintf(stderr, "blyt_libretro_update_assets failed\n");
+        }
         p_retro_run();
         if (p_is_done()) {
             rc = 0;
+            break;
+        }
+        if (run_frames >= 0 && frame + 1 >= run_frames) {
+            rc = 0; /* bounded run for a deliberately non-quitting cart */
             break;
         }
         if (p_reset_cycle)

@@ -1163,11 +1163,11 @@ int blyt_cart_has_layouts(const blyt_cart_t *cart) {
 
 /* Lifecycle name→bit mapping shared by the two mask functions below.
  * init=0, update=1, draw=2, on_new_state=3, on_save_state=4,
- * on_load_state=5, on_quit=6, cleanup=7. */
+ * on_load_state=5, on_quit=6, cleanup=7, on_assets_reloaded=8. */
 static const struct {
     const char *native_name;
     const char *lua_name;
-} lifecycle_map[8] = {
+} lifecycle_map[] = {
     {"blyt_cart_init", "init"},
     {"blyt_cart_update", "update"},
     {"blyt_cart_draw", "draw"},
@@ -1176,7 +1176,9 @@ static const struct {
     {"blyt_cart_on_load_state", "on_load_state"},
     {"blyt_cart_on_quit", "on_quit"},
     {"blyt_cart_cleanup", "cleanup"},
+    {"blyt_cart_on_assets_reloaded", "on_assets_reloaded"},
 };
+#define BLYT_LIFECYCLE_COUNT ((int)(sizeof(lifecycle_map) / sizeof(lifecycle_map[0])))
 
 uint32_t blyt_cart_native_lifecycle_mask(const blyt_cart_t *cart) {
     if (!cart)
@@ -1200,7 +1202,7 @@ uint32_t blyt_cart_native_lifecycle_mask(const blyt_cart_t *cart) {
             if (ELF32_ST_BIND(syms[j].st_info) == STB_LOCAL)
                 continue;
             const char *sym_name = strtab + syms[j].st_name;
-            for (int k = 0; k < 8; k++) {
+            for (int k = 0; k < BLYT_LIFECYCLE_COUNT; k++) {
                 if (strcmp(sym_name, lifecycle_map[k].native_name) == 0)
                     mask |= (1u << k);
             }
@@ -1262,7 +1264,7 @@ uint32_t blyt_cart_lua_lifecycle_mask(const blyt_cart_t *cart) {
         }
     }
     uint32_t mask = 0;
-    for (int k = 0; k < 8; k++) {
+    for (int k = 0; k < BLYT_LIFECYCLE_COUNT; k++) {
         lua_getglobal(L, lifecycle_map[k].lua_name);
         if (lua_isfunction(L, -1))
             mask |= (1u << k);

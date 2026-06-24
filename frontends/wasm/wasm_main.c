@@ -1314,6 +1314,29 @@ static bool dev_ctrl_str(const char *json, const char *key, char *out, size_t ou
     return *v == '"';
 }
 
+/* Parse a JSON array of integers ("key":[1,2,3]) into out[0..cap), returning the
+ * count parsed.  Used for the `assets` id list of the update_assets command. */
+static size_t dev_ctrl_int_array(const char *json, const char *key, uint32_t *out, size_t cap) {
+    const char *v;
+    if (!dev_ctrl_find_value(json, key, &v) || *v != '[')
+        return 0;
+    v++;
+    size_t cnt = 0;
+    while (*v && *v != ']' && cnt < cap) {
+        while (*v == ' ' || *v == '\t' || *v == ',')
+            v++;
+        if (*v == ']' || *v == '\0')
+            break;
+        char *end = NULL;
+        long r = strtol(v, &end, 10);
+        if (end == v)
+            break;
+        out[cnt++] = (uint32_t)r;
+        v = end;
+    }
+    return cnt;
+}
+
 static void dev_ctrl_respond_ok(long id, const char *cmd) {
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"id\":%ld,\"status\":\"ok\",\"cmd\":\"%s\"}", id, cmd);
@@ -1334,6 +1357,12 @@ static long g_dev_ctrl_reload_id = -1;
 /* Pending update_assets request id, valid between blyt_dev_ctrl_command and the
  * blyt_dev_ctrl_assets_fetched callback. -1 when no update_assets is in flight. */
 static long g_dev_ctrl_assets_id = -1;
+
+/* Changed resource ids carried by the in-flight update_assets command, captured
+ * at command time and handed to on_assets_reloaded after the refetch completes
+ * (issue #122). */
+static uint32_t g_dev_ctrl_assets_ids[64];
+static size_t g_dev_ctrl_assets_n;
 
 /* True when the handler can service state/lifecycle commands: a Lua VM with no
  * rv32 session (the dev-loop sweet spot). */
@@ -1451,6 +1480,11 @@ void blyt_dev_ctrl_command(const char *json) {
             dev_ctrl_respond_err(id, cmd, "update_assets already in progress");
             return;
         }
+        /* Capture the changed ids now; on_assets_reloaded receives them once the
+         * refetch + reload completes (issue #122). */
+        g_dev_ctrl_assets_n =
+            dev_ctrl_int_array(json, "assets", g_dev_ctrl_assets_ids,
+                               sizeof(g_dev_ctrl_assets_ids) / sizeof(g_dev_ctrl_assets_ids[0]));
         /* Hand off to JS to refresh the MEMFS staging dir, then continue in
          * blyt_dev_ctrl_assets_fetched. */
         g_dev_ctrl_assets_id = id;
@@ -1475,10 +1509,12 @@ void blyt_dev_ctrl_assets_fetched(int ok) {
         dev_ctrl_respond_err(id, "update_assets", "resource refetch failed");
         return;
     }
-    if (g_session && blyt_session_reload_resources(g_session, g_cart))
+    if (g_session && blyt_session_reload_resources(g_session, g_cart)) {
+        blyt_session_notify_assets_reloaded(g_session, g_dev_ctrl_assets_ids, g_dev_ctrl_assets_n);
         dev_ctrl_respond_ok(id, "update_assets");
-    else
+    } else {
         dev_ctrl_respond_err(id, "update_assets", "reload_resources failed");
+    }
 }
 
 /* Continue a reload after JS rewrote /cart.blyt in MEMFS (ADR-0045 sequence).
