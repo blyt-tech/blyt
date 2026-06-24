@@ -83,6 +83,21 @@ int fc_gdb_stub_check_break(uint32_t pc);
  * Call this before invoking transport->on_stop(). */
 void fc_gdb_stub_notify_stopped(void);
 
+/* Announce a shared-library change (sends T05library:;), prompting lldb to
+ * re-fetch the library list and re-resolve breakpoints (issue #119, debug hot
+ * reload).  Update the layout via fc_gdb_stub_set_layout() before calling. */
+void fc_gdb_stub_notify_library_change(void);
+
+/* Generation counter bumped each time the client reads qXfer:libraries-svr4
+ * (issue #119).  The two-phase reload swap waits on this between its unload and
+ * load events so lldb consumes each library-list state in order. */
+unsigned fc_gdb_stub_lib_fetch_gen(void);
+
+/* Generation counter bumped on each vCont;c continue (issue #119).  The reload
+ * two-phase swap waits on this so each library-change stop is fully processed
+ * (lldb re-resolved, client auto-continued) before the next phase. */
+unsigned fc_gdb_stub_continue_gen(void);
+
 /* Process one pending packet without blocking.
  * For WASM: called each animation tick while paused.
  * For TCP: called from the background reader thread (recv_pkt blocks there). */

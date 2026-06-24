@@ -31,6 +31,7 @@ if (!process.env.BLYT_TRACE) process.env.BLYT_TRACE = 'gdb,dap,lifecycle,frame';
 
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import net from 'node:net';
 import { join } from 'node:path';
 
 const [, , lldbDapPath, gdbPort, cartPath, projectCwd, ...rest] = process.argv;
@@ -123,8 +124,9 @@ async function runDap(fn) {
 
 	let seq = 1;
 	const pending = new Map(); /* reqId → {resolve, reject} */
-	const eventHandlers = {}; /* event name → handler */
-	const onAny = null;
+	const eventHandlers = {}; /* event name → one-shot handler (waitEvent) */
+	const persistentHandlers =
+		{}; /* event name → persistent handler (onEvent) */
 
 	const framer = makeFramer((msg) => {
 		if (msg.type === 'response') {
@@ -142,7 +144,8 @@ async function runDap(fn) {
 			if (h) {
 				h(msg);
 			}
-			if (onAny) onAny(msg);
+			if (persistentHandlers[msg.event])
+				persistentHandlers[msg.event](msg);
 		}
 	});
 
@@ -180,13 +183,18 @@ async function runDap(fn) {
 		});
 	}
 
+	/* Register a persistent handler for an event (unlike one-shot waitEvent). */
+	function onEvent(eventName, handler) {
+		persistentHandlers[eventName] = handler;
+	}
+
 	function close() {
 		proc.stdin.end();
 		proc.kill();
 	}
 
 	try {
-		await fn({ send, waitEvent, close });
+		await fn({ send, waitEvent, onEvent, close });
 	} finally {
 		close();
 		await new Promise((r) => proc.on('exit', r));
@@ -535,12 +543,96 @@ async function testSdkSourceBreakpoint() {
 	});
 }
 
+/* Send one JSON dev-control command to the player's dev-control TCP port and
+ * resolve with its reply line. */
+function devCtrl(port, cmd) {
+	return new Promise((resolve, reject) => {
+		const sock = net.createConnection({ host: '127.0.0.1', port });
+		let buf = '';
+		sock.on('data', (d) => {
+			buf += d.toString();
+			if (buf.includes('\n')) {
+				sock.end();
+				resolve(buf.trim());
+			}
+		});
+		sock.on('error', reject);
+		sock.on('connect', () => sock.write(`${JSON.stringify(cmd)}\n`));
+		setTimeout(() => {
+			sock.end();
+			resolve(buf.trim() || '(no reply)');
+		}, 3000);
+	});
+}
+
+/* Issue #119 (acceptance criterion 1): a reload-while-debugging rebinds a
+ * breakpoint to the NEW code's address. Drives the REAL reload path: set a
+ * source breakpoint against v1 (resolved → A1), then send the dev-control
+ * `reload` pointing at the rebuilt v2 cart (whose function moved). The runtime
+ * swaps the cart in place at a fresh base and performs the two-phase solib swap;
+ * lldb re-reads v2's DWARF and rebinds.
+ *
+ * The DAP setBreakpoints re-query is unreliable here (lldb returns the stale
+ * pre-reload location as the primary instructionReference — Spike W §5c), so the
+ * Rust harness asserts on the GDB-RSP trace (the Z0/z0 packets) instead. This
+ * driver just drives the reload and lets the session settle. */
+async function testReloadRebind() {
+	const devCtrlPort = parseInt(process.env.BLYT_DEV_CTRL_PORT || '0', 10);
+	const v2Cart = process.env.BLYT_V2_CART || '';
+	if (!devCtrlPort || !v2Cart)
+		throw new Error(
+			'reload-rebind needs BLYT_DEV_CTRL_PORT and BLYT_V2_CART',
+		);
+
+	await runDap(async ({ send, onEvent }) => {
+		await send('initialize', { adapterID: 'lldb-dap' });
+		/* Auto-continue on every stop: each reload phase fires a library-change
+		 * stop that lldb does not auto-continue; the client must continue so lldb
+		 * processes it and the runtime can publish the next phase (issue #119,
+		 * the seamless reconnect the extension performs in production). */
+		onEvent('stopped', (ev) => {
+			send('continue', { threadId: ev.body?.threadId ?? 1 }).catch(
+				() => {},
+			);
+		});
+		/* stopOnEntry:false so the cart keeps running update() and services the
+		 * dev-control channel; the breakpoint resolves but is never hit (the
+		 * test function runs only in init()). */
+		const launchP = send('launch', {
+			program: programPath,
+			stopOnEntry: false,
+			launchCommands: [
+				sourceMapCommand(),
+				`gdb-remote 127.0.0.1:${gdbPort}`,
+			],
+		});
+		await send('setBreakpoints', {
+			source: { path: `/blyt/cart/${sourceFile}` },
+			breakpoints: [{ line: breakLine }],
+		});
+		await send('configurationDone');
+		await launchP;
+		await new Promise((r) => setTimeout(r, 500)); /* let the cart run */
+
+		const reply = await devCtrl(devCtrlPort, {
+			id: 1,
+			cmd: 'reload',
+			path: v2Cart,
+		});
+		console.log(`reload reply: ${reply}`);
+		/* Let lldb finish the two-phase re-resolution (add v2 / remove v1). */
+		await new Promise((r) => setTimeout(r, 1500));
+		console.log('reload-rebind: driver done');
+	});
+}
+
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
 const tests = {
 	initialize: testInitialize,
 	'source-breakpoint': testSourceBreakpoint,
 	'attach-bind': testAttachBind,
+	'reload-rebind': testReloadRebind,
 	'auto-start': testAutoStart,
 	'stack-trace': testStackTrace,
 	variables: testVariables,

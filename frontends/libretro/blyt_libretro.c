@@ -407,27 +407,32 @@ bool blyt_libretro_load_state(uint32_t slot) {
     return g_session && blyt_session_load_state(g_session, slot) == 0;
 }
 
-bool blyt_libretro_reload(void) {
-    blyt_state_snapshot_t *snap;
-    blyt_cart_err_t err;
-
-    if (!g_session || !g_cart_path)
+/* In-VM cart-as-library module swap (issue #127, spike-W β / gate G1): swap the
+ * cart's code IN PLACE rather than destroying and recreating the session.  The
+ * rv32 VM, libblyt32/libblyt32lua and the per-session debug state all stay alive
+ * — sidestepping the rv32emu single-VM-per-process global-state hazard a session
+ * recreate crosses (issue #44) — and the dev-control/debug connection survives
+ * the reload.  State is preserved across the swap exactly as before
+ * (snapshot → swap → boot → restore(HOT_RELOAD)).
+ *
+ * `open_path`     — file to load the rebuilt cart bytes from.
+ * `load_base`     — guest base for the new image (0 = native bias, run mode; a
+ *                   fresh slot per reload in debug mode so lldb relocates it).
+ * `reported_path` — path recorded for the GDB library layout (NULL in run mode;
+ *                   a unique path in debug mode so lldb re-reads the new DWARF).
+ * `fire_solib`    — after the swap, fire a solib change event so an attached
+ *                   debugger rebinds breakpoints to the new code (debug mode). */
+static bool reload_impl(const char *open_path, uint32_t load_base, const char *reported_path,
+                        bool fire_solib) {
+    if (!g_session || !open_path)
         return false;
 
-    /* In-VM cart-as-library module swap (issue #127, spike-W β / gate G1): swap
-     * the cart's code IN PLACE rather than destroying and recreating the session.
-     * The rv32 VM, libblyt32/libblyt32lua and the per-session debug state all
-     * stay alive — sidestepping the rv32emu single-VM-per-process global-state
-     * hazard a session recreate crosses (issue #44) — and the dev-control/debug
-     * connection survives the reload.  State is preserved across the swap exactly
-     * as before (snapshot → swap → boot → restore(HOT_RELOAD)). */
-
     /* 1. Snapshot live state (flushing transient state via on_save_state). */
-    snap = blyt_session_snapshot(g_session);
+    blyt_state_snapshot_t *snap = blyt_session_snapshot(g_session);
 
     /* 2. Open the freshly rebuilt cart from disk. */
     blyt_cart_t *new_cart = NULL;
-    err = blyt_cart_open(g_cart_path, &new_cart);
+    blyt_cart_err_t err = blyt_cart_open(open_path, &new_cart);
     if (err != BLYT_CART_OK) {
         if (g_log_cb)
             g_log_cb(RETRO_LOG_ERROR, "blyt: reload failed to open cart: %s\n",
@@ -436,9 +441,8 @@ bool blyt_libretro_reload(void) {
         return false; /* old session keeps running the old code */
     }
 
-    /* 3. Swap the cart image into the live session (same base, run-mode — the
-     *    GDB solib reload event lives in the debug layer, #119). */
-    if (!blyt_session_swap_cart(g_session, new_cart, 0u, NULL)) {
+    /* 3. Swap the cart image into the live session. */
+    if (!blyt_session_swap_cart(g_session, new_cart, load_base, reported_path)) {
         if (g_log_cb)
             g_log_cb(RETRO_LOG_ERROR, "blyt: reload failed to swap cart module\n");
         blyt_cart_close(new_cart);
@@ -459,7 +463,32 @@ bool blyt_libretro_reload(void) {
      *    presented. */
     blyt_session_run_frame(g_session);
     blyt_session_restore(g_session, snap, 3u /* BLYT_LOAD_HOT_RELOAD */);
+
+    /* 6. Debug mode (issue #119): tell the debugger the cart was reloaded so it
+     *    re-reads the new DWARF and rebinds breakpoints to the new addresses. */
+    if (fire_solib)
+        blyt_session_gdb_notify_cart_reloaded(g_session, new_cart, load_base, reported_path);
     return true;
+}
+
+bool blyt_libretro_reload(void) {
+    /* Run-mode reload: same base, no debug solib event. */
+    if (!g_cart_path)
+        return false;
+    return reload_impl(g_cart_path, 0u, NULL, false);
+}
+
+/* Reload-while-debugging (issue #119): re-map the cart at a FRESH base and
+ * re-report its library entry at a unique path (`reported_path`, also the file
+ * the rebuilt bytes are loaded from so the debugger reads exactly what runs),
+ * then fire a solib event so lldb re-reads the new DWARF and rebinds.  Falls
+ * back to g_cart_path if no path is supplied. */
+bool blyt_libretro_reload_for_debug(const char *reported_path) {
+    const char *path = (reported_path && reported_path[0]) ? reported_path : g_cart_path;
+    if (!path)
+        return false;
+    uint32_t base = blyt_session_next_reload_base(g_session);
+    return reload_impl(path, base, reported_path, true);
 }
 
 /* Hot-swap edited assets without a VM restart (issue #91): re-read the resource

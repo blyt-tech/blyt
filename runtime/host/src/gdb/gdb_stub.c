@@ -48,6 +48,14 @@ typedef struct {
      * vCont;c so we can simulate an entry-point stop and let VS Code enable
      * all debug controls before the user explicitly continues. */
     int entry_stop_pending;
+    /* Bumped each time the client reads qXfer:libraries-svr4 (issue #119).  The
+     * debug reload's two-phase solib swap waits on this to know lldb has
+     * consumed one library-list state before publishing the next. */
+    unsigned lib_fetch_gen;
+    /* Bumped on each vCont;c (continue).  The reload two-phase swap waits on
+     * this so each library-change stop is fully processed (lldb re-resolved and
+     * the client auto-continued) before the next phase is published (issue #119). */
+    unsigned continue_gen;
 } gdb_state_t;
 
 #ifdef BLYT_GDB_TCP
@@ -202,6 +210,11 @@ static void handle_qXfer_libraries(const char *args, char *out, size_t cap) {
     if (*p == ',')
         p++;
     uint32_t len = (uint32_t)strtoul(p, NULL, 16);
+
+    /* Record that the client began re-reading the library list (issue #119): the
+     * two-phase reload swap waits on this to sequence its unload/load events. */
+    if (off == 0)
+        g_gdb.lib_fetch_gen++;
 
     char xml[8192];
     int xn = snprintf(xml, sizeof xml, "<library-list-svr4 version=\"1.0\" main-lm=\"0x0\">");
@@ -382,6 +395,8 @@ static int handle_vCont(const char *args, char *out, size_t cap) {
     g_gdb.pending_action = action;
     g_gdb.halted = 0;
     g_gdb.initial_halt = 0;
+    if (action == 0)
+        g_gdb.continue_gen++; /* issue #119: sequences the reload two-phase swap */
     GDB_UNLOCK();
     /* No immediate response — T05 comes from fc_gdb_stub_notify_stopped. */
     return 1;
@@ -620,6 +635,44 @@ void fc_gdb_stub_notify_stopped(void) {
     g_gdb.initial_halt = 0;
     GDB_UNLOCK();
     send_stop_with_regs();
+}
+
+/* Announce a shared-library change to the client (issue #119): sends a stop
+ * reply carrying the `library` reason, which prompts lldb to re-fetch
+ * qXfer:libraries-svr4:read and re-resolve breakpoints bound to the (re)loaded
+ * module.  Used on a debug hot reload after the cart module is swapped and its
+ * library entry re-reported at a fresh base + unique path (Spike W §5e): lldb
+ * re-reads the rebuilt cart's DWARF and rebinds breakpoints to the new code's
+ * addresses — a single clean location, no stale module.  The caller updates the
+ * layout (fc_gdb_stub_set_layout) first. */
+void fc_gdb_stub_notify_library_change(void) {
+    GDB_LOCK();
+    g_gdb.halted = 1;
+    g_gdb.pending_action = -1;
+    g_gdb.initial_halt = 0;
+    GDB_UNLOCK();
+    /* Bare library stop (no register dump): lldb treats this purely as a
+     * shared-library change — re-fetch the list, re-resolve breakpoints, and
+     * auto-continue — rather than a full inspection stop. */
+    send_response("T05library:;thread:01;");
+}
+
+/* Library-list read generation (issue #119): bumped each time the client reads
+ * qXfer:libraries-svr4 from offset 0.  The two-phase reload swap polls this to
+ * confirm lldb consumed one list state before the next is published. */
+unsigned fc_gdb_stub_lib_fetch_gen(void) {
+    GDB_LOCK();
+    unsigned g = g_gdb.lib_fetch_gen;
+    GDB_UNLOCK();
+    return g;
+}
+
+/* Continue (vCont;c) generation — see the struct field (issue #119). */
+unsigned fc_gdb_stub_continue_gen(void) {
+    GDB_LOCK();
+    unsigned g = g_gdb.continue_gen;
+    GDB_UNLOCK();
+    return g;
 }
 
 void fc_gdb_stub_poll(void) {

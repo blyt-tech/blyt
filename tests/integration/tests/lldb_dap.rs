@@ -375,3 +375,221 @@ fn sdl_native_lldb_dap_sdk_source_breakpoint() {
         ],
     );
 }
+
+/* ── Reload-while-debugging (issue #119) ─────────────────────────────────── */
+
+/// C source whose `blyt_lldb_test_fn` sits at a *shiftable* address: `pad` grows
+/// `blyt_pad_fn` before it, moving the following function while keeping line
+/// numbers stable (the breakpoint line stays valid across v1/v2). The function
+/// is referenced (via the volatile `g_keep` pointer) but never called, so its
+/// breakpoint resolves yet never fires — the cart keeps running update() and
+/// services the dev-control channel across the reload.
+fn reload_cart_src(pad: &str) -> String {
+    format!(
+        "#include \"blyt.h\"\n\
+         #include <stdint.h>\n\
+         volatile uint32_t g_counter = 0;\n\
+         void blyt_pad_fn(void) {{ {pad} }}\n\
+         void blyt_lldb_test_fn(void) {{\n\
+         \x20\x20\x20\x20volatile uint32_t local_val = 0xdeadbeef;\n\
+         \x20\x20\x20\x20g_counter = local_val + 1;\n\
+         }}\n\
+         void (*volatile g_keep)(void) = blyt_lldb_test_fn;\n\
+         void blyt_cart_init(void)   {{ blyt_pad_fn(); }}\n\
+         void blyt_cart_update(void) {{ if (g_keep) g_counter++; }}\n\
+         void blyt_cart_draw(void)   {{}}\n"
+    )
+}
+
+/// LLDB-DAP (issue #119, acceptance criterion 1): a reload-while-debugging
+/// rebinds a breakpoint to the NEW code's address — single location, no stale
+/// old location.
+///
+/// Builds two carts whose `blyt_lldb_test_fn` sits at different addresses (v2
+/// has a fatter pad function), starts a debug session against v1, sets a source
+/// breakpoint, then drives the REAL reload (dev-control `reload` pointing at v2).
+/// The runtime swaps the cart in place at a fresh base, re-reports it at v2's
+/// path, and fires the solib event; the driver asserts the breakpoint rebinds to
+/// v2's re-read address (not the stale v1 address, nor a mere relocation).
+///
+/// Requires: blytdebug with BLYT_GDB=ON, SDK, lldb-dap.
+#[test]
+fn sdl_native_lldb_dap_reload_rebinds_breakpoint() {
+    require_sdk();
+    require_gdb();
+    require_lldb_dap();
+
+    const BREAK_LINE: u32 = 6;
+    const SOURCE_FILE: &str = "src/game/c/main.c";
+
+    let tmp = TempDir::new().unwrap();
+    let v1_pad = "g_counter += 1;".to_string();
+    let v2_pad = (0..60)
+        .map(|i| format!("g_counter += {i};"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let v1_dir = tmp.path().join("v1");
+    let v2_dir = tmp.path().join("v2");
+    CartProject::new()
+        .c(&reload_cart_src(&v1_pad))
+        .write(&v1_dir);
+    CartProject::new()
+        .c(&reload_cart_src(&v2_pad))
+        .write(&v2_dir);
+    let v1_cart = build_debug_cart(&v1_dir);
+    let v2_cart = build_debug_cart(&v2_dir);
+
+    let a1 = require_symbol_addr(&v1_cart, "blyt_lldb_test_fn");
+    let a2 = require_symbol_addr(&v2_cart, "blyt_lldb_test_fn");
+    assert_ne!(a1, a2, "test setup broken: the function did not move v1→v2");
+
+    // Spawn blytdebug with both a GDB port and a dev-control port (listen mode).
+    let mut proc = std::process::Command::new(blytdebug())
+        .args([
+            "--gdb",
+            "0",
+            "--dev-ctrl-port",
+            "0",
+            "--headless",
+            v1_cart.to_str().unwrap(),
+        ])
+        .env("BLYT_TRACE", "gdb,dap,lifecycle,frame")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("blytdebug spawn");
+
+    // Drain stderr (carries the BLYT_TRACE RSP trace) so the pipe never blocks.
+    let dbg_stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let mut se = proc.stderr.take().unwrap();
+        let buf = dbg_stderr.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = se.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        });
+    }
+
+    // Parse both ports from stdout (dev-control is announced up front, #119).
+    use std::io::{BufRead, BufReader};
+    let stdout = proc.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut gdb_port = None;
+        let mut dev_port = None;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(i) = line.find("GDB listening on port ") {
+                let rest = &line[i + "GDB listening on port ".len()..];
+                let end = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                gdb_port = rest[..end].parse::<u16>().ok();
+            }
+            if let Some(i) = line.find("Dev control: listening on 127.0.0.1:") {
+                let rest = &line[i + "Dev control: listening on 127.0.0.1:".len()..];
+                let end = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                dev_port = rest[..end].parse::<u16>().ok();
+            }
+            if let (Some(g), Some(d)) = (gdb_port, dev_port) {
+                let _ = tx.send((g, d));
+                return;
+            }
+        }
+    });
+    let (gdb_port, dev_port) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("blytdebug did not announce both GDB and dev-control ports");
+
+    let lldb_dap = lldb_dap_bin().expect("lldb-dap not found");
+    let driver = repo_root().join("tests/dap/run_lldb_dap_test.mjs");
+    let result = Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            lldb_dap.to_str().unwrap(),
+            &gdb_port.to_string(),
+            v1_cart.to_str().unwrap(),
+            v1_dir.to_str().unwrap(),
+            "--test",
+            "reload-rebind",
+        ])
+        .env("BLYT_GDB_BREAK_LINE", BREAK_LINE.to_string())
+        .env("BLYT_SOURCE_FILE", SOURCE_FILE)
+        .env(
+            "BLYT_STUB_PROGRAM",
+            repo_root().join("build/sdk/lib/debug/blyt-debug-stub.elf"),
+        )
+        .env("BLYT_DEV_CTRL_PORT", dev_port.to_string())
+        .env("BLYT_V2_CART", v2_cart.to_str().unwrap())
+        .env("BLYT_V1_FUNC", a1.to_string())
+        .env("BLYT_V2_FUNC", a2.to_string())
+        // First reload re-maps the cart at BLYT_RELOAD_BASE_A (80 MiB).
+        .env("BLYT_REMAP_BASE", (0x05000000u32).to_string())
+        .timeout(Duration::from_secs(40))
+        .assert();
+
+    let out = result.get_output().clone();
+    // Let the stderr-drain thread flush the final RSP packets, then stop the VM.
+    std::thread::sleep(Duration::from_millis(300));
+    let trace = String::from_utf8_lossy(&dbg_stderr.lock().unwrap()).to_string();
+    let _ = proc.kill();
+
+    if let Err(e) = result.try_success() {
+        eprintln!(
+            "--- driver stdout ---\n{}\n--- blytdebug stderr ---\n{trace}",
+            String::from_utf8_lossy(&out.stdout),
+        );
+        panic!("{e}");
+    }
+
+    // Ground truth is the GDB-RSP trace (the DAP re-query is misleading, §5c):
+    // replay the Z0 (insert) / z0 (remove) breakpoint packets to the final
+    // armed set, restricted to cart-code addresses (below the 128 MiB runtime
+    // library base).  After the reload it must be EXACTLY the re-read v2 address
+    // — a single clean location, no stale v1 location (acceptance criteria 1+3).
+    const GUEST_LIB_BASE: u64 = 0x0800_0000;
+    let mut armed: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut first_bp: Option<u64> = None;
+    for line in trace.lines() {
+        for (marker, insert) in [("recv Z0,", true), ("recv z0,", false)] {
+            if let Some(i) = line.find(marker) {
+                let rest = &line[i + marker.len()..];
+                let hex = rest.split(',').next().unwrap_or("");
+                if let Ok(addr) = u64::from_str_radix(hex, 16) {
+                    if insert {
+                        if first_bp.is_none() {
+                            first_bp = Some(addr);
+                        }
+                        armed.insert(addr);
+                    } else {
+                        armed.remove(&addr);
+                    }
+                }
+            }
+        }
+    }
+    let a1_resolved = first_bp.unwrap_or_else(|| panic!("no breakpoint set in trace:\n{trace}"));
+    let line_off = a1_resolved - a1; // line-6 offset within blyt_lldb_test_fn
+    let reread = 0x0500_0000 + a2 + line_off; // base A + v2 function + line offset
+    let cart_armed: Vec<u64> = armed
+        .iter()
+        .copied()
+        .filter(|&a| a < GUEST_LIB_BASE)
+        .collect();
+
+    assert_eq!(
+        cart_armed,
+        vec![reread],
+        "after reload the breakpoint must be a single location at the re-read v2 \
+         address 0x{reread:x} (a1_resolved=0x{a1_resolved:x} v1_fn=0x{a1:x} v2_fn=0x{a2:x}); \
+         got {cart_armed:x?}.\n--- trace ---\n{trace}"
+    );
+}

@@ -83,6 +83,16 @@
 #define BLYT_RESOURCE_SCRATCH_BASE 0x06000000u /* 96 MiB */
 #define BLYT_RESOURCE_SCRATCH_SIZE (16u * 1024u * 1024u) /* 16 MiB */
 
+/* Debug hot-reload cart bases (issue #119).  On a reload-while-debugging the
+ * cart is re-mapped at a FRESH base each time so lldb sees a relocated module
+ * (combined with a unique reported path, this makes it re-read the rebuilt
+ * DWARF — Spike W §5e).  Two 16 MiB slots in the free gaps either side of the
+ * resource scratch region (80–96 MiB and 112–128 MiB); ping-ponging between
+ * them guarantees each reload's base differs from the live one, so the swap
+ * zeroes the whole previous image (no overlap, no stale bytes). */
+#define BLYT_RELOAD_BASE_A 0x05000000u /* 80 MiB: arena-end .. resource scratch */
+#define BLYT_RELOAD_BASE_B 0x07000000u /* 112 MiB: resource scratch-end .. libs */
+
 /* Maximum exported symbols tracked across all loaded runtime libraries. */
 #define MAX_SYMS 2048
 
@@ -210,6 +220,15 @@ typedef struct {
  * subset so a cart can be re-linked against the persistent libs on a hot swap. */
 struct blyt_symtab;
 
+/* Per-library state during dynamic loading; retained on the session (issue #119)
+ * so a hot swap can re-resolve the libs' references back into the cart. */
+typedef struct {
+    const uint8_t *map; /* host-side mapping */
+    size_t size;
+    uint32_t bias; /* guest load bias */
+    bool mmapped; /* true if map was mmap'd and must be munmap'd on cleanup */
+} blyt_lib_t;
+
 struct blyt_session {
     riscv_t *rv;
     /* vm_attr_t must outlive rv: rv_create stores &attr in rv->data (rv->priv),
@@ -285,6 +304,16 @@ struct blyt_session {
      * own symbols are seeded fresh on top of these to re-link a swapped cart
      * against the persistent libs (issue #127) without reloading them. */
     struct blyt_symtab *lib_syms;
+
+    /* Runtime-lib ELF images retained from the initial dynlink (issue #119).
+     * A hot swap must re-resolve the libs' OWN references back into the cart —
+     * libblytcommon's blyt_main calls blyt_cart_init/update/draw through GOT
+     * entries that were resolved to the first cart's addresses; after a swap
+     * (especially at a fresh base) those entries are stale and would jump into
+     * freed/relocated memory.  Re-running resolve_elf_plt needs each lib's host
+     * image, so they are kept mapped for the session (freed in destroy). */
+    blyt_lib_t retained_libs[MAX_RUNTIME_LIBS];
+    int n_retained_libs;
 
     /* Cached guest addresses of cart lifecycle callbacks (0 = not found). */
     uint32_t fn_on_save_state;
@@ -1804,17 +1833,6 @@ static void append_symtab(blyt_symtab_t *dst, const blyt_symtab_t *src) {
 }
 
 /* -------------------------------------------------------------------------
- * Per-library state during dynamic loading
- * ------------------------------------------------------------------------- */
-
-typedef struct {
-    const uint8_t *map; /* host-side mapping */
-    size_t size;
-    uint32_t bias; /* guest load bias */
-    bool mmapped; /* true if map was mmap'd and must be munmap'd on cleanup */
-} blyt_lib_t;
-
-/* -------------------------------------------------------------------------
  * ELF virtual-address → host pointer (for ET_DYN with base=0 at link time)
  * ------------------------------------------------------------------------- */
 
@@ -2174,25 +2192,11 @@ static void record_cart_image_layout(blyt_session_t *s, const blyt_cart_t *cart,
 }
 
 #ifdef BLYT_GDB
-/* Register (or, on a swap, re-report) the cart's OWN entry in the GDB
- * qXfer:libraries-svr4 list (issue #119).  The cart is presented purely as a
- * shared library — never the main executable — so lldb can cleanly unload and
- * reload it.  `reported_path` is the path lldb reads DWARF from (cart->path at
- * attach; a unique checksum path per debug reload so lldb treats the rebuilt
- * cart as a fresh module and re-reads its DWARF, Spike W §5b/§5e).  `base` is
- * the cart's guest load base (0 at attach; a fresh base per reload).  Returns
- * the entry index, or -1 if the table is full / no path. */
-static int register_cart_gdb_library(blyt_session_t *s, const blyt_cart_t *cart, uint32_t base,
-                                     const char *reported_path) {
-    const char *path = (reported_path && reported_path[0]) ? reported_path : cart->path;
-    if (!path)
-        return -1;
-    if (s->gdb_cart_lib_idx < 0) {
-        if (s->gdb_nlibs >= MAX_GDB_LIBS)
-            return -1;
-        s->gdb_cart_lib_idx = s->gdb_nlibs++;
-    }
-    int idx = s->gdb_cart_lib_idx;
+/* Fill GDB svr4 library slot `idx` with the cart at guest base `base`, reported
+ * at `path` (the file lldb reads DWARF from), and mirror it into the stable FFI
+ * array (issue #119). */
+static void fill_cart_gdb_lib_slot(blyt_session_t *s, int idx, const blyt_cart_t *cart,
+                                   uint32_t base, const char *path) {
     blyt_gdb_lib_t *gl = &s->gdb_libs[idx];
     strncpy(gl->path, path, sizeof(gl->path) - 1);
     gl->path[sizeof(gl->path) - 1] = '\0';
@@ -2213,7 +2217,34 @@ static int register_cart_gdb_library(blyt_session_t *s, const blyt_cart_t *cart,
     s->gdb_libs_ffi[idx].path = gl->path;
     s->gdb_libs_ffi[idx].l_addr = gl->l_addr;
     s->gdb_libs_ffi[idx].l_ld = gl->l_ld;
-    return idx;
+}
+
+/* Rebuild the stable FFI mirror from gdb_libs[0..gdb_nlibs) — call after any
+ * entry is moved/removed so the path pointers stay valid (issue #119). */
+static void rebuild_gdb_libs_ffi(blyt_session_t *s) {
+    for (int i = 0; i < s->gdb_nlibs; i++) {
+        s->gdb_libs_ffi[i].path = s->gdb_libs[i].path;
+        s->gdb_libs_ffi[i].l_addr = s->gdb_libs[i].l_addr;
+        s->gdb_libs_ffi[i].l_ld = s->gdb_libs[i].l_ld;
+    }
+}
+
+/* Register the cart's OWN entry in the GDB qXfer:libraries-svr4 list at attach
+ * (issue #119): the cart is presented purely as a shared library, never the
+ * main executable, so lldb can cleanly unload/reload it.  Returns the entry
+ * index, or -1 if the table is full / no path. */
+static int register_cart_gdb_library(blyt_session_t *s, const blyt_cart_t *cart, uint32_t base,
+                                     const char *reported_path) {
+    const char *path = (reported_path && reported_path[0]) ? reported_path : cart->path;
+    if (!path)
+        return -1;
+    if (s->gdb_cart_lib_idx < 0) {
+        if (s->gdb_nlibs >= MAX_GDB_LIBS)
+            return -1;
+        s->gdb_cart_lib_idx = s->gdb_nlibs++;
+    }
+    fill_cart_gdb_lib_slot(s, s->gdb_cart_lib_idx, cart, base, path);
+    return s->gdb_cart_lib_idx;
 }
 #endif /* BLYT_GDB */
 
@@ -2475,10 +2506,14 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
         }
     }
 
-    for (int i = 0; i < nlibs; i++) {
-        if (libs[i].mmapped)
-            munmap((void *)libs[i].map, libs[i].size);
-    }
+    /* Retain the lib images on the session (issue #119) so a hot swap can
+     * re-resolve the libs' references back into the cart (libblytcommon's
+     * blyt_main → blyt_cart_init/update/draw).  Ownership transfers here; the
+     * mmapped ones are munmapped in blyt_session_destroy.  On failure (!ok) the
+     * caller destroys the session, which frees them, so keep them either way. */
+    s->n_retained_libs = nlibs;
+    for (int i = 0; i < nlibs && i < MAX_RUNTIME_LIBS; i++)
+        s->retained_libs[i] = libs[i];
 
 #if defined(BLYT_LUA) && defined(__EMSCRIPTEN__)
     if (ok)
@@ -2603,6 +2638,18 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
     append_symtab(all, s->lib_syms);
     resolve_elf_plt(new_cart->map, new_cart->map_size, mem, load_base, all);
 
+    /* 2b. Re-resolve the runtime libs' OWN references back into the cart against
+     *     the new symbol table (issue #119).  libblytcommon's blyt_main calls
+     *     blyt_cart_init/update/draw through GOT entries bound to the FIRST
+     *     cart's addresses; after the swap those are stale (the cart moved to a
+     *     fresh base and/or its functions shifted) and would jump into freed
+     *     memory.  Re-running each retained lib's PLT/GOT rebinds them to the new
+     *     cart while leaving lib→lib references unchanged. */
+    for (int i = 0; i < s->n_retained_libs; i++) {
+        resolve_elf_plt(s->retained_libs[i].map, s->retained_libs[i].size, mem,
+                        s->retained_libs[i].bias, all);
+    }
+
     /* 3. Re-stamp the libblytc.so arena globals (ADR-0120) so the reloaded cart
      *    starts from a clean arena base/size. */
     uint32_t sym_base = symtab_lookup(all, "blytc_arena_base");
@@ -2652,20 +2699,13 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
     snprintf(s->ctx.cart_name, sizeof(s->ctx.cart_name), "%s", new_cart->id);
     s->ctx.save_version = new_cart->save_version;
 
-#ifdef BLYT_GDB
-    /* Keep the GDB exec-file path coherent (run-mode only — the solib reload
-     * event and fresh checksum-path reporting are the debug layer's job, #119).
-     * reported_path overrides when given so #119 can announce a unique path. */
-    {
-        const char *p = (reported_path && reported_path[0]) ? reported_path : new_cart->path;
-        if (p) {
-            strncpy(s->gdb_exec_path, p, sizeof(s->gdb_exec_path) - 1);
-            s->gdb_exec_path[sizeof(s->gdb_exec_path) - 1] = '\0';
-        }
-    }
-#else
+    /* The GDB library list is NOT touched here (issue #119): the debug-reload
+     * solib swap is a two-phase add-then-remove driven by
+     * blyt_session_gdb_notify_cart_reloaded after this returns, which needs the
+     * OLD cart entry still present.  The exec-file stays empty (cart is a
+     * library, never the main exe).  Run-mode reload leaves the list stale —
+     * harmless without a debugger. */
     (void)reported_path;
-#endif
 
     /* 7. Discard translated code from the OLD image — the block map keys blocks
      *    by guest PC, so blocks at the cart's addresses now hold stale (old)
@@ -3191,6 +3231,11 @@ void blyt_session_destroy(blyt_session_t *session) {
     blyt_resource_table_clear(&session->ctx.resources);
     free(session->ctx.save_dir);
     free(session->lib_syms);
+    /* Release the retained runtime-lib images (issue #119). */
+    for (int i = 0; i < session->n_retained_libs; i++) {
+        if (session->retained_libs[i].mmapped)
+            munmap((void *)session->retained_libs[i].map, session->retained_libs[i].size);
+    }
     rv_delete(session->rv);
     free(session);
 }
@@ -3396,6 +3441,82 @@ void blyt_session_gdb_shutdown(blyt_session_t *s) {
         g_gdb_session = NULL;
 #else
     (void)s;
+#endif
+}
+
+/* Pick the guest load base for the next debug hot reload (issue #119): the slot
+ * the cart is NOT currently at, so the swap re-maps it to a fresh, non-
+ * overlapping base (and zeroes the whole previous image).  The initial cart is
+ * at base 0, so the first reload lands at A, then ping-pongs A↔B. */
+uint32_t blyt_session_next_reload_base(const blyt_session_t *s) {
+    return (s && s->cart_base == BLYT_RELOAD_BASE_A) ? BLYT_RELOAD_BASE_B : BLYT_RELOAD_BASE_A;
+}
+
+#ifdef BLYT_GDB
+/* Publish the current GDB library layout, fire a solib-change event, then block
+ * until the client has FULLY processed it — re-read the library list and
+ * continued (issue #119).  lldb treats a library-change stop as a stop and does
+ * not auto-continue; the DAP client (the extension, or the test driver) must
+ * continue, which both confirms processing finished and lets the next phase be
+ * published without racing.  Waiting on the continue (not just the list read)
+ * is what makes the two-phase add-then-remove land in order. */
+static void publish_libs_and_wait(blyt_session_t *s) {
+    fc_gdb_layout_t layout = {
+        .exec_path = s->gdb_exec_path,
+        .libraries = s->gdb_libs_ffi,
+        .n_libraries = s->gdb_nlibs,
+    };
+    fc_gdb_stub_set_layout(&layout);
+    unsigned cont = fc_gdb_stub_continue_gen();
+    fc_gdb_stub_notify_library_change();
+    /* Wait up to ~3 s for the client to re-resolve and continue.  A timeout is
+     * non-fatal — the next phase still publishes the final library state. */
+    for (int i = 0; i < 3000 && fc_gdb_stub_continue_gen() == cont; i++)
+        usleep(1000);
+}
+#endif
+
+void blyt_session_gdb_notify_cart_reloaded(blyt_session_t *s, const blyt_cart_t *new_cart,
+                                           uint32_t load_base, const char *reported_path) {
+#ifdef BLYT_GDB
+    if (!s || !s->ctx.gdb_enabled || s->gdb_cart_lib_idx < 0)
+        return;
+    const char *path = (reported_path && reported_path[0]) ? reported_path : new_cart->path;
+    if (!path)
+        return;
+
+    int old_idx = s->gdb_cart_lib_idx;
+
+    /* Phase 1 — ADD the rebuilt cart as a NEW library alongside the old one.
+     * lldb loads it (fresh base + unique path → re-reads the new DWARF) and
+     * re-resolves breakpoints onto the new code.  A single combined event makes
+     * lldb unload the old module WITHOUT loading the new one, so we add first. */
+    if (s->gdb_nlibs >= MAX_GDB_LIBS) {
+        /* No room for a transient second entry: fall back to re-reporting in
+         * place (re-resolution still works when the breakpoint was pending). */
+        fill_cart_gdb_lib_slot(s, old_idx, new_cart, load_base, path);
+        publish_libs_and_wait(s);
+        return;
+    }
+    int new_idx = s->gdb_nlibs++;
+    fill_cart_gdb_lib_slot(s, new_idx, new_cart, load_base, path);
+    publish_libs_and_wait(s);
+
+    /* Phase 2 — REMOVE the old cart library so its stale breakpoint location is
+     * dropped, leaving exactly one location per breakpoint.  The new entry is
+     * the last slot (just appended); move it into the old slot and shrink, so
+     * the cart entry lands back at old_idx.  Rebuild the FFI mirror after. */
+    (void)new_idx;
+    s->gdb_libs[old_idx] = s->gdb_libs[s->gdb_nlibs - 1];
+    s->gdb_nlibs--;
+    s->gdb_cart_lib_idx = old_idx;
+    rebuild_gdb_libs_ffi(s);
+    publish_libs_and_wait(s);
+#else
+    (void)s;
+    (void)new_cart;
+    (void)load_base;
+    (void)reported_path;
 #endif
 }
 

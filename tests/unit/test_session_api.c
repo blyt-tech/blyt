@@ -209,7 +209,13 @@ static int mode_swap(const char *v1_path, const char *v2_path, const char *lib_d
         blyt_cart_close(c1);
         return 1;
     }
-    if (!blyt_session_swap_cart(s, c2, 0u, NULL)) {
+    /* Optional non-zero load base (issue #119 debug reload re-maps the cart to a
+     * fresh base each reload).  BLYT_SWAP_BASE overrides the default same-base. */
+    uint32_t swap_base = 0u;
+    const char *base_env = getenv("BLYT_SWAP_BASE");
+    if (base_env && base_env[0])
+        swap_base = (uint32_t)strtoul(base_env, NULL, 0);
+    if (!blyt_session_swap_cart(s, c2, swap_base, NULL)) {
         fprintf(stderr, "swap: blyt_session_swap_cart returned false\n");
         blyt_session_snapshot_free(snap);
         blyt_session_destroy(s);
