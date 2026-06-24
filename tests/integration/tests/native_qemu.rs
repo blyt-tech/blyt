@@ -652,27 +652,42 @@ function draw() end
 
     // ── Gate 9: state buffer save/load round-trip on metal ───────────
     //
-    // Verifies the full Phase 9 native path: alloc slot, write score=42,
-    // save (blyt_save_write), clobber score, reload (blyt_save_read), read
-    // back, confirm value.  BLYT_SAVE_DIR points to a tmpdir on the VM.
+    // Verifies the full native save path: alloc two slots in a mixed-width
+    // record (i32/i8/u16/f64), write distinct values, save (blyt_save_write),
+    // clobber, reload (blyt_save_read), read back, confirm every field in both
+    // slots.  The mixed widths + 2 slots exercise the field-major true-width
+    // packing and per-field save layout (#134) — a single i32 field would not
+    // catch a wrong stride or width.  BLYT_SAVE_DIR points to a tmpdir on the VM.
     println!("Gate 9: state buffer save/load round-trip on metal...");
     {
         let sb_project = tmp.path().join("sb_metal");
         CartProject::new()
             .config(
                 "save_version: 9\n\
-                 records:\n  Game:\n    fields:\n      - { name: score, type: i32 }\n\
-                 state_buffers:\n  game:\n    record: Game\n    count: 1\n",
+                 records:\n  Game:\n    fields:\n\
+                 \x20     - { name: score, type: i32 }\n\
+                 \x20     - { name: lives, type: i8 }\n\
+                 \x20     - { name: level, type: u16 }\n\
+                 \x20     - { name: ratio, type: f64 }\n\
+                 state_buffers:\n  game:\n    record: Game\n    count: 2\n",
             )
             .c(r#"
 #include "blyt.h"
 #include "cart_state.h"
 
-static int32_t g_slot = -1;
+static int32_t g_a = -1, g_b = -1;
 static int g_phase = 0;
 
+static void set_slot(int32_t slot, int32_t score, int8_t lives, uint16_t level, double ratio) {
+    blyt_buffer_set_i32(S_GAME, slot, S_GAME_SCORE, score);
+    blyt_buffer_set_i8(S_GAME, slot, S_GAME_LIVES, lives);
+    blyt_buffer_set_u16(S_GAME, slot, S_GAME_LEVEL, level);
+    blyt_buffer_set_f64(S_GAME, slot, S_GAME_RATIO, ratio);
+}
+
 void blyt_cart_init(void) {
-    blyt_buffer_alloc_slot(S_GAME, &g_slot);
+    blyt_buffer_alloc_slot(S_GAME, &g_a);
+    blyt_buffer_alloc_slot(S_GAME, &g_b);
     blyt_console_debug("sb-init");
 }
 /* save_read fires on_load_state with the version that wrote the save, read
@@ -686,17 +701,30 @@ void blyt_cart_on_load_state(blyt_load_info_t info) {
 }
 void blyt_cart_update(void) {
     if (g_phase == 0) {
-        blyt_buffer_set_i32(S_GAME, g_slot, S_GAME_SCORE, 42);
+        set_slot(g_a, 42, -5, 1000, 3.5);
+        set_slot(g_b, 777, 100, 65000, -2.25);
         blyt_save_write(0);
-        blyt_buffer_set_i32(S_GAME, g_slot, S_GAME_SCORE, 0);
+        set_slot(g_a, 0, 0, 0, 0.0); /* clobber both slots, every field */
+        set_slot(g_b, 0, 0, 0, 0.0);
         g_phase = 1;
     } else {
         blyt_save_read(0);
-        int32_t v = blyt_buffer_get_i32(S_GAME, g_slot, S_GAME_SCORE);
-        if (v == 42) {
+        if (blyt_buffer_get_i32(S_GAME, g_a, S_GAME_SCORE) == 42) {
             blyt_console_debug("score-ok");
         } else {
             blyt_console_debug("score-fail");
+        }
+        int mixed_ok = blyt_buffer_get_i8(S_GAME, g_a, S_GAME_LIVES) == -5 &&
+                       blyt_buffer_get_u16(S_GAME, g_a, S_GAME_LEVEL) == 1000 &&
+                       blyt_buffer_get_f64(S_GAME, g_a, S_GAME_RATIO) == 3.5 &&
+                       blyt_buffer_get_i32(S_GAME, g_b, S_GAME_SCORE) == 777 &&
+                       blyt_buffer_get_i8(S_GAME, g_b, S_GAME_LIVES) == 100 &&
+                       blyt_buffer_get_u16(S_GAME, g_b, S_GAME_LEVEL) == 65000 &&
+                       blyt_buffer_get_f64(S_GAME, g_b, S_GAME_RATIO) == -2.25;
+        if (mixed_ok) {
+            blyt_console_debug("mixed-ok");
+        } else {
+            blyt_console_debug("mixed-fail");
         }
         blyt_quit();
     }
@@ -739,6 +767,11 @@ void blyt_cart_draw(void) {}
         assert!(
             output.contains("score-ok"),
             "expected 'score-ok' in output (save/load round-trip)\noutput: {output}"
+        );
+        assert!(
+            output.contains("mixed-ok"),
+            "expected 'mixed-ok' (i8/u16/f64 fields + 2 slots round-trip through the \
+             field-major true-width save layout; issue #134)\noutput: {output}"
         );
         assert!(
             output.contains("version-ok"),

@@ -128,7 +128,7 @@ static int read_all(int fd, void *buf, unsigned int len) {
     return 0;
 }
 
-/* ── Native state buffer SOA storage (Phase 9) ──────────────────────────── */
+/* ── Native state buffer storage (field-major true-width arena, #134) ─────── */
 
 /* Fixed-dimension limits.  Field handles encode (buf_id-1, field_index-1);
  * slot indices are zero-based.  These must be ≥ the cart's declared values. */
@@ -136,11 +136,68 @@ static int read_all(int fd, void *buf, unsigned int len) {
 #define NATIVE_MAX_SLOTS 64
 #define NATIVE_MAX_FIELDS 64
 
-/* SOA: one uint32_t per (buffer, slot, field).  All types stored as 32-bit
- * raw bits; narrower types (i8, u8, i16, u16, bool) use the low bits only.
- * Zero-initialized BSS: all slots start empty and all values start at 0. */
-/* 64-bit per field so f64 fits (Spike U); 32-bit fields use the low word. */
-static uint64_t s_soa[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS][NATIVE_MAX_FIELDS];
+/* type_tag encoding (schemas/cart_layouts.fbs; matches host state_buffer.c). */
+#define NATIVE_TYPE_I8 0
+#define NATIVE_TYPE_U8 1
+#define NATIVE_TYPE_I16 2
+#define NATIVE_TYPE_U16 3
+#define NATIVE_TYPE_I32 4
+#define NATIVE_TYPE_U32 5
+#define NATIVE_TYPE_F32 6
+#define NATIVE_TYPE_BOOL 7
+#define NATIVE_TYPE_F64 8 /* Spike U: 64-bit double field */
+
+/* True width (bytes) of a field's stored value, by type_tag.  Matches the
+ * host's field_sizeof (state_buffer.c) so the on-wire per-field arrays are
+ * byte-identical in layout. */
+static uint32_t field_width(uint8_t type_tag) {
+    switch (type_tag) {
+    case NATIVE_TYPE_I8:
+    case NATIVE_TYPE_U8:
+    case NATIVE_TYPE_BOOL:
+        return 1u;
+    case NATIVE_TYPE_I16:
+    case NATIVE_TYPE_U16:
+        return 2u;
+    case NATIVE_TYPE_F64:
+        return 8u;
+    case NATIVE_TYPE_I32:
+    case NATIVE_TYPE_U32:
+    case NATIVE_TYPE_F32:
+    default:
+        return 4u;
+    }
+}
+
+/* Field-major true-width storage (issue #134).  A per-buffer byte arena with a
+ * fixed per-field stride; within a field, slots are packed at the field's true
+ * width (element s at offset s*width).  This matches the host's per-field
+ * contiguous layout (blyt_buffer_ctx_t.field_data[fi] in state_buffer.c), so
+ * the NLBY save body is a plain per-field memcpy with no transpose/narrow, and
+ * #129's shared BLYS serializer needs no native-specific byte path.
+ *
+ * Worst-case footprint = NATIVE_MAX_BUF * NATIVE_MAX_FIELDS * NATIVE_MAX_SLOTS
+ * * 8 = 256 KiB — identical to the previous widened uint64 cube.  Still BSS /
+ * zero-init / heap-free (no .init_array constructors run on this path, #43):
+ * empty slots and zero values come free from the BSS zero-fill.  An 8-aligned
+ * base plus an 8-multiple field stride makes every field sub-array (including
+ * f64) naturally 8-aligned. */
+#define NATIVE_FIELD_STRIDE (NATIVE_MAX_SLOTS * 8u)
+#define NATIVE_BUF_STRIDE (NATIVE_MAX_FIELDS * NATIVE_FIELD_STRIDE)
+static uint8_t s_arena[NATIVE_MAX_BUF][NATIVE_BUF_STRIDE] __attribute__((aligned(8)));
+
+/* Base of buffer bi's field fi within the arena (element s at + s*width). */
+static uint8_t *field_base(uint32_t bi, uint32_t fi) {
+    return &s_arena[bi][fi * NATIVE_FIELD_STRIDE];
+}
+
+/* Per-buffer field type tags and field counts, flattened from .cart.layouts at
+ * startup (load_cart_buf_counts).  Used by the per-field save/load memcpy and
+ * the free_slot zeroing loop to know each field's true width; the typed
+ * accessors use their own intrinsic width.  Zero (BSS) until parsed: a buffer
+ * with s_field_count==0 contributes no save bytes and zeroes no fields. */
+static uint8_t s_field_type[NATIVE_MAX_BUF][NATIVE_MAX_FIELDS];
+static uint32_t s_field_count[NATIVE_MAX_BUF];
 
 /* Slot allocation bitset: bit i of byte (i/8) indicates slot i is allocated. */
 static uint8_t s_slot_bits[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS / 8];
@@ -198,16 +255,115 @@ static int ref_ok(uint32_t bi, int32_t slot, uint32_t fi) {
  */
 
 /* Parse the cart ELF's .cart.layouts section to load per-buffer declared slot
- * counts into s_buf_count[].  Must be called before blyt_install_restricted_filter():
+ * counts into s_buf_count[] and per-field type tags into s_field_type[]/
+ * s_field_count[] (#134).  Must be called before blyt_install_restricted_filter():
  * uses openat/statx/mmap/munmap which are in the launcher's RV32 filter but not
- * in the restricted filter.  On any error the NATIVE_MAX_SLOTS defaults stand.
+ * in the restricted filter.  On any error the NATIVE_MAX_SLOTS defaults stand
+ * (and that buffer's field count stays 0).
  *
  * The ELF section walk is shared with the host (runtime/shared); the inline
- * FlatBuffer reads below stay native-side (the host uses flatcc).
- *   CartLayouts: field 1 (buffers) at vtable offset 6
- *   BufferDecl:  field 2 (count)   at vtable offset 8
+ * FlatBuffer reads (below, via the fb_* helpers) stay native-side (host uses flatcc).
+ *   CartLayouts: field 0 (records) at vtable offset 4, field 1 (buffers) at offset 6
+ *   BufferDecl:  field 1 (record_name) at offset 6, field 2 (count) at offset 8
+ *   RecordDecl:  field 0 (name) at offset 4, field 1 (fields) at offset 6
+ *   FieldDecl:   field 1 (type_tag) at offset 6
  *   CartConfig:  field 1 (save_version) at vtable offset 6
  */
+/* ── Minimal inline FlatBuffer readers (bounds-checked against [fb,fb+size)) ──
+ * Used to walk records[]/fields[] for the per-field type tags (#134); the host
+ * uses flatcc, this path stays dependency-free.  All return 0/NULL on any
+ * out-of-range or absent field. */
+
+/* u16 offset of `table`'s field at vtable byte offset `voff`; 0 if absent.
+ * The soffset is signed: a vtable may sit before OR after its table (flatcc
+ * deduplicates vtables, so inner tables like FieldDecl can reference a vtable
+ * emitted after them — a negative soffset).  Handle both directions and bound
+ * the resolved vtable against the buffer rather than assuming soffset > 0. */
+static uint16_t fb_field_off(const uint8_t *fb, uint32_t fb_size, const uint8_t *table,
+                             uint16_t voff) {
+    int32_t soff;
+    blyt32_native_memcpy(&soff, table, 4);
+    if (soff == 0)
+        return 0;
+    const uint8_t *vtable = table - soff; /* soff signed; subtract per spec */
+    if (vtable < fb || vtable + 4u > fb + fb_size)
+        return 0;
+    uint16_t vtsize;
+    blyt32_native_memcpy(&vtsize, vtable, 2);
+    if (vtsize < (uint32_t)voff + 2u || vtable + vtsize > fb + fb_size)
+        return 0;
+    uint16_t foff;
+    blyt32_native_memcpy(&foff, vtable + voff, 2);
+    return foff;
+}
+
+/* Absolute address of a uoffset field (sub-table / vector / string); NULL if absent. */
+static const uint8_t *fb_uoffset_field(const uint8_t *fb, uint32_t fb_size, const uint8_t *table,
+                                       uint16_t voff) {
+    uint16_t foff = fb_field_off(fb, fb_size, table, voff);
+    if (foff == 0)
+        return NULL;
+    const uint8_t *fptr = table + foff;
+    if (fptr + 4u > fb + fb_size)
+        return NULL;
+    uint32_t uoff;
+    blyt32_native_memcpy(&uoff, fptr, 4);
+    const uint8_t *target = fptr + uoff;
+    if (target < fb || target + 4u > fb + fb_size)
+        return NULL;
+    return target;
+}
+
+/* Element i of a uoffset vector `vec` (len at vec[0]); NULL if out of range. */
+static const uint8_t *fb_vec_at(const uint8_t *fb, uint32_t fb_size, const uint8_t *vec,
+                                uint32_t i) {
+    const uint8_t *eref = vec + 4u + i * 4u;
+    if (eref + 4u > fb + fb_size)
+        return NULL;
+    uint32_t uoff;
+    blyt32_native_memcpy(&uoff, eref, 4);
+    const uint8_t *elem = eref + uoff;
+    if (elem < fb || elem + 4u > fb + fb_size)
+        return NULL;
+    return elem;
+}
+
+/* A FlatBuffer string field (voff): returns the byte pointer + length; NULL if absent. */
+static const char *fb_string(const uint8_t *fb, uint32_t fb_size, const uint8_t *table,
+                             uint16_t voff, uint32_t *out_len) {
+    const uint8_t *s = fb_uoffset_field(fb, fb_size, table, voff);
+    if (!s)
+        return NULL;
+    uint32_t len;
+    blyt32_native_memcpy(&len, s, 4);
+    const char *str = (const char *)(s + 4);
+    if (str + len > (const char *)(fb + fb_size))
+        return NULL;
+    *out_len = len;
+    return str;
+}
+
+/* Inline u8 scalar field (voff); `dflt` if absent. */
+static uint8_t fb_u8_field(const uint8_t *fb, uint32_t fb_size, const uint8_t *table, uint16_t voff,
+                           uint8_t dflt) {
+    uint16_t foff = fb_field_off(fb, fb_size, table, voff);
+    if (foff == 0)
+        return dflt;
+    const uint8_t *p = table + foff;
+    if (p + 1u > fb + fb_size)
+        return dflt;
+    return *p;
+}
+
+static int fb_str_eq(const char *a, uint32_t alen, const char *b, uint32_t blen) {
+    if (alen != blen)
+        return 0;
+    for (uint32_t i = 0; i < alen; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
 static void load_cart_buf_counts(void) {
     /* Safe defaults until/unless the ELF is parsed successfully. */
     for (uint32_t bi = 0; bi < NATIVE_MAX_BUF; bi++)
@@ -366,6 +522,13 @@ static void load_cart_buf_counts(void) {
     blyt32_native_memcpy(&vec_len, vec, 4);
     uint32_t n = vec_len < NATIVE_MAX_BUF ? vec_len : NATIVE_MAX_BUF;
 
+    /* records[] vector (CartLayouts field 0, vtable offset 4) — resolved once,
+     * then matched per buffer by record_name to flatten field type tags (#134). */
+    const uint8_t *rec_vec = fb_uoffset_field(fb, fb_size, table, 4);
+    uint32_t n_recs = 0;
+    if (rec_vec)
+        blyt32_native_memcpy(&n_recs, rec_vec, 4);
+
     for (uint32_t bi = 0; bi < n; bi++) {
         const uint8_t *eref = vec + 4u + bi * 4u;
         if (eref + 4u > fb + fb_size)
@@ -397,6 +560,41 @@ static void load_cart_buf_counts(void) {
         uint32_t count;
         blyt32_native_memcpy(&count, count_ptr, 4);
         s_buf_count[bi] = count < NATIVE_MAX_SLOTS ? count : NATIVE_MAX_SLOTS;
+
+        /* Flatten this buffer's field type tags (#134): follow BufferDecl
+         * .record_name (field 1, vtable offset 6) into records[], match by
+         * name, then read each FieldDecl.type_tag (field 1, vtable offset 6).
+         * On any miss s_field_count[bi] stays 0 (no save bytes / no zeroing). */
+        uint32_t rn_len = 0;
+        const char *rn = fb_string(fb, fb_size, elem, 6, &rn_len);
+        if (!rn)
+            continue;
+        for (uint32_t ri = 0; ri < n_recs; ri++) {
+            const uint8_t *rd = fb_vec_at(fb, fb_size, rec_vec, ri);
+            if (!rd)
+                continue;
+            uint32_t rdn_len = 0;
+            const char *rdn = fb_string(fb, fb_size, rd, 4, &rdn_len); /* RecordDecl.name */
+            if (!rdn || !fb_str_eq(rn, rn_len, rdn, rdn_len))
+                continue;
+            const uint8_t *fld_vec = fb_uoffset_field(fb, fb_size, rd, 6); /* RecordDecl.fields */
+            if (!fld_vec)
+                break;
+            uint32_t n_fields;
+            blyt32_native_memcpy(&n_fields, fld_vec, 4);
+            if (n_fields > NATIVE_MAX_FIELDS)
+                n_fields = NATIVE_MAX_FIELDS;
+            for (uint32_t fi = 0; fi < n_fields; fi++) {
+                const uint8_t *fd = fb_vec_at(fb, fb_size, fld_vec, fi);
+                if (!fd)
+                    break;
+                /* type_tag default is 0 (i8): FlatBuffers omits a field equal
+                 * to its schema default, so an absent tag means i8, not i32. */
+                s_field_type[bi][fi] = fb_u8_field(fb, fb_size, fd, 6, NATIVE_TYPE_I8);
+                s_field_count[bi] = fi + 1u;
+            }
+            break;
+        }
     }
 
 done:;
@@ -509,19 +707,21 @@ void blyt_console_debug(const char *s) {
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
 }
 
-/* ── State buffer typed get/set (Phase 9) ────────────────────────────────
+/* ── State buffer typed get/set (Phase 9; field-major storage #134) ───────
  *
  * Buffer handle (buf_h): 1-based buffer index.
  * Field handle (field_h): upper 16 bits = buf_id (must match buf_h),
  *                          lower 16 bits = 1-based field index.
- * All values stored as raw uint32_t bits in s_soa[][slot][field_index].
- * Narrower types use the low bits of the 32-bit slot. */
+ * Each value is stored at its true width in the field-major arena: element s
+ * of buffer bi field fi lives at field_base(bi, fi) + s*width.  Each accessor
+ * reads/writes its own intrinsic width (get_i32 → 4 bytes, get_i8 → 1, etc.). */
 
 float blyt_buffer_get_f32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0.0f;
-    uint32_t bits = s_soa[bi][s][fi];
+    uint32_t bits;
+    blyt32_native_memcpy(&bits, field_base(bi, fi) + (uint32_t)s * 4u, 4);
     blyt32_trace_buf_op("buf_get_f32", b, s, f, bits, 0, 1);
     float v;
     blyt32_native_memcpy(&v, &bits, 4);
@@ -534,15 +734,17 @@ void blyt_buffer_set_f32(blyt_buffer_h b, int32_t s, blyt_field_h f, float v) {
     uint32_t bits;
     blyt32_native_memcpy(&bits, &v, 4);
     blyt32_trace_buf_op("buf_set_f32", b, s, f, bits, 1, 1);
-    s_soa[bi][s][fi] = blyt_canon_f32(bits);
+    bits = blyt_canon_f32(bits);
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s * 4u, &bits, 4);
 }
 
-/* f64 (Spike U): full 64-bit field; stored in the widened SOA slot. */
+/* f64 (Spike U): full 64-bit field; 8-byte-aligned sub-array in the arena. */
 double blyt_buffer_get_f64(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0.0;
-    uint64_t bits = s_soa[bi][s][fi];
+    uint64_t bits;
+    blyt32_native_memcpy(&bits, field_base(bi, fi) + (uint32_t)s * 8u, 8);
     double v;
     blyt32_native_memcpy(&v, &bits, 8);
     return v;
@@ -553,14 +755,16 @@ void blyt_buffer_set_f64(blyt_buffer_h b, int32_t s, blyt_field_h f, double v) {
         return;
     uint64_t bits;
     blyt32_native_memcpy(&bits, &v, 8);
-    s_soa[bi][s][fi] = blyt_canon_f64(bits);
+    bits = blyt_canon_f64(bits);
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s * 8u, &bits, 8);
 }
 
 int32_t blyt_buffer_get_i32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0;
-    uint32_t bits = s_soa[bi][s][fi];
+    uint32_t bits;
+    blyt32_native_memcpy(&bits, field_base(bi, fi) + (uint32_t)s * 4u, 4);
     blyt32_trace_buf_op("buf_get_i32", b, s, f, bits, 0, 0);
     return (int32_t)bits;
 }
@@ -569,14 +773,16 @@ void blyt_buffer_set_i32(blyt_buffer_h b, int32_t s, blyt_field_h f, int32_t v) 
     if (!ref_ok(bi, s, fi))
         return;
     blyt32_trace_buf_op("buf_set_i32", b, s, f, (uint32_t)v, 1, 0);
-    s_soa[bi][s][fi] = (uint32_t)v;
+    uint32_t bits = (uint32_t)v;
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s * 4u, &bits, 4);
 }
 
 uint32_t blyt_buffer_get_u32(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0u;
-    uint32_t bits = s_soa[bi][s][fi];
+    uint32_t bits;
+    blyt32_native_memcpy(&bits, field_base(bi, fi) + (uint32_t)s * 4u, 4);
     blyt32_trace_buf_op("buf_get_u32", b, s, f, bits, 0, 0);
     return bits;
 }
@@ -585,14 +791,15 @@ void blyt_buffer_set_u32(blyt_buffer_h b, int32_t s, blyt_field_h f, uint32_t v)
     if (!ref_ok(bi, s, fi))
         return;
     blyt32_trace_buf_op("buf_set_u32", b, s, f, v, 1, 0);
-    s_soa[bi][s][fi] = v;
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s * 4u, &v, 4);
 }
 
 int16_t blyt_buffer_get_i16(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0;
-    int16_t v16 = (int16_t)(s_soa[bi][s][fi] & 0xFFFFu);
+    int16_t v16;
+    blyt32_native_memcpy(&v16, field_base(bi, fi) + (uint32_t)s * 2u, 2);
     blyt32_trace_buf_op("buf_get_i16", b, s, f, (uint32_t)(int32_t)v16, 0, 0);
     return v16;
 }
@@ -601,14 +808,16 @@ void blyt_buffer_set_i16(blyt_buffer_h b, int32_t s, blyt_field_h f, int16_t v) 
     if (!ref_ok(bi, s, fi))
         return;
     blyt32_trace_buf_op("buf_set_i16", b, s, f, (uint32_t)(int32_t)v, 1, 0);
-    s_soa[bi][s][fi] = (uint32_t)(uint16_t)v;
+    uint16_t raw = (uint16_t)v;
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s * 2u, &raw, 2);
 }
 
 uint16_t blyt_buffer_get_u16(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0u;
-    uint16_t v16 = (uint16_t)(s_soa[bi][s][fi] & 0xFFFFu);
+    uint16_t v16;
+    blyt32_native_memcpy(&v16, field_base(bi, fi) + (uint32_t)s * 2u, 2);
     blyt32_trace_buf_op("buf_get_u16", b, s, f, (uint32_t)v16, 0, 0);
     return v16;
 }
@@ -617,14 +826,15 @@ void blyt_buffer_set_u16(blyt_buffer_h b, int32_t s, blyt_field_h f, uint16_t v)
     if (!ref_ok(bi, s, fi))
         return;
     blyt32_trace_buf_op("buf_set_u16", b, s, f, (uint32_t)v, 1, 0);
-    s_soa[bi][s][fi] = (uint32_t)v;
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s * 2u, &v, 2);
 }
 
 int8_t blyt_buffer_get_i8(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0;
-    int8_t v8 = (int8_t)(s_soa[bi][s][fi] & 0xFFu);
+    int8_t v8;
+    blyt32_native_memcpy(&v8, field_base(bi, fi) + (uint32_t)s, 1);
     blyt32_trace_buf_op("buf_get_i8", b, s, f, (uint32_t)(int32_t)v8, 0, 0);
     return v8;
 }
@@ -633,14 +843,16 @@ void blyt_buffer_set_i8(blyt_buffer_h b, int32_t s, blyt_field_h f, int8_t v) {
     if (!ref_ok(bi, s, fi))
         return;
     blyt32_trace_buf_op("buf_set_i8", b, s, f, (uint32_t)(int32_t)v, 1, 0);
-    s_soa[bi][s][fi] = (uint32_t)(uint8_t)v;
+    uint8_t raw = (uint8_t)v;
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s, &raw, 1);
 }
 
 uint8_t blyt_buffer_get_u8(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return 0u;
-    uint8_t v8 = (uint8_t)(s_soa[bi][s][fi] & 0xFFu);
+    uint8_t v8;
+    blyt32_native_memcpy(&v8, field_base(bi, fi) + (uint32_t)s, 1);
     blyt32_trace_buf_op("buf_get_u8", b, s, f, (uint32_t)v8, 0, 0);
     return v8;
 }
@@ -649,14 +861,16 @@ void blyt_buffer_set_u8(blyt_buffer_h b, int32_t s, blyt_field_h f, uint8_t v) {
     if (!ref_ok(bi, s, fi))
         return;
     blyt32_trace_buf_op("buf_set_u8", b, s, f, (uint32_t)v, 1, 0);
-    s_soa[bi][s][fi] = (uint32_t)v;
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s, &v, 1);
 }
 
 bool blyt_buffer_get_bool(blyt_buffer_h b, int32_t s, blyt_field_h f) {
     uint32_t bi = b - 1u, fi = (f & 0xFFFFu) - 1u;
     if (!ref_ok(bi, s, fi))
         return false;
-    bool vb = s_soa[bi][s][fi] != 0u;
+    uint8_t raw;
+    blyt32_native_memcpy(&raw, field_base(bi, fi) + (uint32_t)s, 1);
+    bool vb = raw != 0u;
     blyt32_trace_buf_op("buf_get_bool", b, s, f, vb ? 1u : 0u, 0, 0);
     return vb;
 }
@@ -665,7 +879,8 @@ void blyt_buffer_set_bool(blyt_buffer_h b, int32_t s, blyt_field_h f, bool v) {
     if (!ref_ok(bi, s, fi))
         return;
     blyt32_trace_buf_op("buf_set_bool", b, s, f, v ? 1u : 0u, 1, 0);
-    s_soa[bi][s][fi] = v ? 1u : 0u;
+    uint8_t raw = v ? 1u : 0u;
+    blyt32_native_memcpy(field_base(bi, fi) + (uint32_t)s, &raw, 1);
 }
 
 /* ── Slot management ────────────────────────────────────────────────────── */
@@ -695,9 +910,12 @@ blyt_result_t blyt_buffer_free_slot(blyt_buffer_h b, int32_t s) {
         return BLYT_ERR_INVALID_ARG;
     blyt32_trace_call("buf_free_slot", (long)s, 0, 0);
     s_slot_bits[bi][(uint32_t)s / 8u] &= (uint8_t)~(1u << ((uint32_t)s % 8u));
-    /* Zero the freed slot's field data (the emulated path does). */
-    for (uint32_t fi = 0; fi < NATIVE_MAX_FIELDS; fi++)
-        s_soa[bi][s][fi] = 0;
+    /* Zero the freed slot's field data per field at its true width (the
+     * emulated path does; host parity). */
+    for (uint32_t fi = 0; fi < s_field_count[bi]; fi++) {
+        uint32_t w = field_width(s_field_type[bi][fi]);
+        blyt32_native_memset(field_base(bi, fi) + (uint32_t)s * w, 0, w);
+    }
     /* Bump the generation (ADR-0096) via the shared primitive.  Storage is
      * biased by -1, so convert to the public value, advance, and re-bias: the
      * public wrap 65535 -> 1 becomes the stored wrap 65534 -> 0, unchanged. */
@@ -734,14 +952,46 @@ bool blyt_buffer_ref_valid(blyt_buffer_h b, blyt_entity_ref_t ref) {
  *   [0..3]    magic: 'N','L','B','Y'
  *   [4..7]    version: 1u (uint32)
  *   [8..11]   cart save_version (ADR-0125)
- *   [12..N]   raw s_soa array
+ *   [12..N]   field data: for each buffer, each field's count*width contiguous
+ *             true-width bytes from the field-major arena (#134).  This matches
+ *             the host's per-field array layout, so the body is a plain
+ *             per-field memcpy with no transpose/narrow.
  *   [N..N+B]  raw s_slot_bits array
  *   [..]      raw s_gen array (per-slot generation counters, ADR-0096;
  *             stored biased by -1, see the s_gen declaration)
  *
+ * The byte layout is cart-dependent (driven by the same .cart.layouts the
+ * writing process parsed) but native-only and ephemeral, so save and load in
+ * the same build always agree.
+ *
  * BLYT_SAVE_DIR environment variable (set by test runner) determines the
  * directory.  File name: slot_<N>.blys in that directory.
  */
+
+/* Write each buffer's field data as per-field contiguous true-width arrays.
+ * Returns 0 on success, -1 on any short write. */
+static int write_field_data(int fd) {
+    for (uint32_t bi = 0; bi < NATIVE_MAX_BUF; bi++) {
+        for (uint32_t fi = 0; fi < s_field_count[bi]; fi++) {
+            uint32_t bytes = s_buf_count[bi] * field_width(s_field_type[bi][fi]);
+            if (bytes && write_all(fd, field_base(bi, fi), bytes) < 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
+/* Mirror of write_field_data for load.  Returns 0 on success, nonzero on error. */
+static int read_field_data(int fd) {
+    for (uint32_t bi = 0; bi < NATIVE_MAX_BUF; bi++) {
+        for (uint32_t fi = 0; fi < s_field_count[bi]; fi++) {
+            uint32_t bytes = s_buf_count[bi] * field_width(s_field_type[bi][fi]);
+            if (bytes && read_all(fd, field_base(bi, fi), bytes) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
 
 blyt_result_t blyt_save_write(uint32_t slot) {
     blyt_cart_on_save_state();
@@ -782,8 +1032,8 @@ blyt_result_t blyt_save_write(uint32_t slot) {
         return BLYT_ERR_IO;
     }
 
-    /* Write SOA data */
-    if (write_all(fd, s_soa, sizeof(s_soa)) < 0) {
+    /* Write field data: per-field contiguous true-width arrays (#134). */
+    if (write_field_data(fd) < 0) {
         blyt_rs_close(fd);
         return BLYT_ERR_IO;
     }
@@ -835,8 +1085,8 @@ blyt_result_t blyt_save_read(uint32_t slot) {
     uint32_t saved_version = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) |
                              ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
 
-    /* Read SOA data */
-    if (read_all(fd, s_soa, sizeof(s_soa)) != 0) {
+    /* Read field data: per-field contiguous true-width arrays (#134). */
+    if (read_field_data(fd) != 0) {
         blyt_rs_close(fd);
         return BLYT_ERR_IO;
     }
