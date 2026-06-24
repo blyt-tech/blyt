@@ -433,7 +433,8 @@ add_library(
   # runtime/shared: freestanding determinism-critical primitives shared with the
   # native guest libs (issue #128); defined once, compiled into both.
   runtime/shared/blyt_fp_canon.c
-  runtime/shared/blyt_elf_section.c)
+  runtime/shared/blyt_elf_section.c
+  runtime/shared/blyt_blys.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
 # same static library is usable in both executables and shared objects.
@@ -543,7 +544,8 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     runtime/host/src/libblyt/trace.c
     runtime/host/src/libblyt/version.c
     runtime/shared/blyt_fp_canon.c
-    runtime/shared/blyt_elf_section.c)
+    runtime/shared/blyt_elf_section.c
+    runtime/shared/blyt_blys.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
   target_include_directories(
@@ -901,6 +903,13 @@ if(BLYT_GDB)
   add_test(NAME test_gdb_stub COMMAND test_gdb_stub)
 endif()
 
+# test_blys: pins the shared BLYS save byte format (runtime/shared/blyt_blys.c)
+# in isolation — exact bytes, write→read round-trip, schema-mismatch. The module
+# is freestanding, so it is compiled straight into the test executable.
+add_executable(test_blys tests/unit/test_blys.c runtime/shared/blyt_blys.c)
+target_include_directories(test_blys PRIVATE runtime/shared)
+add_test(NAME test_blys COMMAND test_blys)
+
 # verify_cart: standalone tool used in CI to confirm blyt build output passes
 # load-time security checks. Not a ctest test; invoked directly with a cart.
 add_executable(verify_cart tests/tools/verify_cart.c)
@@ -1172,7 +1181,7 @@ add_custom_target(
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   USES_TERMINAL VERBATIM
   COMMENT "Running C unit tests (ctest) and Rust devtool unit tests")
-add_dependencies(test-unit test_cart_load test_cart_run)
+add_dependencies(test-unit test_cart_load test_cart_run test_blys)
 if(TARGET test_gdb_stub)
   add_dependencies(test-unit test_gdb_stub)
 endif()

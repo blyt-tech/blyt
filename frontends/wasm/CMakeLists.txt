@@ -339,6 +339,7 @@ add_executable(
   # guest libs (issue #128), consumed by state_buffer.c / cart_load.c above.
   "${BLYT_ROOT}/runtime/shared/blyt_fp_canon.c"
   "${BLYT_ROOT}/runtime/shared/blyt_elf_section.c"
+  "${BLYT_ROOT}/runtime/shared/blyt_blys.c"
   ${BLYT_LUA_SOURCES}
   ${BLYT_DAP_SOURCES}
   ${BLYT_GDB_SOURCES})

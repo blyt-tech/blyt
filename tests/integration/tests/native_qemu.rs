@@ -194,6 +194,22 @@ fn build_cart(project_dir: &Path) -> PathBuf {
     ))
 }
 
+/// Recursively find the first file named `name` under `dir` (the host save path
+/// is `<save_dir>/<cart_name>/slot_0.blys`; this avoids hard-coding cart_name).
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Some(found) = find_file(&p, name) {
+                return Some(found);
+            }
+        } else if p.file_name().is_some_and(|n| n == name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 // ── Gate test ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -784,7 +800,7 @@ void blyt_cart_draw(void) {}
     // ── Gate 10: entity refs + generation counters on metal ──────────
     //
     // The only coverage of the native libblyt32 generation/ref code (ADR-0096)
-    // and its NLBY save extension: lifecycle (alloc/ref/free/stale/realloc),
+    // and its save round-trip: lifecycle (alloc/ref/free/stale/realloc),
     // free-slot field zeroing parity, and gens round-tripping through
     // blyt_save_write/blyt_save_read.
     println!("Gate 10: entity refs + generation counters on metal...");
@@ -851,7 +867,7 @@ void blyt_cart_update(void) {
     blyt_entity_ref_t r2 = blyt_buffer_ref(S_ENTITY, e);       /* gen 2 */
     CHECK(r2 == ((2u << 16) | (uint32_t)e));       /* s7 */
 
-    /* gens round-trip through the NLBY save format */
+    /* gens round-trip through the BLYS save format */
     blyt_buffer_set_u32(S_GLOBALS, 0, S_GLOBALS_TARGET, r2);
     blyt_save_write(0);
     blyt_buffer_free_slot(S_ENTITY, e); /* gen 3; r2 stale */
@@ -916,6 +932,179 @@ void blyt_cart_draw(void) {}
             "expected 'alloc_limit: 4' in output (slot count enforced on metal)\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
+    }
+
+    // ── Gate 11: cross-platform BLYS save contract (#129) ─────────────
+    //
+    // The native and emulated (host) runtimes must produce byte-identical BLYS
+    // saves for the same cart + state, and each must load the other's save.
+    // This is the contract the old ad-hoc native NLBY format broke; Gate 9 only
+    // checked a native-only round-trip and could not catch the divergence.
+    //
+    // One cart drives both: on update it tries blyt_save_read(0); if a save is
+    // present it verifies every field (mixed widths + a freed slot, so the SOA,
+    // slot bitset and generation blobs are all exercised) and prints xload-ok;
+    // otherwise it writes the canonical state and prints wrote.  Running it once
+    // on each platform with an empty save dir yields the two saves to compare;
+    // feeding each platform the other's save exercises the cross-load paths.
+    println!("Gate 11: cross-platform BLYS byte-identity + cross-load...");
+    {
+        let xplat_project = tmp.path().join("xplat");
+        CartProject::new()
+            .config(
+                "save_version: 5\n\
+                 records:\n  Game:\n    fields:\n\
+                 \x20     - { name: score, type: i32 }\n\
+                 \x20     - { name: lives, type: i8 }\n\
+                 \x20     - { name: level, type: u16 }\n\
+                 \x20     - { name: ratio, type: f64 }\n\
+                 \x20     - { name: alive, type: bool }\n\
+                 state_buffers:\n  game:\n    record: Game\n    count: 4\n",
+            )
+            .c(r#"
+#include "blyt.h"
+#include "cart_state.h"
+
+static int g_done = 0;
+
+static void set_slot(int32_t slot, int32_t score, int8_t lives, uint16_t level, double ratio,
+                     bool alive) {
+    blyt_buffer_set_i32(S_GAME, slot, S_GAME_SCORE, score);
+    blyt_buffer_set_i8(S_GAME, slot, S_GAME_LIVES, lives);
+    blyt_buffer_set_u16(S_GAME, slot, S_GAME_LEVEL, level);
+    blyt_buffer_set_f64(S_GAME, slot, S_GAME_RATIO, ratio);
+    blyt_buffer_set_bool(S_GAME, slot, S_GAME_ALIVE, alive);
+}
+
+static int verify(void) {
+    return blyt_buffer_get_i32(S_GAME, 0, S_GAME_SCORE) == 42 &&
+           blyt_buffer_get_i8(S_GAME, 0, S_GAME_LIVES) == -5 &&
+           blyt_buffer_get_u16(S_GAME, 0, S_GAME_LEVEL) == 1000 &&
+           blyt_buffer_get_f64(S_GAME, 0, S_GAME_RATIO) == 3.5 &&
+           blyt_buffer_get_bool(S_GAME, 0, S_GAME_ALIVE) == true &&
+           blyt_buffer_get_i32(S_GAME, 2, S_GAME_SCORE) == 777 &&
+           blyt_buffer_get_i8(S_GAME, 2, S_GAME_LIVES) == 100 &&
+           blyt_buffer_get_u16(S_GAME, 2, S_GAME_LEVEL) == 65000 &&
+           blyt_buffer_get_f64(S_GAME, 2, S_GAME_RATIO) == -2.25 &&
+           blyt_buffer_get_bool(S_GAME, 2, S_GAME_ALIVE) == false;
+}
+
+void blyt_cart_init(void) {
+    int32_t a = -1, b = -1, c = -1;
+    blyt_buffer_alloc_slot(S_GAME, &a); /* 0 */
+    blyt_buffer_alloc_slot(S_GAME, &b); /* 1 */
+    blyt_buffer_alloc_slot(S_GAME, &c); /* 2 */
+    blyt_buffer_free_slot(S_GAME, b); /* free 1 -> gen[1] bumped, bitset = 0,2 */
+}
+void blyt_cart_on_load_state(blyt_load_info_t info) { (void)info; }
+void blyt_cart_update(void) {
+    if (g_done)
+        return;
+    g_done = 1;
+    if (blyt_save_read(0) == BLYT_OK) {
+        blyt_console_debug(verify() ? "xload-ok" : "xload-fail");
+    } else {
+        set_slot(0, 42, -5, 1000, 3.5, true);
+        set_slot(2, 777, 100, 65000, -2.25, false);
+        blyt_save_write(0);
+        blyt_console_debug("wrote");
+    }
+    blyt_quit();
+}
+void blyt_cart_draw(void) {}
+"#)
+            .write(&xplat_project);
+        let xplat_cart = build_cart(&xplat_project);
+        assert!(xplat_cart.exists(), "xplat.blyt not built");
+        assert!(
+            qemu.scp_to(&xplat_cart, "/tmp/blyt_gate/"),
+            "scp xplat.blyt failed"
+        );
+
+        // Helper: run xplat on blytplay (host/emulated path) with a save dir.
+        let run_host = |save_dir: &Path| -> String {
+            let out = Command::new(common::blytplay())
+                .args(["--headless", xplat_cart.to_str().unwrap()])
+                .env("BLYT_SAVE_DIR", save_dir)
+                .output()
+                .expect("run blytplay");
+            assert!(
+                out.status.success(),
+                "blytplay xplat exited non-zero ({:?})\n{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // Host writes its BLYS save to <host_sd>/<cart_name>/slot_0.blys.
+        let host_sd = tmp.path().join("xplat_host_sd");
+        std::fs::create_dir_all(&host_sd).unwrap();
+        let host_out = run_host(&host_sd);
+        assert!(host_out.contains("wrote"), "host write leg: {host_out}");
+        let host_path = find_file(&host_sd, "slot_0.blys").expect("host save not written");
+        let host_bytes = std::fs::read(&host_path).unwrap();
+
+        // Native writes its BLYS save to /tmp/blyt_xplat/slot_0.blys.
+        assert!(qemu.ssh_ok("rm -rf /tmp/blyt_xplat && mkdir -p /tmp/blyt_xplat"));
+        let nout = qemu.ssh(
+            "BLYT_SAVE_DIR=/tmp/blyt_xplat \
+             /tmp/blyt_gate/blyt_native --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/xplat.blyt 2>&1",
+        );
+        let nout_s = String::from_utf8_lossy(&nout.stdout);
+        assert!(
+            nout.status.success() && nout_s.contains("wrote"),
+            "native write leg: {nout_s}"
+        );
+        let od = qemu.ssh("od -An -v -tx1 /tmp/blyt_xplat/slot_0.blys");
+        assert!(od.status.success(), "od native save failed");
+        let native_bytes: Vec<u8> = String::from_utf8_lossy(&od.stdout)
+            .split_whitespace()
+            .map(|h| u8::from_str_radix(h, 16).expect("hex byte"))
+            .collect();
+
+        // Byte-identity: the whole point of the format unification.
+        assert_eq!(
+            host_bytes.len(),
+            native_bytes.len(),
+            "BLYS size differs: host {} vs native {} bytes",
+            host_bytes.len(),
+            native_bytes.len()
+        );
+        assert_eq!(
+            host_bytes, native_bytes,
+            "host and native BLYS bytes differ for identical cart + state"
+        );
+        println!("  byte-identity: {} bytes match", host_bytes.len());
+
+        // Cross-load host->native: feed the host-written save to the native runtime.
+        assert!(qemu.ssh_ok("rm -rf /tmp/blyt_xload && mkdir -p /tmp/blyt_xload"));
+        assert!(
+            qemu.scp_to(&host_path, "/tmp/blyt_xload/"),
+            "scp host save failed"
+        );
+        let xn = qemu.ssh(
+            "BLYT_SAVE_DIR=/tmp/blyt_xload \
+             /tmp/blyt_gate/blyt_native --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/xplat.blyt 2>&1",
+        );
+        let xn_s = String::from_utf8_lossy(&xn.stdout);
+        assert!(
+            xn.status.success() && xn_s.contains("xload-ok"),
+            "host->native cross-load failed: {xn_s}"
+        );
+        println!("  cross-load host->native: xload-ok");
+
+        // Cross-load native->host: feed the native-written save to the host runtime.
+        std::fs::write(&host_path, &native_bytes).unwrap();
+        let xh_out = run_host(&host_sd);
+        assert!(
+            xh_out.contains("xload-ok"),
+            "native->host cross-load failed: {xh_out}"
+        );
+        println!("  cross-load native->host: xload-ok");
+        println!("  PASS: BLYS saves are portable across host and native");
     }
 
     println!("Gate tests passed.");

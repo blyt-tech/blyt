@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include "blyt.h"
+#include "blyt_blys.h" /* runtime/shared: shared BLYS save format (ADR-0125, #129) */
 #include "blyt_elf_section.h" /* runtime/shared: blyt_elf32_find_section */
 #include "blyt_fp_canon.h" /* runtime/shared: blyt_canon_f32/f64 (ADR-0010) */
 #include "blyt_gen.h" /* runtime/shared: blyt_gen_next (ADR-0096) */
@@ -133,7 +134,9 @@ static int read_all(int fd, void *buf, unsigned int len) {
 /* Fixed-dimension limits.  Field handles encode (buf_id-1, field_index-1);
  * slot indices are zero-based.  These must be ≥ the cart's declared values. */
 #define NATIVE_MAX_BUF 8
-#define NATIVE_MAX_SLOTS 64
+/* Must equal BLYS_MAX_SLOTS (host BLYT_MAX_SLOTS) so the on-disk slot bitset and
+ * generation blobs are byte-identical across platforms (#129). */
+#define NATIVE_MAX_SLOTS BLYS_MAX_SLOTS
 #define NATIVE_MAX_FIELDS 64
 
 /* type_tag encoding (schemas/cart_layouts.fbs; matches host state_buffer.c). */
@@ -173,8 +176,8 @@ static uint32_t field_width(uint8_t type_tag) {
  * fixed per-field stride; within a field, slots are packed at the field's true
  * width (element s at offset s*width).  This matches the host's per-field
  * contiguous layout (blyt_buffer_ctx_t.field_data[fi] in state_buffer.c), so
- * the NLBY save body is a plain per-field memcpy with no transpose/narrow, and
- * #129's shared BLYS serializer needs no native-specific byte path.
+ * the BLYS save body is a plain per-field memcpy with no transpose/narrow, and
+ * the shared BLYS serializer (#129) needs no native-specific byte path.
  *
  * Worst-case footprint = NATIVE_MAX_BUF * NATIVE_MAX_FIELDS * NATIVE_MAX_SLOTS
  * * 8 = 256 KiB — identical to the previous widened uint64 cube.  Still BSS /
@@ -202,15 +205,13 @@ static uint32_t s_field_count[NATIVE_MAX_BUF];
 /* Slot allocation bitset: bit i of byte (i/8) indicates slot i is allocated. */
 static uint8_t s_slot_bits[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS / 8];
 
-/* Per-slot generation counters (ADR-0096), stored BIASED: the array holds
- * (generation - 1) so the BSS zero is generation 1 with no initialization
- * code (ELF constructors do not run on this path — carts enter via the
- * custom _blyt_entry, not __libc_start_main, so init arrays are skipped).
- * Public generations are 1..65535 (0 is reserved so a packed ref to slot 0
- * never equals BLYT_ENTITY_REF_NONE); stored values are 0..65534.  Bumped
- * on successful free_slot via the shared blyt_gen_next primitive, with the
- * storage bias applied at the boundary so the on-disk representation is
- * unchanged and matches the emulated path (state_buffer.c) exactly. */
+/* Per-slot generation counters (ADR-0096), stored UNBIASED (1..65535; 0 is
+ * reserved so a packed ref to slot 0 never equals BLYT_ENTITY_REF_NONE).
+ * Initialised to 1 at startup (load_cart_buf_counts) — ELF constructors do not
+ * run on this path (#43), so the init is explicit — matching the host
+ * (state_buffer.c).  Bumped on successful free_slot via the shared blyt_gen_next
+ * primitive.  Stored unbiased so s_gen is the exact 256-byte on-disk gens blob
+ * the shared BLYS serializer writes, byte-identical to the host (#129). */
 static uint16_t s_gen[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS];
 
 /* Per-buffer declared slot count from .cart.layouts, loaded at startup.
@@ -218,22 +219,31 @@ static uint16_t s_gen[NATIVE_MAX_BUF][NATIVE_MAX_SLOTS];
  * array is zero (BSS) but slot functions are not called before startup. */
 static uint32_t s_buf_count[NATIVE_MAX_BUF];
 
+/* Number of declared state buffers (BufferDecl count from .cart.layouts, capped
+ * at NATIVE_MAX_BUF); set in load_cart_buf_counts().  Drives how many CART
+ * sections the BLYS save emits, in declaration order (matches the host). */
+static uint32_t s_n_buffers;
+
+/* Per-buffer name (BufferDecl.name), copied out of the cart ELF at startup
+ * (the mmap is released before save time).  Emitted in each CART section so the
+ * save is self-describing and matches the host byte-for-byte (#129). */
+#define NATIVE_BUF_NAME_CAP 64
+static char s_buf_name[NATIVE_MAX_BUF][NATIVE_BUF_NAME_CAP];
+static uint32_t s_buf_name_len[NATIVE_MAX_BUF];
+
+/* The cart's manifest schema_hash (CartLayouts.schema_hash), loaded at startup.
+ * Stamped into the BLYS header on write and checked against on read (#129). */
+static uint64_t s_schema_hash;
+
 /* The running cart's .cart.config save_version (ADR-0125), loaded at startup
  * by load_cart_buf_counts().  Stamped into the save header on write and
  * reported as blyt_load_info_t.saved_cart_version on read.  0 if undeclared. */
 static uint32_t s_save_version;
 
-/* Storage (biased-by-1) → public generation. */
+/* Per-slot public generation (unbiased; see s_gen). */
 static uint16_t native_gen(uint32_t bi, int32_t s) {
-    return (uint16_t)(s_gen[bi][s] + 1u);
+    return s_gen[bi][s];
 }
-
-/* Save format magic and version (little-endian). */
-#define NATIVE_SAVE_MAGIC_0 'N'
-#define NATIVE_SAVE_MAGIC_1 'L'
-#define NATIVE_SAVE_MAGIC_2 'B'
-#define NATIVE_SAVE_MAGIC_3 'Y'
-#define NATIVE_SAVE_VERSION 1u
 
 static int slot_allocated(uint32_t bi, int32_t slot) {
     return (s_slot_bits[bi][(uint32_t)slot / 8u] >> ((uint32_t)slot % 8u)) & 1u;
@@ -355,6 +365,20 @@ static uint8_t fb_u8_field(const uint8_t *fb, uint32_t fb_size, const uint8_t *t
     return *p;
 }
 
+/* Inline u64 scalar field (voff); `dflt` if absent. */
+static uint64_t fb_u64_field(const uint8_t *fb, uint32_t fb_size, const uint8_t *table,
+                             uint16_t voff, uint64_t dflt) {
+    uint16_t foff = fb_field_off(fb, fb_size, table, voff);
+    if (foff == 0)
+        return dflt;
+    const uint8_t *p = table + foff;
+    if (p + 8u > fb + fb_size)
+        return dflt;
+    uint64_t v;
+    blyt32_native_memcpy(&v, p, 8);
+    return v;
+}
+
 static int fb_str_eq(const char *a, uint32_t alen, const char *b, uint32_t blen) {
     if (alen != blen)
         return 0;
@@ -365,9 +389,14 @@ static int fb_str_eq(const char *a, uint32_t alen, const char *b, uint32_t blen)
 }
 
 static void load_cart_buf_counts(void) {
-    /* Safe defaults until/unless the ELF is parsed successfully. */
-    for (uint32_t bi = 0; bi < NATIVE_MAX_BUF; bi++)
+    /* Safe defaults until/unless the ELF is parsed successfully.  Generations
+     * start at 1 (unbiased; ADR-0096) — set explicitly since no .init_array
+     * constructors run on this path (#43), matching the host (state_buffer.c). */
+    for (uint32_t bi = 0; bi < NATIVE_MAX_BUF; bi++) {
         s_buf_count[bi] = NATIVE_MAX_SLOTS;
+        for (uint32_t s = 0; s < NATIVE_MAX_SLOTS; s++)
+            s_gen[bi][s] = 1;
+    }
 
     const char *path = getenv("BLYT_CART_PATH");
     if (!path || !path[0])
@@ -521,6 +550,11 @@ static void load_cart_buf_counts(void) {
     uint32_t vec_len;
     blyt32_native_memcpy(&vec_len, vec, 4);
     uint32_t n = vec_len < NATIVE_MAX_BUF ? vec_len : NATIVE_MAX_BUF;
+    s_n_buffers = n; /* CART sections emitted, in declaration order (#129) */
+
+    /* CartLayouts.schema_hash (field 2, vtable offset 8, u64) — stamped into the
+     * BLYS header and checked on read (#129). */
+    s_schema_hash = fb_u64_field(fb, fb_size, table, 8, 0);
 
     /* records[] vector (CartLayouts field 0, vtable offset 4) — resolved once,
      * then matched per buffer by record_name to flatten field type tags (#134). */
@@ -560,6 +594,18 @@ static void load_cart_buf_counts(void) {
         uint32_t count;
         blyt32_native_memcpy(&count, count_ptr, 4);
         s_buf_count[bi] = count < NATIVE_MAX_SLOTS ? count : NATIVE_MAX_SLOTS;
+
+        /* Buffer name (BufferDecl.name, field 0, vtable offset 4) — copied out
+         * (the mmap is released before save time) for the CART section (#129). */
+        uint32_t bn_len = 0;
+        const char *bn = fb_string(fb, fb_size, elem, 4, &bn_len);
+        if (bn) {
+            if (bn_len > NATIVE_BUF_NAME_CAP - 1u)
+                bn_len = NATIVE_BUF_NAME_CAP - 1u;
+            blyt32_native_memcpy(s_buf_name[bi], bn, bn_len);
+            s_buf_name[bi][bn_len] = '\0';
+            s_buf_name_len[bi] = bn_len;
+        }
 
         /* Flatten this buffer's field type tags (#134): follow BufferDecl
          * .record_name (field 1, vtable offset 6) into records[], match by
@@ -916,10 +962,9 @@ blyt_result_t blyt_buffer_free_slot(blyt_buffer_h b, int32_t s) {
         uint32_t w = field_width(s_field_type[bi][fi]);
         blyt32_native_memset(field_base(bi, fi) + (uint32_t)s * w, 0, w);
     }
-    /* Bump the generation (ADR-0096) via the shared primitive.  Storage is
-     * biased by -1, so convert to the public value, advance, and re-bias: the
-     * public wrap 65535 -> 1 becomes the stored wrap 65534 -> 0, unchanged. */
-    s_gen[bi][s] = (uint16_t)(blyt_gen_next((uint16_t)(s_gen[bi][s] + 1u)) - 1u);
+    /* Bump the generation (ADR-0096) via the shared primitive (unbiased storage,
+     * wrapping 65535 -> 1), matching the host (state_buffer.c). */
+    s_gen[bi][s] = blyt_gen_next(s_gen[bi][s]);
     return BLYT_OK;
 }
 
@@ -944,53 +989,41 @@ bool blyt_buffer_ref_valid(blyt_buffer_h b, blyt_entity_ref_t ref) {
     return v != 0;
 }
 
-/* ── Save / load (Phase 9) ────────────────────────────────────────────────
+/* ── Save / load (ADR-0125, #129) ──────────────────────────────────────────
  *
- * Save file format (all values little-endian) — the ad-hoc native NLBY format,
- * relocated here behavior-preserving (issue #128); its unification with the
- * host BLYS format (ADR-0125) is issue #129:
- *   [0..3]    magic: 'N','L','B','Y'
- *   [4..7]    version: 1u (uint32)
- *   [8..11]   cart save_version (ADR-0125)
- *   [12..N]   field data: for each buffer, each field's count*width contiguous
- *             true-width bytes from the field-major arena (#134).  This matches
- *             the host's per-field array layout, so the body is a plain
- *             per-field memcpy with no transpose/narrow.
- *   [N..N+B]  raw s_slot_bits array
- *   [..]      raw s_gen array (per-slot generation counters, ADR-0096;
- *             stored biased by -1, see the s_gen declaration)
+ * The on-disk byte layout (BLYS header + one CART section per buffer) is defined
+ * once in runtime/shared/blyt_blys.{c,h} and shared with the host runtime, so
+ * native and host saves are byte-identical and interchangeable.  Native only
+ * adapts its storage (field-major arena, slot bitset, unbiased generations) into
+ * the shared descriptor and provides raw-syscall I/O callbacks.
  *
- * The byte layout is cart-dependent (driven by the same .cart.layouts the
- * writing process parsed) but native-only and ephemeral, so save and load in
- * the same build always agree.
- *
- * BLYT_SAVE_DIR environment variable (set by test runner) determines the
- * directory.  File name: slot_<N>.blys in that directory.
+ * BLYT_SAVE_DIR (set by the test runner) determines the directory; the file is
+ * slot_<N>.blys within it.
  */
 
-/* Write each buffer's field data as per-field contiguous true-width arrays.
- * Returns 0 on success, -1 on any short write. */
-static int write_field_data(int fd) {
-    for (uint32_t bi = 0; bi < NATIVE_MAX_BUF; bi++) {
-        for (uint32_t fi = 0; fi < s_field_count[bi]; fi++) {
-            uint32_t bytes = s_buf_count[bi] * field_width(s_field_type[bi][fi]);
-            if (bytes && write_all(fd, field_base(bi, fi), bytes) < 0)
-                return -1;
-        }
-    }
-    return 0;
+/* I/O callbacks for the shared serializer; ctx is &fd. */
+static int native_sink(void *ctx, const void *buf, uint32_t len) {
+    return write_all(*(const int *)ctx, buf, len);
+}
+static int native_source(void *ctx, void *buf, uint32_t len) {
+    return read_all(*(const int *)ctx, buf, len);
 }
 
-/* Mirror of write_field_data for load.  Returns 0 on success, nonzero on error. */
-static int read_field_data(int fd) {
-    for (uint32_t bi = 0; bi < NATIVE_MAX_BUF; bi++) {
-        for (uint32_t fi = 0; fi < s_field_count[bi]; fi++) {
-            uint32_t bytes = s_buf_count[bi] * field_width(s_field_type[bi][fi]);
-            if (bytes && read_all(fd, field_base(bi, fi), bytes) != 0)
-                return -1;
-        }
+/* Build the shared per-buffer views from native storage.  fd holds each
+ * buffer's field-array base pointers (referenced by views[bi].field_data). */
+static void fill_native_views(blys_buffer_t *views, void *fd[][NATIVE_MAX_FIELDS]) {
+    for (uint32_t bi = 0; bi < s_n_buffers; bi++) {
+        for (uint32_t fi = 0; fi < s_field_count[bi]; fi++)
+            fd[bi][fi] = field_base(bi, fi);
+        views[bi].name = s_buf_name[bi];
+        views[bi].name_len = s_buf_name_len[bi];
+        views[bi].n_fields = s_field_count[bi];
+        views[bi].field_types = s_field_type[bi];
+        views[bi].count = s_buf_count[bi];
+        views[bi].field_data = fd[bi];
+        views[bi].slot_bitset = s_slot_bits[bi];
+        views[bi].slot_gens = s_gen[bi];
     }
-    return 0;
 }
 
 blyt_result_t blyt_save_write(uint32_t slot) {
@@ -1011,41 +1044,13 @@ blyt_result_t blyt_save_write(uint32_t slot) {
     if (fd < 0)
         return BLYT_ERR_IO;
 
-    /* Write header: magic + format version + cart save_version (12 bytes).
-     * The cart save_version (ADR-0125) is reported back as
-     * blyt_load_info_t.saved_cart_version on read. */
-    uint8_t hdr[12];
-    hdr[0] = NATIVE_SAVE_MAGIC_0;
-    hdr[1] = NATIVE_SAVE_MAGIC_1;
-    hdr[2] = NATIVE_SAVE_MAGIC_2;
-    hdr[3] = NATIVE_SAVE_MAGIC_3;
-    hdr[4] = (uint8_t)(NATIVE_SAVE_VERSION & 0xFFu);
-    hdr[5] = (uint8_t)((NATIVE_SAVE_VERSION >> 8) & 0xFFu);
-    hdr[6] = (uint8_t)((NATIVE_SAVE_VERSION >> 16) & 0xFFu);
-    hdr[7] = (uint8_t)((NATIVE_SAVE_VERSION >> 24) & 0xFFu);
-    hdr[8] = (uint8_t)(s_save_version & 0xFFu);
-    hdr[9] = (uint8_t)((s_save_version >> 8) & 0xFFu);
-    hdr[10] = (uint8_t)((s_save_version >> 16) & 0xFFu);
-    hdr[11] = (uint8_t)((s_save_version >> 24) & 0xFFu);
-    if (write_all(fd, hdr, sizeof(hdr)) < 0) {
-        blyt_rs_close(fd);
-        return BLYT_ERR_IO;
-    }
+    blys_buffer_t views[NATIVE_MAX_BUF];
+    void *fd_ptrs[NATIVE_MAX_BUF][NATIVE_MAX_FIELDS];
+    fill_native_views(views, fd_ptrs);
+    blys_header_t hdr = {.schema_hash = s_schema_hash, .save_version = s_save_version};
 
-    /* Write field data: per-field contiguous true-width arrays (#134). */
-    if (write_field_data(fd) < 0) {
-        blyt_rs_close(fd);
-        return BLYT_ERR_IO;
-    }
-
-    /* Write slot bitsets */
-    if (write_all(fd, s_slot_bits, sizeof(s_slot_bits)) < 0) {
-        blyt_rs_close(fd);
-        return BLYT_ERR_IO;
-    }
-
-    /* Write generation counters (ADR-0096) */
-    if (write_all(fd, s_gen, sizeof(s_gen)) < 0) {
+    int rc = blys_write(&hdr, views, s_n_buffers, native_sink, &fd);
+    if (rc != BLYS_OK) {
         blyt_rs_close(fd);
         return BLYT_ERR_IO;
     }
@@ -1068,42 +1073,18 @@ blyt_result_t blyt_save_read(uint32_t slot) {
     if (fd < 0)
         return BLYT_ERR_NOT_FOUND;
 
-    /* Read and verify header (magic + format version + cart save_version). */
-    uint8_t hdr[12];
-    if (read_all(fd, hdr, sizeof(hdr)) != 0) {
-        blyt_rs_close(fd);
-        return BLYT_ERR_IO;
-    }
+    blys_buffer_t views[NATIVE_MAX_BUF];
+    void *fd_ptrs[NATIVE_MAX_BUF][NATIVE_MAX_FIELDS];
+    fill_native_views(views, fd_ptrs);
 
-    if (hdr[0] != NATIVE_SAVE_MAGIC_0 || hdr[1] != NATIVE_SAVE_MAGIC_1 ||
-        hdr[2] != NATIVE_SAVE_MAGIC_2 || hdr[3] != NATIVE_SAVE_MAGIC_3) {
-        blyt_rs_close(fd);
-        return BLYT_ERR_IO;
-    }
-
-    /* The save_version stamped by the cart that wrote this save (ADR-0125). */
-    uint32_t saved_version = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) |
-                             ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
-
-    /* Read field data: per-field contiguous true-width arrays (#134). */
-    if (read_field_data(fd) != 0) {
-        blyt_rs_close(fd);
-        return BLYT_ERR_IO;
-    }
-
-    /* Read slot bitsets */
-    if (read_all(fd, s_slot_bits, sizeof(s_slot_bits)) != 0) {
-        blyt_rs_close(fd);
-        return BLYT_ERR_IO;
-    }
-
-    /* Read generation counters (ADR-0096) */
-    if (read_all(fd, s_gen, sizeof(s_gen)) != 0) {
-        blyt_rs_close(fd);
-        return BLYT_ERR_IO;
-    }
-
+    uint32_t saved_version = 0;
+    int rc = blys_read(s_schema_hash, views, s_n_buffers, native_source, &fd, &saved_version);
     blyt_rs_close(fd);
+    if (rc == BLYS_ERR_SCHEMA)
+        return BLYT_ERR_SCHEMA_MISMATCH;
+    if (rc != BLYS_OK)
+        return BLYT_ERR_IO;
+
     blyt32_trace_call("save_read", (long)slot, 1, 0);
 
     /* Notify the cart that state was loaded, reporting the version that wrote
