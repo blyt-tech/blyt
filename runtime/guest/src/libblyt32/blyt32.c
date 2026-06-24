@@ -1,11 +1,14 @@
 /*
  * libblyt32 — Blyt32 variant shared library, emulated path.
  *
- * Provides ECALL stubs for all Blyt32 API functions.  These shadow
- * libblytcommon.so's definitions via ELF symbol resolution order (carts
- * DT_NEED libblyt32.so directly, so it loads before libblytcommon.so).
+ * Provides ECALL stubs for the host-backed data-transport APIs — state buffers,
+ * save/load, resources — that delegate to a host-side implementation over the
+ * ECALL boundary (the guest side is genuinely variant transport).  The
+ * variant-agnostic lifecycle/IO APIs (blyt_main driver, frame_done,
+ * console_debug, exit, runtime_startup) live in libblytcommon instead
+ * (blyt_common.c + blytcommon_emu.c); see issue #128.
  *
- * The native-path implementation lives in frontends/native/src/libblyt32/
+ * The native-path implementation lives in frontends/native/src/libblytcommon/
  * and uses real Linux syscalls instead of ECALL stubs.
  */
 
@@ -15,7 +18,6 @@
  * ECALL numbers (must match runtime/host/src/libblyt/ecall.h)
  * ------------------------------------------------------------------------- */
 
-#define ECALL_CONSOLE_DEBUG 1
 #define ECALL_SAVE_WRITE 11
 #define ECALL_SAVE_READ 12
 #define ECALL_BUF_OP 50
@@ -49,13 +51,6 @@
  * Internal helpers
  * ------------------------------------------------------------------------- */
 
-static unsigned int blyt32_strlen(const char *s) {
-    const char *p = s;
-    while (*p)
-        p++;
-    return (unsigned int)(p - s);
-}
-
 /* Macro for a typed GET stub: issues ECALL_BUF_OP with the given sub-opcode
  * and returns the result value reinterpreted as the target type. */
 #define STUB_GET(rettype, fn_suffix, op)                                                           \
@@ -88,17 +83,6 @@ static unsigned int blyt32_strlen(const char *s) {
                          : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)                             \
                          : "memory");                                                              \
     }
-
-/* -------------------------------------------------------------------------
- * blyt_console_debug — ADR-0085 ECALL stub (a0=ptr, a1=len)
- * ------------------------------------------------------------------------- */
-
-void blyt_console_debug(const char *s) {
-    register const char *a0 __asm__("a0") = s;
-    register unsigned int a1 __asm__("a1") = blyt32_strlen(s);
-    register long a7 __asm__("a7") = ECALL_CONSOLE_DEBUG;
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
-}
 
 /* -------------------------------------------------------------------------
  * blyt_resource_text_get — resource API ECALL stub (issue #91)
@@ -266,23 +250,7 @@ blyt_result_t blyt_save_read(uint32_t slot) {
     return result;
 }
 
-/* -------------------------------------------------------------------------
- * blyt_exit — clean process exit.
- *
- * Called by _blyt_entry after blyt_main() returns.  On the emulated path the
- * emulator intercepts exit_group(0) via ECALL and halts the simulation.  On
- * the native path this function is shadowed by frontends/native/src/libblyt32
- * which calls exit_group directly without going through musl's cleanup.
- * ------------------------------------------------------------------------- */
-
-__attribute__((noreturn)) void blyt_exit(int code) {
-    register long a0 __asm__("a0") = code;
-    register long a7 __asm__("a7") = 94; /* SYS_exit_group */
-    __asm__ volatile("ecall" : : "r"(a0), "r"(a7));
-    __builtin_unreachable();
-}
-
-/* No-op on emulated targets; native libblyt32.so overrides with the
- * real seccomp install + FCSR reset. */
-void blyt_runtime_startup(void) {
-}
+/* blyt_console_debug, blyt_exit, blyt_runtime_startup, and blyt_frame_done are
+ * variant-agnostic lifecycle/IO APIs and live in libblytcommon (blytcommon_emu.c
+ * emulated / frontends/native/src/libblytcommon/ native), not in this variant
+ * library (issue #128). */

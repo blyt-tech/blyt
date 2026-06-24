@@ -429,7 +429,11 @@ add_library(
   runtime/host/src/libblyt/save.c
   runtime/host/src/libblyt/testcard.c
   runtime/host/src/libblyt/trace.c
-  runtime/host/src/libblyt/version.c)
+  runtime/host/src/libblyt/version.c
+  # runtime/shared: freestanding determinism-critical primitives shared with the
+  # native guest libs (issue #128); defined once, compiled into both.
+  runtime/shared/blyt_fp_canon.c
+  runtime/shared/blyt_elf_section.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
 # same static library is usable in both executables and shared objects.
@@ -438,7 +442,7 @@ set_target_properties(libblyt libblytemu libsoftfloat
 target_include_directories(
   libblyt
   PUBLIC runtime/host/include
-  PRIVATE runtime/host/src/libblyt ${flatcc_SOURCE_DIR}/include
+  PRIVATE runtime/host/src/libblyt runtime/shared ${flatcc_SOURCE_DIR}/include
           "${GENERATED_DIR}" ${RV32EMU_DIR})
 # cart_run.c includes common.h explicitly; the -D flags ensure feature macros
 # expand correctly when rv32emu headers are pulled in from cart_run.c.
@@ -537,14 +541,16 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     runtime/host/src/libblyt/save.c
     runtime/host/src/libblyt/testcard.c
     runtime/host/src/libblyt/trace.c
-    runtime/host/src/libblyt/version.c)
+    runtime/host/src/libblyt/version.c
+    runtime/shared/blyt_fp_canon.c
+    runtime/shared/blyt_elf_section.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
   target_include_directories(
     libblyt_debug
     PUBLIC runtime/host/include
-    PRIVATE runtime/host/src/libblyt ${flatcc_SOURCE_DIR}/include
-            "${GENERATED_DIR}" ${RV32EMU_DIR})
+    PRIVATE runtime/host/src/libblyt runtime/shared
+            ${flatcc_SOURCE_DIR}/include "${GENERATED_DIR}" ${RV32EMU_DIR})
   target_compile_definitions(libblyt_debug PRIVATE ${RV32EMU_FEATURE_DEFS})
   target_link_libraries(
     libblyt_debug

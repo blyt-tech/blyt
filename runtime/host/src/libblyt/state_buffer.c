@@ -7,10 +7,11 @@
 
 #include "state_buffer.h"
 
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "blyt_fp_canon.h" /* runtime/shared: blyt_canon_f32/f64 (ADR-0010) */
+#include "blyt_gen.h" /* runtime/shared: blyt_gen_next (ADR-0096) */
 #include "cart_layouts_reader.h"
 
 /* type_tag encoding (must match ecall.h and config.rs) */
@@ -23,10 +24,6 @@
 #define TYPE_F32 6
 #define TYPE_BOOL 7
 #define TYPE_F64 8 /* Spike U: 64-bit double field */
-
-/* Canonical NaN bit patterns for FP writes (ADR-0010). */
-#define F32_CANONICAL_NAN UINT32_C(0x7FC00000)
-#define F64_CANONICAL_NAN UINT64_C(0x7FF8000000000000)
 
 static size_t field_sizeof(uint8_t type_tag) {
     switch (type_tag) {
@@ -204,13 +201,9 @@ int blyt_state_set(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_
     uint8_t tag = bc->field_types[fi];
     (void)type_tag; /* tag from the field declaration is authoritative */
 
-    /* NaN canonicalization for f32 (ADR-0010) */
-    if (tag == TYPE_F32) {
-        float fv;
-        memcpy(&fv, &value_bits, 4);
-        if (isnan(fv))
-            value_bits = F32_CANONICAL_NAN;
-    }
+    /* NaN canonicalization for f32 (ADR-0010); shared with the native path. */
+    if (tag == TYPE_F32)
+        value_bits = blyt_canon_f32(value_bits);
 
     size_t elem = field_sizeof(tag);
     uint8_t *ptr = (uint8_t *)bc->field_data[fi] + (size_t)slot * elem;
@@ -234,11 +227,8 @@ int blyt_state_set64(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint3
     if (bc->field_types[fi] != TYPE_F64)
         return -1; /* 64-bit path is f64-only */
 
-    /* NaN canonicalization for f64 (ADR-0010) */
-    double dv;
-    memcpy(&dv, &value_bits, 8);
-    if (isnan(dv))
-        value_bits = F64_CANONICAL_NAN;
+    /* NaN canonicalization for f64 (ADR-0010); shared with the native path. */
+    value_bits = blyt_canon_f64(value_bits);
 
     uint8_t *ptr = (uint8_t *)bc->field_data[fi] + (size_t)slot * 8;
     memcpy(ptr, &value_bits, 8);
@@ -391,8 +381,9 @@ int blyt_state_free_slot(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot) {
     }
 
     /* Stale-ref detection (ADR-0096): bump the generation on successful free
-     * only, wrapping 65535 -> 1 (0 is reserved as the invalid sentinel). */
-    bc->slot_gens[slot] = (uint16_t)(bc->slot_gens[slot] == 0xFFFFu ? 1 : bc->slot_gens[slot] + 1);
+     * only, wrapping 65535 -> 1 (0 is reserved as the invalid sentinel).  Host
+     * stores the generation unbiased, so the shared primitive applies directly. */
+    bc->slot_gens[slot] = blyt_gen_next(bc->slot_gens[slot]);
     return 0;
 }
 

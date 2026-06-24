@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "blyt_elf_section.h" /* runtime/shared: blyt_elf32_find_section (#128) */
 #include "cart_config_reader.h"
 #include "cart_config_verifier.h"
 #include "cart_info_reader.h"
@@ -1093,20 +1094,13 @@ fail:
 }
 
 const void *blyt_cart_find_section(const blyt_cart_t *cart, const char *name, size_t *size_out) {
-    const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
-    const Elf32_Shdr *shdrs = (const Elf32_Shdr *)((const uint8_t *)cart->map + eh->e_shoff);
-    const Elf32_Shdr *shstrtab_hdr = &shdrs[eh->e_shstrndx];
-    const char *shstrtab = (const char *)((const uint8_t *)cart->map + shstrtab_hdr->sh_offset);
-
-    for (uint16_t i = 0; i < eh->e_shnum; i++) {
-        const Elf32_Shdr *sh = &shdrs[i];
-        if (strcmp(shstrtab + sh->sh_name, name) == 0) {
-            if (size_out)
-                *size_out = sh->sh_size;
-            return (const uint8_t *)cart->map + sh->sh_offset;
-        }
-    }
-    return NULL;
+    /* Bounds-checked ELF32 section walk shared with the native path (#128). */
+    uint32_t off = 0, size = 0;
+    if (!blyt_elf32_find_section((const uint8_t *)cart->map, cart->map_size, name, &off, &size))
+        return NULL;
+    if (size_out)
+        *size_out = size;
+    return (const uint8_t *)cart->map + off;
 }
 
 int blyt_cart_is_debug(const blyt_cart_t *cart) {

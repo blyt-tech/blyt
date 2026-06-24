@@ -335,6 +335,10 @@ add_executable(
   "${BLYT_ROOT}/runtime/host/src/libblyt/testcard.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/trace.c"
   "${BLYT_ROOT}/runtime/host/src/libblyt/version.c"
+  # runtime/shared: freestanding determinism primitives shared with the native
+  # guest libs (issue #128), consumed by state_buffer.c / cart_load.c above.
+  "${BLYT_ROOT}/runtime/shared/blyt_fp_canon.c"
+  "${BLYT_ROOT}/runtime/shared/blyt_elf_section.c"
   ${BLYT_LUA_SOURCES}
   ${BLYT_DAP_SOURCES}
   ${BLYT_GDB_SOURCES})
@@ -431,6 +435,7 @@ target_include_directories(
           "${GENERATED_DIR}"
           "${BLYT_ROOT}/runtime/host/include"
           "${BLYT_ROOT}/runtime/host/src/libblyt"
+          "${BLYT_ROOT}/runtime/shared"
           ${_BLYT_LUA_INCLUDES}
           ${_BLYT_DAP_INCLUDES}
           ${_BLYT_GDB_INCLUDES})

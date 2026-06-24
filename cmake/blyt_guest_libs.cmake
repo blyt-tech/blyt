@@ -262,9 +262,14 @@ function(blyt_guest_so_objs out strip comment)
     VERBATIM)
 endfunction()
 
-# ── libblytcommon.so — variant-portable blyt.h ECALL stubs ──────────────────
+# ── libblytcommon.so — variant-portable blyt API ────────────────────────────
+# blyt_common.c is the portable lifecycle driver; blytcommon_emu.c holds the
+# emulated-path impls of the variant-agnostic lifecycle/IO APIs (frame_done,
+# console_debug, exit, runtime_startup) — their native counterparts live in
+# frontends/native/src/libblytcommon/blytcommon.c (issue #128).
 set(LIBBLYTCOMMON_SRC
-    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c")
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blytcommon_emu.c")
 foreach(_var release debug)
   blyt_set_variant(${_var})
   blyt_guest_so_objs(
@@ -274,7 +279,7 @@ foreach(_var release debug)
     OBJNS
     libblytcommon-${_var}
     SRCS
-    "${LIBBLYTCOMMON_SRC}"
+    ${LIBBLYTCOMMON_SRC}
     CFLAGS
     ${_VOPT}
     LINK_ARGS
@@ -554,6 +559,7 @@ foreach(_var release debug)
     SRCS
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblyt32/blyt32.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blytcommon_emu.c"
     ${LIBBLYTC_SRCS}
     ${SF_ALL}
     ${SF_RISCV}
@@ -812,26 +818,61 @@ if(BLYT_BUILD_NATIVE)
     "${LIBBLYTC_NATIVE_SRC}"
     "${LD_BLYT_STUB_OUT}")
 
-  # Native libblyt32.so: real API implementations (blyt_console_debug →
-  # write(2), restricted seccomp constructor).  Keep -O0: blyt32.c uses
-  # hand-rolled string helpers prefixed blyt32_native_* so the compiler won't
-  # recognise them as stdlib functions; -O0 avoids loop-idiom rewrites into
-  # libcalls.
+  set(LIBBLYT32_NATIVE_INC "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32")
+  set(LIBBLYTCOMMON_NATIVE_DIR
+      "${CMAKE_SOURCE_DIR}/frontends/native/src/libblytcommon")
+  set(SHARED_DIR "${CMAKE_SOURCE_DIR}/runtime/shared")
+
+  # Native libblytcommon.so (issue #128): the variant-agnostic real-work impls
+  # (state buffers, save/load, frame_done FCSR, console_debug, startup, exit),
+  # recompiled from the native source set — NOT copied from the emulated variant
+  # — plus the portable lifecycle driver (blyt_common.c, shared with the
+  # emulated variant) and the freestanding runtime/shared determinism
+  # primitives.  Keep -O0: the native impls use hand-rolled helpers and raw
+  # inline-asm syscalls; -O0 avoids loop-idiom rewrites into libcalls.  Built via
+  # the multi-source path so each TU (incl. runtime/shared) is its own cacheable,
+  # depfile-tracked rule.  Strong definitions in this variant are what the cart
+  # resolves over the DT_NEEDED chain (-fsemantic-interposition in RV32_BASE
+  # keeps intra-module calls like blyt_main → blyt_frame_done routing through the
+  # PLT, ADR-0129).
+  blyt_guest_so_objs(
+    "${SDK_LIB_NATIVE}/libblytcommon.so"
+    FALSE
+    "Linking libblytcommon.so (native)"
+    OBJNS
+    libblytcommon-native
+    SRCS
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
+    "${LIBBLYTCOMMON_NATIVE_DIR}/blytcommon.c"
+    "${SHARED_DIR}/blyt_fp_canon.c"
+    "${SHARED_DIR}/blyt_elf_section.c"
+    CFLAGS
+    -O0
+    -I
+    "${LIBBLYTCOMMON_NATIVE_DIR}"
+    -I
+    "${LIBBLYT32_NATIVE_INC}" # seccomp_restricted.h
+    -I
+    "${SHARED_DIR}"
+    LINK_ARGS
+    -Wl,-soname,libblytcommon.so)
+
+  # Native libblyt32.so: variant-specific only (currently no symbols — graphics
+  # not yet implemented; issue #128).  Still built and shipped: it is the cart's
+  # direct DT_NEEDED and carries DT_NEEDED libblytcommon.so + libblytc.so so the
+  # cart resolves the relocated symbols and the system C library over the chain.
   set(LIBBLYT32_NATIVE_SRC
       "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c")
-  set(LIBBLYT32_NATIVE_INC "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32")
   blyt_guest_so(
     "${SDK_LIB_NATIVE}/libblyt32.so"
     FALSE
     "Cross-compiling libblyt32.so (native)"
     ARGS
-    -O0
+    -O2
     -Wl,-soname,libblyt32.so
-    -I
-    "${LIBBLYT32_NATIVE_INC}"
     -Wl,-Bdynamic
     -Wl,--no-as-needed
-    "${SDK_LIB}/libblytcommon.so"
+    "${SDK_LIB_NATIVE}/libblytcommon.so"
     "${SDK_LIB_NATIVE}/libblytc.so"
     -Wl,--as-needed
     -o
@@ -839,19 +880,9 @@ if(BLYT_BUILD_NATIVE)
     "${LIBBLYT32_NATIVE_SRC}"
     DEPENDS
     "${LIBBLYT32_NATIVE_SRC}"
-    "${LIBBLYT32_NATIVE_INC}/seccomp_restricted.h"
     "${BLYT_H}"
-    "${SDK_LIB}/libblytcommon.so"
+    "${SDK_LIB_NATIVE}/libblytcommon.so"
     "${SDK_LIB_NATIVE}/libblytc.so")
-
-  # Stage libblytcommon.so alongside so one LD_LIBRARY_PATH covers the set.
-  add_custom_command(
-    OUTPUT "${SDK_LIB_NATIVE}/libblytcommon.so"
-    COMMAND "${CMAKE_COMMAND}" -E copy "${SDK_LIB}/libblytcommon.so"
-            "${SDK_LIB_NATIVE}/libblytcommon.so"
-    DEPENDS "${SDK_LIB}/libblytcommon.so"
-    COMMENT "Staging libblytcommon.so to sdk/lib/native/"
-    VERBATIM)
 
   set(_native_outputs
       "${SDK_LIB_NATIVE}/libblyt32.so" "${SDK_LIB_NATIVE}/libblytc.so"

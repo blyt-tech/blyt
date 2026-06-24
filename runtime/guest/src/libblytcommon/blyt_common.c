@@ -5,9 +5,14 @@
  * state management, and other code that is identical across all execution
  * targets (emulated, native, WASM, libretro).
  *
- * Platform-specific API implementations (blyt_console_debug, blyt_frame_done,
- * graphics, audio, input) live in the variant library (libblyt32.so) which
- * has separate source trees for emulated and native paths.
+ * blyt_frame_done is the one libblytcommon symbol whose implementation is
+ * variant-specific; it lives in its own TU (blyt_frame_done.c emulated /
+ * frontends/native/src/libblytcommon/ native) so each variant links exactly
+ * one definition while sharing the portable driver below (issue #128).
+ *
+ * Other platform-specific API implementations (blyt_console_debug, graphics,
+ * audio, input) live in the variant library (libblyt32.so) which has separate
+ * source trees for emulated and native paths.
  */
 
 #include "blyt.h"
@@ -31,17 +36,14 @@ int blyt_is_quit_requested(void) {
 }
 
 /* -------------------------------------------------------------------------
- * blyt_frame_done — end-of-frame signal (ECALL 2)
+ * blyt_frame_done — end-of-frame signal (ECALL 2 on the emulated path).
  *
- * Called by blyt_main after each blyt_cart_draw().  The host intercepts this
- * ECALL, runs its frame callback (SDL event polling, frame-rate cap, etc.),
- * then resumes the emulator for the next frame without halting it.
+ * Called by blyt_main after each blyt_cart_draw().  Its definition is
+ * variant-specific and lives in its own TU (see the file header); declared
+ * here for blyt_main's call below.
  * ------------------------------------------------------------------------- */
 
-void blyt_frame_done(void) {
-    register long a7 __asm__("a7") = 2; /* BLYT_ECALL_FRAME_DONE */
-    __asm__ volatile("ecall" : : "r"(a7) : "memory");
-}
+void blyt_frame_done(void);
 
 /* -------------------------------------------------------------------------
  * Cart lifecycle entry point stubs (ADR-0087)
