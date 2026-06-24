@@ -1245,47 +1245,104 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 
-    case BLYT_ECALL_RESOURCE_TEXT_GET: {
-        /* a0=handle (in) -> guest ptr (out, 0 if invalid); a1=out_len ptr. */
-        uint32_t handle = rv_get_reg(rv, rv_reg_a0);
-        uint32_t out_len_vaddr = rv_get_reg(rv, rv_reg_a1);
+    /* Resource lifecycle ECALLs (ADR-0027, #123).  Result codes are
+     * blyt_result_t values (BLYT_OK=0, BLYT_ERR_INVALID_ARG=1, BLYT_ERR_IO=3,
+     * BLYT_ERR_NOT_FOUND=4); the host does not include the guest blyt.h. */
+    case BLYT_ECALL_RESOURCE_PIN: {
+        /* a0=id (in) -> result (out); a1=out_ptr vaddr, a2=out_size vaddr.
+         * Copies the bytes into the per-frame guest scratch, returns the guest
+         * pointer + length, and bumps the pin count. */
+        uint32_t id = rv_get_reg(rv, rv_reg_a0);
+        uint32_t out_ptr_vaddr = rv_get_reg(rv, rv_reg_a1);
+        uint32_t out_size_vaddr = rv_get_reg(rv, rv_reg_a2);
         vm_attr_t *attr = PRIV(rv);
         memory_t *mem = attr->mem;
 
-        const blyt_resource_entry_t *e =
-            g_run_ctx ? blyt_resource_table_find(&g_run_ctx->resources, handle) : NULL;
-        blyt_tracef(BLYT_TRACE_API, "resource_text_get(handle=%u) -> %s len=%zu", handle,
-                    e ? "ok" : "NULL", e ? e->len : (size_t)0);
+        blyt_resource_entry_t *e =
+            g_run_ctx ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
+        blyt_tracef(BLYT_TRACE_API, "resource_pin(id=%u) -> %s len=%zu", id, e ? "ok" : "NOT_FOUND",
+                    e ? e->len : (size_t)0);
 
+        uint32_t zero = 0;
         if (!e) {
-            rv_set_reg(rv, rv_reg_a0, 0);
+            if (out_ptr_vaddr)
+                memory_write(mem, out_ptr_vaddr, (const uint8_t *)&zero, 4);
+            rv_set_reg(rv, rv_reg_a0, 4 /* BLYT_ERR_NOT_FOUND */);
             rv->PC += 4;
             return;
         }
 
-        /* Bump-allocate room in the guest scratch region (NUL-terminated for
-         * cart convenience; the returned length is authoritative).  Wrap to the
-         * start if a single fetch would overflow the region. */
+        /* Bump-allocate room in the guest scratch region; wrap to the start if a
+         * single fetch would overflow it.  out_size is authoritative — the bytes
+         * are raw (no NUL terminator; the text_get helper adds its own). */
         uint32_t off = g_run_ctx->resource_scratch_off;
-        uint32_t need = (uint32_t)e->len + 1u;
+        uint32_t need = (uint32_t)e->len;
         if (need > BLYT_RESOURCE_SCRATCH_SIZE) {
-            rv_set_reg(rv, rv_reg_a0, 0); /* resource larger than scratch region */
+            if (out_ptr_vaddr)
+                memory_write(mem, out_ptr_vaddr, (const uint8_t *)&zero, 4);
+            rv_set_reg(rv, rv_reg_a0, 3 /* BLYT_ERR_IO: larger than scratch */);
             rv->PC += 4;
             return;
         }
         if (off + need > BLYT_RESOURCE_SCRATCH_SIZE)
             off = 0;
         uint32_t gptr = BLYT_RESOURCE_SCRATCH_BASE + off;
-        memory_write(mem, gptr, e->data, (uint32_t)e->len);
-        uint8_t nul = 0;
-        memory_write(mem, gptr + (uint32_t)e->len, &nul, 1);
+        if (need)
+            memory_write(mem, gptr, e->data, need);
         g_run_ctx->resource_scratch_off = off + need;
 
-        if (out_len_vaddr) {
+        blyt_rl_pin(&e->rl);
+        if (out_ptr_vaddr)
+            memory_write(mem, out_ptr_vaddr, (const uint8_t *)&gptr, 4);
+        if (out_size_vaddr) {
             uint32_t l = (uint32_t)e->len; /* size_t is 4 bytes on ilp32 */
-            memory_write(mem, out_len_vaddr, (const uint8_t *)&l, 4);
+            memory_write(mem, out_size_vaddr, (const uint8_t *)&l, 4);
         }
-        rv_set_reg(rv, rv_reg_a0, gptr);
+        rv_set_reg(rv, rv_reg_a0, 0 /* BLYT_OK */);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_RESOURCE_UNPIN: {
+        /* a0=id -> result. */
+        uint32_t id = rv_get_reg(rv, rv_reg_a0);
+        blyt_resource_entry_t *e =
+            g_run_ctx ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
+        uint32_t res =
+            !e ? 4u /* NOT_FOUND */ : (blyt_rl_unpin(&e->rl) ? 0u : 1u /* INVALID_ARG */);
+        blyt_tracef(BLYT_TRACE_API, "resource_unpin(id=%u) -> %u", id, res);
+        rv_set_reg(rv, rv_reg_a0, res);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_RESOURCE_LOAD: {
+        /* a0=id -> result; a1=out_handle vaddr. */
+        uint32_t id = rv_get_reg(rv, rv_reg_a0);
+        uint32_t out_handle_vaddr = rv_get_reg(rv, rv_reg_a1);
+        vm_attr_t *attr = PRIV(rv);
+        memory_t *mem = attr->mem;
+
+        blyt_resource_entry_t *e =
+            g_run_ctx ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
+        uint32_t handle = e ? blyt_rl_load(&e->rl, id) : 0u;
+        if (out_handle_vaddr)
+            memory_write(mem, out_handle_vaddr, (const uint8_t *)&handle, 4);
+        blyt_tracef(BLYT_TRACE_API, "resource_load(id=%u) -> handle=%u", id, handle);
+        rv_set_reg(rv, rv_reg_a0, e ? 0u /* OK */ : 4u /* NOT_FOUND */);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_RESOURCE_RELEASE: {
+        /* a0=handle -> result.  The handle packs the id in its low 16 bits. */
+        uint32_t handle = rv_get_reg(rv, rv_reg_a0);
+        uint32_t id = handle & 0xFFFFu;
+        blyt_resource_entry_t *e =
+            (g_run_ctx && handle) ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
+        uint32_t res = (e && blyt_rl_release(&e->rl, handle)) ? 0u /* OK */ : 1u /* INVALID_ARG */;
+        blyt_tracef(BLYT_TRACE_API, "resource_release(handle=%u) -> %u", handle, res);
+        rv_set_reg(rv, rv_reg_a0, res);
         rv->PC += 4;
         return;
     }
@@ -2785,10 +2842,11 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     g_run_ctx = &session->ctx;
     session->ctx.frame_done = false;
     session->ctx.fn_return_done = false;
-    /* Reset the resource scratch bump allocator: pointers from
-     * blyt_resource_text_get are valid only for the frame they were fetched in
-     * (issue #91). */
+    /* Reset the resource scratch bump allocator and force-release any pins still
+     * held: a resource pin (and the guest pointer it returned) is valid only for
+     * the frame it was taken in (ADR-0027 frame-scope amendment, #123). */
     session->ctx.resource_scratch_off = 0;
+    blyt_resource_table_force_release_pins(&session->ctx.resources);
 
     /* BLYT_TRACE frame channel: open a frame unless this run_frame call is
      * driving a host-initiated fn call (begin_fn_call) or resuming a frame

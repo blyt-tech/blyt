@@ -60,12 +60,26 @@
  * For REF_VALID: a1=buf_h, a2=ref; returns 1/0 in a0. */
 #define BLYT_ECALL_BUF_OP 50
 
-/* Resource API (ADR-0040, ADR-0088, issue #91).
- * RESOURCE_TEXT_GET: a0=handle (in) / guest ptr to UTF-8 bytes (out, 0 if the
- *   handle is invalid); a1=out_len ptr (host writes the byte length there).
- *   The bytes are copied into a per-frame guest scratch region; the returned
- *   pointer is valid for the current frame only. */
-#define BLYT_ECALL_RESOURCE_TEXT_GET 60
+/* Resource lifecycle API (ADR-0027, ADR-0040, ADR-0088, issues #91/#123).
+ *
+ * 60 (RESOURCE_TEXT_GET) is retired: text access is now a guest-side helper
+ * (blyt_resource_text_get in libblytcommon) built from pin -> copy -> unpin, not
+ * its own ECALL.  The C ECALL boundary is just the four lifecycle primitives.
+ *
+ * RESOURCE_PIN:     a0=id (in); a1=out_ptr vaddr, a2=out_size vaddr.  Copies the
+ *   resource bytes into the per-frame guest scratch region, writes the guest
+ *   pointer to *out_ptr and the byte length to *out_size, increments the pin
+ *   count, and returns a blyt_result_t in a0.  The pointer is valid for the
+ *   current frame only (force-released at the frame boundary, ADR-0027).
+ * RESOURCE_UNPIN:   a0=id; decrements the pin count; returns blyt_result_t.
+ * RESOURCE_LOAD:    a0=id; a1=out_handle vaddr; writes the generation-stamped
+ *   handle and returns blyt_result_t (BLYT_ERR_NOT_FOUND if absent).
+ * RESOURCE_RELEASE: a0=handle; validates + decrements the load count; returns
+ *   blyt_result_t (BLYT_ERR_INVALID_ARG if the handle is stale). */
+#define BLYT_ECALL_RESOURCE_PIN 61
+#define BLYT_ECALL_RESOURCE_UNPIN 62
+#define BLYT_ECALL_RESOURCE_LOAD 63
+#define BLYT_ECALL_RESOURCE_RELEASE 64
 
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */

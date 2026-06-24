@@ -33,6 +33,19 @@ const blyt_resource_entry_t *blyt_resource_table_find(const blyt_resource_table_
     return NULL;
 }
 
+blyt_resource_entry_t *blyt_resource_table_find_mut(blyt_resource_table_t *t, uint32_t id) {
+    for (size_t i = 0; i < t->count; i++) {
+        if (t->entries[i].id == id)
+            return &t->entries[i];
+    }
+    return NULL;
+}
+
+void blyt_resource_table_force_release_pins(blyt_resource_table_t *t) {
+    for (size_t i = 0; i < t->count; i++)
+        blyt_rl_force_release_pins(&t->entries[i].rl);
+}
+
 static blyt_resource_entry_t *table_push(blyt_resource_table_t *t) {
     if (t->count == t->cap) {
         size_t ncap = t->cap ? t->cap * 2 : 8;
@@ -47,6 +60,7 @@ static blyt_resource_entry_t *table_push(blyt_resource_table_t *t) {
     e->data = NULL;
     e->len = 0;
     e->owned = NULL;
+    e->rl = (blyt_rl_state_t){0};
     return e;
 }
 

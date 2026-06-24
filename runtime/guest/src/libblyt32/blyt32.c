@@ -21,7 +21,6 @@
 #define ECALL_SAVE_WRITE 11
 #define ECALL_SAVE_READ 12
 #define ECALL_BUF_OP 50
-#define ECALL_RESOURCE_TEXT_GET 60
 
 /* BUF_OP sub-opcodes */
 #define BUF_OP_GET_F32 1
@@ -84,19 +83,9 @@
                          : "memory");                                                              \
     }
 
-/* -------------------------------------------------------------------------
- * blyt_resource_text_get — resource API ECALL stub (issue #91)
- * a0=handle (in) / guest ptr to bytes (out, 0 if invalid); a1=out_len ptr.
- * The host writes the byte length to *len and returns the guest pointer.
- * ------------------------------------------------------------------------- */
-
-const char *blyt_resource_text_get(blyt_resource_h handle, size_t *len) {
-    register long a0 __asm__("a0") = (long)handle;
-    register long a1 __asm__("a1") = (long)len;
-    register long a7 __asm__("a7") = ECALL_RESOURCE_TEXT_GET;
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
-    return (const char *)a0;
-}
+/* The resource API (pin/unpin/load/release ECALL stubs + the text_get helper)
+ * moved to libblytcommon (blytcommon_emu.c / resources.c) in #123 — it is
+ * variant-agnostic, not part of the libblyt32 transport surface. */
 
 /* -------------------------------------------------------------------------
  * State buffer typed get/set stubs (ADR-0009, ADR-0010, ADR-0057)

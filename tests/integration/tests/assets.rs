@@ -72,6 +72,70 @@ void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void) {}
 "#;
 
+/// C cart exercising the full resource lifecycle surface (#123): load->handle,
+/// pin->bytes->unpin, then a valid release followed by a stale release. It emits
+/// one deterministic line encoding every observable result so a single substring
+/// match pins identical behaviour across all three legs — proving pin delivers
+/// the exact bytes+length, load returns OK with a non-zero handle, the first
+/// release succeeds, and the stale second release is rejected (INVALID_ARG=1).
+const LIFECYCLE_C: &str = r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+#include <string.h>
+
+void blyt_cart_init(void) {
+    blyt_resource_h h = BLYT_RESOURCE_INVALID;
+    blyt_result_t lr = blyt_resource_load(R_GREETING, &h);
+
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_result_t pr = blyt_resource_pin(R_GREETING, &ptr, &size);
+    char g[64];
+    size_t n = size < sizeof(g) - 1 ? size : sizeof(g) - 1;
+    if (ptr) memcpy(g, ptr, n);
+    g[ptr ? n : 0] = '\0';
+    blyt_resource_unpin(R_GREETING);
+
+    blyt_result_t r1 = blyt_resource_release(h);       /* valid */
+    blyt_result_t r2 = blyt_resource_release(h);       /* stale -> rejected */
+
+    char line[256];
+    snprintf(line, sizeof(line),
+             "R[%s] load=%d h=%d pin=%d bytes=%d rel1=%d rel2=%d",
+             g, (int)lr, (int)(h != BLYT_RESOURCE_INVALID), (int)pr,
+             (int)size, (int)r1, (int)r2);
+    blyt_console_debug(line);
+}
+
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#;
+
+/// Packed cart: the full lifecycle surface (load/pin/unpin/release + stale
+/// rejection) produces identical observable output on native, WASM, libretro.
+#[test]
+fn resource_lifecycle_round_trips_all_legs() {
+    require_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("resource_lifecycle");
+    CartProject::new()
+        .c(LIFECYCLE_C)
+        .asset("greeting.txt", "Hello from assets!")
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    run_cart_all_legs(
+        &cart,
+        "R[Hello from assets!] load=0 h=1 pin=0 bytes=18 rel1=0 rel2=1",
+    );
+}
+
 /// Packed cart: the greeting asset is embedded as an ELF section and reaches the
 /// cart through the resource handle API — identically on native, WASM, libretro.
 #[test]

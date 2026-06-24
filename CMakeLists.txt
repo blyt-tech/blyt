@@ -910,6 +910,13 @@ add_executable(test_blys tests/unit/test_blys.c runtime/shared/blyt_blys.c)
 target_include_directories(test_blys PRIVATE runtime/shared)
 add_test(NAME test_blys COMMAND test_blys)
 
+# test_resource_lifecycle: pins the shared resource load/pin refcount state
+# machine (runtime/shared/blyt_resource_lifecycle.h, #123). Header-only and
+# freestanding, so the test just needs the include dir.
+add_executable(test_resource_lifecycle tests/unit/test_resource_lifecycle.c)
+target_include_directories(test_resource_lifecycle PRIVATE runtime/shared)
+add_test(NAME test_resource_lifecycle COMMAND test_resource_lifecycle)
+
 # verify_cart: standalone tool used in CI to confirm blyt build output passes
 # load-time security checks. Not a ctest test; invoked directly with a cart.
 add_executable(verify_cart tests/tools/verify_cart.c)
@@ -1181,7 +1188,8 @@ add_custom_target(
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   USES_TERMINAL VERBATIM
   COMMENT "Running C unit tests (ctest) and Rust devtool unit tests")
-add_dependencies(test-unit test_cart_load test_cart_run test_blys)
+add_dependencies(test-unit test_cart_load test_cart_run test_blys
+                 test_resource_lifecycle)
 if(TARGET test_gdb_stub)
   add_dependencies(test-unit test_gdb_stub)
 endif()

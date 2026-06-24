@@ -12,6 +12,7 @@
 #include "cart_resources.h"
 #include "cart_state.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* s_frame is deliberately plain static state (not a state buffer) to
@@ -21,15 +22,17 @@ static int s_frame;
 void blyt_cart_init(void) {
     s_frame = 0;
 
-    /* Load the text asset by handle and print its contents. */
+    /* Load the text asset by id and print its contents.  text_get returns an
+     * owned, NUL-terminated copy (built from pin -> copy -> unpin); free it. */
     size_t len = 0;
-    const char *txt = blyt_resource_text_get(R_GREETING, &len);
+    char *txt = blyt_resource_text_get(R_GREETING, &len);
     if (txt) {
         char buf[128];
         size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
         memcpy(buf, txt, n);
         buf[n] = '\0';
         blyt_console_debug(buf);
+        free(txt);
     }
 }
 

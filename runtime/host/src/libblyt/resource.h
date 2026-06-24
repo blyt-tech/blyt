@@ -15,6 +15,8 @@
 
 #include "blyt_runtime.h"
 
+#include "blyt_resource_lifecycle.h" /* runtime/shared: load/pin refcount state */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,6 +26,7 @@ typedef struct {
     const uint8_t *data; /* bytes; aliases the cart map, or points at `owned` */
     size_t len;
     void *owned; /* heap buffer to free on clear; NULL when data aliases the map */
+    blyt_rl_state_t rl; /* load/pin refcounts + load generation (#123) */
 } blyt_resource_entry_t;
 
 typedef struct {
@@ -35,6 +38,11 @@ typedef struct {
 void blyt_resource_table_init(blyt_resource_table_t *t);
 void blyt_resource_table_clear(blyt_resource_table_t *t);
 const blyt_resource_entry_t *blyt_resource_table_find(const blyt_resource_table_t *t, uint32_t id);
+/* Mutable lookup for the lifecycle ECALLs (pin/unpin/load/release mutate the
+ * entry's refcounts). Returns NULL if `id` is absent. */
+blyt_resource_entry_t *blyt_resource_table_find_mut(blyt_resource_table_t *t, uint32_t id);
+/* Frame-boundary force-release: drop every entry's pin count (ADR-0027). */
+void blyt_resource_table_force_release_pins(blyt_resource_table_t *t);
 
 /* Release: populate from a packed cart's `.cart.resource.<id>` sections. Entry
  * data aliases the cart map. Clears existing entries first. Returns the number
