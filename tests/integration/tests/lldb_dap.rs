@@ -601,8 +601,12 @@ fn sdl_native_lldb_dap_reload_rebinds_breakpoint() {
     // — a single clean location, no stale v1 location (acceptance criteria 1+3).
     let cart_armed = final_armed_cart_bps(&trace);
     let a1_resolved = first_armed_bp(&trace).expect("no breakpoint set in trace");
-    let line_off = a1_resolved - a1; // line-6 offset within blyt_lldb_test_fn
-    let reread = 0x0500_0000 + a2 + line_off; // base A + v2 function + line offset
+    // The cart is relocated to base A at attach (issue #119, fix A2), so the
+    // initial bind resolves at base_A + v1_fn + line_offset; subtract base A to
+    // recover the line offset within the function.
+    let line_off = a1_resolved - 0x0500_0000 - a1; // line-6 offset within blyt_lldb_test_fn
+    // The cart starts at base A, so the first reload ping-pongs it to base B.
+    let reread = 0x0700_0000 + a2 + line_off; // base B + v2 function + line offset
 
     assert_eq!(
         cart_armed,

@@ -300,6 +300,14 @@ struct blyt_session {
     uint32_t cart_base;
     uint32_t cart_span;
 
+    /* The cart this session runs, retained so a gdb-enabled session can relocate
+     * it off base 0 before init() (issue #119, fix A2): on base 0 the cart image
+     * overlaps the lldb-dap stub main-exe's segments, so lldb misattributes the
+     * cart's text to the stub and native frames don't resolve.  Relocating to
+     * BLYT_RELOAD_BASE_A in blyt_session_gdb_listen via blyt_session_swap_cart
+     * moves it clear.  Owned by the frontend; outlives the session. */
+    const blyt_cart_t *cart;
+
     /* Runtime-lib symbol table retained from the initial dynlink: the cart's
      * own symbols are seeded fresh on top of these to re-link a swapped cart
      * against the persistent libs (issue #127) without reloading them. */
@@ -2813,6 +2821,10 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
         return NULL;
     }
 
+    /* Retain the cart so a gdb-enabled session can relocate it off base 0 before
+     * init() (issue #119, fix A2; see blyt_session_gdb_listen). */
+    s->cart = cart;
+
     /* Record cart image placement + BSS regions (the cart loads at bias 0 as the
      * rv32emu main program; blyt_session_swap_cart re-records on a hot swap). */
     record_cart_image_layout(s, cart, 0u);
@@ -3390,6 +3402,25 @@ int blyt_session_gdb_listen(blyt_session_t *s, int *port_out) {
     if (!s)
         return -1;
 
+    /* Relocate the cart off base 0 before init() (issue #119, fix A2).  rv32emu
+     * places the cart image at guest base 0, which overlaps the lldb-dap stub
+     * main-exe's segments; lldb then misattributes the cart's text to the stub
+     * and native frames don't resolve (hybrid carts always collide; pure-native
+     * escapes only by layout luck).  Move the cart to BLYT_RELOAD_BASE_A via the
+     * proven hot-swap path — it re-maps + relinks the cart, rebinds the retained
+     * libs' GOTs into it, zeroes the old base-0 image, and rv_resets to the new
+     * entry.  init() has not run yet (the frontend gates on gdb_wait_attached),
+     * so the Lua VM also loads its chunk from BASE_A.  Runs once per session.
+     * Release/metal are unaffected: this is reached only in a gdb-enabled
+     * (emulated-debug) session, and carts are PIC so the base is behaviour-
+     * irrelevant — determinism is preserved (release stays at base 0). */
+    if (s->cart && s->cart_base == 0) {
+        if (blyt_session_swap_cart(s, s->cart, BLYT_RELOAD_BASE_A, NULL)) {
+            register_cart_gdb_library(s, s->cart, BLYT_RELOAD_BASE_A, NULL);
+            rebuild_gdb_libs_ffi(s);
+        }
+    }
+
     /* Register layout with the stub.  Use the stable gdb_libs_ffi array whose
      * path pointers remain valid for the session's lifetime. */
     fc_gdb_layout_t layout = {
@@ -3446,8 +3477,9 @@ void blyt_session_gdb_shutdown(blyt_session_t *s) {
 
 /* Pick the guest load base for the next debug hot reload (issue #119): the slot
  * the cart is NOT currently at, so the swap re-maps it to a fresh, non-
- * overlapping base (and zeroes the whole previous image).  The initial cart is
- * at base 0, so the first reload lands at A, then ping-pongs A↔B. */
+ * overlapping base (and zeroes the whole previous image).  A gdb-enabled session
+ * relocates the cart to base A at attach (fix A2, blyt_session_gdb_listen), so
+ * the first reload lands at B, then ping-pongs A↔B. */
 uint32_t blyt_session_next_reload_base(const blyt_session_t *s) {
     return (s && s->cart_base == BLYT_RELOAD_BASE_A) ? BLYT_RELOAD_BASE_B : BLYT_RELOAD_BASE_A;
 }
