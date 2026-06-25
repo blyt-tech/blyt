@@ -59,6 +59,7 @@ bool blyt_libretro_dap_wait_ready(void);
 #ifdef BLYT_GDB
 bool blyt_libretro_gdb_wait_attached(void);
 void blyt_libretro_gdb_continue_initial_halt(void);
+bool blyt_libretro_gdb_wait_client_continue(void);
 #endif
 
 /* -------------------------------------------------------------------------
@@ -699,12 +700,22 @@ int main(int argc, char *argv[]) {
         blyt_libretro_gdb_wait_attached();
 #endif
 #if defined(BLYT_DAP) && defined(BLYT_GDB)
-    /* Hybrid mode (both DAP and GDB active): Lua breakpoints are already
-     * registered (DAP configurationDone received above).  Clear the GDB
-     * initial halt so the cart can run immediately — we don't need lldb-dap
-     * to send vCont;c before Lua code executes. */
-    if (g_dap_port >= 0 && g_gdb_port >= 0)
-        blyt_libretro_gdb_continue_initial_halt();
+    /* Hybrid mode (both DAP and GDB active): the Lua breakpoints are already
+     * registered (DAP configurationDone received above).  Wait for the native
+     * side (lldb-dap) to finish ITS initial configuration too — fetch the svr4
+     * library list, insert its breakpoints, and issue its first continue —
+     * before releasing the cart, so a native breakpoint's ebreak is patched in
+     * before any cart code runs (issue #119).  Otherwise an early native call
+     * (e.g. on_new_state → a Lua-exported C function) executes first and caches a
+     * translated block with no ebreak that the later insertion never
+     * re-translates (rv32emu single-VM block cache, cf. #42), so the breakpoint
+     * silently never fires — observed only on slow hosts where the insert loses
+     * the race.  Fall back to force-clearing the halt if the native client never
+     * continues (e.g. no lldb on the native side), so boot cannot wedge. */
+    if (g_dap_port >= 0 && g_gdb_port >= 0) {
+        if (!blyt_libretro_gdb_wait_client_continue())
+            blyt_libretro_gdb_continue_initial_halt();
+    }
 #endif
 
     SDL_Window *win = NULL;

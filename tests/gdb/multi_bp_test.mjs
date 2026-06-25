@@ -18,8 +18,6 @@
  * Node.js 22+ required.
  */
 
-import { cartLoadBase } from './cart_base.mjs';
-
 const [, , endpoint] = process.argv;
 const bpAddrsRaw = process.env.BLYT_GDB_BP_ADDRS || '';
 
@@ -159,13 +157,6 @@ async function main() {
 		t.send('+');
 		t.send(frame('?'));
 		await t.recv();
-
-		/* Rebase symbol vaddrs by the cart library's load base (issue #119, fix
-		 * A2): the cart is a relocated shared library, so the `nm`-derived
-		 * addresses (and the PC comparison below) must be offset by its svr4
-		 * l_addr to match the running code. */
-		const cartBase = await cartLoadBase((p) => t.exchange(p));
-		for (let i = 0; i < bpAddrs.length; i++) bpAddrs[i] += cartBase;
 
 		/* Set Z0 for every address. */
 		for (const addr of bpAddrs) {

@@ -363,6 +363,14 @@ void blyt_libretro_gdb_continue_initial_halt(void) {
     if (g_session)
         blyt_session_gdb_continue_initial_halt(g_session);
 }
+
+/* In hybrid mode, wait for lldb-dap to finish its initial configuration (insert
+ * breakpoints + first continue) before the cart runs, so a native breakpoint is
+ * patched in before any cart code executes (issue #119).  Returns true once the
+ * client has continued, false on timeout. */
+bool blyt_libretro_gdb_wait_client_continue(void) {
+    return g_session && blyt_session_gdb_wait_client_continue(g_session) != 0;
+}
 #endif
 
 blyt_cart_run_err_t blyt_libretro_run_err(void) {

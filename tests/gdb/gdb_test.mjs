@@ -27,8 +27,6 @@
  * Node.js 22+ required.
  */
 
-import { cartLoadBase } from './cart_base.mjs';
-
 const [, , endpoint, ...rest] = process.argv;
 let breakAddr = process.env.BLYT_GDB_BREAK_ADDR || null;
 for (let i = 0; i < rest.length; i++) {
@@ -244,17 +242,8 @@ async function main() {
 			console.log('PASS: qXfer:features:read contains riscv target.xml');
 		}
 
-		/* Rebase symbol vaddrs by the cart's library load base (issue #119, fix
-		 * A2): the cart is a relocated shared library, so a `nm`-derived vaddr
-		 * must be offset by the cart's svr4 l_addr to hit the running code —
-		 * exactly what a debugger does. */
-		const cartBase =
-			breakAddr || process.env.BLYT_GDB_MEM_ADDR
-				? await cartLoadBase((p) => t.exchange(p))
-				: 0;
-
 		if (breakAddr) {
-			const addrHex = (parseInt(breakAddr, 16) + cartBase).toString(16);
+			const addrHex = parseInt(breakAddr, 16).toString(16);
 			console.log(`[gdb_test] setting Z0 at 0x${addrHex}`);
 
 			/* 5. Set software breakpoint. */
@@ -334,8 +323,9 @@ async function main() {
 
 			/* Optional: memory read at a known address. */
 			if (process.env.BLYT_GDB_MEM_ADDR) {
-				const memAddr = (
-					parseInt(process.env.BLYT_GDB_MEM_ADDR, 16) + cartBase
+				const memAddr = parseInt(
+					process.env.BLYT_GDB_MEM_ADDR,
+					16,
 				).toString(16);
 				const memResp = await t.exchange(`m${memAddr},4`);
 				if (memResp?.length !== 8 || memResp.startsWith('E')) {

@@ -27,8 +27,6 @@
  * Node.js 22+ required.
  */
 
-import { cartLoadBase } from './cart_base.mjs';
-
 const DAP_ENDPOINT = process.argv[2];
 const GDB_ENDPOINT = process.argv[3];
 let gdbBreakAddr = null;
@@ -295,16 +293,9 @@ async function main() {
 	const initStop = await gdb.recv();
 	console.log(`[gdb] ? → ${initStop}`);
 
-	/* Rebase the native symbol vaddr by the cart library's load base (issue #119,
-	 * fix A2): the cart is a relocated shared library, so the `nm`-derived entry
-	 * address must be offset by its svr4 l_addr to hit the running code. */
-	const cartBase = gdbBreakAddr
-		? await cartLoadBase((p) => gdb.exchange(p))
-		: 0;
-
 	/* Set software breakpoint at native function entry (if address provided). */
 	if (gdbBreakAddr) {
-		const addrHex = (parseInt(gdbBreakAddr, 16) + cartBase).toString(16);
+		const addrHex = parseInt(gdbBreakAddr, 16).toString(16);
 		const bpResp = await gdb.exchange(`Z0,${addrHex},4`);
 		assert(bpResp === 'OK', `GDB Z0 at 0x${addrHex}: ${bpResp}`);
 	}
@@ -369,7 +360,7 @@ async function main() {
 	console.log(`[dap] stopped at line ${frames1[0]?.line} (expected 3)`);
 
 	if (gdbBreakAddr) {
-		const addrHex = (parseInt(gdbBreakAddr, 16) + cartBase).toString(16);
+		const addrHex = parseInt(gdbBreakAddr, 16).toString(16);
 
 		/* Register DAP stopped-2 listener BEFORE sending next, so the event
 		 * is not missed while GDB stepping is in progress. */

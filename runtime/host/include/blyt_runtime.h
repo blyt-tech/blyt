@@ -428,6 +428,19 @@ int blyt_session_gdb_wait_attached(blyt_session_t *s);
  */
 void blyt_session_gdb_continue_initial_halt(blyt_session_t *s);
 
+/*
+ * Block until the GDB client has finished its initial configuration (fetched the
+ * library list, inserted its breakpoints, and issued its first vCont;c) so a
+ * native breakpoint's ebreak is patched in before any cart code runs (issue
+ * #119).  Used by the hybrid gate in place of immediately force-clearing the
+ * initial halt: an early native call would otherwise cache a translated block
+ * with no ebreak that the later insertion never re-translates (rv32emu single-VM
+ * block cache, cf. #42).  Returns 1 once the client has continued, 0 on timeout
+ * (the caller should then force-clear the halt so boot cannot wedge).  No-op /
+ * returns 0 when BLYT_GDB is not compiled in or on WASM (async transport).
+ */
+int blyt_session_gdb_wait_client_continue(blyt_session_t *s);
+
 /* --- --reset-every-frame cycle (save-state stress testing) ---------------- */
 
 /*

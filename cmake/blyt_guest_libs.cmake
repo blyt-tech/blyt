@@ -289,22 +289,35 @@ endforeach()
 set(LIBBLYTCOMMON_OUT "${SDK_LIB}/libblytcommon.so")
 
 # ── blyt-debug-stub.elf — lldb-dap `program` stub (issue #119) ───────────────
-# A minimal riscv32 ET_DYN ELF that lldb-dap loads as its `program` so the cart
-# is never the main executable (and so stays a cleanly unloadable/reloadable
-# shared library across a hot reload — Spike W §5d/§5e).  Debug-only; never run.
-blyt_guest_so(
-  "${SDK_LIB_DEBUG}/blyt-debug-stub.elf"
-  FALSE
-  "Linking blyt-debug-stub.elf (lldb-dap program stub, issue #119)"
-  ARGS
-  -O0
-  -g
-  "${CMAKE_SOURCE_DIR}/runtime/guest/src/debug-stub/blyt_debug_stub.c"
-  -o
-  "${SDK_LIB_DEBUG}/blyt-debug-stub.elf"
-  -Wl,-soname,blyt-debug-stub.elf
-  DEPENDS
-  "${CMAKE_SOURCE_DIR}/runtime/guest/src/debug-stub/blyt_debug_stub.c")
+# A minimal riscv32 ELF that lldb-dap loads as its `program` so the cart is never
+# the main executable (and so stays a cleanly unloadable/reloadable shared
+# library across a hot reload — Spike W §5d/§5e).  Debug-only; never run.
+#
+# Built as a STATIC ET_EXEC linked at a fixed high base (0x40000000) so its
+# PT_LOAD segments cannot overlap the cart, which the emulated loader maps at
+# guest base 0 (issue #119).  An ET_DYN stub does not work: lldb treats a shared
+# object as relocatable and rebases it to ~0 regardless of its link-time
+# --image-base (confirmed: lldb 22 loads an ET_DYN stub's .text at ~0x1250),
+# colliding with the cart's text so it misattributes the cart's code to the stub
+# and native frames resolve to line 0 (worst for hybrid carts, whose text spans
+# the stub range).  An ET_EXEC has fixed vaddrs lldb honours on every platform.
+# The stub is never mapped into the guest VM (it is purely lldb-side metadata),
+# so 0x40000000 — above both the cart region and the runtime libs at 0x08000000
+# — only needs to be a valid rv32 vaddr that no real module uses.  Entry is the
+# stub function (never executed); -static -nostartfiles avoids a dynamic linker
+# and a missing-_start warning.
+add_custom_command(
+  OUTPUT "${SDK_LIB_DEBUG}/blyt-debug-stub.elf"
+  COMMAND
+    "${BLYT_RV32_CLANG}" --target=riscv32-linux-gnu -march=rv32imafdc
+    -mabi=ilp32d -no-pie -fno-pic -static -nostdlib -nostartfiles -O0 -g -I
+    "${GUEST_INC_DIR}" "-fuse-ld=${BLYT_RV32_LLD}" -Wl,--image-base=0x40000000
+    -Wl,-e,blyt_debug_stub
+    "${CMAKE_SOURCE_DIR}/runtime/guest/src/debug-stub/blyt_debug_stub.c" -o
+    "${SDK_LIB_DEBUG}/blyt-debug-stub.elf"
+  DEPENDS "${CMAKE_SOURCE_DIR}/runtime/guest/src/debug-stub/blyt_debug_stub.c"
+  COMMENT "Linking blyt-debug-stub.elf (lldb-dap program stub, issue #119)"
+  VERBATIM)
 add_custom_target(blyt_debug_stub ALL DEPENDS "${SDK_LIB_DEBUG}/blyt-debug-stub.elf")
 
 # ── musl bits/ generation (configure time) ──────────────────────────────────
