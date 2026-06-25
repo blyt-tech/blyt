@@ -494,9 +494,9 @@ fn wasm_c_cart_gdb_interrupt() {
         .success();
 }
 
-/// WASM GDB: qXfer:exec-file:read returns the cart path.
+/// WASM GDB: qXfer:exec-file:read is EMPTY — the cart is a library (issue #119).
 #[test]
-fn wasm_c_cart_gdb_exec_file_query() {
+fn wasm_c_cart_gdb_exec_file_empty() {
     require_sdk();
     require_wasm_debug();
 
@@ -811,14 +811,16 @@ fn sdl_c_cart_gdb_interrupt() {
         .success();
 }
 
-/// SDL2 GDB: qXfer:exec-file:read returns the cart path.
+/// SDL2 GDB: qXfer:exec-file:read is EMPTY — the cart is a library (issue #119).
 ///
-/// After the GDB handshake, sends qXfer:exec-file:read::0,4000 and asserts
-/// the response starts with 'l' and contains the cart filename.
+/// The cart is presented purely as a shared library (lldb-dap's `program` is a
+/// stub ELF), never as the main executable, so the exec-file query returns the
+/// bare end-of-data marker. After the GDB handshake, sends
+/// qXfer:exec-file:read::0,4000 and asserts the response is empty.
 ///
 /// Requires: blytplay with BLYT_GDB=ON, SDK.
 #[test]
-fn sdl_c_cart_gdb_exec_file_query() {
+fn sdl_c_cart_gdb_exec_file_empty() {
     require_sdk();
     require_gdb();
 

@@ -45,6 +45,7 @@ void blyt_libretro_reset(void);
 bool blyt_libretro_save_state(uint32_t slot);
 bool blyt_libretro_load_state(uint32_t slot);
 bool blyt_libretro_reload(void);
+bool blyt_libretro_reload_for_debug(const char *reported_path); /* issue #119 */
 bool blyt_libretro_update_assets(const uint32_t *ids, size_t n);
 
 /* Used only by the SDL frontend (direct link) for loop termination and exit
@@ -58,6 +59,7 @@ bool blyt_libretro_dap_wait_ready(void);
 #ifdef BLYT_GDB
 bool blyt_libretro_gdb_wait_attached(void);
 void blyt_libretro_gdb_continue_initial_halt(void);
+bool blyt_libretro_gdb_wait_client_continue(void);
 #endif
 
 /* -------------------------------------------------------------------------
@@ -420,7 +422,20 @@ static void dev_ctrl_dispatch(const char *json) {
         else
             dev_ctrl_err(id, cmd, "load_state failed");
     } else if (strcmp(cmd, "reload") == 0) {
-        if (blyt_libretro_reload())
+        /* Reload-while-debugging (issue #119): when a GDB session is active, the
+         * cart must be re-mapped at a fresh base and re-reported to lldb at a
+         * unique path (`path`, the rebuilt debug ELF the devtool staged) so it
+         * re-reads the new DWARF and rebinds breakpoints, then a solib event is
+         * fired.  Without a debugger this is an ordinary in-place reload. */
+        bool ok;
+        if (g_gdb_port >= 0) {
+            char path[4096];
+            const char *p = dev_ctrl_str(json, "path", path, sizeof(path)) ? path : NULL;
+            ok = blyt_libretro_reload_for_debug(p);
+        } else {
+            ok = blyt_libretro_reload();
+        }
+        if (ok)
             dev_ctrl_ok(id, cmd);
         else
             dev_ctrl_err(id, cmd, "reload failed");
@@ -660,6 +675,17 @@ int main(int argc, char *argv[]) {
     double fps = av.timing.fps > 0.0 ? av.timing.fps : 60.0;
     uint32_t frame_ms = (uint32_t)(1000.0 / fps);
 
+    /* Dev control channel (issue #87): start the listener — or dial the devtool
+     * hub (issue #90, option 2) — BEFORE any debugger wait, so the dev-control
+     * port is announced up front and an orchestrator can drive a hot reload
+     * without first attaching a debugger (issue #119).  Non-blocking in either
+     * case — the cart runs whether or not a controller is present.  The two
+     * modes are mutually exclusive; --dev-ctrl-connect wins if both are set. */
+    if (g_dev_ctrl_connect_port >= 0)
+        dev_ctrl_connect(g_dev_ctrl_connect_port);
+    else if (g_dev_ctrl_port >= 0)
+        dev_ctrl_start(g_dev_ctrl_port);
+
 #ifdef BLYT_DAP
     /* Wait for the DAP client to finish configuration (setBreakpoints +
      * configurationDone) before starting the game loop, so that breakpoints
@@ -674,23 +700,23 @@ int main(int argc, char *argv[]) {
         blyt_libretro_gdb_wait_attached();
 #endif
 #if defined(BLYT_DAP) && defined(BLYT_GDB)
-    /* Hybrid mode (both DAP and GDB active): Lua breakpoints are already
-     * registered (DAP configurationDone received above).  Clear the GDB
-     * initial halt so the cart can run immediately — we don't need lldb-dap
-     * to send vCont;c before Lua code executes. */
-    if (g_dap_port >= 0 && g_gdb_port >= 0)
-        blyt_libretro_gdb_continue_initial_halt();
+    /* Hybrid mode (both DAP and GDB active): the Lua breakpoints are already
+     * registered (DAP configurationDone received above).  Wait for the native
+     * side (lldb-dap) to finish ITS initial configuration too — fetch the svr4
+     * library list, insert its breakpoints, and issue its first continue —
+     * before releasing the cart, so a native breakpoint's ebreak is patched in
+     * before any cart code runs (issue #119).  Otherwise an early native call
+     * (e.g. on_new_state → a Lua-exported C function) executes first and caches a
+     * translated block with no ebreak that the later insertion never
+     * re-translates (rv32emu single-VM block cache, cf. #42), so the breakpoint
+     * silently never fires — observed only on slow hosts where the insert loses
+     * the race.  Fall back to force-clearing the halt if the native client never
+     * continues (e.g. no lldb on the native side), so boot cannot wedge. */
+    if (g_dap_port >= 0 && g_gdb_port >= 0) {
+        if (!blyt_libretro_gdb_wait_client_continue())
+            blyt_libretro_gdb_continue_initial_halt();
+    }
 #endif
-
-    /* Dev control channel (issue #87): start the listener — or dial the devtool
-     * hub (issue #90, option 2) — now that the cart is loaded and the session
-     * exists.  Non-blocking in either case — the cart runs immediately whether
-     * or not a controller is present.  The two modes are mutually exclusive;
-     * --dev-ctrl-connect wins if both are somehow set. */
-    if (g_dev_ctrl_connect_port >= 0)
-        dev_ctrl_connect(g_dev_ctrl_connect_port);
-    else if (g_dev_ctrl_port >= 0)
-        dev_ctrl_start(g_dev_ctrl_port);
 
     SDL_Window *win = NULL;
     if (!headless) {

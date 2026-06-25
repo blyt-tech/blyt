@@ -48,6 +48,14 @@ typedef struct {
      * vCont;c so we can simulate an entry-point stop and let VS Code enable
      * all debug controls before the user explicitly continues. */
     int entry_stop_pending;
+    /* Bumped each time the client reads qXfer:libraries-svr4 (issue #119).  The
+     * debug reload's two-phase solib swap waits on this to know lldb has
+     * consumed one library-list state before publishing the next. */
+    unsigned lib_fetch_gen;
+    /* Bumped on each vCont;c (continue).  The reload two-phase swap waits on
+     * this so each library-change stop is fully processed (lldb re-resolved and
+     * the client auto-continued) before the next phase is published (issue #119). */
+    unsigned continue_gen;
 } gdb_state_t;
 
 #ifdef BLYT_GDB_TCP
@@ -118,22 +126,30 @@ static void send_response(const char *payload) {
 /* Build a T05 stop reply with all 33 register values inline.
  * LLDB caches these and skips individual p-register round trips on stops,
  * which eliminates ~33 WebSocket exchanges per conditional breakpoint hit. */
-static void send_stop_with_regs(void) {
+/* `reason` is the stop-reason field (e.g. "swbreak:;" or "library:;"), inserted
+ * right after "T05" and before "thread:01;". */
+static void send_stop_with_regs_reason(const char *reason) {
     if (!g_gdb.ops.read_regs) {
-        send_response("T05swbreak:;thread:01;");
+        char small[64];
+        snprintf(small, sizeof small, "T05%sthread:01;", reason);
+        send_response(small);
         return;
     }
     uint8_t regs[33 * 4];
     g_gdb.ops.read_regs(regs);
     /* 22 chars header + 33 × 12 ("xx:xxxxxxxx;") + NUL = ~420 bytes */
     char buf[512];
-    int n = snprintf(buf, sizeof buf, "T05swbreak:;thread:01;");
+    int n = snprintf(buf, sizeof buf, "T05%sthread:01;", reason);
     for (int i = 0; i < 33; i++) {
         const uint8_t *r = regs + i * 4;
         n += snprintf(buf + n, (int)sizeof(buf) - n, "%02x:%02x%02x%02x%02x;", i, r[0], r[1], r[2],
                       r[3]);
     }
     send_response(buf);
+}
+
+static void send_stop_with_regs(void) {
+    send_stop_with_regs_reason("swbreak:;");
 }
 
 static void clear_all_breakpoints(void) {
@@ -194,6 +210,11 @@ static void handle_qXfer_libraries(const char *args, char *out, size_t cap) {
     if (*p == ',')
         p++;
     uint32_t len = (uint32_t)strtoul(p, NULL, 16);
+
+    /* Record that the client began re-reading the library list (issue #119): the
+     * two-phase reload swap waits on this to sequence its unload/load events. */
+    if (off == 0)
+        g_gdb.lib_fetch_gen++;
 
     char xml[8192];
     int xn = snprintf(xml, sizeof xml, "<library-list-svr4 version=\"1.0\" main-lm=\"0x0\">");
@@ -374,6 +395,8 @@ static int handle_vCont(const char *args, char *out, size_t cap) {
     g_gdb.pending_action = action;
     g_gdb.halted = 0;
     g_gdb.initial_halt = 0;
+    if (action == 0)
+        g_gdb.continue_gen++; /* issue #119: sequences the reload two-phase swap */
     GDB_UNLOCK();
     /* No immediate response — T05 comes from fc_gdb_stub_notify_stopped. */
     return 1;
@@ -398,8 +421,18 @@ static void handle_packet(const char *pkt) {
     } else if (strncmp(pkt, "qXfer:features:read:", 20) == 0) {
         handle_qXfer_features(pkt + 20, out, sizeof out);
     } else if (pkt[0] == '?' && pkt[1] == '\0') {
-        /* Include register values so lldb skips individual p-register queries. */
-        send_stop_with_regs();
+        /* Include register values so lldb skips individual p-register queries.
+         * On the initial attach stop, carry the `library:` reason when a cart
+         * library is present (issue #119): lldb-dap's `program` is a stub ELF
+         * with no loader rendezvous, so nothing would otherwise prompt lldb to
+         * read qXfer:libraries-svr4 — and the cart (a shared library) would stay
+         * unknown, leaving breakpoints pending until the first reload.  The
+         * `library:` reason makes lldb fetch the svr4 list at attach so cart
+         * breakpoints bind (with an address) before init() runs. */
+        if (g_gdb.initial_halt && g_gdb.layout.n_libraries > 0)
+            send_stop_with_regs_reason("library:;");
+        else
+            send_stop_with_regs();
         return;
     } else if (pkt[0] == 'c' && (pkt[1] == '\0' || pkt[1] == ';')) {
         /* Legacy continue — treat identically to vCont;c. */
@@ -602,6 +635,44 @@ void fc_gdb_stub_notify_stopped(void) {
     g_gdb.initial_halt = 0;
     GDB_UNLOCK();
     send_stop_with_regs();
+}
+
+/* Announce a shared-library change to the client (issue #119): sends a stop
+ * reply carrying the `library` reason, which prompts lldb to re-fetch
+ * qXfer:libraries-svr4:read and re-resolve breakpoints bound to the (re)loaded
+ * module.  Used on a debug hot reload after the cart module is swapped and its
+ * library entry re-reported at a fresh base + unique path (Spike W §5e): lldb
+ * re-reads the rebuilt cart's DWARF and rebinds breakpoints to the new code's
+ * addresses — a single clean location, no stale module.  The caller updates the
+ * layout (fc_gdb_stub_set_layout) first. */
+void fc_gdb_stub_notify_library_change(void) {
+    GDB_LOCK();
+    g_gdb.halted = 1;
+    g_gdb.pending_action = -1;
+    g_gdb.initial_halt = 0;
+    GDB_UNLOCK();
+    /* Bare library stop (no register dump): lldb treats this purely as a
+     * shared-library change — re-fetch the list, re-resolve breakpoints, and
+     * auto-continue — rather than a full inspection stop. */
+    send_response("T05library:;thread:01;");
+}
+
+/* Library-list read generation (issue #119): bumped each time the client reads
+ * qXfer:libraries-svr4 from offset 0.  The two-phase reload swap polls this to
+ * confirm lldb consumed one list state before the next is published. */
+unsigned fc_gdb_stub_lib_fetch_gen(void) {
+    GDB_LOCK();
+    unsigned g = g_gdb.lib_fetch_gen;
+    GDB_UNLOCK();
+    return g;
+}
+
+/* Continue (vCont;c) generation — see the struct field (issue #119). */
+unsigned fc_gdb_stub_continue_gen(void) {
+    GDB_LOCK();
+    unsigned g = g_gdb.continue_gen;
+    GDB_UNLOCK();
+    return g;
 }
 
 void fc_gdb_stub_poll(void) {

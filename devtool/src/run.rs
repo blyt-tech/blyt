@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use notify::{RecursiveMode, Watcher};
 use tungstenite::Message;
 
-use crate::build::{build_for_dev, sdk_root_from_exe};
+use crate::build::{build_for_dev, json_escape, sdk_root_from_exe};
 
 /* -------------------------------------------------------------------------
  * Error type
@@ -575,6 +575,27 @@ mod tests {
     fn dispatch_nothing_changed() {
         let same = idx(&[(1, "resources/greeting-aaaa.data")]);
         assert_eq!(dispatch_signals(&same, &same, false), (false, vec![]));
+    }
+
+    #[test]
+    fn reload_message_run_mode_has_no_path() {
+        // Run-mode reload reloads in place — no checksum path (issue #119).
+        assert_eq!(reload_message(7, None), r#"{"id":7,"cmd":"reload"}"#);
+    }
+
+    #[test]
+    fn reload_message_debug_mode_carries_staged_path() {
+        // Debug-mode reload carries the content-addressed ELF path so lldb
+        // re-reads the new DWARF at a unique path (issue #119).
+        assert_eq!(
+            reload_message(3, Some("/tmp/proj/build/.dbg.00000000deadbeef.elf")),
+            r#"{"id":3,"cmd":"reload","path":"/tmp/proj/build/.dbg.00000000deadbeef.elf"}"#
+        );
+        // Paths with quotes/backslashes are JSON-escaped.
+        assert_eq!(
+            reload_message(1, Some(r#"/x/"a"\b"#)),
+            r#"{"id":1,"cmd":"reload","path":"/x/\"a\"\\b"}"#
+        );
     }
 
     #[test]
@@ -1250,6 +1271,20 @@ fn elf_hash(path: &Path) -> Option<u64> {
     fs::read(path).ok().map(|b| xxhash_rust::xxh3::xxh3_64(&b))
 }
 
+/// Build the dev-control `reload` command (issue #88/#119).  In debug mode a
+/// `staged_path` (a content-addressed copy of the rebuilt debug ELF) is included
+/// so a live lldb session re-reads the new DWARF at a unique path; run mode
+/// reloads in place and omits it.
+fn reload_message(msg_id: u64, staged_path: Option<&str>) -> String {
+    match staged_path {
+        Some(p) => format!(
+            "{{\"id\":{msg_id},\"cmd\":\"reload\",\"path\":\"{}\"}}",
+            json_escape(p)
+        ),
+        None => format!("{{\"id\":{msg_id},\"cmd\":\"reload\"}}"),
+    }
+}
+
 /// Parse `build/resource-id-index` into `(id, rel_path)` pairs (issue #91).
 /// Returns an empty vec when the index is absent (no assets).
 fn read_resource_index(build_dir: &Path) -> Vec<(u32, String)> {
@@ -1394,6 +1429,11 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
         // which point the runtime has acked the swap and released any pinned
         // bytes from the in-flight frame (ADR-0088 GC, issue #91).
         let mut pending_gc: Vec<PathBuf> = Vec::new();
+        // Previous content-addressed debug ELF awaiting GC (issue #119): a debug
+        // reload stages a `.dbg.<hash>.elf` copy so lldb re-reads the new DWARF
+        // at a unique path; the previous one is dropped when the next is staged,
+        // by which point lldb has cached the rebuilt module.
+        let mut prev_dbg_staged: Option<PathBuf> = None;
 
         let settle = std::time::Duration::from_millis(150);
         let mut msg_id: u64 = 1;
@@ -1430,7 +1470,30 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
                         msg_id += 1;
                     }
                     if reload {
-                        let msg = format!("{{\"id\":{msg_id},\"cmd\":\"reload\"}}");
+                        // Debug mode (issue #119): stage a content-addressed copy
+                        // of the rebuilt ELF and pass its path so a live lldb
+                        // session re-reads the new DWARF at a unique path and
+                        // rebinds breakpoints.  Run mode reloads in place (no path).
+                        let staged_path: Option<String> = if debug {
+                            let hash = new_hash.or(last_hash).unwrap_or(0);
+                            let staged = build_dir.join(format!(".dbg.{hash:016x}.elf"));
+                            match fs::copy(&elf, &staged) {
+                                Ok(_) => {
+                                    if let Some(old) = prev_dbg_staged.replace(staged.clone()) {
+                                        let _ = fs::remove_file(old);
+                                    }
+                                    let abs = staged.canonicalize().unwrap_or(staged);
+                                    Some(abs.to_string_lossy().into_owned())
+                                }
+                                Err(e) => {
+                                    eprintln!("[reload] could not stage debug ELF: {e}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let msg = reload_message(msg_id, staged_path.as_deref());
                         let n = hub.broadcast(None, &msg);
                         println!("[reload] signalled {n} runtime(s)");
                         msg_id += 1;

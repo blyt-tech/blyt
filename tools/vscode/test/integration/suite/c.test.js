@@ -12,6 +12,7 @@ const { assert } = h;
 const C = 'src/game/c/hello.c';
 const BP_SNPRINTF = 34; // snprintf(buf, ...)   (x,y already assigned)
 const BP_DEBUG = 35; // blyt_console_debug(buf)
+const BP_INIT = 10; // s_frame = 0;  (blyt_cart_init body — runs once per boot)
 
 describe('C cart (native debug)', () => {
 	afterEach(async () => h.reset());
@@ -90,5 +91,50 @@ describe('C cart (native debug)', () => {
 			BP_DEBUG,
 			'next stop is the newly added breakpoint, not the removed one',
 		);
+	});
+
+	/* Issue #119 acceptance criteria 1+5: a native debug session survives a hot
+	 * reload, and an init() breakpoint rebinds and re-fires on the rebuilt code
+	 * — the user never re-launches.  init() runs once per boot, so its
+	 * breakpoint re-firing proves the cart rebooted AND the breakpoint rebound
+	 * across the reload (new guest base, fresh DWARF). */
+	it('rebinds an init() breakpoint across a hot reload', async () => {
+		const wf = h.folder('hello-c');
+		const uri = h.fileUri(wf, C);
+		h.addBreakpoint(uri, BP_INIT);
+		await h.startNative(wf);
+
+		const session = await h.waitForSession(
+			h.byMode('gdb'),
+			'gdb (native) session',
+		);
+
+		/* The breakpoint binds at attach and fires when init() runs at boot. */
+		const stop1 = await h.waitStopped(session, 'initial init() stop');
+		assert.strictEqual(stop1.body.reason, 'breakpoint');
+		const f1 = await h.topFrame(session, stop1.body.threadId);
+		assert.strictEqual(f1.line, BP_INIT);
+		assert.strictEqual(f1.name, 'blyt_cart_init');
+		await h.cont(session, stop1.body.threadId);
+
+		/* Edit + save → `blyt debug` watcher rebuilds → dev-control `reload` →
+		 * blytdebug two-phase solib swap + cart reboot.  The proxy auto-continues
+		 * the solib-swap (SIGTRAP) stops; the re-fired init() breakpoint surfaces
+		 * as reason 'breakpoint' at the new base.  Generous wait covers the
+		 * rebuild + swap. */
+		h.touchRebuild(uri);
+		const stop2 = await h.waitStopped(
+			session,
+			'post-reload init() stop',
+			60000,
+		);
+		assert.strictEqual(stop2.body.reason, 'breakpoint');
+		const f2 = await h.topFrame(session, stop2.body.threadId);
+		assert.strictEqual(
+			f2.line,
+			BP_INIT,
+			'init() breakpoint re-fired after the reload',
+		);
+		assert.strictEqual(f2.name, 'blyt_cart_init');
 	});
 });

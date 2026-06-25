@@ -347,4 +347,30 @@ void blyt_cart_draw(void)   {}
         out.contains("swap-ok"),
         "swap did not complete with the VM persisted; output: {out}"
     );
+
+    // Issue #119: a debug reload re-maps the cart at a FRESH guest base each
+    // time.  Re-run the same swap at a non-zero base (BLYT_SWAP_BASE) — this
+    // exercises the runtime re-resolving the runtime libs' references back into
+    // the cart (libblytcommon's blyt_main → blyt_cart_init/update/draw), which a
+    // same-base swap leaves coincidentally valid.  Without that re-resolution the
+    // re-booted cart jumps into freed memory at the old base.
+    let out2 = Command::new(test_session_api())
+        .args([
+            "swap",
+            v1.to_str().unwrap(),
+            v2.to_str().unwrap(),
+            sdk_dir().join("lib").to_str().unwrap(),
+        ])
+        .env("BLYT_SWAP_BASE", "0x05000000")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out2 = String::from_utf8_lossy(&out2);
+    assert!(
+        out2.contains("swap-v2-init") && out2.contains("swap-ok"),
+        "fresh-base swap (BLYT_SWAP_BASE) did not boot v2 cleanly — runtime-lib \
+         references into the cart were not re-resolved; output: {out2}"
+    );
 }

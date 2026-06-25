@@ -13,6 +13,7 @@
 
 const vscode = require('vscode');
 const path = require('node:path');
+const fs = require('node:fs');
 const assert = require('node:assert');
 
 /* session.id -> { session, stops: [], stopWaiters: [], terminated } */
@@ -321,6 +322,22 @@ function waitBreakpointBound(session, line, timeoutMs = 30000) {
 	});
 }
 
+/* Trigger a reload-while-debugging cycle by editing a C source on disk: append a
+ * unique `used,retain` global so the `blyt debug` file watcher sees a real change
+ * and the rebuild produces a byte-distinct ELF (new content hash → lldb re-reads
+ * the DWARF instead of caching), WITHOUT shifting any existing line numbers.  The
+ * watcher rebuilds, signals the dev-control hub's `reload`, and blytdebug does the
+ * two-phase solib swap + reboots the cart (issue #119).  Each call appends a
+ * distinct marker so repeated reloads stay byte-distinct. */
+let reloadMarkerSeq = 0;
+function touchRebuild(uri) {
+	reloadMarkerSeq += 1;
+	const marker =
+		`\n__attribute__((used, retain)) static volatile int ` +
+		`blyt_reload_marker_${reloadMarkerSeq} = ${reloadMarkerSeq};\n`;
+	fs.appendFileSync(uri.fsPath, marker);
+}
+
 /* Stop everything and clear breakpoints between tests. */
 async function reset() {
 	try {
@@ -353,6 +370,7 @@ module.exports = {
 	cont,
 	breakpointResultsFor,
 	waitBreakpointBound,
+	touchRebuild,
 	reset,
 	assert,
 };

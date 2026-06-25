@@ -33,7 +33,7 @@ Module._load = function (request, ...rest) {
 };
 
 const { _test } = require('../extension.js');
-const { sdkDir, traceChannels, debugCartPath } = _test;
+const { sdkDir, traceChannels, debugCartPath, debugStubPath } = _test;
 
 /* Reset config + the env var each helper reads to a known clean state. */
 function reset() {
@@ -112,4 +112,20 @@ test('debugCartPath only touches a trailing .blyt extension', () => {
 		debugCartPath(path.join('a.blyt', 'hello.blyt')),
 		path.join('a.blyt', 'hello.dbg.blyt'),
 	);
+});
+
+/* ── debugStubPath (issue #119) ───────────────────────────────────────────── */
+
+test('debugStubPath points at the SDK debug stub ELF', () => {
+	reset();
+	settings.sdkDir = '/sdk';
+	assert.strictEqual(
+		debugStubPath(),
+		path.join('/sdk', 'lib', 'debug', 'blyt-debug-stub.elf'),
+	);
+});
+
+test('debugStubPath returns empty when the SDK is not configured', () => {
+	reset();
+	assert.strictEqual(debugStubPath(), '');
 });

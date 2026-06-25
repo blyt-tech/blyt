@@ -53,8 +53,20 @@ describe('Hybrid Lua+C cart (native debug)', () => {
 				assert.ok((f.source?.path || '').endsWith('main.lua'));
 				const v = await h.locals(lua, f.id);
 				assert.strictEqual(v.slot, '0');
-				assert.strictEqual(v.x, '161');
-				assert.strictEqual(v.y, '121');
+				/* The first update() hit lands on whichever 10-frame tick the Lua
+				 * breakpoint was armed by — frame 10 (x=161) on a fast host, but a
+				 * slow CI runner can run a tick before the async bp-arm completes
+				 * and first stop at frame 20 (x=162).  That is a debugger
+				 * arming-vs-frame-loop race, NOT a cart-determinism issue, so assert
+				 * the player position is COHERENT for some such tick (x and y
+				 * advance together from 160,120) rather than pinning the exact
+				 * frame. */
+				const x = parseInt(v.x, 10);
+				const y = parseInt(v.y, 10);
+				assert.ok(
+					x >= 161 && y === x - 40,
+					`coherent player pos at first update hit (x=${v.x}, y=${v.y})`,
+				);
 				luaOk = true;
 				await h.cont(lua, ev.body.threadId);
 			} else {
@@ -116,4 +128,15 @@ describe('Hybrid Lua+C cart (native debug)', () => {
 			}
 		}
 	});
+
+	/* Hybrid reload-while-debugging (issue #119 criteria 4+5 — both Lua and native
+	 * init breakpoints re-fire after a hot reload) is covered by the Rust
+	 * integration test `sdl_hybrid_lldb_dap_reload_fires_both_init_breakpoints`
+	 * (tests/integration/tests/lldb_dap.rs), which drives the same dual-client
+	 * reload deterministically without an Electron window.  A VS Code-level hybrid
+	 * reload test was tried here but proved too fragile under xvfb on slow CI
+	 * runners (a third hybrid session in one window racing the prior sessions'
+	 * teardown), so it was dropped in favour of that reliable coverage.  The
+	 * extension's reload path itself is exercised by the C-native reload test in
+	 * c.test.js. */
 });

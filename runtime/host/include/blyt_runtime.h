@@ -220,6 +220,27 @@ bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart);
 bool blyt_session_swap_cart(blyt_session_t *session, const blyt_cart_t *new_cart,
                             uint32_t load_base, const char *reported_path);
 
+/* Guest load base for the next debug hot reload (issue #119): a fresh slot the
+ * cart is not currently mapped at, so the swap relocates it (and lldb, seeing a
+ * new base + unique path, re-reads the rebuilt DWARF).  Pass to
+ * blyt_session_swap_cart as load_base on a reload-while-debugging. */
+uint32_t blyt_session_next_reload_base(const blyt_session_t *session);
+
+/* Announce a just-swapped cart to the attached debugger (issue #119) so lldb
+ * re-reads the rebuilt cart's DWARF and rebinds breakpoints to the new
+ * addresses — a single clean location, no stale module.  Call AFTER
+ * blyt_session_swap_cart with the SAME new_cart/load_base/reported_path.
+ *
+ * Performs a two-phase shared-library swap that mirrors a dlopen-then-dlclose
+ * rendezvous: (1) announce the rebuilt cart as a NEW library (fresh base +
+ * unique path) so lldb loads it and re-resolves breakpoints onto the new code,
+ * then (2) drop the previous cart library so its stale location is removed —
+ * leaving exactly one location per breakpoint.  A single combined event makes
+ * lldb unload the old module without loading the new one, so the two phases are
+ * sequenced via the client's library-list reads.  No-op when GDB is inactive. */
+void blyt_session_gdb_notify_cart_reloaded(blyt_session_t *session, const blyt_cart_t *new_cart,
+                                           uint32_t load_base, const char *reported_path);
+
 /* Opaque identity of the underlying rv32 VM.  Stable for the life of a session
  * and across blyt_session_swap_cart (which reuses the VM); a freshly created
  * session has a different id.  For tests/introspection only. */
@@ -406,6 +427,19 @@ int blyt_session_gdb_wait_attached(blyt_session_t *s);
  * initial-halt state.
  */
 void blyt_session_gdb_continue_initial_halt(blyt_session_t *s);
+
+/*
+ * Block until the GDB client has finished its initial configuration (fetched the
+ * library list, inserted its breakpoints, and issued its first vCont;c) so a
+ * native breakpoint's ebreak is patched in before any cart code runs (issue
+ * #119).  Used by the hybrid gate in place of immediately force-clearing the
+ * initial halt: an early native call would otherwise cache a translated block
+ * with no ebreak that the later insertion never re-translates (rv32emu single-VM
+ * block cache, cf. #42).  Returns 1 once the client has continued, 0 on timeout
+ * (the caller should then force-clear the halt so boot cannot wedge).  No-op /
+ * returns 0 when BLYT_GDB is not compiled in or on WASM (async transport).
+ */
+int blyt_session_gdb_wait_client_continue(blyt_session_t *s);
 
 /* --- --reset-every-frame cycle (save-state stress testing) ---------------- */
 
