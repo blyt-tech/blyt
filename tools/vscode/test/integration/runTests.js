@@ -19,8 +19,9 @@
  * exercises the extension's session orchestration — not just the runtime.
  *
  * NOTE: native debug sessions open an SDL2 window (the extension does not pass
- * --headless in native mode), so this currently needs a display. On CI that
- * means wrapping the run in xvfb-run; see test/integration/README.md.
+ * --headless in native mode), so this currently needs a display. On Linux that
+ * means wrapping the run in xvfb-run; the `test-vscode` cmake target does this
+ * automatically. See test/integration/README.md.
  */
 
 const path = require('node:path');
@@ -46,6 +47,24 @@ function fail(msg) {
 	process.exit(1);
 }
 
+/* BLYT_IT_CART narrows the run to a single cart window (parity with the cargo
+ * suites' BLYT_TEST_FILTER). Matches against the cart dir, the spec filename, or
+ * the `dir/spec` pair — whichever the caller finds convenient. */
+function selectCarts(carts) {
+	const sel = process.env.BLYT_IT_CART;
+	if (!sel) return carts;
+	const filtered = carts.filter(
+		({ dir, spec }) =>
+			dir === sel || spec === sel || `${dir}/${spec}`.includes(sel),
+	);
+	if (filtered.length === 0)
+		fail(
+			`BLYT_IT_CART=${sel} matched no cart (have: ` +
+				`${carts.map((c) => `${c.dir}/${c.spec}`).join(', ')})`,
+		);
+	return filtered;
+}
+
 async function main() {
 	const extensionDevelopmentPath = path.resolve(__dirname, '..', '..');
 	const extensionTestsPath = path.resolve(__dirname, 'suite', 'index.js');
@@ -63,8 +82,13 @@ async function main() {
 
 	const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'blyt-vscode-it-'));
 
+	/* BLYT_VSCODE_TEST_CACHE redirects the @vscode/test-electron download cache
+	 * (default: <package>/.vscode-test). The test-linux-docker leg points it at a
+	 * named volume so the pinned VS Code build is not re-downloaded every run. */
+	const cachePath = process.env.BLYT_VSCODE_TEST_CACHE || undefined;
+
 	let anyFailed = false;
-	for (const { dir, spec } of CARTS) {
+	for (const { dir, spec } of selectCarts(CARTS)) {
 		/* Each cart is its own single-folder workspace. Copy (minus build/) and
 		 * build --debug; the extension rebuilds incrementally in-session. */
 		const src = path.join(repoRoot, 'examples', dir);
@@ -88,6 +112,7 @@ async function main() {
 		try {
 			await runTests({
 				version: VSCODE_VERSION,
+				cachePath,
 				extensionDevelopmentPath,
 				extensionTestsPath,
 				launchArgs: [
@@ -97,6 +122,16 @@ async function main() {
 					'--disable-workspace-trust',
 					'--disable-gpu',
 					'--no-cached-data',
+					/* The WASM-debug leg runs the cart's frame loop (requestAnimationFrame)
+					 * inside a VS Code webview. Chromium throttles rAF and timers in
+					 * renderers it considers backgrounded/occluded — which a headless,
+					 * unfocused test window often is — so the cart stalls before frame 10
+					 * and the breakpoint never hits (a 120s timeout, not a 2–20s stop).
+					 * Disable that throttling so the loop advances deterministically
+					 * regardless of window focus. */
+					'--disable-background-timer-throttling',
+					'--disable-renderer-backgrounding',
+					'--disable-backgrounding-occluded-windows',
 				],
 				extensionTestsEnv: {
 					BLYT_SDK_DIR: sdkDir,
@@ -111,9 +146,31 @@ async function main() {
 				`[runTests] ${dir} (${spec}) failed: ${err?.message ? err.message : err}`,
 			);
 		}
+
+		/* Reap the cart's `blyt debug` dev-server, if it outlived its window.
+		 * The extension kills it on session terminate / deactivate, but
+		 * @vscode/test-electron tears the window down at end-of-run, and a
+		 * non-detached grandchild can outlive that exit and orphan (holding
+		 * ports + spinning the cart loop). Keying the kill on this run's unique
+		 * tmpRoot makes it unambiguously our own process — never a developer's
+		 * real session. Best-effort; unix-only (the suite runs on macOS/Linux).
+		 * The proper fix lives extension-side (kill the dev-server even on abrupt
+		 * window teardown) — tracked in #142; this reaper goes away once that
+		 * lands. */
+		reapDevServers(tmpRoot);
 	}
 
 	if (anyFailed) fail('one or more cart windows had failing tests');
+}
+
+/* Kill any lingering process whose command line references `marker` (this run's
+ * throwaway workspace root). Silent if pkill is absent or matches nothing. */
+function reapDevServers(marker) {
+	try {
+		cp.spawnSync('pkill', ['-f', marker], { stdio: 'ignore' });
+	} catch {
+		/* no pkill (non-unix) — nothing to do */
+	}
 }
 
 main();

@@ -1121,9 +1121,17 @@ add_custom_target(wasm_test_deps
 # VS Code extension dependencies. tools/vscode ships its own package.json and a
 # gitignored node_modules; the extension's unit tests (node --test) and a manual
 # debug session both need it installed, and a fresh worktree has neither.
+#
+# `npm install` only runs when tools/vscode is writable. Inside
+# test-linux-docker the repo is mounted read-only and npm would fail with EROFS
+# writing package-lock.json — there the container reuses the host's node_modules
+# (the host runs this target first, since test-linux-docker depends on it). The
+# stamp itself lives under the writable build dir, so it can always be touched.
 add_custom_command(
   OUTPUT "${CMAKE_BINARY_DIR}/npm-install-vscode-ext.stamp"
-  COMMAND npm install
+  COMMAND
+    sh -c
+    "if [ -w . ]; then npm install; else echo 'tools/vscode is read-only (container ro mount) — reusing existing node_modules'; fi"
   COMMAND "${CMAKE_COMMAND}" -E touch
           "${CMAKE_BINARY_DIR}/npm-install-vscode-ext.stamp"
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/tools/vscode"
@@ -1223,6 +1231,60 @@ add_custom_target(
   COMMENT "Running Rust integration tests (cargo nextest -p integration)")
 add_dependencies(test-integration sdk)
 
+# ── test-vscode ───────────────────────────────────────────────────────────────
+# Run the VS Code extension tests against this worktree's freshly-built SDK: 1.
+# extension unit tests   (node --test — cart-detection + proxy logic; cheap,
+# display-free, SDK-free), then 2. the headless debugger integration suite
+# (test/integration/runTests.js), which drives real blyt debug sessions through
+# the extension in a headless VS Code. This is the cross-platform leg we most
+# need to reproduce locally (breakpoint-verify ordering, native-vs-companion-Lua
+# launch timing).
+#
+# The integration suite needs a display: blytdebug opens an SDL2 window (no
+# --headless in native mode) and @vscode/test-electron launches a real Electron
+# app. On Linux we wrap it in xvfb-run when available; on macOS it runs against
+# the real display (a few windows flicker open and closed). The pinned VS Code
+# build is downloaded on first run into tools/vscode/.vscode-test (override with
+# BLYT_VSCODE_TEST_CACHE — the Linux Docker leg points this at a cache volume).
+#
+# Usage: cmake --build build --target test-vscode Narrowing (parity with
+# BLYT_TEST_FILTER): cmake -DBLYT_VSCODE_GREP=<mocha name regex> -B build   #
+# narrow test names cmake -DBLYT_VSCODE_CART=<cart dir|spec>    -B build   # one
+# cart window cmake --build build --target test-vscode
+#
+set(BLYT_VSCODE_GREP
+    ""
+    CACHE STRING "Mocha grep for test-vscode integration suite (BLYT_IT_GREP)")
+set(BLYT_VSCODE_CART
+    ""
+    CACHE STRING
+          "Cart selector for test-vscode integration suite (BLYT_IT_CART)")
+find_program(_BLYT_XVFB_RUN xvfb-run HINTS /usr/bin /usr/local/bin NO_CACHE)
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND _BLYT_XVFB_RUN)
+  set(_blyt_vscode_it_wrap "${_BLYT_XVFB_RUN}" -a)
+else()
+  set(_blyt_vscode_it_wrap)
+endif()
+add_custom_target(
+  test-vscode
+  COMMAND npm test
+  COMMAND
+    ${_blyt_vscode_it_wrap} ${CMAKE_COMMAND} -E env
+    BLYT_SDK_DIR=${CMAKE_BINARY_DIR}/sdk BLYT_IT_GREP=${BLYT_VSCODE_GREP}
+    BLYT_IT_CART=${BLYT_VSCODE_CART} npm run test:integration
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools/vscode
+  USES_TERMINAL VERBATIM
+  COMMENT
+    "Running VS Code extension unit tests + headless debugger integration suite"
+)
+add_dependencies(test-vscode sdk vscode_ext_deps)
+
+# Fold the VS Code suite into the standard local integration flow: building
+# test-integration runs test-vscode first (it is a dependency), so the one
+# documented "run integration tests locally" command covers the VS Code debugger
+# suite too. (Defined here, after test-vscode exists.)
+add_dependencies(test-integration test-vscode)
+
 # ── test-prereqs ──────────────────────────────────────────────────────────────
 # Build/install everything the test suites need, so a fresh worktree does not
 # silently skip (or fail) the wasm, native-QEMU, or VS Code legs. Aggregates the
@@ -1282,6 +1344,15 @@ set(BLYT_LINUX_ARCH
     "amd64"
     CACHE STRING
           "Docker target architecture for test-linux-docker (amd64 or arm64)")
+# Opt out of the VS Code debugger integration leg inside the container (e.g.
+# when iterating on a Rust-only failure). The cargo suite still runs.
+option(BLYT_SKIP_VSCODE "Skip the VS Code suite in test-linux-docker" OFF)
+if(BLYT_SKIP_VSCODE)
+  set(_blyt_docker_vscode
+      "echo '[test-linux-docker] BLYT_SKIP_VSCODE=1 — skipping VS Code suite'")
+else()
+  set(_blyt_docker_vscode "cmake --build /build --target test-vscode")
+endif()
 find_program(
   _BLYT_DOCKER docker
   HINTS /usr/local/bin /opt/homebrew/bin /usr/bin NO_CACHE
@@ -1294,8 +1365,13 @@ if(_BLYT_DOCKER)
       blyt-testing-${BLYT_LINUX_ARCH} -f
       "${CMAKE_SOURCE_DIR}/Dockerfile.testing" "${CMAKE_SOURCE_DIR}"
     COMMAND
-      /usr/bin/env docker run --platform linux/${BLYT_LINUX_ARCH} --rm -v
-      "${CMAKE_SOURCE_DIR}:/repo:ro" -v
+      # --shm-size: the default 64 MB /dev/shm is too small for the VS Code
+      # debugger suite's Electron renderers — a webview (wasm leg) or multiple
+      # debug sessions (hybrid leg) exhaust it and the renderer dies with
+      # "renderer process gone (reason: crashed, code: 5)". 2 GB matches what a
+      # CI runner provides.
+      /usr/bin/env docker run --platform linux/${BLYT_LINUX_ARCH} --rm
+      --shm-size=2g -v "${CMAKE_SOURCE_DIR}:/repo:ro" -v
       blyt-linux-build-${BLYT_LINUX_ARCH}:/build
       # Compiler caches live in their own volume so wiping the build volume (the
       # usual reset) keeps them; ccache/sccache are picked up automatically by
@@ -1306,12 +1382,23 @@ if(_BLYT_DOCKER)
       # re-downloaded on every docker run (mirrors the CI actions/cache).
       -v
       "blyt-fetchcontent-cache-${BLYT_LINUX_ARCH}:/root/.cache/blyt/fetchcontent"
+      # VS Code build cache: the pinned @vscode/test-electron download persisted
+      # in a named volume so test-vscode does not re-download VS Code every run
+      # (mirrors the CI actions/cache keyed on VSCODE_VERSION). The JS modules
+      # are resolved from the mounted repo's tools/vscode/node_modules
+      # (installed on the host by vscode_ext_deps, a dependency of this target).
+      -v "blyt-vscode-test-cache-${BLYT_LINUX_ARCH}:/vscode-test-cache" -e
+      BLYT_VSCODE_TEST_CACHE=/vscode-test-cache
       # The native RISC-V QEMU gate is host-independent and would run nested
       # under Rosetta here; skip it in the Docker image (runs natively + in CI).
       -e BLYT_SKIP_QEMU_GATE=1 blyt-testing-${BLYT_LINUX_ARCH} bash -c
-      "source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1; set -e && cmake -B /build -G Ninja -DBLYT_BUILD_NATIVE=OFF /repo && cmake --build /build --parallel && cmake --build /build --target sdk && BLYT_BUILD_DIR=/build CARGO_HOME=/build/cargo-home CARGO_TARGET_DIR=/build/cargo-target cargo test --workspace -- ${BLYT_LINUX_TEST_FILTER} --nocapture"
+      "source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1; set -e && cmake -B /build -G Ninja -DBLYT_BUILD_NATIVE=OFF /repo && cmake --build /build --parallel && cmake --build /build --target sdk && BLYT_BUILD_DIR=/build CARGO_HOME=/build/cargo-home CARGO_TARGET_DIR=/build/cargo-target cargo test --workspace -- ${BLYT_LINUX_TEST_FILTER} --nocapture && ${_blyt_docker_vscode}"
     COMMENT "Building and running integration tests in Linux Docker container"
     USES_TERMINAL VERBATIM)
+  # node_modules is gitignored and the repo is mounted read-only, so the
+  # in-container VS Code suite reuses the host's install (mirrors the Playwright
+  # JS-from-host / binary-in-cache split). Ensure it exists on the host.
+  add_dependencies(test-linux-docker vscode_ext_deps)
 else()
   add_custom_target(
     test-linux-docker
