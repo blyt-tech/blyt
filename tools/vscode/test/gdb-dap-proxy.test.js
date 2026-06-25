@@ -166,3 +166,75 @@ test('non-.lua setBreakpoints is forwarded to lldb, not fabricated', async () =>
 		'no response is fabricated for non-.lua sources',
 	);
 });
+
+/* ── reload-window auto-continue (issue #119) ─────────────────────────────────
+ * A reload's two-phase solib swap surfaces to lldb as reason "exception" /
+ * "signal SIGTRAP" stops.  Within the reload window the proxy must auto-continue
+ * these transparently; real user breakpoints, and any stop after the window,
+ * must pass through.  shouldAutoContinueStop is the pure decision the proxy uses
+ * in _drain. */
+
+const stoppedEv = (body) => ({ type: 'event', event: 'stopped', body });
+
+test('exception/SIGTRAP stop within the reload window is auto-continued', () => {
+	const until = 1000;
+	assert.strictEqual(
+		BlytGdbDapProxy.shouldAutoContinueStop(
+			stoppedEv({ reason: 'exception', description: 'signal SIGTRAP' }),
+			500,
+			until,
+		),
+		true,
+	);
+	/* reason "exception" alone (no description) also counts. */
+	assert.strictEqual(
+		BlytGdbDapProxy.shouldAutoContinueStop(
+			stoppedEv({ reason: 'exception' }),
+			500,
+			until,
+		),
+		true,
+	);
+});
+
+test('a real breakpoint stop within the window passes through', () => {
+	assert.strictEqual(
+		BlytGdbDapProxy.shouldAutoContinueStop(
+			stoppedEv({ reason: 'breakpoint' }),
+			500,
+			1000,
+		),
+		false,
+	);
+});
+
+test('an exception stop after the window passes through', () => {
+	assert.strictEqual(
+		BlytGdbDapProxy.shouldAutoContinueStop(
+			stoppedEv({ reason: 'exception', description: 'signal SIGTRAP' }),
+			1500,
+			1000,
+		),
+		false,
+	);
+	/* No reload yet (window = 0) → never auto-continue. */
+	assert.strictEqual(
+		BlytGdbDapProxy.shouldAutoContinueStop(
+			stoppedEv({ reason: 'exception' }),
+			1,
+			0,
+		),
+		false,
+	);
+});
+
+test('non-stopped events are never auto-continued', () => {
+	assert.strictEqual(
+		BlytGdbDapProxy.shouldAutoContinueStop(
+			{ type: 'event', event: 'output', body: {} },
+			500,
+			1000,
+		),
+		false,
+	);
+});

@@ -1,5 +1,6 @@
 const vscode = require('vscode');
 const cp = require('node:child_process');
+const net = require('node:net');
 const path = require('node:path');
 const fs = require('node:fs');
 const yaml = require('js-yaml');
@@ -153,6 +154,17 @@ function localizeCartPath(p, cwd) {
  * load (ADR-0129).  Only a trailing `.blyt` is rewritten. */
 function debugCartPath(cart) {
 	return cart.replace(/\.blyt$/, '.dbg.blyt');
+}
+
+/* lldb-dap's `program` for a native/hybrid debug session (issue #119): a minimal
+ * stub ELF (`<sdk>/lib/debug/blyt-debug-stub.elf`), NOT the cart.  The cart is
+ * presented purely as a shared library (the runtime's svr4 list) and never as the
+ * main executable, so it can be cleanly unloaded/reloaded across a hot reload
+ * without leaving a stale duplicate breakpoint location.  Returns '' if the SDK
+ * is not configured. */
+function debugStubPath() {
+	const sdk = sdkDir();
+	return sdk ? path.join(sdk, 'lib', 'debug', 'blyt-debug-stub.elf') : '';
 }
 
 /* BLYT_TRACE channels for debug sessions, passed as a --trace parameter to
@@ -521,16 +533,21 @@ function startBlytRunSimple(cartPath, cwd, output) {
 	});
 }
 
-/* Spawns `blytdebug --gdb 0 <cartPath>` (native cart) or
- * `blytdebug --debug 0 <cartPath>` (Lua cart) and resolves once the process
- * announces a debug port on stdout.  SDK binaries locate their own lib dir
- * relative to themselves so no BLYT_LIB_DIR is needed. */
-function startNativeDebug(cartPath, cwd, output, isLua) {
+/* Spawns `blytdebug --gdb 0 <target>` (native cart) or
+ * `blytdebug --debug 0 <target>` (Lua cart) and resolves once the process
+ * announces a debug port on stdout.  `target` may be a cart file or a project
+ * dir (blytdebug derives build/.dbg.elf from a dir).  When `devCtrlPort` is set,
+ * blytdebug dials the devtool's dev-control hub (`--dev-ctrl-connect`) so a
+ * watcher-driven rebuild hot-reloads the live debug session (issue #119).  SDK
+ * binaries locate their own lib dir relative to themselves so no BLYT_LIB_DIR is
+ * needed. */
+function startNativeDebug(target, cwd, output, isLua, devCtrlPort) {
 	const blytdebug = findSdkBin('blytdebug');
 	if (!blytdebug)
 		return Promise.reject(new Error('blytdebug not found in SDK'));
 	const flag = isLua ? '--debug' : '--gdb';
-	const args = [flag, '0', cartPath];
+	const args = [flag, '0', target];
+	if (devCtrlPort) args.unshift('--dev-ctrl-connect', String(devCtrlPort));
 	const trace = traceChannels();
 	if (trace) args.unshift(`--trace=${trace}`);
 	return new Promise((resolve, reject) => {
@@ -590,14 +607,19 @@ function startNativeDebug(cartPath, cwd, output, isLua) {
 	});
 }
 
-/* Spawns `blytdebug --debug 0 --gdb 0 <cartPath>` for hybrid Lua+native carts
+/* Spawns `blytdebug --debug 0 --gdb 0 <target>` for hybrid Lua+native carts
  * and resolves once BOTH the DAP port (Lua) and GDB port (native) are announced.
- * The caller starts two debug sessions that share this process. */
-function startHybridNativeDebug(cartPath, cwd, output) {
+ * `target` may be a cart file or a project dir.  When `devCtrlPort` is set,
+ * blytdebug dials the devtool's dev-control hub (`--dev-ctrl-connect`) for
+ * reload-while-debugging (issue #119).  The caller starts two debug sessions
+ * that share this process. */
+function startHybridNativeDebug(target, cwd, output, devCtrlPort) {
 	const blytdebug = findSdkBin('blytdebug');
 	if (!blytdebug)
 		return Promise.reject(new Error('blytdebug not found in SDK'));
-	const hybridArgs = ['--debug', '0', '--gdb', '0', cartPath];
+	const hybridArgs = ['--debug', '0', '--gdb', '0', target];
+	if (devCtrlPort)
+		hybridArgs.unshift('--dev-ctrl-connect', String(devCtrlPort));
 	const hybridTrace = traceChannels();
 	if (hybridTrace) hybridArgs.unshift(`--trace=${hybridTrace}`);
 	return new Promise((resolve, reject) => {
@@ -801,11 +823,33 @@ async function autoSetupVscode(output) {
  *     object entirely; the subsequent setBreakpoints creates a fresh one,
  *     clearing the stale stop-reason reference. */
 class BlytGdbDapProxy {
-	constructor(lldbDapBin) {
+	/* Window (ms) after a `reload` broadcast during which lldb's library-change
+	 * stops are auto-continued transparently.  Generous enough to cover the
+	 * two-phase solib swap (publish + wait, ~3 s each) plus the post-reload
+	 * init() frame, then normal stop handling resumes. */
+	static RELOAD_WINDOW_MS = 12000;
+
+	/* True if `msg` is a stopped event that should be auto-continued because it
+	 * is a reload's solib-swap stop (lldb reports these as reason "exception" /
+	 * "signal SIGTRAP") and we are still within the reload window.  Real user
+	 * breakpoints (reason "breakpoint") always pass through.  Pure decision so
+	 * it can be unit-tested without a live lldb-dap. */
+	static shouldAutoContinueStop(msg, now, reloadWindowUntil) {
+		if (msg?.type !== 'event' || msg.event !== 'stopped') return false;
+		if (now > reloadWindowUntil) return false;
+		const reason = msg.body?.reason;
+		const desc = msg.body?.description || '';
+		return reason === 'exception' || /sigtrap|signal/i.test(desc);
+	}
+
+	constructor(lldbDapBin, devCtrlPort) {
 		this._lldbSeq = 0;
 		this._vsSeq = 0;
 		this._pending = new Map();
 		this._buf = Buffer.alloc(0);
+		/* End of the current reload auto-continue window (epoch ms); 0 = none. */
+		this._reloadWindowUntil = 0;
+		this._devCtrlSock = null;
 
 		/* VS Code's DebugAdapterInlineImplementation requires the DebugAdapter
 		 * interface: onDidSendMessage must be a vscode.Event<T>, not a plain
@@ -821,6 +865,35 @@ class BlytGdbDapProxy {
 			this._drain();
 		});
 		this._proc.stderr.on('data', () => {});
+
+		/* Observe the devtool's dev-control hub (issue #119): on each `reload`
+		 * broadcast, open an auto-continue window so the reload's solib-swap
+		 * stops are continued transparently rather than surfacing to the user as
+		 * spurious SIGTRAP halts.  The player also dials this hub to perform the
+		 * actual in-VM cart swap; we are a passive observer. */
+		if (devCtrlPort) this._watchDevCtrl(devCtrlPort);
+	}
+
+	_watchDevCtrl(port) {
+		const sock = net.connect(port, '127.0.0.1');
+		this._devCtrlSock = sock;
+		let buf = '';
+		sock.on('data', (d) => {
+			buf += d.toString();
+			let nl;
+			while ((nl = buf.indexOf('\n')) >= 0) {
+				const line = buf.slice(0, nl);
+				buf = buf.slice(nl + 1);
+				try {
+					if (JSON.parse(line).cmd === 'reload')
+						this._reloadWindowUntil =
+							Date.now() + BlytGdbDapProxy.RELOAD_WINDOW_MS;
+				} catch (_) {
+					/* non-JSON / partial — ignore */
+				}
+			}
+		});
+		sock.on('error', () => {}); /* hub may close on session end */
 	}
 
 	_drain() {
@@ -858,6 +931,18 @@ class BlytGdbDapProxy {
 					this._pending.delete(msg.request_seq);
 					p(msg);
 				}
+			} else if (
+				BlytGdbDapProxy.shouldAutoContinueStop(
+					msg,
+					Date.now(),
+					this._reloadWindowUntil,
+				)
+			) {
+				/* Reload solib-swap stop — continue lldb transparently and do
+				 * NOT surface it to VS Code (issue #119). */
+				this._ask('continue', {
+					threadId: msg.body?.threadId ?? 1,
+				}).catch(() => {});
 			} else {
 				this._emitter.fire(msg);
 			}
@@ -959,6 +1044,9 @@ class BlytGdbDapProxy {
 	dispose() {
 		try {
 			this._proc.kill();
+		} catch (_) {}
+		try {
+			this._devCtrlSock?.destroy();
 		} catch (_) {}
 	}
 }
@@ -1113,7 +1201,10 @@ function activate(context) {
 					);
 				if (cfg._blytMode === 'gdb')
 					return new vscode.DebugAdapterInlineImplementation(
-						new BlytGdbDapProxy(findLldbDap()),
+						new BlytGdbDapProxy(
+							findLldbDap(),
+							cfg._blytDevCtrlPort,
+						),
 					);
 				/* 'run' — Run Without Debugging: no relay, just a process wrapper. */
 				return new vscode.DebugAdapterInlineImplementation(
@@ -1184,11 +1275,12 @@ function activate(context) {
 				}
 
 				/* Native (SDL2 window) modes — player (project-dir dev, with
-				 * live reload in run mode) and player-cart (prebuilt cart file, no
-				 * watcher).  No HTTP server, no webview panel.  Debug is
-				 * direct-connect (lldb-dap → GDB) for both; reload is suppressed
-				 * during a native debug session (the seamless reload-while-debugging
-				 * version is the #119 follow-up). */
+				 * live reload) and player-cart (prebuilt cart file, no watcher).
+				 * No HTTP server, no webview panel.  Native/hybrid debug is
+				 * lldb-dap → GDB with seamless reload-while-debugging (#119): a
+				 * `blyt debug <dir>` watcher/hub drives in-VM cart reloads that
+				 * rebind the live lldb session (the cart is a reloadable shared
+				 * library behind a stub `program`). */
 				if (nativeWindow) {
 					if (config.noDebug) {
 						/* player-cart Ctrl+F5: run the prebuilt cart file in an SDL2
@@ -1287,24 +1379,24 @@ function activate(context) {
 						};
 					}
 
-					/* F5: run with blytdebug and connect the IDE debugger. */
-					if (!(await build(cwd, true))) return undefined;
-					const debugCart = debugCartPath(cart);
+					/* F5: connect the IDE debugger to a player (SDL2) window. */
 
-					/* Hybrid cart: spawn blytdebug with both --debug and --gdb, then
-					 * start a companion Lua DAP session programmatically.  The GDB
-					 * (native) session owns the process; the Lua session holds no proc
-					 * reference so terminating Lua alone leaves native running. */
-					if (isHybrid) {
+					/* Pure-Lua native window: direct blytdebug --debug (Lua DAP).
+					 * Lua-only transparent reload-while-debugging is tracked
+					 * separately (#140 — out of #119 scope). */
+					if (isLua) {
+						if (!(await build(cwd, true))) return undefined;
+						const debugCart = debugCartPath(cart);
 						output.appendLine(
-							`\n── blytdebug --debug 0 --gdb 0 ${debugCart}`,
+							`\n── blytdebug --debug 0 ${debugCart}`,
 						);
-						let hybridResult;
+						let luaResult;
 						try {
-							hybridResult = await startHybridNativeDebug(
+							luaResult = await startNativeDebug(
 								debugCart,
 								cwd,
 								output,
+								true,
 							);
 						} catch (e) {
 							vscode.window.showErrorMessage(
@@ -1312,81 +1404,98 @@ function activate(context) {
 							);
 							return undefined;
 						}
-						const {
-							proc: hybridProc,
-							dapPort: hybridDap,
-							gdbPort: hybridGdb,
-						} = hybridResult;
-						const hybridTempId = nextId++;
-						pendingProcs.set(hybridTempId, hybridProc);
-						/* Fire and forget: VS Code resolves the Lua session in parallel.
-						 * _blytPreresolved skips re-detection; no _blytTempId so the
-						 * companion session does not take ownership of the process. */
-						vscode.debug.startDebugging(folder, {
-							type: 'blyt',
-							request: 'launch',
-							name: 'Lua (blyt hybrid)',
-							_blytMode: 'lua',
-							_blytDapPort: hybridDap,
-							sourceMap: sourceMapPairs(cwd).flat(),
-							_blytPreresolved: true,
-						});
-						return {
-							...config,
-							_blytMode: 'gdb',
-							program: debugCart,
-							stopOnEntry: false,
-							launchCommands: [
-								sourceMapCommand(cwd),
-								`gdb-remote 127.0.0.1:${hybridGdb}`,
-							],
-							_blytTempId: hybridTempId,
-						};
-					}
-
-					output.appendLine(
-						`\n── blytdebug ${isLua ? '--debug' : '--gdb'} 0 ${debugCart}`,
-					);
-					let nativeResult;
-					try {
-						nativeResult = await startNativeDebug(
-							debugCart,
-							cwd,
-							output,
-							isLua,
-						);
-					} catch (e) {
-						vscode.window.showErrorMessage(`Blyt: ${e.message}`);
-						return undefined;
-					}
-					const { proc: nativeProc, gdbPort, dapPort } = nativeResult;
-
-					if (isLua) {
-						const tempId = await trackProc(nativeProc, null);
+						const tempId = await trackProc(luaResult.proc, null);
 						return {
 							...config,
 							cart,
 							_blytMode: 'lua',
 							_blytTempId: tempId,
-							_blytDapPort: dapPort,
+							_blytDapPort: luaResult.dapPort,
 							sourceMap: sourceMapPairs(cwd).flat(),
 						};
 					}
 
-					/* Native cart: lldb-dap connects directly to the GDB RSP port.
-					 * No WebSocket relay or "wait for WASM ready" step needed. */
-					const nativeTempId = nextId++;
-					pendingProcs.set(nativeTempId, nativeProc);
+					/* Native (C/Rust/C++) or hybrid: seamless
+					 * reload-while-debugging (#119).  Start `blyt debug <dir>` for
+					 * the file watcher + dev-control hub (its WASM serve is unused
+					 * here; it also builds build/.dbg.elf), then run blytdebug
+					 * dialing that hub (--dev-ctrl-connect) so a watcher-driven
+					 * rebuild hot-reloads the LIVE debug session.  lldb-dap's
+					 * `program` is the stub ELF (the cart is presented as a
+					 * reloadable shared library); the proxy watches the same hub to
+					 * auto-continue the reload's solib-swap stops. */
+					output.appendLine(`\n── blyt debug ${cwd}`);
+					let serveResult;
+					try {
+						serveResult = await startDevtool(cwd, cwd, output);
+					} catch (e) {
+						vscode.window.showErrorMessage(`Blyt: ${e.message}`);
+						return undefined;
+					}
+					const { proc: devtoolProc, devCtrlPort } = serveResult;
+
+					output.appendLine(
+						`\n── blytdebug ${isHybrid ? '--debug 0 ' : ''}--gdb 0` +
+							` --dev-ctrl-connect ${devCtrlPort} ${cwd}`,
+					);
+					let dbgResult;
+					try {
+						dbgResult = isHybrid
+							? await startHybridNativeDebug(
+									cwd,
+									cwd,
+									output,
+									devCtrlPort,
+								)
+							: await startNativeDebug(
+									cwd,
+									cwd,
+									output,
+									false,
+									devCtrlPort,
+								);
+					} catch (e) {
+						vscode.window.showErrorMessage(`Blyt: ${e.message}`);
+						try {
+							devtoolProc.kill();
+						} catch (_) {}
+						return undefined;
+					}
+
+					/* The GDB (native) session owns both processes: the blytdebug
+					 * player and the devtool watcher/hub (aux).  The stop button
+					 * tears both down. */
+					const gdbTempId = nextId++;
+					pendingProcs.set(gdbTempId, dbgResult.proc);
+					pendingAuxProcs.set(gdbTempId, devtoolProc);
+
+					if (isHybrid) {
+						/* Companion Lua DAP session (fire-and-forget): holds no
+						 * proc reference so terminating Lua alone leaves native
+						 * running.  Its source-line breakpoints re-arm host-side
+						 * across a reload, so no dev-control observation needed. */
+						vscode.debug.startDebugging(folder, {
+							type: 'blyt',
+							request: 'launch',
+							name: 'Lua (blyt hybrid)',
+							_blytMode: 'lua',
+							_blytDapPort: dbgResult.dapPort,
+							sourceMap: sourceMapPairs(cwd).flat(),
+							_blytPreresolved: true,
+						});
+					}
+
 					return {
 						...config,
 						_blytMode: 'gdb',
-						program: debugCart,
+						program: debugStubPath(),
 						stopOnEntry: false,
 						launchCommands: [
 							sourceMapCommand(cwd),
-							`gdb-remote 127.0.0.1:${gdbPort}`,
+							`gdb-remote 127.0.0.1:${dbgResult.gdbPort}`,
 						],
-						_blytTempId: nativeTempId,
+						_blytTempId: gdbTempId,
+						_blytDevCtrlPort: devCtrlPort,
 					};
 				}
 
@@ -1459,11 +1568,6 @@ function activate(context) {
 					if (!(await build(cwd, true))) return undefined;
 					launchArg = debugCartPath(cart);
 				}
-				/* The debug cart ELF lldb-dap loads for symbols (native/hybrid
-				 * `program`).  In project-dir mode `blyt debug` builds it
-				 * internally; debugCartPath derives that path from the detected
-				 * release cart either way. */
-				const debugCart = debugCartPath(cart);
 				output.appendLine(`\n── blyt debug ${launchArg}`);
 				let result;
 				try {
@@ -1472,7 +1576,8 @@ function activate(context) {
 					vscode.window.showErrorMessage(`Blyt: ${e.message}`);
 					return undefined;
 				}
-				const { proc, httpPort, dapPort, gdbPort } = result;
+				const { proc, httpPort, dapPort, gdbPort, devCtrlPort } =
+					result;
 
 				/* Lua cart: connect VS Code's DAP client straight to the relay. */
 				if (isLua) {
@@ -1573,7 +1678,9 @@ function activate(context) {
 				if (cartUrl) pendingUrls.set(tempId, cartUrl);
 
 				/* lldb-dap launch config:
-				 *   program        — cart ELF; LLDB auto-detects riscv32 and loads symbols
+				 *   program        — stub ELF (#119), NOT the cart; LLDB detects
+				 *                    riscv32 from it and the cart is a reloadable
+				 *                    shared library via the relay's svr4 list
 				 *   launchCommands — replaces `process launch` with a remote gdb-remote
 				 *                    connection; prevents lldb-dap from trying to exec the
 				 *                    RISC-V binary locally (which fails on macOS/x86).
@@ -1586,13 +1693,14 @@ function activate(context) {
 				return {
 					...config,
 					_blytMode: 'gdb',
-					program: debugCart,
+					program: debugStubPath(),
 					stopOnEntry: false,
 					launchCommands: [
 						sourceMapCommand(cwd),
 						`gdb-remote 127.0.0.1:${gdbPort}`,
 					],
 					_blytTempId: tempId,
+					_blytDevCtrlPort: devCtrlPort,
 				};
 			},
 		}),
@@ -1804,6 +1912,7 @@ module.exports._test = {
 	sourceMapCommand,
 	localizeCartPath,
 	debugCartPath,
+	debugStubPath,
 	sdkDir,
 	traceChannels,
 };
