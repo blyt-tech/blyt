@@ -138,6 +138,19 @@ static bool g_lua_needs_start = false; /* waiting for configurationDone */
  * coroutine.  wasm_lua_loop waits here (returning each tick) until the GDB
  * client sends vCont;c, then clears the flag and resumes the coroutine. */
 static bool g_trampoline_gdb_paused = false;
+
+/* Deferred debug-reload state machine (issue #170).  A hot reload during a live
+ * lldb-dap session cannot re-arm breakpoints or run the reloaded init()
+ * synchronously inside the dev-control ccall: the WASM gdb relay only delivers
+ * packets when the event loop runs, which is blocked for the whole ccall.  So a
+ * debug reload swaps the cart and BEGINS the async two-phase solib re-arm inside
+ * the ccall, then hands off to the main loop — REARM pumps the solib swap each
+ * tick (letting lldb re-read the new DWARF and rebind breakpoints), then
+ * RUN_INIT runs the reloaded init() under the loop (where an init breakpoint can
+ * round-trip) and restores the state snapshot once init completes. */
+typedef enum { RELOAD_NONE = 0, RELOAD_REARM, RELOAD_INIT } reload_phase_t;
+static reload_phase_t g_reload_phase = RELOAD_NONE;
+static blyt_state_snapshot_t *g_reload_snap = NULL;
 #endif
 /* BLYT_LUA_TYPE_* constants — must match blyt.h guest SDK definition. */
 #define WASM_LUA_TYPE_VOID 0
@@ -149,6 +162,15 @@ static bool g_trampoline_gdb_paused = false;
 /* Coroutine body: run init() + on_new_state(), then finish (LUA_OK). */
 static const char co_body_init[] = "init() "
                                    "if type(on_new_state) == 'function' then on_new_state() end";
+
+#ifdef BLYT_GDB
+/* Coroutine body for a debug hot reload (issue #170): run ONLY init() under the
+ * loop's INIT phase (so a Lua init() breakpoint fires under the master hook and
+ * a Lua→native trampoline can yield for a native breakpoint).  No on_new_state()
+ * — the reload preserves state: the loop runs the restore + on_load_state tail
+ * once init() completes, not a fresh-boot reset. */
+static const char co_body_reload_init[] = "init()";
+#endif
 
 /* Coroutine body: per-frame update/draw loop with frame-boundary yield. */
 static const char co_body_running[] = "while not blyt.should_quit() do "
@@ -1256,7 +1278,8 @@ static int wasm_load_lua_bytecode(lua_State *L, const unsigned char *data, size_
  *   ext_snap       — when non-NULL, a snapshot captured by the caller before a
  *                    cart swap (reload); used instead of capturing internally.
  *                    Ownership transfers to this function (it is freed here). */
-static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_snap) {
+static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_snap,
+                             bool defer_init) {
     blyt_state_snapshot_t *snap = ext_snap;
     blyt_state_ctx_t *sctx = active_state_ctx();
 
@@ -1410,6 +1433,32 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
         }
     }
 
+#ifdef BLYT_GDB
+    if (defer_init) {
+        /* Debug hot reload (issue #170): DON'T run init() synchronously here — it
+         * would run outside any coroutine (so a Lua→native trampoline could not
+         * yield for a native GDB breakpoint) and before the DAP master hook is
+         * re-armed (so a Lua init() breakpoint could not fire), which is exactly
+         * why the pre-fix reload reported native=1 lua=0.  Instead set up the
+         * INIT-phase coroutine + master hook and let wasm_lua_loop drive init()
+         * under the loop like a cold boot, so BOTH init breakpoints fire and
+         * round-trip.  The restore + on_load_state(HOT_RELOAD) tail runs once
+         * that init() completes (wasm_lua_reload_restore_tail), so the caller
+         * keeps ownership of the snapshot (g_reload_snap). */
+        g_lua_co = lua_newthread(g_lua);
+        g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
+        luaL_loadstring(g_lua_co, co_body_reload_init);
+#ifdef BLYT_DAP
+        if (fc_master_hook_cfg.dap_enabled)
+            fc_consolelua_master_hook_install(g_lua_co);
+#endif
+        g_lua_phase = LUA_PHASE_INIT;
+        return true;
+    }
+#else
+    (void)defer_init;
+#endif
+
     /* Step 12: call init() from C (no coroutine needed for this reset call) */
     lua_getglobal(g_lua, "init");
     if (lua_isfunction(g_lua, -1)) {
@@ -1471,10 +1520,39 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     return true;
 }
 
+#ifdef BLYT_GDB
+/* Deferred tail of a hybrid debug hot reload (issue #170): once the reloaded
+ * init() has run under wasm_lua_loop's INIT phase (both the Lua and native init
+ * breakpoints having fired), restore the pre-reload state buffers and replay
+ * on_load_state(HOT_RELOAD).  Mirrors wasm_lua_rebuild steps 13-14 — the part
+ * skipped by defer_init so it lands after the deferred init() instead of before
+ * the state existed. */
+static void wasm_lua_reload_restore_tail(void) {
+    if (g_reload_snap) {
+        blyt_state_ctx_restore_snapshot(active_state_ctx(), g_reload_snap);
+        blyt_state_snapshot_free(g_reload_snap);
+        g_reload_snap = NULL;
+    }
+    lua_getglobal(g_lua, "on_load_state");
+    if (lua_isfunction(g_lua, -1)) {
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_load_state");
+        lua_newtable(g_lua);
+        lua_pushinteger(g_lua, 3); /* BLYT_LOAD_HOT_RELOAD */
+        lua_setfield(g_lua, -2, "reason");
+        lua_pushinteger(g_lua, 0);
+        lua_setfield(g_lua, -2, "saved_cart_version");
+        lua_pcall(g_lua, 1, 0, 0);
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_load_state");
+    } else {
+        lua_pop(g_lua, 1);
+    }
+}
+#endif
+
 /* --reset-every-frame stress cycle: rebuild the VM preserving state and replay
  * on_load_state(HOT_RELOAD).  Thin wrapper over the shared rebuild path. */
 static void wasm_lua_reset_cycle(void) {
-    wasm_lua_rebuild(true, NULL);
+    wasm_lua_rebuild(true, NULL, false);
 }
 
 /* -------------------------------------------------------------------------
@@ -1643,7 +1721,7 @@ void blyt_dev_ctrl_command(const char *json) {
             dev_ctrl_respond_err(id, cmd, "reset not supported for carts with native code yet");
             return;
         }
-        if (wasm_lua_rebuild(false, NULL))
+        if (wasm_lua_rebuild(false, NULL, false))
             dev_ctrl_respond_ok(id, cmd);
         else
             dev_ctrl_respond_err(id, cmd, "reset failed");
@@ -1855,7 +1933,22 @@ static void wasm_session_reload(long id) {
             dev_ctrl_respond_err(id, "reload", blyt_cart_err_str(cerr));
             return;
         }
-        if (!blyt_session_swap_cart(g_session, new_cart, 0u, NULL)) {
+
+        /* Debug reload (issue #170): under a live lldb-dap session, re-map the
+         * cart's native module at a FRESH base + host-resolvable path so lldb
+         * re-reads the new DWARF.  In run mode it stays at the native base with
+         * no debugger to notify. */
+        uint32_t base = 0u;
+        char *reported = NULL;
+#ifdef BLYT_GDB
+        bool debug_reload = blyt_session_gdb_is_debugging(g_session);
+        if (debug_reload) {
+            base = blyt_session_next_reload_base(g_session);
+            reported = blyt_js_cart_path(); /* host path lldb opens for DWARF (#144) */
+        }
+#endif
+        if (!blyt_session_swap_cart(g_session, new_cart, base, reported)) {
+            free(reported);
             blyt_cart_close(new_cart);
             if (snap)
                 blyt_state_snapshot_free(snap);
@@ -1868,6 +1961,7 @@ static void wasm_session_reload(long id) {
         size_t bc_size = 0;
         const void *bc = blyt_cart_find_section(g_cart, ".cart.lua", &bc_size);
         if (!bc) {
+            free(reported);
             if (snap)
                 blyt_state_snapshot_free(snap);
             dev_ctrl_respond_err(id, "reload", "reloaded cart has no Lua section");
@@ -1877,10 +1971,37 @@ static void wasm_session_reload(long id) {
         g_lua_bytecode = bc;
         g_lua_bytecode_size = bc_size;
 
-        /* Rebuild host Lua from the new bytecode, restoring the pre-swap snapshot
-         * and replaying on_load_state(HOT_RELOAD).  rebuild() takes ownership of
-         * snap and re-binds the native lifecycle trampolines to the new module. */
-        if (wasm_lua_rebuild(true, snap))
+#ifdef BLYT_GDB
+        if (debug_reload) {
+            if (reported)
+                blyt_session_gdb_set_cart_path(g_session, reported);
+            blyt_session_gdb_reload_notify_begin(g_session, new_cart, base, reported);
+            free(reported);
+            /* Rebuild host Lua from the new bytecode (re-binding the native
+             * lifecycle trampolines to the swapped module) but DEFER init() to
+             * the loop's INIT phase so both init breakpoints fire; the state
+             * restore + on_load_state(HOT_RELOAD) tail runs once that init()
+             * completes.  Hand off to wasm_lua_loop: REARM drives the solib
+             * re-arm, then INIT runs the reloaded init().  On failure rebuild
+             * has already freed snap; on the deferred-success path it leaves
+             * snap untouched, so the restore tail takes ownership below. */
+            if (!wasm_lua_rebuild(true, snap, true /* defer_init */)) {
+                dev_ctrl_respond_err(id, "reload", "rebuild failed");
+                return;
+            }
+            g_reload_snap = snap; /* owned by the deferred restore tail */
+            g_reload_phase = RELOAD_REARM;
+            dev_ctrl_respond_ok(id, "reload");
+            return;
+        }
+        free(reported); /* NULL in run mode; harmless */
+#endif
+
+        /* Run-mode reload: rebuild host Lua from the new bytecode, restoring the
+         * pre-swap snapshot and replaying on_load_state(HOT_RELOAD).  rebuild()
+         * takes ownership of snap and re-binds the native lifecycle trampolines
+         * to the new module. */
+        if (wasm_lua_rebuild(true, snap, false))
             dev_ctrl_respond_ok(id, "reload");
         else
             dev_ctrl_respond_err(id, "reload", "rebuild failed");
@@ -1897,6 +2018,38 @@ static void wasm_session_reload(long id) {
         dev_ctrl_respond_err(id, "reload", blyt_cart_err_str(cerr));
         return;
     }
+
+#ifdef BLYT_GDB
+    /* Debug reload (issue #170): under a live lldb-dap session, re-map the cart
+     * at a FRESH base + host-resolvable path (so lldb re-reads the new DWARF and
+     * rebinds onto the new code) and drive the solib re-arm + reloaded init()
+     * asynchronously under wasm_loop — the synchronous boot+restore below cannot
+     * round-trip the debugger from inside this ccall.  Reply ok now; the loop
+     * carries the reload to completion. */
+    if (blyt_session_gdb_is_debugging(g_session)) {
+        uint32_t base = blyt_session_next_reload_base(g_session);
+        char *reported = blyt_js_cart_path(); /* host path lldb opens for DWARF (#144) */
+        if (!blyt_session_swap_cart(g_session, new_cart, base, reported)) {
+            free(reported);
+            blyt_cart_close(new_cart);
+            blyt_session_snapshot_free(snap);
+            dev_ctrl_respond_err(id, "reload", "cart module swap failed");
+            return;
+        }
+        blyt_cart_close(g_cart);
+        g_cart = new_cart;
+        if (reported)
+            blyt_session_gdb_set_cart_path(g_session, reported);
+        blyt_session_gdb_reload_notify_begin(g_session, new_cart, base, reported);
+        free(reported);
+        g_reload_snap = snap; /* init()+restore run under wasm_loop after re-arm */
+        g_reload_phase = RELOAD_REARM;
+        dev_ctrl_respond_ok(id, "reload");
+        return;
+    }
+#endif
+
+    /* Run-mode reload: same base, synchronous boot + restore (no debugger). */
     if (!blyt_session_swap_cart(g_session, new_cart, 0u, NULL)) {
         blyt_cart_close(new_cart);
         blyt_session_snapshot_free(snap);
@@ -1968,8 +2121,11 @@ void blyt_dev_ctrl_reload_fetched(int ok) {
     g_lua_bytecode_size = bc_size;
 
     /* Rebuild from the new bytecode, restoring the pre-swap snapshot and
-     * replaying on_load_state(HOT_RELOAD).  rebuild() takes ownership of snap. */
-    if (wasm_lua_rebuild(true, snap))
+     * replaying on_load_state(HOT_RELOAD).  rebuild() takes ownership of snap.
+     * Pure-Lua carts have no native (rv32) GDB breakpoints to re-arm, so the
+     * synchronous rebuild is fine here — the debug-reload deferral (issue #170)
+     * is only needed for hybrid carts (handled in wasm_session_reload). */
+    if (wasm_lua_rebuild(true, snap, false))
         dev_ctrl_respond_ok(id, "reload");
     else
         dev_ctrl_respond_err(id, "reload", "rebuild failed");
@@ -1986,6 +2142,23 @@ void blyt_dev_ctrl_reload_fetched(int ok) {
 static void wasm_lua_loop(void) {
     if (!g_lua)
         return;
+
+#ifdef BLYT_GDB
+    /* Debug reload (issue #170), phase 1: pump the async two-phase solib re-arm
+     * before running the reloaded init().  Holding off init() until lldb has
+     * re-read the new DWARF and rebound its breakpoints is what arms BOTH the
+     * Lua and native init breakpoints before init() runs under the INIT phase
+     * below — the reload-time equivalent of the startup armed-before-init gate. */
+    if (g_reload_phase == RELOAD_REARM) {
+#ifdef BLYT_DAP
+        fc_dap_poll_messages(); /* keep the companion Lua DAP connection serviced */
+#endif
+        if (blyt_session_gdb_reload_notify_pump(g_session))
+            g_reload_phase = RELOAD_INIT; /* re-armed → INIT phase runs init() */
+        blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H); /* hold the last frame */
+        return;
+    }
+#endif
 
 #ifdef BLYT_DAP
     /* Drain WebSocket queue: delivers new breakpoints, continue/step responses. */
@@ -2084,6 +2257,16 @@ static void wasm_lua_loop(void) {
         int nres = 0;
         int status = lua_resume(g_lua_co, g_lua, 0, &nres);
         if (status == LUA_OK) {
+#ifdef BLYT_GDB
+            /* Debug reload (issue #170), phase 2: the reloaded init() finished
+             * (both init breakpoints having fired under the loop) — run the
+             * deferred state restore + on_load_state(HOT_RELOAD) tail before the
+             * cart starts its RUNNING frames. */
+            if (g_reload_phase == RELOAD_INIT) {
+                wasm_lua_reload_restore_tail();
+                g_reload_phase = RELOAD_NONE;
+            }
+#endif
             /* init() + on_new_state() done — create running coroutine */
             luaL_unref(g_lua, LUA_REGISTRYINDEX, g_lua_co_ref);
             g_lua_co = lua_newthread(g_lua);
@@ -2415,6 +2598,19 @@ static void wasm_loop(void) {
     if (!g_session)
         return;
 
+#ifdef BLYT_GDB
+    /* Debug reload (issue #170), phase 1: pump the async two-phase solib re-arm.
+     * Do NOT run the cart until lldb has re-read the new DWARF and rebound its
+     * breakpoints, so an init() breakpoint binds to the new code before init
+     * runs (the reload-time equivalent of the startup armed-before-init gate). */
+    if (g_reload_phase == RELOAD_REARM) {
+        if (blyt_session_gdb_reload_notify_pump(g_session))
+            g_reload_phase = RELOAD_INIT; /* re-armed → run the reloaded init() */
+        blyt_js_present(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H); /* hold the last frame */
+        return;
+    }
+#endif
+
     blyt_cart_run_err_t err = blyt_session_run_frame(g_session);
 
 #ifdef BLYT_GDB
@@ -2438,6 +2634,16 @@ static void wasm_loop(void) {
     if (s_gdb_timing_polling) {
         emscripten_set_main_loop_timing(EM_TIMING_RAF, 0);
         s_gdb_timing_polling = false;
+    }
+
+    /* Debug reload (issue #170), phase 2: the reloaded init() frame completed —
+     * restore state over the fresh buffers and replay on_load_state(HOT_RELOAD),
+     * the deferred tail of the swap.  Any init() breakpoint already round-tripped
+     * via the GDB_PAUSED handling above across prior ticks. */
+    if (g_reload_phase == RELOAD_INIT && err == BLYT_RUN_FRAME_DONE) {
+        blyt_session_restore(g_session, g_reload_snap, 3u /* BLYT_LOAD_HOT_RELOAD */);
+        g_reload_snap = NULL;
+        g_reload_phase = RELOAD_NONE;
     }
 #endif
 

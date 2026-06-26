@@ -1073,8 +1073,6 @@ fn run_wasm_lldb_dap_reload(
 /// lldb-dap session and asserts on the GDB-RSP trace that the breakpoint rebinds
 /// to v2's re-read address.
 #[test]
-#[ignore = "blocked on #170: WASM debug-reload rebind unimplemented in wasm_session_reload \
-            (run-mode only — no fresh base / notify_cart_reloaded / cart-path re-apply)"]
 fn wasm_native_lldb_dap_reload_rebinds_breakpoint() {
     require_sdk();
     require_wasm_debug();
@@ -1136,8 +1134,6 @@ fn wasm_native_lldb_dap_reload_rebinds_breakpoint() {
 /// driven over the WASM browser relay (gdb WS↔TCP bridge + Lua DAP WS relay) with
 /// the reload driven by the in-process dev-control ccall.
 #[test]
-#[ignore = "blocked on #170: WASM hybrid debug-reload re-arm gate unimplemented — after reload the \
-            'both views armed before init()' gate is absent (post-reload native=1 lua=0)"]
 fn wasm_hybrid_lldb_dap_reload_fires_both_init_breakpoints() {
     require_sdk();
     require_lua_sdk();
@@ -1248,8 +1244,6 @@ fn rust_pad(n: usize) -> String {
 /// with a Rust fixture.  Asserts the same single-location rebind to v2's re-read
 /// address on the GDB-RSP trace.
 #[test]
-#[ignore = "blocked on #170: WASM debug-reload rebind unimplemented in wasm_session_reload \
-            (run-mode only — no fresh base / notify_cart_reloaded / cart-path re-apply)"]
 fn wasm_rust_lldb_dap_reload_rebinds_breakpoint() {
     require_sdk();
     require_wasm_debug();
