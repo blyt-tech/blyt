@@ -1137,6 +1137,10 @@ static void wasm_register_resource_api(lua_State *L) {
     lua_newtable(L);
     lua_pushcfunction(L, wasm_resource_text);
     lua_setfield(L, -2, "text");
+    /* :bytes() — binary-oriented alias of the same lstring copy (#162), mirroring
+     * the guest register_resource_module so the host-Lua fast path matches. */
+    lua_pushcfunction(L, wasm_resource_text);
+    lua_setfield(L, -2, "bytes");
     lua_pushcfunction(L, wasm_resource_release);
     lua_setfield(L, -2, "release");
     lua_setfield(L, -2, "__index");

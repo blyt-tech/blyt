@@ -107,8 +107,8 @@ pub struct CartProject {
     rust_lib_names: Vec<String>,
     /// Contents of blyt.config.yaml (state buffers, fps, etc.)
     config_yaml: Option<String>,
-    /// (relative_path_within_assets, content) pairs for assets/ (issue #91).
-    asset_files: Vec<(String, String)>,
+    /// (relative_path_within_assets, bytes) pairs for assets/ (issue #91/#162).
+    asset_files: Vec<(String, Vec<u8>)>,
 }
 
 impl CartProject {
@@ -126,9 +126,20 @@ impl CartProject {
     }
 
     /// Add `content` as `assets/<rel_path>` (issue #91). The packer derives the
-    /// resource name from the path and emits an R_<NAME> constant.
+    /// resource name from the path and emits an R_<NAME> constant. `write`
+    /// auto-declares the asset's extension as an `include:` glob (#162: nothing
+    /// is auto-scanned).
     pub fn asset(mut self, rel_path: &str, content: &str) -> Self {
-        self.asset_files.push((rel_path.into(), content.into()));
+        self.asset_files
+            .push((rel_path.into(), content.as_bytes().to_vec()));
+        self
+    }
+
+    /// Add opaque `bytes` as `assets/<rel_path>` — for raw resources whose
+    /// content is binary (embedded NULs, non-UTF8). Same auto-declaration as
+    /// `asset` (#162).
+    pub fn asset_bytes(mut self, rel_path: &str, bytes: &[u8]) -> Self {
+        self.asset_files.push((rel_path.into(), bytes.to_vec()));
         self
     }
 
@@ -229,24 +240,29 @@ impl CartProject {
         )
         .unwrap();
 
-        // blyt.build.yaml — language declaration (ADR-0073).
-        // Pure Lua carts omit the file; all other combinations require explicit declaration.
+        // blyt.build.yaml — language declaration (ADR-0073) + asset declaration
+        // (ADR-0088 amendment, #162: nothing is auto-scanned, so any asset's
+        // extension must be declared as an `include:` glob).  Pure Lua carts
+        // omit the file unless they ship assets.
         let native_count = [has_c, has_cpp, has_rust].iter().filter(|&&b| b).count();
+        let mut manifest = String::new();
         if has_lua && native_count == 0 {
-            // pure Lua: no blyt.build.yaml needed
+            // pure Lua: language declaration only needed alongside an assets block
+            if !self.asset_files.is_empty() {
+                manifest.push_str("language: lua\n");
+            }
         } else if !has_lua && native_count == 1 {
             // pure native: singular `language:` form
-            let manifest = if has_c {
+            manifest.push_str(if has_c {
                 "language: c\n"
             } else if has_cpp {
                 "language: \"c++\"\n"
             } else {
                 "language: rust\n"
-            };
-            fs::write(dir.join("blyt.build.yaml"), manifest).unwrap();
+            });
         } else {
             // hybrid Lua + native: `languages:` map
-            let mut manifest = String::from("languages:\n");
+            manifest.push_str("languages:\n");
             if has_lua {
                 manifest.push_str("  lua:\n");
             }
@@ -259,6 +275,9 @@ impl CartProject {
             if has_rust {
                 manifest.push_str("  rust:\n");
             }
+        }
+        manifest.push_str(&assets_include_block(&self.asset_files));
+        if !manifest.is_empty() {
             fs::write(dir.join("blyt.build.yaml"), manifest).unwrap();
         }
 
@@ -313,6 +332,34 @@ impl CartProject {
             fs::write(dest, content).unwrap();
         }
     }
+}
+
+/// Generate the `assets:` block declaring an `include:` glob for every distinct
+/// extension present in `asset_files` (under the default `assets/` dir). Empty
+/// when there are no assets. Mirrors a real cart explicitly declaring its asset
+/// types (#162 — no auto-scan).
+fn assets_include_block(asset_files: &[(String, Vec<u8>)]) -> String {
+    let mut exts: Vec<String> = Vec::new();
+    for (rel, _) in asset_files {
+        if let Some(ext) = std::path::Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            let e = ext.to_string();
+            if !exts.contains(&e) {
+                exts.push(e);
+            }
+        }
+    }
+    if exts.is_empty() {
+        return String::new();
+    }
+    exts.sort();
+    let mut s = String::from("assets:\n  dirs:\n    - dir: assets/\n      include:\n");
+    for e in exts {
+        s.push_str(&format!("        - \"**/*.{e}\"\n"));
+    }
+    s
 }
 
 // -------------------------------------------------------------------------

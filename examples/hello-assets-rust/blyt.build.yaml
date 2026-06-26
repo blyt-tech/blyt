@@ -1,1 +1,10 @@
 language: rust
+
+# Assets must be declared explicitly (ADR-0088 amendment, #162): nothing is
+# auto-scanned. `assets/greeting.txt` is a `.txt`, so it ships as a `text`
+# resource (R_GREETING).
+assets:
+  dirs:
+    - dir: assets/
+      include:
+        - "**/*.txt"

@@ -154,6 +154,15 @@ blyt_result_t blyt_resource_release(blyt_resource_h handle);
  * id or allocation failure.  Not its own ECALL — a guest-side helper. */
 char *blyt_resource_text_get(blyt_resource_id_t id, size_t *len);
 
+/* bytes_get: the opaque-bytes companion to text_get (#162).  Returns a freshly
+ * allocated copy of the resource's *exact* bytes (the caller owns it and must
+ * free() it) and writes the byte length to *len.  Unlike text_get it appends no
+ * NUL terminator and makes no text assumption, so it round-trips binary blobs
+ * (embedded NULs, high bytes) faithfully — *len is authoritative.  Returns NULL
+ * (leaving *len untouched) on an unknown id or allocation failure.  Not its own
+ * ECALL — a guest-side helper. */
+void *blyt_resource_bytes_get(blyt_resource_id_t id, size_t *len);
+
 /* -------------------------------------------------------------------------
  * Cart lifecycle types for save/load callbacks (ADR-0087 amendment)
  * ------------------------------------------------------------------------- */

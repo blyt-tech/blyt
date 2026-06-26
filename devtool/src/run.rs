@@ -1398,9 +1398,10 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
                 eprintln!("[watch] cannot watch {}: {e}", src.display());
             }
         }
-        // Watch assets/ so edits hot-swap via update_assets (issue #91, amends #88).
-        let assets = project_dir.join("assets");
-        if assets.is_dir() {
+        // Watch every declared asset dir so edits hot-swap via update_assets
+        // (issue #91/#162, amends #88) — not just assets/, since additional
+        // dirs declared in blyt.build.yaml ship resources too.
+        for assets in crate::build::asset_watch_dirs(&project_dir) {
             if let Err(e) = watcher.watch(&assets, RecursiveMode::Recursive) {
                 eprintln!("[watch] cannot watch {}: {e}", assets.display());
             }

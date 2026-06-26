@@ -1,8 +1,8 @@
-language: c
+language: lua
 
 # Assets must be declared explicitly (ADR-0088 amendment, #162): nothing is
 # auto-scanned. `assets/greeting.txt` is a `.txt`, so it ships as a `text`
-# resource (R_GREETING).
+# resource (R_GREETING / R.GREETING).
 assets:
   dirs:
     - dir: assets/

@@ -29,6 +29,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::cell::Cell;
 use core::ffi::c_void;
 use core::str::Utf8Error;
@@ -90,6 +91,17 @@ impl TextHandle {
         let pinned = pin(ResourceHandle(self.id));
         String::from_utf8(pinned.as_bytes().into())
             .expect("blyt: resource bytes are not valid UTF-8")
+    }
+
+    /// Copy the resource's exact bytes into an owned `Vec<u8>` — the opaque-bytes
+    /// companion to [`text_string`] (#162).  No UTF-8 validation and no NUL
+    /// games, so it round-trips binary blobs faithfully.  Unlike a [`pin`], the
+    /// copy outlives the current frame.
+    ///
+    /// [`text_string`]: TextHandle::text_string
+    pub fn bytes_vec(&self) -> Vec<u8> {
+        let pinned = pin(ResourceHandle(self.id));
+        pinned.as_bytes().into()
     }
 
     /// Advisory release: tell the runtime the cart no longer needs this

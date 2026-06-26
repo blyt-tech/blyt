@@ -1,11 +1,15 @@
 //! Asset pipeline — Phase 1 (transform to content-addressed staging) and the
-//! resource-id-index + generated constant headers (issue #91).
+//! resource-id-index + generated constant headers (issue #91, #162).
 //!
-//! Text (`.txt`) is the only asset type for now; every future asset type adds
-//! a transform here (extension → resource type) and a runtime decoder. The
-//! resource model follows ADR-0040 (names in source, integer handles at
-//! runtime) and ADR-0088 (two-phase build; dev mode runs Phase 1 only and the
-//! runtime reads the staging directory).
+//! Membership is explicit (ADR-0088 amendment, #162): nothing is auto-scanned —
+//! every asset a cart ships is declared via an `include:` glob in the
+//! `assets:` block of `blyt.build.yaml`. A resource's *type* is decided by its
+//! extension independent of how it was included: `.txt` → text, everything else
+//! → `raw` (opaque bytes). `text` and `raw` are both identity-copy transforms
+//! today; future typed transforms (sprite/audio/...) add a real transform here
+//! and become auto-scanned. The resource model follows ADR-0040 (names in
+//! source, integer handles at runtime) and ADR-0088 (two-phase build; dev mode
+//! runs Phase 1 only and the runtime reads the staging directory).
 //!
 //! Staging is content-addressed (`resources/<name>-<fp>.data`) so files are
 //! never overwritten in place — a changed asset gets a new file alongside the
@@ -15,9 +19,40 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::{BuildError, Task, TaskInput, build_err};
+
+/// A resource's type, decided by its file extension (ADR-0088 amendment). Both
+/// variants are an identity copy today; the distinction is recorded in the
+/// `.meta` `type=` field (descriptive only — the runtime serves `.data` bytes
+/// and never reads `.meta`). `blyt_resource_text_get` works for either, since
+/// its length out-param is authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResourceType {
+    Text,
+    Raw,
+}
+
+impl ResourceType {
+    /// `.txt` is text; every other extension is opaque `raw` bytes. When a real
+    /// transform for an extension lands (sprite/audio/...), it gets its own
+    /// variant here and becomes auto-scanned.
+    fn from_extension(ext: Option<&str>) -> Self {
+        match ext {
+            Some("txt") => ResourceType::Text,
+            _ => ResourceType::Raw,
+        }
+    }
+
+    fn meta_name(self) -> &'static str {
+        match self {
+            ResourceType::Text => "text",
+            ResourceType::Raw => "raw",
+        }
+    }
+}
 
 /// A scanned asset resolved to its resource name, content fingerprint, and
 /// content-addressed staging paths. `id` is assigned by `scan_assets` after the
@@ -33,6 +68,9 @@ pub(super) struct AssetInfo {
     pub rel_data: String,
     pub data_output: PathBuf,
     pub meta_output: PathBuf,
+    /// Resource type, derived from the source extension (`.txt` → text, else
+    /// raw). Drives the `.meta` `type=` field only.
+    pub resource_type: ResourceType,
 }
 
 /// Map a path relative to `assets/` to a resource name per ADR-0040:
@@ -83,61 +121,257 @@ fn c_constant(name: &str) -> String {
     format!("R_{}", name.to_ascii_uppercase())
 }
 
-fn is_text_extension(ext: Option<&str>) -> bool {
-    matches!(ext, Some("txt"))
+// -------------------------------------------------------------------------
+// `assets:` block of blyt.build.yaml (ADR-0088 amendment, #162)
+//
+//   assets:
+//     dirs:
+//       - dir: assets/          # default dir; entry optional
+//         include: ["**/*.txt", "**/*.lvl"]
+//         exclude: ["wip/**"]
+//       - dir: other_assets/
+//         constant_prefix: DATA # required for any non-assets/ dir
+//         include: ["**/*.dat"]
+//
+// Membership of a dir = include-matched files minus exclude-matched files
+// (auto-scan of processed types is reserved for when those transforms land).
+// Globs are relative to the dir's root. `constant_prefix` is prepended to each
+// derived resource name (empty default for assets/, required otherwise).
+// -------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AssetsConfig {
+    #[serde(default)]
+    pub dirs: Vec<AssetDir>,
 }
 
-fn collect_asset_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), BuildError> {
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AssetDir {
+    pub dir: String,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub constant_prefix: Option<String>,
+}
+
+/// Lean view over blyt.build.yaml that captures only the `assets:` block and
+/// ignores the language/build fields (no `deny_unknown_fields`).
+#[derive(serde::Deserialize, Default)]
+struct AssetsManifest {
+    #[serde(default)]
+    assets: Option<AssetsConfig>,
+}
+
+/// Read the `assets:` block from `<project_dir>/blyt.build.yaml`. Returns an
+/// empty config when the file is absent or has no `assets:` block.
+pub(super) fn read_assets_config(project_dir: &Path) -> Result<AssetsConfig, BuildError> {
+    let path = project_dir.join("blyt.build.yaml");
+    if !path.exists() {
+        return Ok(AssetsConfig::default());
+    }
+    let text = fs::read_to_string(&path)?;
+    let manifest: AssetsManifest =
+        serde_yaml::from_str(&text).map_err(|e| build_err(format!("blyt.build.yaml: {e}")))?;
+    Ok(manifest.assets.unwrap_or_default())
+}
+
+/// Absolute paths of every declared asset directory (the default `assets/`
+/// plus any `assets.dirs` entries) that currently exists. Dev-mode watch uses
+/// this so edits in additional dirs hot-swap like edits in `assets/` (#162).
+pub(super) fn watch_dirs(project_dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
+    let config = read_assets_config(project_dir)?;
+    let dirs = resolve_asset_dirs(&config)?;
+    let mut out = Vec::new();
+    for d in &dirs {
+        let abs = project_dir.join(normalize_dir(&d.dir));
+        if abs.is_dir() {
+            out.push(abs);
+        }
+    }
+    Ok(out)
+}
+
+/// A declared asset directory resolved to its constant prefix and glob lists.
+struct ResolvedDir {
+    /// Directory path relative to the project root, e.g. `assets/`.
+    dir: String,
+    /// Constant prefix (empty for `assets/`), folded into each resource name.
+    prefix: String,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    /// Explicitly declared in the manifest (vs the implicit default `assets/`).
+    /// A missing explicit dir is an error; a missing implicit one is skipped.
+    explicit: bool,
+}
+
+/// Strip a trailing slash so `assets/` and `assets` compare equal.
+fn normalize_dir(dir: &str) -> &str {
+    dir.strip_suffix('/').unwrap_or(dir)
+}
+
+/// `constant_prefix` must already be a valid uppercase identifier fragment
+/// (`[A-Z0-9_]*`; empty permitted) — the packer prepends it verbatim and does
+/// not transform it (ADR-0088).
+fn validate_prefix(p: &str) -> Result<(), BuildError> {
+    if p.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        Ok(())
+    } else {
+        Err(build_err(format!(
+            "blyt.build.yaml: constant_prefix {p:?} must contain only [A-Z0-9_]"
+        )))
+    }
+}
+
+/// Resolve the declared dirs, adding the implicit default `assets/` (empty
+/// prefix) when it is not declared, and validating prefixes. `assets/` may omit
+/// `constant_prefix`; every other dir must declare one.
+fn resolve_asset_dirs(config: &AssetsConfig) -> Result<Vec<ResolvedDir>, BuildError> {
+    let mut dirs: Vec<ResolvedDir> = Vec::new();
+    let mut has_default = false;
+    for entry in &config.dirs {
+        let is_default = normalize_dir(&entry.dir) == "assets";
+        has_default |= is_default;
+        let prefix = match &entry.constant_prefix {
+            Some(p) => {
+                validate_prefix(p)?;
+                p.clone()
+            }
+            None if is_default => String::new(),
+            None => {
+                return Err(build_err(format!(
+                    "blyt.build.yaml: asset dir {:?} must declare a `constant_prefix` \
+                     (only assets/ may omit it)",
+                    entry.dir
+                )));
+            }
+        };
+        dirs.push(ResolvedDir {
+            dir: entry.dir.clone(),
+            prefix,
+            include: entry.include.clone(),
+            exclude: entry.exclude.clone(),
+            explicit: true,
+        });
+    }
+    if !has_default {
+        // The default dir is always a member dir; with no includes (and no
+        // auto-scan types yet) it simply contributes nothing.
+        dirs.insert(
+            0,
+            ResolvedDir {
+                dir: "assets/".to_string(),
+                prefix: String::new(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+                explicit: false,
+            },
+        );
+    }
+    Ok(dirs)
+}
+
+/// Build a `GlobSet` from dir-root-relative patterns. An empty pattern list
+/// yields a set that matches nothing.
+fn build_globset(patterns: &[String], dir: &str) -> Result<GlobSet, BuildError> {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        let glob = Glob::new(p).map_err(|e| {
+            build_err(format!(
+                "blyt.build.yaml: dir {dir:?}: invalid glob {p:?}: {e}"
+            ))
+        })?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map_err(|e| build_err(format!("blyt.build.yaml: dir {dir:?}: bad globs: {e}")))
+}
+
+/// Collect every file under `dir`, returned as paths relative to `root`.
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), BuildError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_asset_sources(&path, out)?;
-        } else if is_text_extension(path.extension().and_then(OsStr::to_str)) {
-            out.push(path);
+            collect_files(root, &path, out)?;
+        } else {
+            out.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
         }
     }
     Ok(())
 }
 
-/// Scan `<project_dir>/assets/` for known asset types and resolve each to an
-/// `AssetInfo` with a content fingerprint and content-addressed staging paths
-/// under `<top_build>/resources/`. The set is sorted by resource name and
-/// assigned 1-based integer IDs. Errors on a name collision (two files that
-/// derive the same resource name). Returns an empty vec when there is no
-/// `assets/` directory.
+/// Scan the declared asset directories (ADR-0088 amendment) and resolve each
+/// included file to an `AssetInfo` with a content fingerprint and
+/// content-addressed staging paths under `<top_build>/resources/`. Membership
+/// is include-minus-exclude per dir; the resource type is by extension. The set
+/// is sorted by resource name and assigned 1-based integer IDs. Errors on a name
+/// collision (two files — possibly in different dirs — deriving the same name).
 pub(super) fn scan_assets(
     project_dir: &Path,
     top_build: &Path,
 ) -> Result<Vec<AssetInfo>, BuildError> {
-    let assets_dir = project_dir.join("assets");
-    if !assets_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut sources = Vec::new();
-    collect_asset_sources(&assets_dir, &mut sources)?;
-    sources.sort();
+    let config = read_assets_config(project_dir)?;
+    let dirs = resolve_asset_dirs(&config)?;
 
     let resources_dir = top_build.join("resources");
     let mut assets: Vec<AssetInfo> = Vec::new();
-    for source in sources {
-        let rel = source.strip_prefix(&assets_dir).unwrap_or(&source);
-        let resource_name = resource_name_from_rel(rel)?;
-        let bytes = fs::read(&source)?;
-        let fingerprint = format!("{:016x}", xxh3_64(&bytes));
-        let rel_data = format!("resources/{resource_name}-{fingerprint}.data");
-        let data_output = resources_dir.join(format!("{resource_name}-{fingerprint}.data"));
-        let meta_output = resources_dir.join(format!("{resource_name}-{fingerprint}.meta"));
-        assets.push(AssetInfo {
-            id: 0, // assigned below
-            resource_name,
-            source,
-            fingerprint,
-            rel_data,
-            data_output,
-            meta_output,
-        });
+    for d in &dirs {
+        let abs = project_dir.join(normalize_dir(&d.dir));
+        if !abs.exists() {
+            if d.explicit {
+                return Err(build_err(format!(
+                    "blyt.build.yaml: asset dir {:?} does not exist",
+                    d.dir
+                )));
+            }
+            continue;
+        }
+
+        let include = build_globset(&d.include, &d.dir)?;
+        let exclude = build_globset(&d.exclude, &d.dir)?;
+
+        let mut files = Vec::new();
+        collect_files(&abs, &abs, &mut files)?;
+        files.sort();
+
+        for rel in files {
+            // Membership: an include match that is not excluded. (Auto-scan of
+            // processed types is empty until those transforms land.)
+            if !include.is_match(&rel) || exclude.is_match(&rel) {
+                continue;
+            }
+            let base = resource_name_from_rel(&rel)?;
+            let resource_name = if d.prefix.is_empty() {
+                base
+            } else {
+                format!("{}_{}", d.prefix.to_ascii_lowercase(), base)
+            };
+            let source = abs.join(&rel);
+            let bytes = fs::read(&source)?;
+            let fingerprint = format!("{:016x}", xxh3_64(&bytes));
+            let rel_data = format!("resources/{resource_name}-{fingerprint}.data");
+            let data_output = resources_dir.join(format!("{resource_name}-{fingerprint}.data"));
+            let meta_output = resources_dir.join(format!("{resource_name}-{fingerprint}.meta"));
+            assets.push(AssetInfo {
+                id: 0, // assigned below
+                resource_name,
+                source,
+                fingerprint,
+                rel_data,
+                data_output,
+                meta_output,
+                resource_type: ResourceType::from_extension(
+                    rel.extension().and_then(OsStr::to_str),
+                ),
+            });
+        }
     }
 
     // Deterministic IDs: sort by resource name, assign 1..=N.
@@ -156,11 +390,16 @@ pub(super) fn scan_assets(
     Ok(assets)
 }
 
-/// Minimal `.meta` for a text asset. Establishes the per-resource metadata
-/// pattern future asset types fill out (dimensions, format, …); the runtime
-/// uses the `.data` length for text so this is descriptive only.
-fn text_meta_contents(a: &AssetInfo) -> String {
-    format!("type=text\nname={}\n", a.resource_name)
+/// Minimal `.meta` for an asset. Establishes the per-resource metadata pattern
+/// future asset types fill out (dimensions, format, …); the runtime serves the
+/// `.data` bytes and never reads `.meta`, so the `type=` field is descriptive
+/// only (`text` vs `raw`, by extension).
+fn meta_contents(a: &AssetInfo) -> String {
+    format!(
+        "type={}\nname={}\n",
+        a.resource_type.meta_name(),
+        a.resource_name
+    )
 }
 
 /// `resource-id-index` body: one `<id> <rel_data>` line per resource, ordered
@@ -260,7 +499,8 @@ impl Task for AssetTask {
         if let Some(parent) = self.data_output.parent() {
             fs::create_dir_all(parent)?;
         }
-        // Text passes through verbatim; the transform is the identity copy.
+        // text and raw both pass through verbatim; the transform is the
+        // identity copy. Typed transforms (sprite/audio/...) will branch here.
         fs::copy(&self.source, &self.data_output)?;
         fs::write(&self.meta_output, &self.meta)?;
         Ok(())
@@ -374,7 +614,7 @@ pub(super) fn plan_assets(
             source: a.source.clone(),
             data_output: a.data_output.clone(),
             meta_output: a.meta_output.clone(),
-            meta: text_meta_contents(a),
+            meta: meta_contents(a),
             key_str: format!("asset/{}", a.resource_name),
         }));
         resource_sections.push((format!(".cart.resource.{}", a.id), a.data_output.clone()));
@@ -439,6 +679,7 @@ mod tests {
             rel_data: format!("resources/{n}-{fp}.data"),
             data_output: PathBuf::from(format!("build/resources/{n}-{fp}.data")),
             meta_output: PathBuf::from(format!("build/resources/{n}-{fp}.meta")),
+            resource_type: ResourceType::Text,
         }
     }
 
@@ -487,5 +728,141 @@ mod tests {
         assert!(m.contains(
             "pub const R_HERO_IDLE: blyt::ResourceHandle = blyt::ResourceHandle::new(2);"
         ));
+    }
+
+    /* --- include-driven membership + type-by-extension (#162) --- */
+
+    /// Write a throwaway project with the given `blyt.build.yaml` body and asset
+    /// files, then scan it. `files` are `(rel_path_under_project, bytes)`.
+    fn scan(build_yaml: &str, files: &[(&str, &[u8])]) -> Result<Vec<AssetInfo>, BuildError> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        if !build_yaml.is_empty() {
+            fs::write(root.join("blyt.build.yaml"), build_yaml).unwrap();
+        }
+        for (rel, bytes) in files {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, bytes).unwrap();
+        }
+        scan_assets(root, &root.join("build"))
+    }
+
+    fn names(assets: &[AssetInfo]) -> Vec<String> {
+        assets.iter().map(|a| a.resource_name.clone()).collect()
+    }
+
+    #[test]
+    fn glob_double_star_matches_top_level() {
+        // `**/*.txt` must match a file directly under the dir root, not only in
+        // a subdirectory.
+        let set = build_globset(&["**/*.txt".to_string()], "assets/").unwrap();
+        assert!(set.is_match(Path::new("greeting.txt")));
+        assert!(set.is_match(Path::new("sub/greeting.txt")));
+        assert!(!set.is_match(Path::new("greeting.bin")));
+    }
+
+    #[test]
+    fn nothing_is_auto_scanned_without_include() {
+        // A bare assets/ with a .txt but no `assets:` declaration ships nothing
+        // (no default passthrough types — #162).
+        let assets = scan("language: lua\n", &[("assets/greeting.txt", b"hi")]).unwrap();
+        assert!(
+            assets.is_empty(),
+            "expected no assets, got {:?}",
+            names(&assets)
+        );
+    }
+
+    #[test]
+    fn include_selects_and_type_is_by_extension() {
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: assets/\n      include: [\"**/*.txt\", \"**/*.lvl\"]\n";
+        let assets = scan(
+            yaml,
+            &[
+                ("assets/greeting.txt", b"hi"),
+                ("assets/level1.lvl", b"\x00\x01\x02"),
+                ("assets/notes.md", b"ignored"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(names(&assets), vec!["greeting", "level1"]);
+        let txt = assets
+            .iter()
+            .find(|a| a.resource_name == "greeting")
+            .unwrap();
+        let lvl = assets.iter().find(|a| a.resource_name == "level1").unwrap();
+        assert_eq!(txt.resource_type, ResourceType::Text);
+        assert_eq!(lvl.resource_type, ResourceType::Raw);
+        assert_eq!(meta_contents(txt), "type=text\nname=greeting\n");
+        assert_eq!(meta_contents(lvl), "type=raw\nname=level1\n");
+    }
+
+    #[test]
+    fn exclude_drops_included_files() {
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: assets/\n      include: [\"**/*.dat\"]\n      exclude: [\"wip/**\"]\n";
+        let assets = scan(
+            yaml,
+            &[("assets/keep.dat", b"a"), ("assets/wip/draft.dat", b"b")],
+        )
+        .unwrap();
+        assert_eq!(names(&assets), vec!["keep"]);
+    }
+
+    #[test]
+    fn constant_prefix_folds_into_resource_name() {
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: other_assets/\n      constant_prefix: DATA\n      include: [\"**/*.dat\"]\n";
+        let assets = scan(yaml, &[("other_assets/level.dat", b"x")]).unwrap();
+        assert_eq!(names(&assets), vec!["data_level"]);
+        assert!(generate_c_header(&assets).contains("#define R_DATA_LEVEL"));
+    }
+
+    #[test]
+    fn non_assets_dir_requires_constant_prefix() {
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: other_assets/\n      include: [\"**/*.dat\"]\n";
+        let err = scan(yaml, &[("other_assets/level.dat", b"x")])
+            .err()
+            .expect("missing constant_prefix should be rejected");
+        assert!(err.to_string().contains("constant_prefix"), "{err}");
+    }
+
+    #[test]
+    fn invalid_constant_prefix_rejected() {
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: other_assets/\n      constant_prefix: data\n      include: [\"**/*.dat\"]\n";
+        let err = scan(yaml, &[("other_assets/level.dat", b"x")])
+            .err()
+            .expect("lowercase constant_prefix should be rejected");
+        assert!(err.to_string().contains("[A-Z0-9_]"), "{err}");
+    }
+
+    #[test]
+    fn cross_dir_name_collision_errors() {
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: assets/\n      include: [\"**/*.dat\"]\n    - dir: other_assets/\n      constant_prefix: \"\"\n      include: [\"**/*.dat\"]\n";
+        let err = scan(
+            yaml,
+            &[("assets/level.dat", b"a"), ("other_assets/level.dat", b"b")],
+        )
+        .err()
+        .expect("colliding names across dirs should be rejected");
+        assert!(err.to_string().contains("collision"), "{err}");
+    }
+
+    #[test]
+    fn raw_bytes_pass_through_verbatim() {
+        // Opaque bytes (embedded NUL, high bytes) survive the identity copy and
+        // drive the content fingerprint.
+        let raw: &[u8] = &[0x00, 0xFF, 0x10, b'h', b'i', 0x00];
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: assets/\n      include: [\"**/*.bin\"]\n";
+        let assets = scan(yaml, &[("assets/blob.bin", raw)]).unwrap();
+        assert_eq!(names(&assets), vec!["blob"]);
+        assert_eq!(assets[0].resource_type, ResourceType::Raw);
+        assert_eq!(assets[0].fingerprint, format!("{:016x}", xxh3_64(raw)));
     }
 }
