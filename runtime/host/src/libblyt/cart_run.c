@@ -2674,7 +2674,14 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
     }
 
     /* 3. Re-stamp the libblytc.so arena globals (ADR-0120) so the reloaded cart
-     *    starts from a clean arena base/size. */
+     *    starts from a clean arena base/size, and re-zero the arena allocator's
+     *    ready flag (issue #133, spike-W gate G4) so the next malloc()
+     *    re-initialises its bump pointer + free list.  libblytc persists across
+     *    the swap, so without this the reloaded cart's allocations would
+     *    continue past the previous cart's — drifting addresses (not
+     *    bit-identical to a fresh load) and, accumulated over a long edit-reload
+     *    session, exhausting the arena (each Lua init() allocates the whole Lua
+     *    state from it). */
     uint32_t sym_base = symtab_lookup(all, "blytc_arena_base");
     uint32_t sym_size = symtab_lookup(all, "blytc_arena_size");
     if (sym_base != 0 && sym_size != 0) {
@@ -2683,6 +2690,12 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
         memory_write(mem, sym_base, v, 4);
         write_u32_le(v, BLYT_ARENA_SIZE);
         memory_write(mem, sym_size, v, 4);
+    }
+    uint32_t sym_ready = symtab_lookup(all, "blytc_arena_ready");
+    if (sym_ready != 0) {
+        uint8_t v[4];
+        write_u32_le(v, 0);
+        memory_write(mem, sym_ready, v, 4);
     }
 
     /* 4. Re-resolve the cart's lifecycle entry points (and WASM hybrid exports)
@@ -2699,7 +2712,16 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
      *    cart region sits below the runtime libs and the trampolines, so this
      *    never touches them).  Same base: zero only the tail past the new span;
      *    a different base (the debug layer's fresh-base reload, #119): the whole
-     *    old region is uncovered. */
+     *    old region is uncovered.
+     *
+     *    Inter-segment gaps WITHIN the new image are deliberately NOT zeroed
+     *    (issue #133 acceptance #4): they are never referenced by the cart and
+     *    are not part of any determinism/replay contract, so the residue is
+     *    harmless.  Making them fresh-load-identical would mean zeroing the whole
+     *    region before mapping, which would forfeit the map-first guarantee above
+     *    (a malformed new image must leave the old cart running untouched).  The
+     *    accumulation hazard this issue targets is the arena allocator (step 3),
+     *    not these gaps. */
     if (old_span) {
         if (old_base == s->cart_base) {
             if (old_span > s->cart_span)

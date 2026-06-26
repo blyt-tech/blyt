@@ -337,6 +337,102 @@ fn native_dev_control_lifecycle_commands() {
     );
 }
 
+/// Build a pure-Lua cart that prints the guest address of a freshly allocated
+/// table on every init(): `probe addr=table: 0x...`.  That address is where the
+/// libblytc arena placed the new Lua state, so it is identical on every load
+/// **iff** the arena allocator is reset on a hot swap (issue #133).  Without the
+/// reset it climbs monotonically from the very first reload, as each reload's
+/// Lua state is allocated past the previous cart's un-reclaimed arena.
+fn arena_probe_cart(tmp: &TempDir) -> std::path::PathBuf {
+    let project = tmp.path().join("arena_probe");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \tblyt.debug.print('probe addr=' .. tostring({}))\n\
+             end\n\
+             function update() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+    build_lua_cart(&project)
+}
+
+/// N consecutive hot reloads of the same cart must reach a stable steady state:
+/// every reload's arena allocations land at the same guest addresses as the very
+/// first (fresh) load — i.e. the hot-reloaded VM is bit-identical to a fresh load
+/// (issue #133, spike-W gate G4).  The cart prints the address of a fresh table
+/// in init(); `blyt_session_swap_cart` must reset the libblytc arena allocator's
+/// bump pointer + free list so that address does not drift (and, accumulated over
+/// many reloads, does not exhaust the 16 MiB arena).  Pre-fix this fails on the
+/// first reload, as the address climbs the moment a second cart load reuses the
+/// persistent arena.
+#[test]
+fn native_dev_control_reload_arena_steady_state() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+
+    let cart = arena_probe_cart(&tmp);
+    let (mut child, port, lines) = spawn_player_with_dev_ctrl(&cart, save_dir.path());
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect dev control");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let read_half = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(read_half);
+
+    // Drive N reloads of the same cart, leaving a frame's worth of slack after
+    // each so the swapped-in cart's init() actually runs (and prints) before the
+    // next reload reboots it.
+    const N: usize = 12;
+    for i in 0..N {
+        let id = 100 + i as i64;
+        let resp = dev_ctrl_cmd(
+            &mut stream,
+            &mut reader,
+            &format!(r#"{{"id":{id},"cmd":"reload"}}"#),
+        );
+        assert!(
+            resp.contains(&format!("\"id\":{id}")) && resp.contains("\"status\":\"ok\""),
+            "reload {i} did not succeed: {resp}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Let the final reload's init() output flush.
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let out = lines.lock().unwrap().clone();
+    let addrs: Vec<&str> = out
+        .iter()
+        .filter_map(|l| l.split("probe addr=").nth(1).map(str::trim))
+        .collect();
+
+    // Initial (fresh) load + N reloads = N+1 probe lines.
+    assert!(
+        addrs.len() >= N + 1,
+        "expected at least {} probe lines (fresh load + {N} reloads), got {}; player output:\n{:#?}",
+        N + 1,
+        addrs.len(),
+        out
+    );
+
+    let baseline = addrs[0];
+    for (i, a) in addrs.iter().enumerate() {
+        assert_eq!(
+            *a, baseline,
+            "arena allocation address drifted on reload {i}: {a:?} != fresh-load baseline \
+             {baseline:?} — libblytc arena allocator not reset on the hot swap (issue #133). \
+             All probes:\n{addrs:#?}"
+        );
+    }
+}
+
 /* ── native player as an outbound dev-control client (issue #90, option 2) ──── */
 
 /// Spawn the player in dial-out mode (`--dev-ctrl-connect <port>`), draining its

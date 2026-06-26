@@ -49,7 +49,18 @@ typedef struct {
  * Block h's next pointer is stored in h->next (plain offset, BLKC_NONE if none). */
 static uint32_t g_free_head = BLKC_NONE;
 static uint32_t g_bump = 0; /* offset past last initialised block */
-static int g_ready = 0;
+
+/* Allocator-ready flag — also the host's hot-reload reset lever (issue #133).
+ * The host re-stamps blytc_arena_base/size on every cart load; on an in-VM hot
+ * swap (blyt_session_swap_cart) the libblytc image persists, so the bump pointer
+ * and free list would otherwise carry over from the previous cart — drifting
+ * allocation addresses and, accumulated over a long edit-reload session,
+ * exhausting the arena.  The host re-zeros this exported symbol after the
+ * base/size re-stamp; the next malloc() then re-initialises g_bump/g_free_head
+ * from scratch, making a reloaded cart's allocations bit-identical to a fresh
+ * load.  Kept here (not host-stamped directly) so the BLKC_NONE free-list
+ * sentinel stays the allocator's secret.  0 = needs (re)init, 1 = ready. */
+int blytc_arena_ready = 0;
 
 /* ---- helpers ---- */
 
@@ -108,10 +119,15 @@ static void coalesce_forward(blk_hdr_t *h) {
 /* ---- public API ---- */
 
 void *malloc(size_t n) {
-    if (!g_ready) {
+    if (!blytc_arena_ready) {
         if (!blytc_arena_base || !blytc_arena_size)
             return NULL;
-        g_ready = 1;
+        /* Fresh load OR post-hot-swap reset (issue #133): restart allocation
+         * from the arena base with an empty free list.  On a genuine fresh load
+         * these already hold their initial values, so this is a no-op there. */
+        g_bump = 0;
+        g_free_head = BLKC_NONE;
+        blytc_arena_ready = 1;
     }
     if (n == 0)
         n = 1;
