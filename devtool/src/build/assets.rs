@@ -20,6 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use unicode_normalization::UnicodeNormalization;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::{BuildError, Task, TaskInput, build_err};
@@ -73,21 +74,43 @@ pub(super) struct AssetInfo {
     pub resource_type: ResourceType,
 }
 
-/// Map a path relative to `assets/` to a resource name per ADR-0040:
-/// strip the extension, replace separators and any non-identifier character
-/// with `_`, collapse runs of `_`, trim leading/trailing `_`, lowercase.
-/// Errors if nothing remains (e.g. `assets/--.txt`).
+/// Map a path relative to a resource dir to a resource name per ADR-0088's
+/// 8-step transform: strip the extension; NFD-decompose and drop combining
+/// diacritical marks (so `café`→`cafe`); replace separators and any remaining
+/// non-identifier character with `_`; collapse runs of `_`; trim
+/// leading/trailing `_`; lowercase. Per ADR-0088's build-errors table, rejects
+/// (rather than silently mangling): a stem empty after sanitisation, a
+/// normalized name beginning with a digit, and a non-ASCII character that
+/// survives diacritic removal (CJK, ß, emoji — no ASCII fold exists).
 pub(super) fn resource_name_from_rel(rel: &Path) -> Result<String, BuildError> {
     let without_ext = rel.with_extension("");
     let raw = without_ext.to_string_lossy();
 
-    let mut subbed = String::with_capacity(raw.len());
-    for ch in raw.chars() {
+    // ADR-0088 step 3: NFD decomposition, then drop combining diacritical marks
+    // (U+0300–U+036F) so accented letters fold to their ASCII base.
+    let decomposed: String = raw
+        .nfd()
+        .filter(|ch| !matches!(ch, '\u{0300}'..='\u{036F}'))
+        .collect();
+
+    // ADR-0088 build error: a character with no ASCII fold (CJK, ß, emoji, …)
+    // survives diacritic removal. Reject rather than underscore it away — the
+    // alternative silently mangles the constant.
+    if let Some(ch) = decomposed.chars().find(|ch| !ch.is_ascii()) {
+        return Err(build_err(format!(
+            "asset {} contains non-ASCII character {ch:?} with no ASCII \
+             equivalent after diacritic removal; resource names must be ASCII",
+            rel.display()
+        )));
+    }
+
+    // ADR-0088 step 4: separators, dashes, spaces, dots, and anything else that
+    // is not a C/Lua identifier character collapse to `_`.
+    let mut subbed = String::with_capacity(decomposed.len());
+    for ch in decomposed.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
             subbed.push(ch);
         } else {
-            // Directory separators, dashes, spaces, dots, and anything else
-            // that is not a C/Lua identifier character collapse to `_`.
             subbed.push('_');
         }
     }
@@ -113,6 +136,18 @@ pub(super) fn resource_name_from_rel(rel: &Path) -> Result<String, BuildError> {
             rel.display()
         )));
     }
+
+    // ADR-0088 build error: a normalized identifier beginning with a digit is
+    // not a valid C/Lua identifier (`R_3D` aside, the Lua `R.` key `R.3D` is
+    // invalid) — reject rather than emit an uncompilable constant.
+    if trimmed.starts_with(|ch: char| ch.is_ascii_digit()) {
+        return Err(build_err(format!(
+            "asset {} derives resource name `{trimmed}`, which begins with a \
+             digit; resource constants must start with a letter or underscore",
+            rel.display()
+        )));
+    }
+
     Ok(trimmed.to_ascii_lowercase())
 }
 
@@ -665,9 +700,40 @@ mod tests {
     }
 
     #[test]
+    fn name_transform_strips_diacritics() {
+        // ADR-0088 step 3: NFD decomposition + combining-mark removal folds
+        // accented letters to their ASCII base rather than dropping them.
+        assert_eq!(name("café.txt"), "cafe");
+        assert_eq!(name("piñata.txt"), "pinata");
+        assert_eq!(name("über/Ähnlich.txt"), "uber_ahnlich");
+        assert_eq!(name("menu/Crème Brûlée.txt"), "menu_creme_brulee");
+    }
+
+    #[test]
     fn name_transform_rejects_empty() {
         assert!(resource_name_from_rel(Path::new("--.txt")).is_err());
         assert!(resource_name_from_rel(Path::new("__.txt")).is_err());
+    }
+
+    #[test]
+    fn name_transform_rejects_leading_digit() {
+        // ADR-0088 build error: a normalized identifier beginning with a digit
+        // is not a valid C/Lua identifier — reject rather than emit `R_3D`.
+        assert!(resource_name_from_rel(Path::new("3d.txt")).is_err());
+        assert!(resource_name_from_rel(Path::new("3d/model.txt")).is_err());
+        assert!(resource_name_from_rel(Path::new("2x-scale.txt")).is_err());
+        // A digit elsewhere is fine.
+        assert_eq!(name("level3.txt"), "level3");
+        assert_eq!(name("sfx/jump 1.wav"), "sfx_jump_1");
+    }
+
+    #[test]
+    fn name_transform_rejects_residual_non_ascii() {
+        // ADR-0088 build error: characters with no ASCII fold (CJK, ß, emoji)
+        // survive diacritic removal and must be rejected, not underscored.
+        assert!(resource_name_from_rel(Path::new("日本.txt")).is_err());
+        assert!(resource_name_from_rel(Path::new("hero_日.txt")).is_err());
+        assert!(resource_name_from_rel(Path::new("party🎉.txt")).is_err());
     }
 
     fn asset(id: u32, n: &str, fp: &str) -> AssetInfo {
