@@ -1231,6 +1231,14 @@ add_custom_target(
   USES_TERMINAL VERBATIM
   COMMENT "Running Rust integration tests (cargo nextest -p integration)")
 add_dependencies(test-integration sdk)
+# The libretro all-legs tests dlopen blyt_libretro.so from a test_libretro_core
+# harness; neither is part of `sdk` (they build under the default `all` target),
+# so depend on them explicitly or a fresh worktree fails the libretro leg at
+# setup (issue #172, same class as #150). Both targets only exist when the RV32
+# toolchain is present (LIBBLYTC_OUT) — guard accordingly.
+if(TARGET test_libretro_core)
+  add_dependencies(test-integration test_libretro_core blyt_libretro)
+endif()
 
 # ── test-vscode ───────────────────────────────────────────────────────────────
 # Run the VS Code extension tests against this worktree's freshly-built SDK: 1.
@@ -1315,6 +1323,12 @@ add_dependencies(test-prereqs sdk npm_ci wasm_test_deps vscode_ext_deps)
 # where it exists.
 if(TARGET blyt_native_riscv64)
   add_dependencies(test-prereqs blyt_native_riscv64)
+endif()
+# The libretro all-legs tests need blyt_libretro.so + its test_libretro_core
+# harness, which are not part of `sdk` (issue #172). Build them too so
+# session-warmup leaves the libretro leg runnable. Guarded on LIBBLYTC_OUT.
+if(TARGET test_libretro_core)
+  add_dependencies(test-prereqs test_libretro_core blyt_libretro)
 endif()
 
 # ── test-linux-docker ─────────────────────────────────────────────────────────
