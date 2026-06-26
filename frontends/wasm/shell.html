@@ -41,6 +41,9 @@
       /* Relay ports injected by `blyt run --debug`.  0 when debugging is not active. */
       window.blyt_dap_port = {{BLYT_DAP_PORT}};
       window.blyt_gdb_port = {{BLYT_GDB_PORT}};
+      /* Host path of the debug cart ELF, so lldb-dap can open it locally to read
+       * the cart's DWARF (issue #144).  "" when not debugging. */
+      window.blyt_cart_path = "{{BLYT_CART_PATH}}";
       /* Dev control relay port (issue #87) — injected in project-dir mode, 0
        * otherwise.  Carries runtime lifecycle commands (reload/save/load/reset)
        * over a WebSocket to the devtool's relay (PORT+5). */

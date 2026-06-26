@@ -234,6 +234,24 @@ EM_JS(int, blyt_js_gdb_port, (void), {
         return window.blyt_gdb_port | 0;
     return 0;
 });
+
+/* Read the host-side path of the debug cart ELF, injected by `blyt debug` into
+ * shell.html (issue #144).  lldb-dap opens this path to read the cart's DWARF;
+ * without it the svr4 list reports the in-memory "/cart.blyt" which the host
+ * lldb cannot open, so cart breakpoints never bind.  Returns a malloc'd C string
+ * (caller frees) or 0 when not set. */
+EM_JS(char *, blyt_js_cart_path, (void), {
+    var p =
+        (typeof globalThis !== 'undefined' && globalThis.__blyt_cart_path) ||
+        (typeof window !== 'undefined' && window.blyt_cart_path) ||
+        0;
+    if (!p)
+        return 0;
+    var len = lengthBytesUTF8(p) + 1;
+    var ptr = _malloc(len);
+    stringToUTF8(p, ptr, len);
+    return ptr;
+});
 #endif
 
 /* clang-format on */
@@ -1868,6 +1886,13 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
             }
 #ifdef BLYT_GDB
             {
+                /* Report a host-resolvable cart path so lldb-dap can read the
+                 * native (C) side's DWARF over the browser relay (issue #144). */
+                char *cart_path = blyt_js_cart_path();
+                if (cart_path) {
+                    blyt_session_gdb_set_cart_path(g_session, cart_path);
+                    free(cart_path);
+                }
                 int p = blyt_js_gdb_port();
                 if (p > 0)
                     blyt_session_gdb_listen(g_session, &p);
@@ -2100,6 +2125,13 @@ int main(void) {
 
 #ifdef BLYT_GDB
     {
+        /* Report a host-resolvable cart path to lldb-dap before listening, so
+         * cart breakpoints bind over the browser relay (issue #144). */
+        char *cart_path = blyt_js_cart_path();
+        if (cart_path) {
+            blyt_session_gdb_set_cart_path(g_session, cart_path);
+            free(cart_path);
+        }
         int gdb_port = blyt_js_gdb_port();
         if (gdb_port > 0)
             blyt_session_gdb_listen(g_session, &gdb_port);

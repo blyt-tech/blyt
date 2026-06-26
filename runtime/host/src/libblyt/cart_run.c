@@ -3427,6 +3427,23 @@ int blyt_session_gdb_listen(blyt_session_t *s, int *port_out) {
 #endif
 }
 
+void blyt_session_gdb_set_cart_path(blyt_session_t *s, const char *host_path) {
+#ifdef BLYT_GDB
+    if (!s || s->gdb_cart_lib_idx < 0 || !host_path || !host_path[0])
+        return;
+    /* Rename the cart's already-registered svr4 entry; l_addr/l_ld are unchanged
+     * (same ELF, same load base) — only the path lldb opens for DWARF differs
+     * (issue #144).  The FFI mirror shares gl->path, so re-point it too. */
+    blyt_gdb_lib_t *gl = &s->gdb_libs[s->gdb_cart_lib_idx];
+    strncpy(gl->path, host_path, sizeof(gl->path) - 1);
+    gl->path[sizeof(gl->path) - 1] = '\0';
+    s->gdb_libs_ffi[s->gdb_cart_lib_idx].path = gl->path;
+#else
+    (void)s;
+    (void)host_path;
+#endif
+}
+
 void blyt_session_gdb_shutdown(blyt_session_t *s) {
 #ifdef BLYT_GDB
     if (!s || !s->ctx.gdb_enabled)

@@ -1667,10 +1667,19 @@ fn handle_connection(
                 // Replace {{BLYT_DAP_PORT}}/{{BLYT_GDB_PORT}} with the relay
                 // ports and {{BLYT_TRACE}} with the trace channel list ("" off).
                 let html = String::from_utf8_lossy(&data);
+                // Absolute, JS-string-escaped host path of the cart ELF so
+                // lldb-dap can open it locally for DWARF (issue #144).
+                let cart_abs =
+                    fs::canonicalize(cart_path).unwrap_or_else(|_| cart_path.to_path_buf());
+                let cart_js = cart_abs
+                    .to_string_lossy()
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"");
                 let patched = html
                     .replace("{{BLYT_DAP_PORT}}", &dap_port.to_string())
                     .replace("{{BLYT_GDB_PORT}}", &gdb_port.to_string())
                     .replace("{{BLYT_DEV_CTRL_PORT}}", &dev_ctrl_port.to_string())
+                    .replace("{{BLYT_CART_PATH}}", &cart_js)
                     .replace("{{BLYT_TRACE}}", trace);
                 respond(&mut stream, 200, content_type, patched.as_bytes());
             } else {
