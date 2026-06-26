@@ -283,6 +283,17 @@ struct blyt_session {
     /* Software breakpoints: saved original words. */
     blyt_gdb_bp_t gdb_bps[MAX_GDB_BREAKS];
     int gdb_nbp;
+    /* Non-blocking two-phase reload solib swap state (issue #170, WASM).  Driven
+     * by blyt_session_gdb_reload_notify_begin/_pump across async ticks; 0 when
+     * no swap is in flight, 1 after phase 1 published, 2 after phase 2 published.
+     * reload_notify_cont is the continue_gen snapshot at the last publish (the
+     * swap advances when the client re-resolves and continues past it);
+     * reload_notify_old_idx is the stale cart slot dropped in phase 2;
+     * reload_notify_ticks bounds the wait so a clientless session can't wedge. */
+    int reload_notify_phase;
+    unsigned reload_notify_cont;
+    int reload_notify_old_idx;
+    int reload_notify_ticks;
 #endif
 
     /* Cart BSS regions (recorded at load time for blyt_reset_every_frame_cycle). */
@@ -3532,6 +3543,20 @@ uint32_t blyt_session_next_reload_base(const blyt_session_t *s) {
 }
 
 #ifdef BLYT_GDB
+/* Publish the current GDB library layout and fire a solib-change event (a
+ * library:; stop), prompting the client to re-read the list and re-resolve
+ * breakpoints.  Does NOT wait — the caller decides how to wait for the client to
+ * consume it (synchronous busy-wait for TCP, async tick pump for WASM). */
+static void publish_libs_nowait(blyt_session_t *s) {
+    fc_gdb_layout_t layout = {
+        .exec_path = s->gdb_exec_path,
+        .libraries = s->gdb_libs_ffi,
+        .n_libraries = s->gdb_nlibs,
+    };
+    fc_gdb_stub_set_layout(&layout);
+    fc_gdb_stub_notify_library_change();
+}
+
 /* Publish the current GDB library layout, fire a solib-change event, then block
  * until the client has FULLY processed it — re-read the library list and
  * continued (issue #119).  lldb treats a library-change stop as a stop and does
@@ -3540,20 +3565,23 @@ uint32_t blyt_session_next_reload_base(const blyt_session_t *s) {
  * published without racing.  Waiting on the continue (not just the list read)
  * is what makes the two-phase add-then-remove land in order. */
 static void publish_libs_and_wait(blyt_session_t *s) {
-    fc_gdb_layout_t layout = {
-        .exec_path = s->gdb_exec_path,
-        .libraries = s->gdb_libs_ffi,
-        .n_libraries = s->gdb_nlibs,
-    };
-    fc_gdb_stub_set_layout(&layout);
     unsigned cont = fc_gdb_stub_continue_gen();
-    fc_gdb_stub_notify_library_change();
+    publish_libs_nowait(s);
     /* Wait up to ~3 s for the client to re-resolve and continue.  A timeout is
      * non-fatal — the next phase still publishes the final library state. */
     for (int i = 0; i < 3000 && fc_gdb_stub_continue_gen() == cont; i++)
         usleep(1000);
 }
 #endif
+
+bool blyt_session_gdb_is_debugging(const blyt_session_t *s) {
+#ifdef BLYT_GDB
+    return s && s->ctx.gdb_enabled && s->gdb_cart_lib_idx >= 0;
+#else
+    (void)s;
+    return false;
+#endif
+}
 
 void blyt_session_gdb_notify_cart_reloaded(blyt_session_t *s, const blyt_cart_t *new_cart,
                                            uint32_t load_base, const char *reported_path) {
@@ -3596,6 +3624,105 @@ void blyt_session_gdb_notify_cart_reloaded(blyt_session_t *s, const blyt_cart_t 
     (void)new_cart;
     (void)load_base;
     (void)reported_path;
+#endif
+}
+
+#ifdef BLYT_GDB
+/* Phase 2 of the two-phase swap (no publish): drop the stale cart library entry
+ * by folding the transient new slot (the last one) into the old slot and
+ * shrinking, so exactly one cart entry remains and lands back at old_idx. */
+static void reload_notify_drop_old(blyt_session_t *s) {
+    int old_idx = s->reload_notify_old_idx;
+    s->gdb_libs[old_idx] = s->gdb_libs[s->gdb_nlibs - 1];
+    s->gdb_nlibs--;
+    s->gdb_cart_lib_idx = old_idx;
+    rebuild_gdb_libs_ffi(s);
+}
+
+/* Upper bound on async pump ticks per phase (issue #170): a real client
+ * re-resolves in a handful of ticks; this only bounds a debug session with no
+ * live client so the reload cannot wedge forever waiting on continue_gen. */
+#define BLYT_RELOAD_NOTIFY_MAX_TICKS 100000
+#endif
+
+bool blyt_session_gdb_reload_notify_begin(blyt_session_t *s, const blyt_cart_t *new_cart,
+                                          uint32_t load_base, const char *reported_path) {
+#ifdef BLYT_GDB
+    if (!blyt_session_gdb_is_debugging(s))
+        return false;
+    const char *path = (reported_path && reported_path[0]) ? reported_path : new_cart->path;
+    if (!path)
+        return false;
+
+    s->reload_notify_old_idx = s->gdb_cart_lib_idx;
+    s->reload_notify_ticks = 0;
+
+    /* Phase 1 — ADD the rebuilt cart as a NEW library alongside the old one
+     * (fresh base + unique path → lldb re-reads the new DWARF and re-resolves
+     * breakpoints onto the new code).  Publish the solib-change stop and return;
+     * the caller pumps until the client consumes it. */
+    if (s->gdb_nlibs >= MAX_GDB_LIBS) {
+        /* No room for a transient second entry: re-report in place — a single
+         * publish (re-resolution still works when the breakpoint is pending). */
+        fill_cart_gdb_lib_slot(s, s->gdb_cart_lib_idx, new_cart, load_base, path);
+        s->reload_notify_cont = fc_gdb_stub_continue_gen();
+        publish_libs_nowait(s);
+        s->reload_notify_phase = 2; /* no old entry to drop; just await consume */
+        return true;
+    }
+    int new_idx = s->gdb_nlibs++;
+    fill_cart_gdb_lib_slot(s, new_idx, new_cart, load_base, path);
+    s->reload_notify_cont = fc_gdb_stub_continue_gen();
+    publish_libs_nowait(s);
+    s->reload_notify_phase = 1;
+    return true;
+#else
+    (void)s;
+    (void)new_cart;
+    (void)load_base;
+    (void)reported_path;
+    return false;
+#endif
+}
+
+bool blyt_session_gdb_reload_notify_pump(blyt_session_t *s) {
+#ifdef BLYT_GDB
+    if (!s || s->reload_notify_phase == 0)
+        return true; /* nothing in flight */
+
+    /* Service one queued client packet so its library reads + vCont continue can
+     * advance.  continue_gen ticks when the client re-resolves and continues. */
+    fc_gdb_stub_poll();
+
+    if (fc_gdb_stub_continue_gen() == s->reload_notify_cont) {
+        /* This phase not yet consumed.  Bound the wait so a session with no live
+         * client cannot wedge — on timeout, force the final library state. */
+        if (++s->reload_notify_ticks < BLYT_RELOAD_NOTIFY_MAX_TICKS)
+            return false;
+        if (s->reload_notify_phase == 1) {
+            reload_notify_drop_old(s);
+            publish_libs_nowait(s);
+        }
+        s->reload_notify_phase = 0;
+        return true;
+    }
+
+    if (s->reload_notify_phase == 1) {
+        /* Phase 1 consumed → Phase 2: drop the stale entry, publish, await its
+         * consume so exactly one breakpoint location survives. */
+        reload_notify_drop_old(s);
+        s->reload_notify_cont = fc_gdb_stub_continue_gen();
+        publish_libs_nowait(s);
+        s->reload_notify_ticks = 0;
+        s->reload_notify_phase = 2;
+        return false;
+    }
+
+    s->reload_notify_phase = 0; /* phase 2 consumed → swap complete */
+    return true;
+#else
+    (void)s;
+    return true;
 #endif
 }
 

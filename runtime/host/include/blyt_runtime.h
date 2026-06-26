@@ -241,6 +241,39 @@ uint32_t blyt_session_next_reload_base(const blyt_session_t *session);
 void blyt_session_gdb_notify_cart_reloaded(blyt_session_t *session, const blyt_cart_t *new_cart,
                                            uint32_t load_base, const char *reported_path);
 
+/* True when this session is being actively debugged over GDB (issue #170): GDB
+ * is enabled (a listener was started via blyt_session_gdb_listen) and a cart
+ * library is registered.  The WASM frontend uses this to choose the debug-aware
+ * reload sequence (fresh base + async solib re-arm) over the run-mode reload.
+ * (Note: the WASM relay never marks a client "connected" the way TCP does, so
+ * this gates on GDB being enabled, not on fc_gdb_stub_has_client.) */
+bool blyt_session_gdb_is_debugging(const blyt_session_t *session);
+
+/* NON-BLOCKING two-phase solib swap for the WASM debug hot reload (issue #170).
+ *
+ * blyt_session_gdb_notify_cart_reloaded performs the two-phase add-then-remove
+ * library swap with a SYNCHRONOUS busy-wait (publish_libs_and_wait) between
+ * phases — correct for the native TCP transport whose background thread services
+ * the client concurrently, but unusable on WASM where the single-threaded gdb
+ * stub is polled per animation tick and the relay only delivers packets when the
+ * event loop runs.  These two entry points drive the same swap across async
+ * main-loop ticks instead:
+ *
+ *   _begin publishes phase 1 (announce the rebuilt cart as a NEW library at its
+ *   fresh base/path, firing the solib-change stop) and returns immediately.  The
+ *   caller must NOT run cart frames until the swap finishes — it pumps _pump()
+ *   each tick (which polls the stub so the client's library reads + continue are
+ *   processed); once the client has consumed phase 1, _pump publishes phase 2
+ *   (drop the stale entry) and, once that too is consumed, returns true.
+ *
+ * _begin returns false when GDB is not actively debugging (caller then takes the
+ * run-mode path); _pump returns true (done) when no swap is in progress.  _pump
+ * also force-completes after a bounded number of ticks so a debug session with
+ * no live client cannot wedge the reload. */
+bool blyt_session_gdb_reload_notify_begin(blyt_session_t *session, const blyt_cart_t *new_cart,
+                                          uint32_t load_base, const char *reported_path);
+bool blyt_session_gdb_reload_notify_pump(blyt_session_t *session);
+
 /* Opaque identity of the underlying rv32 VM.  Stable for the life of a session
  * and across blyt_session_swap_cart (which reuses the VM); a freshly created
  * session has a different id.  For tests/introspection only. */
