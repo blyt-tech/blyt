@@ -46,6 +46,24 @@ void blyt_cart_update(void) { print_greeting(); }
 void blyt_cart_draw(void) {}
 "#;
 
+/// Pure-Lua counterpart of PER_FRAME_LOADER_C: re-reads and prints R.GREETING
+/// every frame through the resource handle API, so the WASM host-Lua fast path
+/// (g_session == NULL) can observe a hot-swap on the frame after update_assets.
+/// Never quits — the driver stops it.
+const PER_FRAME_LOADER_LUA: &str = r#"
+local R = require("cart_resources")
+local function print_greeting()
+    local res = blyt.resource.load(R.GREETING)
+    if res then
+        blyt.debug.print(res:text())
+        res:release()
+    end
+end
+function init() print_greeting() end
+function update() print_greeting() end
+function draw() end
+"#;
+
 /// Minimal C cart that loads R_GREETING and prints its bytes verbatim.
 const LOADER_C: &str = r#"
 #include "blyt.h"
@@ -515,8 +533,24 @@ fn text_asset_wasm_dev_mode_hot_swap() {
     // (the server rebuilds internally, but this surfaces build errors directly).
     build_dev_elf(&project);
 
-    let sdk = sdk_dir();
+    run_wasm_dev_hotswap(
+        &project,
+        "VERSION_ONE",
+        "VERSION_TWO",
+        "C per-frame hot-swap",
+    );
+}
+
+/// Shared WASM hot-swap browser harness: serve `project` via `blyt run`, drive it
+/// in headless Chromium through dev_asset_hotswap_test.mjs (edit the greeting
+/// asset from `v1` to `v2` and assert the swap reaches the cart with no restart).
+/// The caller must have already written + built the project (build_dev_elf).
+/// `context` labels the failure so callers can distinguish C vs pure-Lua legs.
+fn run_wasm_dev_hotswap(project: &std::path::Path, v1: &str, v2: &str, context: &str) {
     use std::process::{Command as StdCommand, Stdio};
+    use std::sync::{Arc, Mutex};
+
+    let sdk = sdk_dir();
     let mut child = StdCommand::new(blyt_bin())
         .args(["run", project.to_str().unwrap()])
         .env("BLYT_SDK_DIR", &sdk)
@@ -527,9 +561,7 @@ fn text_asset_wasm_dev_mode_hot_swap() {
         .spawn()
         .expect("spawn blyt run");
 
-    // Read the server's stdout on a background thread so we can find its port.
     let mut stdout = child.stdout.take().unwrap();
-    use std::sync::{Arc, Mutex};
     let buf = Arc::new(Mutex::new(String::new()));
     let buf_t = buf.clone();
     let reader = std::thread::spawn(move || {
@@ -547,7 +579,6 @@ fn text_asset_wasm_dev_mode_hot_swap() {
     });
 
     let url = wait_for_serving_url(&buf, Duration::from_secs(30));
-
     let driver = repo_root().join("tests/wasm/dev_asset_hotswap_test.mjs");
     let asset = project.join("assets/greeting.txt");
     let status = std::process::Command::new("node")
@@ -555,8 +586,8 @@ fn text_asset_wasm_dev_mode_hot_swap() {
             driver.to_str().unwrap(),
             &url,
             asset.to_str().unwrap(),
-            "VERSION_ONE",
-            "VERSION_TWO",
+            v1,
+            v2,
         ])
         .status()
         .expect("run dev_asset_hotswap_test.mjs");
@@ -565,8 +596,35 @@ fn text_asset_wasm_dev_mode_hot_swap() {
     let _ = reader.join();
     assert!(
         status.success(),
-        "dev_asset_hotswap_test.mjs failed; blyt run output:\n{}",
+        "{context}: dev_asset_hotswap_test.mjs failed; blyt run output:\n{}",
         buf.lock().unwrap()
+    );
+}
+
+/// WASM dev-mode hot-swap, pure-Lua fast path (issue #120): same browser path as
+/// the C test above, but the cart is pure-Lua so it runs host-side in g_lua with
+/// g_session == NULL.  The swap must reach it through the host-Lua resource table
+/// reload — proving the #118 update_assets gate is gone and the fast-path table is
+/// reloaded between frames with no VM restart.
+#[test]
+fn text_asset_wasm_dev_mode_hot_swap_lua() {
+    require_lua_sdk();
+    require_wasm();
+    require_playwright();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("assets_wasm_hotswap_lua");
+    CartProject::new()
+        .lua(PER_FRAME_LOADER_LUA)
+        .asset("greeting.txt", "VERSION_ONE")
+        .write(&project);
+
+    build_dev_elf(&project);
+    run_wasm_dev_hotswap(
+        &project,
+        "VERSION_ONE",
+        "VERSION_TWO",
+        "pure-Lua per-frame hot-swap",
     );
 }
 
@@ -850,56 +908,11 @@ fn on_assets_reloaded_c_wasm() {
         .write(&project);
     build_dev_elf(&project);
 
-    let sdk = sdk_dir();
-    use std::process::{Command as StdCommand, Stdio};
-    let mut child = StdCommand::new(blyt_bin())
-        .args(["run", project.to_str().unwrap()])
-        .env("BLYT_SDK_DIR", &sdk)
-        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
-        .env("BLYT_CLANG", sdk.join("bin/blyt-clang"))
-        .env("BLYT_WASM_DIR", find_wasm_dir())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn blyt run");
-
-    let mut stdout = child.stdout.take().unwrap();
-    use std::sync::{Arc, Mutex};
-    let buf = Arc::new(Mutex::new(String::new()));
-    let buf_t = buf.clone();
-    let reader = std::thread::spawn(move || {
-        let mut chunk = [0u8; 1024];
-        loop {
-            match stdout.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => buf_t
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&chunk[..n])),
-                Err(_) => break,
-            }
-        }
-    });
-
-    let url = wait_for_serving_url(&buf, Duration::from_secs(30));
-    let driver = repo_root().join("tests/wasm/dev_asset_hotswap_test.mjs");
-    let asset = project.join("assets/greeting.txt");
-    let status = std::process::Command::new("node")
-        .args([
-            driver.to_str().unwrap(),
-            &url,
-            asset.to_str().unwrap(),
-            "VERSION_ONE",
-            "VERSION_TWO",
-        ])
-        .status()
-        .expect("run dev_asset_hotswap_test.mjs");
-
-    let _ = child.kill();
-    let _ = reader.join();
-    assert!(
-        status.success(),
-        "cache-at-init cart did not observe swap on WASM; blyt run output:\n{}",
-        buf.lock().unwrap()
+    run_wasm_dev_hotswap(
+        &project,
+        "VERSION_ONE",
+        "VERSION_TWO",
+        "C cache-at-init callback",
     );
 }
 
@@ -1027,6 +1040,34 @@ fn on_assets_reloaded_lua_native_bytes() {
     assert!(
         out.contains("VERSION_TWO"),
         "expected Lua-re-derived text after on_assets_reloaded, got: {out}"
+    );
+}
+
+/// Lua leg (WASM host-Lua fast path, issue #120): the same cache-at-init Lua cart
+/// driven through the real browser path.  With g_session == NULL there is no rv32
+/// session to reload, so a post-swap VERSION_TWO proves the host-Lua fast path
+/// reloaded its own g_lua_resources table AND fired on_assets_reloaded in g_lua —
+/// the wiring this issue adds.  update() never re-reads, so a per-frame re-read
+/// cannot mask a missing callback.
+#[test]
+fn on_assets_reloaded_lua_wasm_bytes() {
+    require_lua_sdk();
+    require_wasm();
+    require_playwright();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("reload_bytes_lua_wasm");
+    CartProject::new()
+        .lua(CACHE_AT_INIT_LUA)
+        .asset("greeting.txt", "VERSION_ONE")
+        .write(&project);
+    build_dev_elf(&project);
+
+    run_wasm_dev_hotswap(
+        &project,
+        "VERSION_ONE",
+        "VERSION_TWO",
+        "pure-Lua cache-at-init callback",
     );
 }
 
