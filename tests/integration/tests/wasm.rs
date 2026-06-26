@@ -350,3 +350,168 @@ end
         .assert()
         .success();
 }
+
+/// Native/hybrid live reload in WASM-dev run mode (issue #124): a cart with
+/// native code must hot-swap via the in-VM cart-as-library module swap
+/// (blyt_session_swap_cart, issue #127) — not refuse with "reload not supported
+/// for carts with native code yet".  This is the WASM analog of the player's
+/// session-swap reload (blyt_libretro_reload); the player/native legs already
+/// reload native carts, the WASM leg is the one this issue fixes.
+///
+/// cart_v1 init sets score=7; cart_v2 init sets score=100.  A working reload
+/// preserves v1's score=7 across the code swap and fires v2's
+/// on_load_state(HOT_RELOAD), so the v2 code reports score=7 reason=3 — a fresh
+/// boot would report 100, and no reload at all would keep running v1.
+const NATIVE_RELOAD_V1: &str = r#"
+#include "blyt.h"
+#include "cart_state.h"
+#include <stdio.h>
+
+void blyt_cart_init(void) {
+    int32_t slot = -1;
+    blyt_buffer_alloc_slot(S_GAME, &slot);
+    blyt_buffer_set_i32(S_GAME, slot, S_GAME_SCORE, 7);
+}
+void blyt_cart_update(void) {}
+void blyt_cart_draw(void) {}
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "v1 load score=%d reason=%d",
+             blyt_buffer_get_i32(S_GAME, 0, S_GAME_SCORE), (int)info.reason);
+    blyt_console_debug(buf);
+}
+"#;
+
+const NATIVE_RELOAD_V2: &str = r#"
+#include "blyt.h"
+#include "cart_state.h"
+#include <stdio.h>
+
+void blyt_cart_init(void) {
+    int32_t slot = -1;
+    blyt_buffer_alloc_slot(S_GAME, &slot);
+    blyt_buffer_set_i32(S_GAME, slot, S_GAME_SCORE, 100);
+}
+void blyt_cart_update(void) {}
+void blyt_cart_draw(void) {}
+void blyt_cart_on_load_state(blyt_load_info_t info) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "v2 load score=%d reason=%d",
+             blyt_buffer_get_i32(S_GAME, 0, S_GAME_SCORE), (int)info.reason);
+    blyt_console_debug(buf);
+}
+"#;
+
+#[test]
+fn wasm_dev_control_native_reload() {
+    require_wasm();
+    let wasm_dir = find_wasm_dir();
+
+    let tmp = TempDir::new().unwrap();
+
+    let project_v1 = tmp.path().join("native_reload_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(NATIVE_RELOAD_V1)
+        .write(&project_v1);
+    let cart_v1 = build_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("native_reload_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(NATIVE_RELOAD_V2)
+        .write(&project_v2);
+    let cart_v2 = build_cart(&project_v2);
+
+    let driver = repo_root().join("tests/wasm/native_reload_test.js");
+    Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart_v1.to_str().unwrap(),
+            cart_v2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+/// Hybrid (Lua + native) live reload in WASM-dev (issue #124).  A hybrid cart
+/// runs its Lua host-side over a bridge to native code in the rv32 session, so a
+/// reload must refresh BOTH: swap the native module (so new native code runs)
+/// AND rebuild the host-Lua VM, with state preserved.  The native module exports
+/// `tag()` (v1→1, v2→2) and the Lua `on_load_state` reports the buffer score,
+/// the live native tag, and the reason.  A working reload preserves score=7,
+/// runs the new native code (tag=2) and the new Lua (`v2 load`), and fires
+/// on_load_state(HOT_RELOAD): "v2 load score=7 tag=2 reason=3".  tag=2 (not 1)
+/// is what proves the native module — not just the host-Lua side — reloaded.
+const HYBRID_RELOAD_C_V1: &str = r#"
+#include "blyt.h"
+BLYT_LUA_MODULE_EXPORT_RAW(native, tag) { lua_pushinteger(L, 1); return 1; }
+"#;
+const HYBRID_RELOAD_C_V2: &str = r#"
+#include "blyt.h"
+BLYT_LUA_MODULE_EXPORT_RAW(native, tag) { lua_pushinteger(L, 2); return 1; }
+"#;
+const HYBRID_RELOAD_LUA_V1: &str = r#"
+local native = require("native")
+function init()
+    local slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].score = 7
+end
+function update() end
+function draw() end
+function on_load_state(info)
+    blyt.debug.print("v1 load score=" .. S.game[0].score
+        .. " tag=" .. native.tag() .. " reason=" .. info.reason)
+end
+"#;
+const HYBRID_RELOAD_LUA_V2: &str = r#"
+local native = require("native")
+function init()
+    local slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].score = 100
+end
+function update() end
+function draw() end
+function on_load_state(info)
+    blyt.debug.print("v2 load score=" .. S.game[0].score
+        .. " tag=" .. native.tag() .. " reason=" .. info.reason)
+end
+"#;
+
+#[test]
+fn wasm_dev_control_hybrid_reload() {
+    require_wasm();
+    require_lua_sdk();
+    let wasm_dir = find_wasm_dir();
+
+    let tmp = TempDir::new().unwrap();
+
+    let project_v1 = tmp.path().join("hybrid_reload_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(HYBRID_RELOAD_LUA_V1)
+        .c(HYBRID_RELOAD_C_V1)
+        .write(&project_v1);
+    let cart_v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("hybrid_reload_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(HYBRID_RELOAD_LUA_V2)
+        .c(HYBRID_RELOAD_C_V2)
+        .write(&project_v2);
+    let cart_v2 = build_lua_cart(&project_v2);
+
+    let driver = repo_root().join("tests/wasm/native_reload_test.js");
+    Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart_v1.to_str().unwrap(),
+            cart_v2.to_str().unwrap(),
+            "tag=2",
+        ])
+        .assert()
+        .success();
+}

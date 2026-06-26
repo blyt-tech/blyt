@@ -1340,6 +1340,20 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     wasm_register_s_proxy(g_lua);
     wasm_register_resource_api(g_lua);
 
+    /* Step 8b: for hybrid carts, recreate the Lua↔native exchange thread and
+     * register the native export modules BEFORE the bytecode runs — the cart's
+     * top-level `require("<module>")` resolves during bytecode load (step 9), so
+     * the trampolines must already be installed.  Mirrors the initial-load order
+     * in run_lua_cart (bridge attach precedes wasm_load_lua_bytecode); doing it
+     * after, as before, broke a hybrid reload of any cart that require()s a
+     * native module at chunk top level (issue #124). */
+    if (g_session && g_has_lua_exports) {
+        g_lua_exch = lua_newthread(g_lua);
+        g_lua_exch_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
+        blyt_session_lua_bridge_attach(g_session, g_lua_exch);
+        wasm_register_lua_trampolines(g_lua, g_session);
+    }
+
     /* Step 9: re-run .cart.lua section (handles BLMC + module registration). */
     if (wasm_load_lua_bytecode(g_lua, (const unsigned char *)g_lua_bytecode, g_lua_bytecode_size) !=
         0) {
@@ -1388,14 +1402,6 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
             }
             maybe_inject_lifecycle_cb(g_lua, cbs[i].name, fn);
         }
-    }
-
-    /* Step 11: if has_lua_exports, recreate exchange thread and bridge */
-    if (g_session && g_has_lua_exports) {
-        g_lua_exch = lua_newthread(g_lua);
-        g_lua_exch_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
-        blyt_session_lua_bridge_attach(g_session, g_lua_exch);
-        wasm_register_lua_trampolines(g_lua, g_session);
     }
 
     /* Step 12: call init() from C (no coroutine needed for this reset call) */
@@ -1693,10 +1699,10 @@ void blyt_dev_ctrl_command(const char *json) {
     }
 
     if (strcmp(cmd, "reload") == 0) {
-        if (!dev_ctrl_lua_path()) {
-            dev_ctrl_respond_err(id, cmd, "reload not supported for carts with native code yet");
-            return;
-        }
+        /* Reload is supported for every cart type: pure-Lua carts swap host-Lua
+         * bytecode (g_session == NULL), while native/hybrid carts (g_session !=
+         * NULL) swap the cart's code in the live rv32 session via the in-VM
+         * cart-as-library module swap (issue #124, on top of #127's β). */
         if (g_dev_ctrl_reload_id >= 0) {
             dev_ctrl_respond_err(id, cmd, "reload already in progress");
             return;
@@ -1800,6 +1806,104 @@ void blyt_dev_ctrl_assets_fetched(int ok) {
     }
 }
 
+/* Native/hybrid live reload (issue #124): swap the cart's code in the live rv32
+ * session via the in-VM cart-as-library module swap (blyt_session_swap_cart,
+ * issue #127), mirroring the player's blyt_libretro_reload — the rv32 VM,
+ * libblyt32/libblyt32lua and the dev-control connection all PERSIST (no session
+ * recreate, so the rv32emu single-VM-per-process global-state hazard is never
+ * crossed).  State is preserved across the swap exactly as the player does it:
+ * snapshot → swap → boot init() → restore(HOT_RELOAD).
+ *
+ * Two cart shapes reach here (g_session != NULL):
+ *   - pure-native (g_lua == NULL): the whole cart runs in the VM; snapshot and
+ *     restore go through the session, which drives the native cart's
+ *     on_save_state/on_load_state hooks.
+ *   - hybrid (g_lua != NULL): the cart's Lua runs host-side over a native
+ *     bridge.  The native module is swapped, then the host-Lua VM is rebuilt
+ *     from the new cart's bytecode (re-binding the native lifecycle trampolines
+ *     to the swapped module's exports) with state restored and the host-Lua
+ *     on_load_state(HOT_RELOAD) replayed.  The state snapshot is taken BEFORE
+ *     the swap because the swap re-boots the cart and re-inits its state ctx.
+ * Reports its own ok/error response. */
+static void wasm_session_reload(long id) {
+    blyt_cart_t *new_cart = NULL;
+
+    if (g_lua) {
+        /* Hybrid: flush live host-Lua state via on_save_state, then snapshot the
+         * shared state buffers before the swap. */
+        blyt_state_ctx_t *sctx = active_state_ctx();
+        blyt_state_snapshot_t *snap = NULL;
+        if (sctx) {
+            lua_getglobal(g_lua, "on_save_state");
+            if (lua_isfunction(g_lua, -1))
+                lua_pcall(g_lua, 0, 0, 0);
+            else
+                lua_pop(g_lua, 1);
+            snap = blyt_state_ctx_snapshot(sctx);
+        }
+
+        blyt_cart_err_t cerr = blyt_cart_open("/cart.blyt", &new_cart);
+        if (cerr != BLYT_CART_OK) {
+            if (snap)
+                blyt_state_snapshot_free(snap);
+            dev_ctrl_respond_err(id, "reload", blyt_cart_err_str(cerr));
+            return;
+        }
+        if (!blyt_session_swap_cart(g_session, new_cart, 0u, NULL)) {
+            blyt_cart_close(new_cart);
+            if (snap)
+                blyt_state_snapshot_free(snap);
+            dev_ctrl_respond_err(id, "reload", "cart module swap failed");
+            return;
+        }
+        blyt_cart_close(g_cart);
+        g_cart = new_cart;
+
+        size_t bc_size = 0;
+        const void *bc = blyt_cart_find_section(g_cart, ".cart.lua", &bc_size);
+        if (!bc) {
+            if (snap)
+                blyt_state_snapshot_free(snap);
+            dev_ctrl_respond_err(id, "reload", "reloaded cart has no Lua section");
+            g_lua_fatal = true;
+            return;
+        }
+        g_lua_bytecode = bc;
+        g_lua_bytecode_size = bc_size;
+
+        /* Rebuild host Lua from the new bytecode, restoring the pre-swap snapshot
+         * and replaying on_load_state(HOT_RELOAD).  rebuild() takes ownership of
+         * snap and re-binds the native lifecycle trampolines to the new module. */
+        if (wasm_lua_rebuild(true, snap))
+            dev_ctrl_respond_ok(id, "reload");
+        else
+            dev_ctrl_respond_err(id, "reload", "rebuild failed");
+        return;
+    }
+
+    /* Pure-native: snapshot via the session (drives native on_save_state), swap
+     * the cart module, boot the new init(), then restore over the fresh buffers
+     * and notify the cart via on_load_state(HOT_RELOAD). */
+    blyt_state_snapshot_t *snap = blyt_session_snapshot(g_session);
+    blyt_cart_err_t cerr = blyt_cart_open("/cart.blyt", &new_cart);
+    if (cerr != BLYT_CART_OK) {
+        blyt_session_snapshot_free(snap);
+        dev_ctrl_respond_err(id, "reload", blyt_cart_err_str(cerr));
+        return;
+    }
+    if (!blyt_session_swap_cart(g_session, new_cart, 0u, NULL)) {
+        blyt_cart_close(new_cart);
+        blyt_session_snapshot_free(snap);
+        dev_ctrl_respond_err(id, "reload", "cart module swap failed");
+        return;
+    }
+    blyt_cart_close(g_cart);
+    g_cart = new_cart;
+    blyt_session_run_frame(g_session); /* runs the new cart's init() */
+    blyt_session_restore(g_session, snap, 3u); /* BLYT_LOAD_HOT_RELOAD; frees snap */
+    dev_ctrl_respond_ok(id, "reload");
+}
+
 /* Continue a reload after JS rewrote /cart.blyt in MEMFS (ADR-0045 sequence).
  * ok==0 means the JS-side refetch failed. */
 EMSCRIPTEN_KEEPALIVE
@@ -1811,6 +1915,13 @@ void blyt_dev_ctrl_reload_fetched(int ok) {
 
     if (!ok) {
         dev_ctrl_respond_err(id, "reload", "cart refetch failed");
+        return;
+    }
+
+    /* Native/hybrid carts (g_session != NULL) swap the cart module in the live
+     * session; pure-Lua fast-path carts rebuild the host-Lua VM below. */
+    if (g_session) {
+        wasm_session_reload(id);
         return;
     }
 
