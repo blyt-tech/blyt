@@ -73,6 +73,7 @@ pub(super) struct CompileRustTask {
     pub extra_rustflags: String,
     pub is_lua: bool,
     pub cart_state_rs: Option<PathBuf>,
+    pub cart_resources_rs: Option<PathBuf>,
     pub output: PathBuf,
     pub source_dir: PathBuf,
 }
@@ -98,6 +99,9 @@ impl Task for CompileRustTask {
         if let Some(ref rs) = self.cart_state_rs {
             v.push(TaskInput::File(rs.clone()));
         }
+        if let Some(ref rs) = self.cart_resources_rs {
+            v.push(TaskInput::File(rs.clone()));
+        }
         v
     }
     fn outputs(&self) -> Vec<PathBuf> {
@@ -113,6 +117,7 @@ impl Task for CompileRustTask {
             &self.extra_rustflags,
             self.is_lua,
             self.cart_state_rs.as_deref(),
+            self.cart_resources_rs.as_deref(),
         )?;
         if archive != self.output {
             fs::copy(&archive, &self.output)
@@ -226,6 +231,7 @@ fn build_rust_archive(
     extra_rustflags: &str,
     is_lua: bool,
     cart_state_rs: Option<&Path>,
+    cart_resources_rs: Option<&Path>,
 ) -> Result<PathBuf, BuildError> {
     let mut cmd = cargo_cart_cmd(cargo, rust_manifest, build_dir);
     cmd.arg("--config").arg(format!(
@@ -248,6 +254,10 @@ fn build_rust_archive(
     if let Some(rs_path) = cart_state_rs {
         let abs = std::fs::canonicalize(rs_path).unwrap_or_else(|_| rs_path.to_path_buf());
         cargo_cmd.env("BLYT_CART_STATE_RS", abs);
+    }
+    if let Some(rs_path) = cart_resources_rs {
+        let abs = std::fs::canonicalize(rs_path).unwrap_or_else(|_| rs_path.to_path_buf());
+        cargo_cmd.env("BLYT_CART_RESOURCES_RS", abs);
     }
     let rust_flags = format!(
         "{extra_rustflags} --remap-path-prefix={}=/blyt/sdk/rust/blyt",
@@ -321,6 +331,7 @@ mod tests {
             extra_rustflags: String::new(),
             is_lua: false,
             cart_state_rs: None,
+            cart_resources_rs: None,
             output,
             source_dir,
         }
@@ -366,6 +377,18 @@ mod tests {
         let mut task = base_task(manifest, d.path().join("src"), d.path().join("libcart.a"));
         task.cart_state_rs = Some(cart_state.clone());
         assert!(task.inputs().contains(&TaskInput::File(cart_state)));
+    }
+
+    #[test]
+    fn inputs_includes_cart_resources_rs_when_set() {
+        let d = tempdir().unwrap();
+        let manifest = d.path().join("Cargo.toml");
+        fs::write(&manifest, "").unwrap();
+        let cart_resources = d.path().join("cart_resources.rs");
+        fs::write(&cart_resources, "").unwrap();
+        let mut task = base_task(manifest, d.path().join("src"), d.path().join("libcart.a"));
+        task.cart_resources_rs = Some(cart_resources.clone());
+        assert!(task.inputs().contains(&TaskInput::File(cart_resources)));
     }
 
     #[test]
