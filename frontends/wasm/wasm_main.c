@@ -1710,16 +1710,12 @@ void blyt_dev_ctrl_command(const char *json) {
 
     if (strcmp(cmd, "update_assets") == 0) {
         /* Hot-swap edited resources between frames; no VM restart (issue #118).
-         * Reloading the resource table operates on the emulated rv32 session's
-         * resources, so it is language-agnostic but needs a session: pure-Lua
-         * fast-path carts (g_session == NULL) have no resource access yet (#120).
-         * The `assets` id list is informational — the browser refetches the whole
-         * content-addressed staging dir and the host re-reads the index. */
-        if (!g_session) {
-            dev_ctrl_respond_err(
-                id, cmd, "update_assets not supported for pure-Lua carts (no resource access yet)");
-            return;
-        }
+         * Reloading the resource table is language-agnostic: session-backed
+         * (C/hybrid) carts reload the rv32 session's ctx.resources, pure-Lua
+         * fast-path carts (g_session == NULL) reload the host-side g_lua_resources
+         * the blyt.resource.* binding reads (issue #120).  The `assets` id list is
+         * informational — the browser refetches the whole content-addressed
+         * staging dir and the host re-reads the index. */
         if (g_dev_ctrl_assets_id >= 0) {
             dev_ctrl_respond_err(id, cmd, "update_assets already in progress");
             return;
@@ -1739,10 +1735,39 @@ void blyt_dev_ctrl_command(const char *json) {
     dev_ctrl_respond_err(id, cmd, "unknown command");
 }
 
+/* Host-Lua fast path (g_session == NULL): fire the cart's global
+ * on_assets_reloaded(ids) directly in g_lua, mirroring the emulated guest hook
+ * (blyt_cart_on_assets_reloaded in libblyt32lua, issue #122) — the changed
+ * resource ids are presented as a 1-based integer array.  No-op when the cart
+ * defines no hook or the id set is empty. */
+static void wasm_lua_notify_assets_reloaded(const uint32_t *ids, size_t n) {
+    if (!g_lua || n == 0 || ids == NULL)
+        return;
+    lua_getglobal(g_lua, "on_assets_reloaded");
+    if (lua_isfunction(g_lua, -1)) {
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_assets_reloaded n=%zu", n);
+        lua_createtable(g_lua, (int)n, 0);
+        for (size_t i = 0; i < n; i++) {
+            lua_pushinteger(g_lua, (lua_Integer)ids[i]);
+            lua_seti(g_lua, -2, (lua_Integer)(i + 1));
+        }
+        if (lua_pcall(g_lua, 1, 0, 0) != LUA_OK) {
+            blyt_js_error(lua_tostring(g_lua, -1));
+            lua_pop(g_lua, 1);
+        }
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_assets_reloaded");
+    } else {
+        lua_pop(g_lua, 1);
+    }
+}
+
 /* Continue an update_assets after JS refreshed the resource staging dir in MEMFS
  * (issue #118).  ok==0 means the JS-side refetch failed.  Reloading the table
  * re-reads the (now updated) resource-id-index from BLYT_RESOURCE_DIR; the next
- * frame's blyt_resource_text_get sees the new bytes. */
+ * frame's resource read sees the new bytes.  Session-backed carts reload the
+ * rv32 session's ctx.resources; pure-Lua fast-path carts (g_session == NULL)
+ * reload the host-side g_lua_resources table the blyt.resource.* binding reads
+ * (issue #120). */
 EMSCRIPTEN_KEEPALIVE
 void blyt_dev_ctrl_assets_fetched(int ok) {
     long id = g_dev_ctrl_assets_id;
@@ -1753,11 +1778,25 @@ void blyt_dev_ctrl_assets_fetched(int ok) {
         dev_ctrl_respond_err(id, "update_assets", "resource refetch failed");
         return;
     }
-    if (g_session && blyt_session_reload_resources(g_session, g_cart)) {
-        blyt_session_notify_assets_reloaded(g_session, g_dev_ctrl_assets_ids, g_dev_ctrl_assets_n);
+    if (g_session) {
+        if (blyt_session_reload_resources(g_session, g_cart)) {
+            blyt_session_notify_assets_reloaded(g_session, g_dev_ctrl_assets_ids,
+                                                g_dev_ctrl_assets_n);
+            dev_ctrl_respond_ok(id, "update_assets");
+        } else {
+            dev_ctrl_respond_err(id, "update_assets", "reload_resources failed");
+        }
+        return;
+    }
+    /* Pure-Lua fast path: reload the standalone host table (load_for_cart clears
+     * it first, so superseded entries drop and current ones re-read), then fire
+     * the cart's Lua callback with the changed ids. */
+    if (g_lua_resources_loaded) {
+        blyt_resource_table_load_for_cart(&g_lua_resources, g_cart);
+        wasm_lua_notify_assets_reloaded(g_dev_ctrl_assets_ids, g_dev_ctrl_assets_n);
         dev_ctrl_respond_ok(id, "update_assets");
     } else {
-        dev_ctrl_respond_err(id, "update_assets", "reload_resources failed");
+        dev_ctrl_respond_err(id, "update_assets", "no resource table to reload");
     }
 }
 
