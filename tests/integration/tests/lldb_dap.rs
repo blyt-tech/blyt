@@ -2,9 +2,9 @@ mod common;
 
 use assert_cmd::Command;
 use common::{
-    CartProject, blytdebug, build_debug_cart, build_debug_lua_cart, lldb_dap_bin, repo_root,
-    require_gdb, require_lldb_dap, require_lua_sdk, require_rust_riscv_target, require_sdk,
-    require_symbol_addr,
+    CartProject, blytdebug, build_debug_cart, build_debug_lua_cart, find_wasm_debug_dir,
+    lldb_dap_bin, repo_root, require_gdb, require_lldb_dap, require_lua_sdk,
+    require_rust_riscv_target, require_sdk, require_symbol_addr, require_wasm_debug,
 };
 use std::time::Duration;
 use tempfile::TempDir;
@@ -941,4 +941,62 @@ fn sdl_hybrid_lldb_dap_reload_fires_both_init_breakpoints() {
         );
         panic!("{e}");
     }
+}
+
+/* ── WASM lldb-dap over the browser GDB relay (issue #144) ───────────────────
+ *
+ * The `blyt debug <dir>` WASM debug path drives the WASM runtime with lldb-dap
+ * over a WS↔TCP relay.  run_wasm_lldb_dap_test.mjs reproduces that bridge
+ * headlessly (WASM runtime in Node ↔ lldb-dap over TCP), so this is the
+ * CI-stable equivalent of the VS Code wasm.test.js "C cart (WASM debug)" case —
+ * same observable contract, no Electron.  It reuses the native run_lldb_dap
+ * client driver, asserting identical behaviour across the native and WASM legs. */
+fn run_wasm_lldb_dap_test(test_name: &str, project: &std::path::Path, cart: &std::path::Path) {
+    let lldb_dap = lldb_dap_bin().expect("lldb-dap not found");
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_wasm_lldb_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            lldb_dap.to_str().unwrap(),
+            cart.to_str().unwrap(),
+            project.to_str().unwrap(),
+            "--test",
+            test_name,
+        ])
+        .env("BLYT_GDB_BREAK_LINE", BREAK_LINE.to_string())
+        .env("BLYT_SOURCE_FILE", "src/game/c/main.c")
+        // lldb-dap `program` = the stub ELF, never the cart (issue #119).
+        .env(
+            "BLYT_STUB_PROGRAM",
+            repo_root().join("build/sdk/lib/debug/blyt-debug-stub.elf"),
+        )
+        .timeout(Duration::from_secs(120))
+        .assert()
+        .success();
+}
+
+/// LLDB-DAP over the WASM browser relay (issue #144): a source breakpoint in a
+/// pure-C cart binds via the svr4 library list and actually stops.  Regression
+/// guard for the cart-as-library/stub-program model (#119), which broke the WASM
+/// relay path — a coalesced RSP frame (lldb-dap pipelines in no-ack mode; the
+/// relay forwards each TCP read as one WebSocket frame) dropped the `vCont;c`,
+/// so the cart never continued to the breakpoint and the session timed out.
+///
+/// Requires: SDK + debug WASM runtime, lldb-dap, `readelf` for DWARF.
+#[test]
+fn wasm_lldb_dap_source_breakpoint() {
+    require_sdk();
+    require_wasm_debug();
+    require_lldb_dap();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_lldb_src_bp");
+    CartProject::new().c(LLDB_TEST_C).write(&project);
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists());
+    require_symbol_addr(&cart, "blyt_lldb_test_fn");
+
+    run_wasm_lldb_dap_test("auto-start", &project, &cart);
 }

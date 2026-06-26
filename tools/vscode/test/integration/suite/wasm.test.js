@@ -14,19 +14,18 @@ const { assert } = h;
 const C = 'src/game/c/hello.c';
 const BP_SNPRINTF = 34; // snprintf(buf, ...)   (x,y already assigned)
 
-/* SKIPPED pending #144.  WASM native/hybrid step-debugging (lldb-dap over the
- * devtool's browser GDB relay) is broken on the #119 branch: the breakpoint
- * never stops and the session times out.  This is a regression caused by #119's
- * foundation (cart-as-shared-library + stub-program `program`, in the shared
- * emulated loader cart_run.c which compiles into the WASM runtime too), so it is
- * a #119 continuation tracked separately as #144 — NOT a #119 acceptance gate
- * (WASM-dev is out of #119's spec scope; criteria are native/player only).  The
- * #119 cart-relocation fix (A2) resolved the native+hybrid frame-resolution
- * regression but did not fix the WASM relay path.  Un-skip when #144 lands. */
+/* Fixed by #144.  Under #119's cart-as-library/stub-program model, lldb-dap's
+ * `program` is the stub ELF, so it reads the cart's DWARF from the file named in
+ * the svr4 library list.  The WASM runtime loads the cart from the in-memory
+ * "/cart.blyt", which host-side lldb cannot open — so the breakpoint never bound
+ * and the session timed out.  The fix injects a host-resolvable cart-ELF path
+ * (`blyt debug` → shell.html → blyt_session_gdb_set_cart_path).  A headless,
+ * Electron-free version of this lives in the integration suite as
+ * lldb_dap.rs::wasm_lldb_dap_source_breakpoint (tests/dap/run_wasm_lldb_dap_test.mjs). */
 describe('C cart (WASM debug)', () => {
 	afterEach(async () => h.reset());
 
-	it.skip('resolves a WASM debug session and stops at a C breakpoint', async () => {
+	it('resolves a WASM debug session and stops at a C breakpoint', async () => {
 		const wf = h.folder('hello-c');
 		h.addBreakpoint(h.fileUri(wf, C), BP_SNPRINTF);
 		await h.startWasm(wf);

@@ -986,7 +986,8 @@ add_custom_target(
 # The players, guest libraries, and native libs all build directly into sdk/ via
 # the ninja graph.  Declare them as dependencies so `cmake --build build
 # --target sdk` refreshes them before assembling the rest of the SDK.
-foreach(_sdk_dep blytplay blytdebug guest_libs libblyt32_native_so)
+foreach(_sdk_dep blytplay blytdebug guest_libs libblyt32_native_so
+                 blyt_debug_stub)
   if(TARGET ${_sdk_dep})
     add_dependencies(sdk ${_sdk_dep})
   endif()

@@ -321,6 +321,16 @@ int blyt_session_dap_wait_ready(blyt_session_t *s);
  */
 int blyt_session_gdb_listen(blyt_session_t *s, int *port_out);
 
+/* Override the filesystem path reported for the cart in the GDB
+ * qXfer:libraries-svr4 list (issue #144).  lldb-dap opens this path locally to
+ * read the cart's ELF sections + DWARF; a native session already reports the
+ * real on-disk cart path, but the WASM runtime loads the cart from an in-memory
+ * virtual path ("/cart.blyt") that the host-side lldb cannot open — so cart
+ * breakpoints never bind and the session hangs.  The WASM frontend calls this
+ * with a host-resolvable path to the same debug cart ELF.  No-op if GDB is not
+ * enabled, no cart library is registered, or host_path is empty. */
+void blyt_session_gdb_set_cart_path(blyt_session_t *s, const char *host_path);
+
 /* Stop the GDB server. Idempotent. */
 void blyt_session_gdb_shutdown(blyt_session_t *s);
 
