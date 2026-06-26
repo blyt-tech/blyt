@@ -23,6 +23,8 @@
 #include <lua.h>
 #include <lualib.h>
 
+#include <string.h>
+
 #include "blyt.h"
 #ifdef BLYT_DAP
 #include "master_hook.h"
@@ -237,6 +239,133 @@ static int lua_buf_ref_slot(lua_State *L) {
     return 1;
 }
 
+/* -------------------------------------------------------------------------
+ * blyt.resource.* — text resource API (#93; ADR-0027, ADR-0068, ADR-0086,
+ * ADR-0120).  Thin Lua layer over the resource lifecycle ECALLs (#123):
+ *   blyt.resource.load(id)  -> handle object (userdata) | nil
+ *   blyt.resource.pin(id)   -> ptr, size | nil   (frame-scoped raw bytes)
+ *   blyt.resource.unpin(id)
+ *   handle:text()           -> owned Lua string (pin -> copy -> unpin)
+ *   handle:release()        -> advisory release (also run by __gc)
+ * Handle metamethods: __gc (release), __eq (by handle+id), __tostring.
+ * ------------------------------------------------------------------------- */
+
+#define BLYT_RESOURCE_HANDLE_MT "blyt.resource.handle"
+
+typedef struct {
+    blyt_resource_id_t id;
+    blyt_resource_h handle;
+    int released; /* 1 once release has run (explicit or __gc) — avoids double release */
+} lua_resource_handle_t;
+
+static int lua_resource_load(lua_State *L) {
+    blyt_resource_id_t id = (blyt_resource_id_t)luaL_checkinteger(L, 1);
+    blyt_resource_h h = BLYT_RESOURCE_INVALID;
+    if (blyt_resource_load(id, &h) != BLYT_OK || h == BLYT_RESOURCE_INVALID) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_resource_handle_t *uh = (lua_resource_handle_t *)lua_newuserdatauv(L, sizeof(*uh), 0);
+    uh->id = id;
+    uh->handle = h;
+    uh->released = 0;
+    luaL_setmetatable(L, BLYT_RESOURCE_HANDLE_MT);
+    return 1;
+}
+
+static int lua_resource_text(lua_State *L) {
+    lua_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+    const void *ptr = NULL;
+    size_t size = 0;
+    if (blyt_resource_pin(uh->id, &ptr, &size) != BLYT_OK || !ptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, (const char *)ptr, size);
+    blyt_resource_unpin(uh->id);
+    return 1;
+}
+
+static int lua_resource_release(lua_State *L) {
+    lua_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+    if (!uh->released) {
+        blyt_resource_release(uh->handle);
+        uh->released = 1;
+    }
+    return 0;
+}
+
+static int lua_resource_eq(lua_State *L) {
+    lua_resource_handle_t *a = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+    lua_resource_handle_t *b = luaL_checkudata(L, 2, BLYT_RESOURCE_HANDLE_MT);
+    lua_pushboolean(L, a->handle == b->handle && a->id == b->id);
+    return 1;
+}
+
+static int lua_resource_tostring(lua_State *L) {
+    lua_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+    lua_pushfstring(L, "resource<%d>", (int)uh->id);
+    return 1;
+}
+
+/* Module-level pin/unpin take the integer id directly (ADR-0120): pin returns a
+ * lightuserdata pointer + size, valid only within the current frame. */
+static int lua_resource_pin(lua_State *L) {
+    blyt_resource_id_t id = (blyt_resource_id_t)luaL_checkinteger(L, 1);
+    const void *ptr = NULL;
+    size_t size = 0;
+    if (blyt_resource_pin(id, &ptr, &size) != BLYT_OK || !ptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlightuserdata(L, (void *)ptr);
+    lua_pushinteger(L, (lua_Integer)size);
+    return 2;
+}
+
+static int lua_resource_unpin(lua_State *L) {
+    blyt_resource_unpin((blyt_resource_id_t)luaL_checkinteger(L, 1));
+    return 0;
+}
+
+/* Build the handle metatable and the blyt.resource module table, aliasing
+ * blyt32.resource == blyt.resource (ADR-0086 shared module).  Call after the
+ * blyt and blyt32 globals exist. */
+static void register_resource_module(lua_State *L) {
+    luaL_newmetatable(L, BLYT_RESOURCE_HANDLE_MT); /* mt */
+    lua_pushcfunction(L, lua_resource_release); /* __gc: idempotent release */
+    lua_setfield(L, -2, "__gc");
+    lua_pushcfunction(L, lua_resource_eq);
+    lua_setfield(L, -2, "__eq");
+    lua_pushcfunction(L, lua_resource_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_newtable(L); /* __index method table */
+    lua_pushcfunction(L, lua_resource_text);
+    lua_setfield(L, -2, "text");
+    lua_pushcfunction(L, lua_resource_release);
+    lua_setfield(L, -2, "release");
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop mt */
+
+    lua_newtable(L); /* resource module */
+    lua_pushcfunction(L, lua_resource_load);
+    lua_setfield(L, -2, "load");
+    lua_pushcfunction(L, lua_resource_pin);
+    lua_setfield(L, -2, "pin");
+    lua_pushcfunction(L, lua_resource_unpin);
+    lua_setfield(L, -2, "unpin");
+
+    lua_getglobal(L, "blyt");
+    lua_pushvalue(L, -2); /* resource */
+    lua_setfield(L, -2, "resource");
+    lua_pop(L, 1); /* pop blyt */
+    lua_getglobal(L, "blyt32");
+    lua_pushvalue(L, -2); /* resource */
+    lua_setfield(L, -2, "resource");
+    lua_pop(L, 1); /* pop blyt32 */
+    lua_pop(L, 1); /* pop resource module */
+}
+
 static void register_blyt32(lua_State *L) {
     /* --- shared: blyt.debug subtable --- */
     lua_newtable(L); /* idx A: blyt.debug */
@@ -316,8 +445,42 @@ static void register_blyt32(lua_State *L) {
 
     lua_pop(L, 1); /* pop blyt.debug (idx A) */
 
+    register_resource_module(L); /* blyt.resource.* + blyt32.resource.* (#93) */
+
     lua_pushcfunction(L, lua_blyt_require);
     lua_setglobal(L, "require");
+}
+
+/*
+ * Derive a require()-able module name from a loaded chunk's embedded source
+ * name (the basename, minus ".lua").  The chunk function must be on the stack
+ * top; it is left untouched.  Writes "" if the source is unavailable.
+ *
+ * This lets a bundled chunk that returns a table (the packer-generated
+ * `cart_resources`, ADR-0040) be registered into LUA_LOADED_TABLE so the
+ * sandboxed require (lua_blyt_require) resolves it — the same path the WASM
+ * host-Lua loader uses, so the two stay byte-for-byte behaviourally identical.
+ */
+static void chunk_module_name(lua_State *L, char *out, size_t outsz) {
+    out[0] = '\0';
+    lua_Debug ar;
+    lua_pushvalue(L, -1); /* dup the chunk function for getinfo to consume */
+    if (lua_getinfo(L, ">S", &ar) && ar.source) {
+        const char *src = ar.source;
+        if (*src == '@' || *src == '=')
+            src++;
+        const char *base = src;
+        for (const char *p = src; *p; p++)
+            if (*p == '/' || *p == '\\')
+                base = p + 1;
+        size_t len = strlen(base);
+        if (len > 4 && strcmp(base + len - 4, ".lua") == 0)
+            len -= 4;
+        if (len >= outsz)
+            len = outsz - 1;
+        memcpy(out, base, len);
+        out[len] = '\0';
+    }
 }
 
 static lua_State *open_state(void) {
@@ -383,11 +546,22 @@ static lua_State *open_state(void) {
                     lua_close(L);
                     return NULL;
                 }
-                if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+                char modname[64];
+                chunk_module_name(L, modname, sizeof(modname));
+                if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
                     blyt_console_debug(lua_tostring(L, -1));
                     lua_close(L);
                     return NULL;
                 }
+                /* Register a non-nil table return as a require()-able module
+                 * (e.g. the packer-generated cart_resources, ADR-0040). */
+                if (modname[0] != '\0' && !lua_isnil(L, -1)) {
+                    luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+                    lua_pushvalue(L, -2); /* the chunk's return value */
+                    lua_setfield(L, -2, modname);
+                    lua_pop(L, 1); /* pop _LOADED */
+                }
+                lua_pop(L, 1); /* pop the chunk return value */
                 data += csz;
                 remaining -= csz;
             }

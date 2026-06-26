@@ -1941,7 +1941,14 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
 
     if is_lua {
         let luac = lua::find_luac();
-        let lua_files = lua::collect_lua_files(&project_dir.join("src/game/lua"))?;
+        let mut lua_files = lua::collect_lua_files(&project_dir.join("src/game/lua"))?;
+        // Bundle the packer-generated `cart_resources` module (ADR-0040) as the
+        // FIRST chunk so `require("cart_resources")` resolves before any cart
+        // code runs it at module scope (#93).  CompileLuaTask lists each file as
+        // an input, so the engine sequences the generating task ahead of it.
+        if has_assets {
+            lua_files.insert(0, build_dir.join("blyt/lua/cart_resources.lua"));
+        }
         let bytecode_path = build_dir.join("bytecode.luac");
         let data_c = build_dir.join("cart_lua_data.c");
         let glue_src = build_dir.join("__blyt_lua_glue.c");

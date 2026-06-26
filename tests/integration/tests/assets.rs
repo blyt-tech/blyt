@@ -157,6 +157,81 @@ fn text_asset_round_trips_all_legs() {
     run_cart_all_legs(&cart, "Hello from assets!");
 }
 
+/// Pure-Lua cart resolving the resource id through the packer-generated
+/// `require("cart_resources")` module (ADR-0040), then reading it via the
+/// handle API.  Exercises the bundled-Lua-module path AND the resource binding;
+/// asserted identical across native / WASM (host-Lua) / libretro — the WASM leg
+/// in particular proves the host-side reimplementation matches the guest one.
+const LUA_RESOURCE_REQUIRE: &str = r#"
+local R = require("cart_resources")
+function init()
+    local res = blyt.resource.load(R.GREETING)
+    blyt.debug.print(string.format("R[%d]=%s", R.GREETING, res:text()))
+    res:release()
+end
+function update() blyt.quit() end
+function draw() end
+"#;
+
+#[test]
+fn lua_resource_require_round_trips_all_legs() {
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_resource_require");
+    CartProject::new()
+        .lua(LUA_RESOURCE_REQUIRE)
+        .asset("greeting.txt", "Hello from assets!")
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    run_cart_all_legs(&cart, "R[1]=Hello from assets!");
+}
+
+/// Pure-Lua cart exercising the full handle surface: idempotent load (`==`
+/// holds), module-level `pin`/`unpin` returning a frame-scoped pointer + size,
+/// `:text()` owned copy, `__tostring`.  One deterministic line pins identical
+/// behaviour across native / WASM / libretro.
+const LUA_RESOURCE_LIFECYCLE: &str = r#"
+function init()
+    local a = blyt.resource.load(1)
+    local b = blyt.resource.load(1)
+    local ptr, size = blyt.resource.pin(1)
+    blyt.resource.unpin(1)
+    local txt = a:text()
+    a:release()
+    blyt.debug.print(string.format(
+        "L[%s] size=%d eq=%s ptr=%s ts=%s",
+        txt, size, tostring(a == b), tostring(ptr ~= nil), tostring(a)))
+end
+function update() blyt.quit() end
+function draw() end
+"#;
+
+#[test]
+fn lua_resource_lifecycle_round_trips_all_legs() {
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_resource_lifecycle");
+    CartProject::new()
+        .lua(LUA_RESOURCE_LIFECYCLE)
+        .asset("greeting.txt", "Hello from assets!")
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    run_cart_all_legs(
+        &cart,
+        "L[Hello from assets!] size=18 eq=true ptr=true ts=resource<1>",
+    );
+}
+
 /// Dev mode: a project-dir dev ELF carries no embedded resources; the runtime
 /// reads the bytes from the content-addressed staging directory via the
 /// resource-id-index (BLYT_RESOURCE_DIR).
@@ -829,6 +904,93 @@ fn on_assets_reloaded_lua_libretro_ids_payload() {
     assert!(
         out.contains("reloaded:7"),
         "expected Lua on_assets_reloaded to receive id [7] on libretro, got: {out}"
+    );
+}
+
+/// Lua cart: caches the greeting at init via the resource API and re-emits the
+/// cached copy every frame.  It re-reads ONLY in on_assets_reloaded — update()
+/// never re-reads — so a post-swap VERSION_TWO proves the callback fired AND the
+/// Lua resource binding observed the swapped bytes.  This is the bytes-level
+/// re-derivation coverage the payload-only Lua tests above cannot give, now that
+/// #93 lands the read API on the emulated legs (#122 follow-up).
+const CACHE_AT_INIT_LUA: &str = r#"
+local cached
+local function cache_greeting()
+    local res = blyt.resource.load(1)
+    if res then
+        cached = res:text()
+        res:release()
+    end
+end
+function init() cache_greeting() end
+function on_assets_reloaded(_ids) cache_greeting() end
+function update()
+    if cached then
+        blyt.debug.print(cached)
+    end
+end
+function draw() end
+"#;
+
+/// Lua leg (native, emulated): a cache-at-init Lua cart re-derives swapped bytes
+/// only because on_assets_reloaded fired and the Lua resource read returned the
+/// new content (update() never re-reads).
+#[test]
+fn on_assets_reloaded_lua_native_bytes() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("reload_bytes_lua_native");
+    CartProject::new()
+        .lua(CACHE_AT_INIT_LUA)
+        .asset("greeting.txt", "VERSION_ONE")
+        .write(&project);
+    build_dev_elf(&project);
+
+    let out = native_update_assets_capture(&project, Some(("greeting.txt", "VERSION_TWO")), "[1]");
+    assert!(
+        out.contains("VERSION_ONE"),
+        "expected pre-swap cached text, got: {out}"
+    );
+    assert!(
+        out.contains("VERSION_TWO"),
+        "expected Lua-re-derived text after on_assets_reloaded, got: {out}"
+    );
+}
+
+/// Lua leg (libretro, emulated): same cache-at-init Lua cart; at frame 2 repoint
+/// BLYT_RESOURCE_DIR at the v2 staging dir and fire update_assets.  The cart
+/// prints VERSION_ONE until the callback re-reads v2 through the Lua binding.
+#[test]
+fn on_assets_reloaded_lua_libretro_bytes() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("reload_bytes_lua_libretro");
+    CartProject::new()
+        .lua(CACHE_AT_INIT_LUA)
+        .asset("greeting.txt", "VERSION_ONE")
+        .write(&project);
+
+    build_dev_elf(&project);
+    let build_dir = project.join("build");
+    let v1_dir = tmp.path().join("res_v1");
+    copy_dir(&build_dir, &v1_dir);
+
+    std::fs::write(project.join("assets/greeting.txt"), "VERSION_TWO").unwrap();
+    let elf = build_dev_elf(&project); // build_dir now holds v2 staging
+
+    let out = libretro_update_assets_capture(&elf, Some(&v1_dir), Some(&build_dir), "1", 2, 6);
+    assert!(
+        out.contains("VERSION_ONE"),
+        "expected pre-swap cached text on libretro, got: {out}"
+    );
+    assert!(
+        out.contains("VERSION_TWO"),
+        "expected Lua-re-derived text after on_assets_reloaded on libretro, got: {out}"
     );
 }
 

@@ -36,6 +36,7 @@
 #include "blyt_trace.h"
 
 #ifdef BLYT_LUA
+#include "resource.h"
 #include "save.h"
 #include "state_buffer.h"
 #include "testcard.h"
@@ -123,6 +124,11 @@ static bool g_has_lua_exports = false;
 static blyt_state_ctx_t *g_lua_state_ctx = NULL;
 static char *g_lua_save_dir = NULL;
 static char g_lua_cart_name[64];
+/* Host-side resource table for pure-Lua carts (g_session == NULL): there is no
+ * session run ctx to carry ctx.resources, so the blyt.resource.* host binding
+ * reads this instead (#93/#120).  Hybrid carts use the session's table. */
+static blyt_resource_table_t g_lua_resources;
+static bool g_lua_resources_loaded = false;
 #ifdef BLYT_DAP
 static bool g_lua_dap_paused = false; /* hook yielded, waiting for DAP */
 static bool g_lua_needs_start = false; /* waiting for configurationDone */
@@ -568,6 +574,10 @@ static void lua_cleanup(void) {
         free(g_lua_state_ctx);
         g_lua_state_ctx = NULL;
     }
+    if (g_lua_resources_loaded) {
+        blyt_resource_table_clear(&g_lua_resources);
+        g_lua_resources_loaded = false;
+    }
     if (g_lua_save_dir) {
         free(g_lua_save_dir);
         g_lua_save_dir = NULL;
@@ -995,6 +1005,222 @@ static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
 }
 
 /* -------------------------------------------------------------------------
+ * blyt.resource.* — host-Lua reimplementation (#93).
+ *
+ * On WASM all Lua runs host-side (g_lua), so the guest libblyt32lua binding is
+ * never reached.  This mirrors it byte-for-byte behaviourally, reading the host
+ * resource table directly (no ECALL): the session's ctx.resources for hybrid
+ * carts, the standalone g_lua_resources for pure-Lua carts.  The handle/refcount
+ * semantics replicate the resource lifecycle ECALL handlers in cart_run.c.
+ * ------------------------------------------------------------------------- */
+
+#define BLYT_RESOURCE_HANDLE_MT "blyt.resource.handle"
+
+typedef struct {
+    uint32_t id;
+    uint32_t handle;
+    int released;
+} wasm_resource_handle_t;
+
+static blyt_resource_table_t *active_resource_table(void) {
+    if (g_session)
+        return blyt_session_resources(g_session);
+    return g_lua_resources_loaded ? &g_lua_resources : NULL;
+}
+
+static int wasm_resource_load(lua_State *L) {
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_resource_table_t *t = active_resource_table();
+    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, id) : NULL;
+    if (!e) {
+        lua_pushnil(L);
+        return 1;
+    }
+    wasm_resource_handle_t *uh = (wasm_resource_handle_t *)lua_newuserdatauv(L, sizeof(*uh), 0);
+    uh->id = id;
+    uh->handle = blyt_rl_load(&e->rl, id);
+    uh->released = 0;
+    luaL_setmetatable(L, BLYT_RESOURCE_HANDLE_MT);
+    return 1;
+}
+
+static int wasm_resource_text(lua_State *L) {
+    wasm_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+    blyt_resource_table_t *t = active_resource_table();
+    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, uh->id) : NULL;
+    if (!e) {
+        lua_pushnil(L);
+        return 1;
+    }
+    blyt_rl_pin(&e->rl); /* pin -> copy -> unpin (frame-scoped pointer, ADR-0027) */
+    lua_pushlstring(L, (const char *)e->data, e->len);
+    blyt_rl_unpin(&e->rl);
+    return 1;
+}
+
+static int wasm_resource_release(lua_State *L) {
+    wasm_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+    if (!uh->released) {
+        blyt_resource_table_t *t = active_resource_table();
+        blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, uh->id) : NULL;
+        if (e)
+            blyt_rl_release(&e->rl, uh->handle);
+        uh->released = 1;
+    }
+    return 0;
+}
+
+static int wasm_resource_eq(lua_State *L) {
+    wasm_resource_handle_t *a = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+    wasm_resource_handle_t *b = luaL_checkudata(L, 2, BLYT_RESOURCE_HANDLE_MT);
+    lua_pushboolean(L, a->handle == b->handle && a->id == b->id);
+    return 1;
+}
+
+static int wasm_resource_tostring(lua_State *L) {
+    wasm_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+    lua_pushfstring(L, "resource<%d>", (int)uh->id);
+    return 1;
+}
+
+static int wasm_resource_pin(lua_State *L) {
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_resource_table_t *t = active_resource_table();
+    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, id) : NULL;
+    if (!e) {
+        lua_pushnil(L);
+        return 1;
+    }
+    blyt_rl_pin(&e->rl);
+    lua_pushlightuserdata(L, (void *)(uintptr_t)e->data);
+    lua_pushinteger(L, (lua_Integer)e->len);
+    return 2;
+}
+
+static int wasm_resource_unpin(lua_State *L) {
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_resource_table_t *t = active_resource_table();
+    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, id) : NULL;
+    if (e)
+        blyt_rl_unpin(&e->rl);
+    return 0;
+}
+
+/* Register blyt.resource.* + blyt32.resource.* into g_lua, mirroring the guest
+ * register_resource_module.  Call after the blyt/blyt32 globals exist. */
+static void wasm_register_resource_api(lua_State *L) {
+    luaL_newmetatable(L, BLYT_RESOURCE_HANDLE_MT);
+    lua_pushcfunction(L, wasm_resource_release); /* __gc: idempotent release */
+    lua_setfield(L, -2, "__gc");
+    lua_pushcfunction(L, wasm_resource_eq);
+    lua_setfield(L, -2, "__eq");
+    lua_pushcfunction(L, wasm_resource_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_newtable(L);
+    lua_pushcfunction(L, wasm_resource_text);
+    lua_setfield(L, -2, "text");
+    lua_pushcfunction(L, wasm_resource_release);
+    lua_setfield(L, -2, "release");
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop mt */
+
+    lua_newtable(L); /* resource module */
+    lua_pushcfunction(L, wasm_resource_load);
+    lua_setfield(L, -2, "load");
+    lua_pushcfunction(L, wasm_resource_pin);
+    lua_setfield(L, -2, "pin");
+    lua_pushcfunction(L, wasm_resource_unpin);
+    lua_setfield(L, -2, "unpin");
+
+    lua_getglobal(L, "blyt");
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, "resource");
+    lua_pop(L, 1);
+    lua_getglobal(L, "blyt32");
+    if (lua_istable(L, -1)) {
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, "resource");
+    }
+    lua_pop(L, 1);
+    lua_pop(L, 1); /* pop resource module */
+}
+
+/* Derive a require()-able module name from a loaded chunk's embedded source
+ * (basename minus ".lua"); the chunk function must be on the stack top and is
+ * left untouched.  Mirrors chunk_module_name in libblyt32lua. */
+static void wasm_chunk_module_name(lua_State *L, char *out, size_t outsz) {
+    out[0] = '\0';
+    lua_Debug ar;
+    lua_pushvalue(L, -1);
+    if (lua_getinfo(L, ">S", &ar) && ar.source) {
+        const char *src = ar.source;
+        if (*src == '@' || *src == '=')
+            src++;
+        const char *base = src;
+        for (const char *p = src; *p; p++)
+            if (*p == '/' || *p == '\\')
+                base = p + 1;
+        size_t len = strlen(base);
+        if (len > 4 && strcmp(base + len - 4, ".lua") == 0)
+            len -= 4;
+        if (len >= outsz)
+            len = outsz - 1;
+        memcpy(out, base, len);
+        out[len] = '\0';
+    }
+}
+
+/* Load the cart's .cart.lua: a single raw bytecode chunk, or the BLMC multi-
+ * chunk container (issue #54).  A chunk returning a non-nil table is registered
+ * as a require()-able module (cart_resources, ADR-0040), keyed by source
+ * basename.  Mirrors open_state in libblyt32lua so the host-Lua fast path stays
+ * behaviourally identical.  Returns 0 on success; on failure returns nonzero
+ * with an error string on the stack top. */
+static int wasm_load_lua_bytecode(lua_State *L, const unsigned char *data, size_t size) {
+    if (size >= 8 && data[0] == 'B' && data[1] == 'L' && data[2] == 'M' && data[3] == 'C') {
+        unsigned int nchunks = (unsigned int)data[4] | ((unsigned int)data[5] << 8) |
+                               ((unsigned int)data[6] << 16) | ((unsigned int)data[7] << 24);
+        data += 8;
+        size -= 8;
+        for (unsigned int ci = 0; ci < nchunks; ci++) {
+            if (size < 4) {
+                lua_pushstring(L, "BLMC truncated");
+                return 1;
+            }
+            unsigned int csz = (unsigned int)data[0] | ((unsigned int)data[1] << 8) |
+                               ((unsigned int)data[2] << 16) | ((unsigned int)data[3] << 24);
+            data += 4;
+            size -= 4;
+            if (csz > size) {
+                lua_pushstring(L, "BLMC chunk size overflow");
+                return 1;
+            }
+            if (luaL_loadbuffer(L, (const char *)data, csz, "@chunk") != LUA_OK)
+                return 1;
+            char modname[64];
+            wasm_chunk_module_name(L, modname, sizeof(modname));
+            if (lua_pcall(L, 0, 1, 0) != LUA_OK)
+                return 1;
+            if (modname[0] != '\0' && !lua_isnil(L, -1)) {
+                luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+                lua_pushvalue(L, -2);
+                lua_setfield(L, -2, modname);
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+            data += csz;
+            size -= csz;
+        }
+        return 0;
+    }
+    if (luaL_loadbuffer(L, (const char *)data, size, "@cart") != LUA_OK)
+        return 1;
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK)
+        return 1;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Reset-every-frame cycle for the Lua path
  *
  * Full VM teardown + recreate: destroys the coroutine and all Lua globals,
@@ -1090,15 +1316,15 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     lua_pushcfunction(g_lua, wasm_lua_require);
     lua_setglobal(g_lua, "require");
 
-    /* Step 8: re-register state API */
+    /* Step 8: re-register state + resource API */
     if (active_state_ctx())
         wasm_register_state_api(g_lua, g_session);
     wasm_register_s_proxy(g_lua);
+    wasm_register_resource_api(g_lua);
 
-    /* Step 9: re-run .cart.lua section */
-    if (luaL_loadbuffer(g_lua, (const char *)g_lua_bytecode, g_lua_bytecode_size, "@cart") !=
-            LUA_OK ||
-        lua_pcall(g_lua, 0, 0, 0) != LUA_OK) {
+    /* Step 9: re-run .cart.lua section (handles BLMC + module registration). */
+    if (wasm_load_lua_bytecode(g_lua, (const unsigned char *)g_lua_bytecode, g_lua_bytecode_size) !=
+        0) {
         blyt_js_error(lua_tostring(g_lua, -1));
         lua_close(g_lua);
         g_lua = NULL;
@@ -1897,20 +2123,24 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
              * time: ≤63 bytes, so it always fits g_lua_cart_name[64]). */
             snprintf(g_lua_cart_name, sizeof(g_lua_cart_name), "%s", blyt_cart_id(g_cart));
         }
-        /* Register state buffer + save/load API for any cart with state. */
+        /* Pure-Lua carts have no session run ctx to carry resources, so load a
+         * host-side table the blyt.resource.* binding reads (#93).  Hybrid carts
+         * use the session's ctx.resources (populated by blyt_session_create). */
+        if (!g_session) {
+            blyt_resource_table_init(&g_lua_resources);
+            blyt_resource_table_load_for_cart(&g_lua_resources, g_cart);
+            g_lua_resources_loaded = true;
+        }
+        /* Register state buffer + save/load + resource API. */
         if (active_state_ctx())
             wasm_register_state_api(g_lua, g_session);
         wasm_register_s_proxy(g_lua);
+        wasm_register_resource_api(g_lua);
     }
 
-    /* Load and execute the bytecode chunk (defines init/update/draw globals). */
-    if (luaL_loadbuffer(g_lua, (const char *)bytecode, bytecode_size, "@cart") != LUA_OK) {
-        blyt_js_error(lua_tostring(g_lua, -1));
-        lua_close(g_lua);
-        g_lua = NULL;
-        return 1;
-    }
-    if (lua_pcall(g_lua, 0, 0, 0) != LUA_OK) {
+    /* Load and execute the bytecode (single chunk or BLMC; registers bundled
+     * require()-able modules such as cart_resources). */
+    if (wasm_load_lua_bytecode(g_lua, (const unsigned char *)bytecode, bytecode_size) != 0) {
         blyt_js_error(lua_tostring(g_lua, -1));
         lua_close(g_lua);
         g_lua = NULL;

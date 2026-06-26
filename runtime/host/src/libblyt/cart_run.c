@@ -2535,8 +2535,8 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
  * .cart.resource.<id> sections; a dev (project-dir) build has none, so read the
  * staging directory that sits alongside the dev ELF (the cart path's directory).
  * BLYT_RESOURCE_DIR overrides the location (e.g. the WASM dev path). */
-static void load_session_resources(blyt_run_ctx_t *ctx, const blyt_cart_t *cart) {
-    if (blyt_resource_table_load_from_cart(&ctx->resources, cart) != 0)
+void blyt_resource_table_load_for_cart(blyt_resource_table_t *t, const blyt_cart_t *cart) {
+    if (blyt_resource_table_load_from_cart(t, cart) != 0)
         return; /* packed cart: resources come from embedded sections */
 
     const char *res_dir = getenv("BLYT_RESOURCE_DIR");
@@ -2550,7 +2550,15 @@ static void load_session_resources(blyt_run_ctx_t *ctx, const blyt_cart_t *cart)
         }
     }
     if (res_dir)
-        blyt_resource_table_load_from_index(&ctx->resources, res_dir);
+        blyt_resource_table_load_from_index(t, res_dir);
+}
+
+static void load_session_resources(blyt_run_ctx_t *ctx, const blyt_cart_t *cart) {
+    blyt_resource_table_load_for_cart(&ctx->resources, cart);
+}
+
+blyt_resource_table_t *blyt_session_resources(blyt_session_t *s) {
+    return &s->ctx.resources;
 }
 
 bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart) {
