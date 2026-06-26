@@ -1027,3 +1027,55 @@ state_buffers:
         .assert()
         .success();
 }
+
+/// SDL2 Lua DAP reload continuity (issue #140): a hot reload on a pure-Lua
+/// native-window debug session must be *uninterrupted* — the same DAP TCP
+/// connection keeps working, and source-line breakpoints re-arm on the new
+/// Lua state without a session restart.  Builds two cart versions sharing
+/// the same init() line layout (breakpoint at line 2), stops at it, continues,
+/// fires a dev-control reload to swap in v2, then asserts the same connection
+/// delivers a second init() stop (re-arm confirmed, session persisted, no
+/// restart needed).
+#[test]
+fn sdl_dap_lua_reload_keeps_session() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytdebug().exists(),
+        "blytdebug not built — run `cmake --build build` first"
+    );
+
+    // Both carts share the same line structure so the breakpoint at line 2
+    // (the `local x = ...` assignment) is valid in both.  The value of x
+    // differs between v1/v2 so the builds are byte-distinct.
+    let cart_lua = |val: i32| {
+        format!(
+            "function init()\n\
+             \x20   local x = {val}\n\
+             end\n\
+             function update() end\n\
+             function draw() end\n"
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let p1 = tmp.path().join("sdl_lua_reload_v1");
+    CartProject::new().lua(&cart_lua(42)).write(&p1);
+    let cart_v1 = build_lua_cart(&p1);
+
+    let p2 = tmp.path().join("sdl_lua_reload_v2");
+    CartProject::new().lua(&cart_lua(99)).write(&p2);
+    let cart_v2 = build_lua_cart(&p2);
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_lua_reload_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart_v1.to_str().unwrap(),
+            cart_v2.to_str().unwrap(),
+            "2",
+        ])
+        .assert()
+        .success();
+}

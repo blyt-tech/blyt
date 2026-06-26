@@ -1381,22 +1381,21 @@ function activate(context) {
 
 					/* F5: connect the IDE debugger to a player (SDL2) window. */
 
-					/* Pure-Lua native window: direct blytdebug --debug (Lua DAP).
-					 * Lua-only transparent reload-while-debugging is tracked
-					 * separately (#140 — out of #119 scope). */
+					/* Pure-Lua native window: reload-while-debugging (#140).
+					 * Start `blyt debug <dir>` for the file watcher + dev-control
+					 * hub (builds build/.dbg.elf; WASM serve is unused here), then
+					 * run blytdebug dialing that hub (--dev-ctrl-connect) so a
+					 * watcher-driven rebuild hot-reloads the live Lua DAP session.
+					 * Source-line breakpoints persist in the host DAP server and
+					 * re-arm on the new Lua state without a session restart. */
 					if (isLua) {
-						if (!(await build(cwd, true))) return undefined;
-						const debugCart = debugCartPath(cart);
-						output.appendLine(
-							`\n── blytdebug --debug 0 ${debugCart}`,
-						);
-						let luaResult;
+						output.appendLine(`\n── blyt debug ${cwd}`);
+						let luaServeResult;
 						try {
-							luaResult = await startNativeDebug(
-								debugCart,
+							luaServeResult = await startDevtool(
+								cwd,
 								cwd,
 								output,
-								true,
 							);
 						} catch (e) {
 							vscode.window.showErrorMessage(
@@ -1404,12 +1403,40 @@ function activate(context) {
 							);
 							return undefined;
 						}
-						const tempId = await trackProc(luaResult.proc, null);
+						const {
+							proc: luaDevtoolProc,
+							devCtrlPort: luaDevCtrlPort,
+						} = luaServeResult;
+
+						output.appendLine(
+							`\n── blytdebug --debug 0` +
+								` --dev-ctrl-connect ${luaDevCtrlPort} ${cwd}`,
+						);
+						let luaResult;
+						try {
+							luaResult = await startNativeDebug(
+								cwd,
+								cwd,
+								output,
+								true,
+								luaDevCtrlPort,
+							);
+						} catch (e) {
+							vscode.window.showErrorMessage(
+								`Blyt: ${e.message}`,
+							);
+							try {
+								luaDevtoolProc.kill();
+							} catch (_) {}
+							return undefined;
+						}
+						const luaTempId = await trackProc(luaResult.proc, null);
+						pendingAuxProcs.set(luaTempId, luaDevtoolProc);
 						return {
 							...config,
 							cart,
 							_blytMode: 'lua',
-							_blytTempId: tempId,
+							_blytTempId: luaTempId,
 							_blytDapPort: luaResult.dapPort,
 							sourceMap: sourceMapPairs(cwd).flat(),
 						};
