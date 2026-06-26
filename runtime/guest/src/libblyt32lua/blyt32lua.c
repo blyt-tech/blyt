@@ -496,9 +496,10 @@ static lua_State *open_state(void) {
         return NULL;
 
     /* Open the same library set as the WASM host-side state (wasm_main.c
-     * run_lua_cart): base, math, string, table, coroutine.  The two paths
-     * must expose identical globals or carts behave differently per target
-     * (Spike T stage 1 found pairs() present on WASM, absent here). */
+     * run_lua_cart): base, math, string, table, coroutine, utf8.  The two
+     * paths must expose identical globals or carts behave differently per
+     * target (Spike T stage 1 found pairs() present on WASM, absent here).
+     * utf8 is allowed by ADR-0079 (read-only, deterministic; issue #167). */
     luaL_requiref(L, "_G", luaopen_base, 1);
     lua_pop(L, 1);
     luaL_requiref(L, "math", luaopen_math, 1);
@@ -508,6 +509,8 @@ static lua_State *open_state(void) {
     luaL_requiref(L, "table", luaopen_table, 1);
     lua_pop(L, 1);
     luaL_requiref(L, "coroutine", luaopen_coroutine, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, LUA_UTF8LIBNAME, luaopen_utf8, 1);
     lua_pop(L, 1);
     blyt_console_debug("open_state: stdlib subset opened");
 

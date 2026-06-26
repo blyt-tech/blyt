@@ -3,9 +3,9 @@ mod common;
 use assert_cmd::Command;
 use common::{
     CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_libretro_core,
-    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, run_cart_libretro,
-    run_cart_libretro_expect_fail, run_cart_native, run_cart_native_expect_fail, run_cart_wasm,
-    sdk_dir,
+    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs,
+    run_cart_libretro, run_cart_libretro_expect_fail, run_cart_native, run_cart_native_expect_fail,
+    run_cart_wasm, sdk_dir,
 };
 use tempfile::TempDir;
 
@@ -1477,4 +1477,50 @@ fn lua_c_hybrid_f64_number_wasm() {
     let tmp = TempDir::new().unwrap();
     let cart = build_lua_c_hybrid_f64_number_cart(tmp.path());
     run_cart_wasm(&cart, "lua+c f64 ok");
+}
+
+/// The `utf8` standard library is allowed by ADR-0079 ("Read-only iteration
+/// utilities; deterministic") but was historically stubbed out. This exercises
+/// `utf8.len` / `utf8.offset` / `utf8.codepoint` / `utf8.codes` /
+/// `utf8.charpattern` on a mixed 1-/2-/3-byte string and asserts byte-identical
+/// output across native (blytplay), WASM (host-Lua fast path) and libretro —
+/// proving the library is registered everywhere and is deterministic.
+///
+/// String is `a` (U+0061, 1 byte) + `é` (U+00E9, 2 bytes) + `€` (U+20AC, 3
+/// bytes): 6 bytes, 3 chars. The 3rd char starts at byte 4 and its codepoint
+/// is 0x20AC = 8364; the codepoint sum is 0x61+0xE9+0x20AC = 8694.
+const LUA_UTF8: &str = r#"
+function init()
+    local s = "a\u{E9}\u{20AC}"
+    local sum = 0
+    for _, c in utf8.codes(s) do
+        sum = sum + c
+    end
+    local pat = 0
+    for _ in string.gmatch(s, utf8.charpattern) do
+        pat = pat + 1
+    end
+    blyt.debug.print(string.format(
+        "utf8 b=%d c=%d off3=%d cp3=%d sum=%d pat=%d",
+        #s, utf8.len(s), utf8.offset(s, 3),
+        utf8.codepoint(s, utf8.offset(s, 3)), sum, pat))
+end
+function update() blyt.quit() end
+function draw() end
+"#;
+
+#[test]
+fn lua_utf8_library_all_legs() {
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_utf8");
+    CartProject::new().lua(LUA_UTF8).write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    run_cart_all_legs(&cart, "utf8 b=6 c=3 off3=4 cp3=8364 sum=8694 pat=3");
 }

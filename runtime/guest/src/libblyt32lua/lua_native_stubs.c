@@ -10,7 +10,9 @@
  *   - stdio stubs (fopen/fclose/fprintf/stderr/…): Lua's file-I/O paths are
  *     excluded from the sandboxed cart build, so these are dead code paths;
  *     they exist only to satisfy link-time references from lauxlib.c etc.
- *   - Excluded Lua standard-library openers (luaopen_io/os/debug/package/utf8)
+ *   - Excluded Lua standard-library openers (luaopen_io/os/debug/package).
+ *     (utf8 is NOT stubbed — ADR-0079 allows it and lutf8lib.c is compiled
+ *     in; issue #167.)
  *
  * abort() and __syscall_ret() use the native rv32 SYS_exit_group syscall
  * (not BLYT_ECALL_EXIT) so the cart terminates cleanly under seccomp.
@@ -344,10 +346,6 @@ int luaopen_debug(lua_State *L) {
     return 0;
 }
 int luaopen_package(lua_State *L) {
-    (void)L;
-    return 0;
-}
-int luaopen_utf8(lua_State *L) {
     (void)L;
     return 0;
 }

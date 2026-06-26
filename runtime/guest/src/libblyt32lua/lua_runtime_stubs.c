@@ -15,8 +15,9 @@
  * on the first indirect call through those GOT slots.
  *
  * --- Excluded stdlib openers ---
- * linit.c references luaopen_io/os/debug/package/utf8 which are excluded
- * from libblytcommonlua.so.  Stub openers return 0 (register nothing).
+ * linit.c references luaopen_io/os/debug/package which are excluded from
+ * libblytcommonlua.so.  Stub openers return 0 (register nothing).  (utf8 is
+ * NOT stubbed — ADR-0079 allows it and lutf8lib.c is compiled in; issue #167.)
  *
  * NOT defined here (already in LIBBLYTC_SRCS / the musl string sources):
  *   strpbrk, strspn — musl src/string
@@ -182,10 +183,6 @@ int luaopen_debug(lua_State *L) {
     return 0;
 }
 int luaopen_package(lua_State *L) {
-    (void)L;
-    return 0;
-}
-int luaopen_utf8(lua_State *L) {
     (void)L;
     return 0;
 }

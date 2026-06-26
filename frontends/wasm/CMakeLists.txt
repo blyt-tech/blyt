@@ -94,6 +94,9 @@ set(LUA_DIR "${BLYT_LUA_SOURCE_DIR}")
 set(BLYT_LUA_SOURCES "")
 if(EXISTS "${LUA_DIR}/lvm.c")
   file(GLOB LUA_ALL_SRCS "${LUA_DIR}/*.c")
+  # Exclude the standalone interpreter, compiler, and sandboxed-out libs. utf8
+  # is KEPT (ADR-0079, issue #167) so the host-Lua fast path matches the guest
+  # build.
   foreach(
     _EXCL
     "${LUA_DIR}/lua.c"
@@ -102,8 +105,7 @@ if(EXISTS "${LUA_DIR}/lvm.c")
     "${LUA_DIR}/liolib.c"
     "${LUA_DIR}/loslib.c"
     "${LUA_DIR}/loadlib.c"
-    "${LUA_DIR}/ldblib.c"
-    "${LUA_DIR}/lutf8lib.c")
+    "${LUA_DIR}/ldblib.c")
     list(REMOVE_ITEM LUA_ALL_SRCS "${_EXCL}")
   endforeach()
   set(BLYT_LUA_SOURCES ${LUA_ALL_SRCS})
