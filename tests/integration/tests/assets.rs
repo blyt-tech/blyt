@@ -130,6 +130,86 @@ void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void) {}
 "#;
 
+/// C cart that pins AND loads all 100 distinct resource ids and verifies each
+/// pin delivers the *exact* embedded bytes (not merely that the call returned
+/// OK — the #98 anti-pattern), emitting one deterministic summary line. The
+/// native bare-metal path historically capped its resource table at 64 entries
+/// (NATIVE_MAX_RES), so the 65th+ distinct id silently returned NOT_FOUND on
+/// metal while every emulated leg (host table grows via realloc) served it
+/// (#141). Resource ids are 1-based, assigned in sorted-name order, so the
+/// zero-padded `res_<k>.txt` assets map id (k+1) -> "payload-<k>".
+const MANY_RESOURCES_C: &str = r#"
+#include "blyt.h"
+#include <stdio.h>
+#include <string.h>
+
+#define N 100
+
+void blyt_cart_init(void) {
+    int pin_ok = 0, load_ok = 0, match = 0, first_bad = -1;
+    for (int k = 0; k < N; k++) {
+        blyt_resource_id_t id = (blyt_resource_id_t)(k + 1);
+        char expect[32];
+        int elen = snprintf(expect, sizeof(expect), "payload-%03d", k);
+
+        blyt_resource_h h = BLYT_RESOURCE_INVALID;
+        if (blyt_resource_load(id, &h) == BLYT_OK && h != BLYT_RESOURCE_INVALID)
+            load_ok++;
+
+        const void *ptr = NULL;
+        size_t size = 0;
+        blyt_result_t pr = blyt_resource_pin(id, &ptr, &size);
+        if (pr == BLYT_OK && ptr) {
+            pin_ok++;
+            if ((int)size == elen && memcmp(ptr, expect, (size_t)elen) == 0)
+                match++;
+            else if (first_bad < 0)
+                first_bad = k + 1;
+        } else if (first_bad < 0) {
+            first_bad = k + 1;
+        }
+        blyt_resource_unpin(id);
+        blyt_resource_release(h);
+    }
+
+    char line[128];
+    snprintf(line, sizeof(line), "RES_MANY pin_ok=%d load_ok=%d match=%d first_bad=%d", pin_ok,
+             load_ok, match, first_bad);
+    blyt_console_debug(line);
+}
+
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#;
+
+/// Packed cart with **100** distinct resources: every id pins/loads back its
+/// exact embedded bytes, identically across native / WASM / libretro. Pins the
+/// host==native parity contract well past the old native 64-entry cap (#141);
+/// the native bare-metal cap itself (a distinct artifact) is covered by the
+/// QEMU gate.
+#[test]
+fn many_resources_round_trip_all_legs() {
+    require_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("many_resources");
+    let mut p = CartProject::new().c(MANY_RESOURCES_C);
+    for k in 0..100 {
+        p = p.asset(&format!("res_{k:03}.txt"), &format!("payload-{k:03}"));
+    }
+    p.write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    run_cart_all_legs(
+        &cart,
+        "RES_MANY pin_ok=100 load_ok=100 match=100 first_bad=-1",
+    );
+}
+
 /// Packed cart: the full lifecycle surface (load/pin/unpin/release + stale
 /// rejection) produces identical observable output on native, WASM, libretro.
 #[test]

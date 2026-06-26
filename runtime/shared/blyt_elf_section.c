@@ -12,9 +12,20 @@
 #define ELF32_SH_OFFSET 16u
 #define ELF32_SH_SIZE 20u
 
-int blyt_elf32_find_section(const uint8_t *elf, size_t elf_size, const char *name,
-                            uint32_t *out_offset, uint32_t *out_size) {
-    if (!elf || !name || elf_size < ELF32_EHDR_MIN)
+/* Resolved view of an ELF32 section-header table + its name string table. */
+typedef struct {
+    const uint8_t *shdrs; /* base of the section-header array */
+    uint16_t shnum; /* number of section headers */
+    const char *strtab; /* section-name string table */
+    uint32_t strtab_size; /* its byte length (names need not be NUL-terminated) */
+} blyt_sht_t;
+
+/* Parse and bounds-check the section-header table and name string table of the
+ * ELF32 image at [elf, elf+elf_size).  Returns 1 and fills *out on success; 0 if
+ * the image is too small/malformed.  Shared by find_section and the prefix
+ * enumerator so there is exactly one validated header walk. */
+static int resolve_sht(const uint8_t *elf, size_t elf_size, blyt_sht_t *out) {
+    if (!elf || elf_size < ELF32_EHDR_MIN)
         return 0;
 
     uint32_t e_shoff;
@@ -37,19 +48,33 @@ int blyt_elf32_find_section(const uint8_t *elf, size_t elf_size, const char *nam
     __builtin_memcpy(&strtab_size, strtab_shdr + ELF32_SH_SIZE, 4);
     if (strtab_off == 0u || strtab_size == 0u || (uint64_t)strtab_off + strtab_size > elf_size)
         return 0;
-    const char *strtab = (const char *)(elf + strtab_off);
 
-    for (uint16_t i = 0; i < e_shnum; i++) {
-        const uint8_t *shdr = shdrs + (uint32_t)i * ELF32_SHDR_SIZE;
+    out->shdrs = shdrs;
+    out->shnum = e_shnum;
+    out->strtab = (const char *)(elf + strtab_off);
+    out->strtab_size = strtab_size;
+    return 1;
+}
+
+int blyt_elf32_find_section(const uint8_t *elf, size_t elf_size, const char *name,
+                            uint32_t *out_offset, uint32_t *out_size) {
+    if (!name)
+        return 0;
+    blyt_sht_t sht;
+    if (!resolve_sht(elf, elf_size, &sht))
+        return 0;
+
+    for (uint16_t i = 0; i < sht.shnum; i++) {
+        const uint8_t *shdr = sht.shdrs + (uint32_t)i * ELF32_SHDR_SIZE;
         uint32_t sh_name;
         __builtin_memcpy(&sh_name, shdr + ELF32_SH_NAME, 4);
-        if (sh_name >= strtab_size)
+        if (sh_name >= sht.strtab_size)
             continue;
 
         /* Compare `name` against the candidate within the string table, never
          * reading past strtab_size (the table need not be NUL-terminated). */
-        const char *cand = strtab + sh_name;
-        size_t avail = (size_t)(strtab_size - sh_name);
+        const char *cand = sht.strtab + sh_name;
+        size_t avail = (size_t)(sht.strtab_size - sh_name);
         size_t k = 0;
         while (k < avail && name[k] != '\0' && cand[k] == name[k])
             k++;
@@ -68,4 +93,70 @@ int blyt_elf32_find_section(const uint8_t *elf, size_t elf_size, const char *nam
         return 1;
     }
     return 0;
+}
+
+size_t blyt_elf32_for_each_section_prefix(const uint8_t *elf, size_t elf_size, const char *prefix,
+                                          blyt_elf32_section_fn cb, void *ctx) {
+    if (!prefix || !cb)
+        return 0;
+    blyt_sht_t sht;
+    if (!resolve_sht(elf, elf_size, &sht))
+        return 0;
+
+    size_t matched = 0;
+    for (uint16_t i = 0; i < sht.shnum; i++) {
+        const uint8_t *shdr = sht.shdrs + (uint32_t)i * ELF32_SHDR_SIZE;
+        uint32_t sh_name;
+        __builtin_memcpy(&sh_name, shdr + ELF32_SH_NAME, 4);
+        if (sh_name >= sht.strtab_size)
+            continue;
+
+        const char *cand = sht.strtab + sh_name;
+        size_t avail = (size_t)(sht.strtab_size - sh_name);
+
+        /* Match `prefix` fully against the candidate, staying within strtab. */
+        size_t p = 0;
+        while (p < avail && prefix[p] != '\0' && cand[p] == prefix[p])
+            p++;
+        if (prefix[p] != '\0')
+            continue; /* prefix not fully matched (mismatch or ran off the table) */
+
+        /* The suffix runs from cand+p to the name's NUL; it must terminate
+         * within the string table. */
+        size_t s = p;
+        while (s < avail && cand[s] != '\0')
+            s++;
+        if (s >= avail)
+            continue; /* name not NUL-terminated within strtab */
+
+        uint32_t sh_off, sh_size;
+        __builtin_memcpy(&sh_off, shdr + ELF32_SH_OFFSET, 4);
+        __builtin_memcpy(&sh_size, shdr + ELF32_SH_SIZE, 4);
+        if ((uint64_t)sh_off + sh_size > elf_size)
+            continue; /* skip a malformed section; keep enumerating the rest */
+
+        cb(cand + p, (uint32_t)(s - p), sh_off, sh_size, ctx);
+        matched++;
+    }
+    return matched;
+}
+
+int blyt_elf32_parse_u32(const char *s, uint32_t len, uint32_t *out_id) {
+    if (!s || len == 0u)
+        return 0;
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c < '0' || c > '9')
+            return 0;
+        uint32_t d = (uint32_t)(c - '0');
+        if (v > (0xFFFFFFFFu - d) / 10u)
+            return 0; /* would overflow uint32_t */
+        v = v * 10u + d;
+    }
+    if (v == 0u)
+        return 0; /* id 0 is reserved */
+    if (out_id)
+        *out_id = v;
+    return 1;
 }

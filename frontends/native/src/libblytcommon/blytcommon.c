@@ -661,16 +661,66 @@ done:;
  * Only embedded `.cart.resource.<id>` sections are served; the dev-mode staging
  * directory is an emulated-path-only concern. */
 
-#define NATIVE_MAX_RES 64
-static const uint8_t *s_cart_map; /* retained read-only cart mapping, or NULL */
-static uint32_t s_cart_size;
-static struct {
+/* The resource table is sized from the cart's actual `.cart.resource.<id>`
+ * section count at startup — no fixed compile-time cap; the bound is memory
+ * (#141).  It is malloc'd once from the pre-filter window (mmap, syscall 222, is
+ * on the restricted allowlist, so malloc works on this path too) and fully
+ * populated, then never grown — deterministic and matching the host's eager
+ * load model (resource.c blyt_resource_table_load_from_cart). */
+typedef struct {
     uint32_t id;
     const uint8_t *data; /* points into s_cart_map */
     uint32_t len;
     blyt_rl_state_t rl;
-    uint8_t used;
-} s_res[NATIVE_MAX_RES];
+} native_res_t;
+
+static const uint8_t *s_cart_map; /* retained read-only cart mapping, or NULL */
+static uint32_t s_cart_size;
+static native_res_t *s_res; /* malloc'd array of s_res_count entries, or NULL */
+static uint32_t s_res_count;
+
+/* malloc/free come from ld-blyt.so.1 (system musl) via the DT_NEEDED chain; the
+ * native libblytcommon has no other libc dependency declared, so declare them
+ * here rather than pulling in <stdlib.h>. */
+extern void *malloc(size_t);
+
+/* ── Shared `.cart.resource.<id>` enumeration (runtime/shared, #141) ──
+ * Two-pass eager load: count the numeric resource sections, allocate exactly
+ * that many entries, then fill them.  The id parse and section walk are shared
+ * with the host (blyt_elf32_for_each_section_prefix / blyt_elf32_parse_u32) so
+ * resource discovery cannot drift between the two paths. */
+#define NATIVE_RES_PREFIX ".cart.resource."
+
+static void res_count_cb(const char *suffix, uint32_t suffix_len, uint32_t off, uint32_t size,
+                         void *vctx) {
+    (void)off;
+    (void)size;
+    uint32_t id;
+    if (blyt_elf32_parse_u32(suffix, suffix_len, &id))
+        (*(uint32_t *)vctx)++;
+}
+
+struct res_fill_ctx {
+    native_res_t *arr;
+    uint32_t cap;
+    uint32_t n;
+    const uint8_t *map;
+};
+
+static void res_fill_cb(const char *suffix, uint32_t suffix_len, uint32_t off, uint32_t size,
+                        void *vctx) {
+    struct res_fill_ctx *c = (struct res_fill_ctx *)vctx;
+    uint32_t id;
+    if (!blyt_elf32_parse_u32(suffix, suffix_len, &id))
+        return;
+    if (c->n >= c->cap)
+        return; /* defensive: the count and fill passes see the same sections */
+    c->arr[c->n].id = id;
+    c->arr[c->n].data = c->map + off;
+    c->arr[c->n].len = size;
+    c->arr[c->n].rl = (blyt_rl_state_t){0};
+    c->n++;
+}
 
 /* mmap the cart ELF read-only and RETAIN it (no munmap): pin returns pointers
  * into this mapping for the cart's lifetime.  Must run before the restricted
@@ -728,61 +778,36 @@ static void resources_init(void) {
         return; /* mmap error */
     s_cart_map = (const uint8_t *)map;
     s_cart_size = file_size;
+
+    /* Size the resource table from the cart's actual `.cart.resource.<id>`
+     * section count and fully populate it (#141).  Two passes over the shared
+     * ELF walk: count, then fill.  On OOM (or zero resources) the table stays
+     * empty and every lookup returns NOT_FOUND — never a stale pointer. */
+    uint32_t n = 0;
+    blyt_elf32_for_each_section_prefix(s_cart_map, s_cart_size, NATIVE_RES_PREFIX, res_count_cb,
+                                       &n);
+    if (n == 0)
+        return;
+    native_res_t *arr = (native_res_t *)malloc((size_t)n * sizeof(native_res_t));
+    if (!arr)
+        return;
+    struct res_fill_ctx fc = {arr, n, 0, s_cart_map};
+    blyt_elf32_for_each_section_prefix(s_cart_map, s_cart_size, NATIVE_RES_PREFIX, res_fill_cb,
+                                       &fc);
+    s_res = arr;
+    s_res_count = fc.n;
 }
 
-/* Build ".cart.resource.<id>" into buf (cap >= 32). */
-static const char *res_section_name(char *buf, uint32_t id) {
-    static const char pfx[] = ".cart.resource.";
-    unsigned int i = 0;
-    for (; pfx[i]; i++)
-        buf[i] = pfx[i];
-    char num[12];
-    int ni = 0;
-    uint32_t n = id;
-    do {
-        num[ni++] = (char)('0' + (int)(n % 10u));
-        n /= 10u;
-    } while (n);
-    for (int j = ni - 1; j >= 0; j--)
-        buf[i++] = num[j];
-    buf[i] = '\0';
-    return buf;
-}
-
+/* Look up a resource entry by id in the eagerly-populated table; -1 if absent. */
 static int res_find(uint32_t id) {
-    for (int i = 0; i < NATIVE_MAX_RES; i++)
-        if (s_res[i].used && s_res[i].id == id)
-            return i;
+    for (uint32_t i = 0; i < s_res_count; i++)
+        if (s_res[i].id == id)
+            return (int)i;
     return -1;
 }
 
-/* Find an existing entry or lazily create one by locating the cart's
- * `.cart.resource.<id>` section.  Returns the index or -1 if absent / full. */
-static int res_get(uint32_t id) {
-    int i = res_find(id);
-    if (i >= 0)
-        return i;
-    if (!s_cart_map)
-        return -1;
-    char name[40];
-    uint32_t off = 0, size = 0;
-    if (!blyt_elf32_find_section(s_cart_map, s_cart_size, res_section_name(name, id), &off, &size))
-        return -1;
-    for (int j = 0; j < NATIVE_MAX_RES; j++) {
-        if (!s_res[j].used) {
-            s_res[j].used = 1;
-            s_res[j].id = id;
-            s_res[j].data = s_cart_map + off;
-            s_res[j].len = size;
-            s_res[j].rl = (blyt_rl_state_t){0};
-            return j;
-        }
-    }
-    return -1; /* table full */
-}
-
 blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size) {
-    int i = res_get(id);
+    int i = res_find(id);
     if (i < 0) {
         if (out_ptr)
             *out_ptr = 0;
@@ -804,7 +829,7 @@ blyt_result_t blyt_resource_unpin(blyt_resource_id_t id) {
 }
 
 blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_handle) {
-    int i = res_get(id);
+    int i = res_find(id);
     if (i < 0) {
         if (out_handle)
             *out_handle = BLYT_RESOURCE_INVALID;
@@ -827,9 +852,8 @@ blyt_result_t blyt_resource_release(blyt_resource_h handle) {
 
 /* Frame-boundary force-release: drop every pin (ADR-0027 frame-scope). */
 static void resources_force_release_pins(void) {
-    for (int i = 0; i < NATIVE_MAX_RES; i++)
-        if (s_res[i].used)
-            blyt_rl_force_release_pins(&s_res[i].rl);
+    for (uint32_t i = 0; i < s_res_count; i++)
+        blyt_rl_force_release_pins(&s_res[i].rl);
 }
 
 void blyt_runtime_startup(void) {
