@@ -232,6 +232,77 @@ fn lua_resource_lifecycle_round_trips_all_legs() {
     );
 }
 
+/// Rust cart exercising the full SDK resource surface (#94): the packer-generated
+/// `R_GREETING: blyt::ResourceHandle` constant (pulled in via
+/// `include!(env!("BLYT_CART_RESOURCES_RS"))`), `resource::load` →
+/// `TextHandle::text_string` (owned copy), `resource::pin` →
+/// `PinnedResource::as_str`/`as_raw` (frame-scoped borrow), and `release`.  One
+/// deterministic line encodes every observable result — the greeting text, the
+/// owned-copy length, the pinned length, and that the owned copy equals the
+/// borrow — so a single substring match pins identical behaviour across all
+/// three legs (and proves the bytes are real, not a green-but-ignored stub).
+const LIFECYCLE_RUST: &str = r#"#![no_std]
+
+extern crate alloc;
+use alloc::format;
+
+include!(env!("BLYT_CART_RESOURCES_RS"));
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {
+    let res = blyt::resource::load(R_GREETING);
+    let owned = res.text_string();
+
+    let pinned = blyt::resource::pin(R_GREETING);
+    let borrowed = pinned.as_str().unwrap();
+    let (_ptr, size) = pinned.as_raw();
+
+    blyt::console_debug(&format!(
+        "R[{}] owned_len={} pin_len={} eq={}",
+        borrowed,
+        owned.len(),
+        size,
+        owned == borrowed
+    ));
+
+    drop(pinned);
+    res.release();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    blyt::quit();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#;
+
+/// Packed Rust cart: the full SDK resource surface produces identical observable
+/// output on native, WASM, libretro.
+#[test]
+fn rust_resource_round_trips_all_legs() {
+    require_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("rust_resource");
+    CartProject::new()
+        .rust(LIFECYCLE_RUST)
+        .asset("greeting.txt", "Hello from assets!")
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    run_cart_all_legs(
+        &cart,
+        "R[Hello from assets!] owned_len=18 pin_len=18 eq=true",
+    );
+}
+
 /// Dev mode: a project-dir dev ELF carries no embedded resources; the runtime
 /// reads the bytes from the content-addressed staging directory via the
 /// resource-id-index (BLYT_RESOURCE_DIR).

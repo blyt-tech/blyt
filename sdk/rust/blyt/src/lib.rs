@@ -13,11 +13,15 @@
 use core::ffi::c_char;
 
 pub mod buffer;
+pub mod resource;
 pub mod save;
 pub use buffer::{
     BlytBufferH, BlytEntityRef, BlytFieldH, BLYT_ENTITY_REF_NONE, BLYT_FIELD_NONE,
     BLYT_INVALID_SLOT,
 };
+// Re-exported at the crate root so the packer-generated `cart_resources.rs` can
+// name the type as `blyt::ResourceHandle` (issue #94).
+pub use resource::ResourceHandle;
 
 // -------------------------------------------------------------------------
 // Raw C API

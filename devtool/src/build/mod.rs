@@ -1888,6 +1888,7 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
         &top_build,
         &build_dir.join("blyt/c"),
         &build_dir.join("blyt/lua"),
+        &build_dir.join("blyt/rust"),
     );
     tasks.extend(asset_tasks);
 
@@ -2078,6 +2079,7 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
                 extra_rustflags: rust_extra_flags.clone(),
                 is_lua: true,
                 cart_state_rs: None,
+                cart_resources_rs: None,
                 output,
                 source_dir: lib_path,
             }));
@@ -2171,6 +2173,14 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
         } else {
             None
         };
+        // Resource constants (#94): generated only when the cart bundles assets,
+        // matching the C/Lua header gating.  The cart pulls them in with
+        // `include!(env!("BLYT_CART_RESOURCES_RS"))`.
+        let cart_resources_rs = if has_assets {
+            Some(build_dir.join("blyt/rust/cart_resources.rs"))
+        } else {
+            None
+        };
         let output = rust_build_dir.join("cart.a");
         tasks.push(Box::new(rust::CompileRustTask {
             key_str: "cargo_game".to_string(),
@@ -2183,6 +2193,7 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
             extra_rustflags: rust_extra_flags.clone(),
             is_lua,
             cart_state_rs,
+            cart_resources_rs,
             output: output.clone(),
             source_dir: project_dir.join("src/game/rust"),
         }));
@@ -2397,6 +2408,7 @@ pub fn build_single_lib(
             extra_rustflags: String::new(),
             is_lua: false,
             cart_state_rs: None,
+            cart_resources_rs: None,
             output: output.clone(),
             source_dir: src_dir,
         })];
