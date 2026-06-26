@@ -19,12 +19,28 @@
  * same driver used by the native SDL lldb-dap suite), so the WASM leg asserts
  * the identical observable contract.
  *
+ * Reload-while-debugging (issue #165): the native SDL reload tests drive a real
+ * hot reload through the player's dev-control TCP port (blytdebug --dev-ctrl-port
+ * N), which the child driver connects to.  The WASM runtime has no such TCP port
+ * — its reload is an in-process `blyt_dev_ctrl_command` ccall on the Emscripten
+ * Module, which lives HERE in the orchestrator, not in the lldb-dap child.  So
+ * for reload tests this orchestrator stands up a dev-control TCP *shim*: the
+ * child driver's `reload` JSON (the same {id,cmd:"reload",path} it sends the
+ * native player) arrives on the shim, which translates it into the in-process
+ * ccall (write the rebuilt cart into MEMFS → blyt_dev_ctrl_reload_fetched →
+ * blyt_session_swap_cart).  The child `reload-rebind` / `reload-n` driver tests
+ * are reused verbatim; the Rust harness asserts on the GDB-RSP trace exactly as
+ * the SDL leg does.  It also updates globalThis.__blyt_cart_path to the reloaded
+ * cart so lldb re-reads the new cart's DWARF after the swap (issue #144 path
+ * machinery applied to the rebuilt entry).
+ *
  * Usage:
  *   node run_wasm_lldb_dap_test.mjs <wasm_dir> <lldb-dap> <cart> <cwd> \
  *        [--test <name>]
  *
  * Environment (passed through to run_lldb_dap_test.mjs):
- *   BLYT_STUB_PROGRAM, BLYT_SOURCE_FILE, BLYT_GDB_BREAK_LINE, BLYT_TRACE
+ *   BLYT_STUB_PROGRAM, BLYT_SOURCE_FILE, BLYT_GDB_BREAK_LINE, BLYT_TRACE,
+ *   BLYT_V2_CART / BLYT_RELOAD_CARTS (reload tests)
  *
  * Exit 0 on success, non-zero on failure.  Node.js 22+ required.
  */
@@ -227,6 +243,13 @@ function startBridge() {
 	});
 }
 
+/* ── Reload state (issue #165) ──────────────────────────────────────────────
+ *
+ * `M` is the captured Emscripten Module (for the in-process reload ccall);
+ * `devCtrlResponses` accumulates the runtime's dev-control JSON replies. */
+let M = null;
+const devCtrlResponses = [];
+
 /* ── Load blytdebug.js (the WASM runtime) ───────────────────────────────────── */
 
 function loadWasmRuntime(wasmDir, cartPath, gdbWsPort) {
@@ -244,9 +267,16 @@ function loadWasmRuntime(wasmDir, cartPath, gdbWsPort) {
 		 * DWARF (issue #144): the runtime otherwise reports the in-memory
 		 * "/cart.blyt", which host-side lldb cannot open. */
 		globalThis.__blyt_cart_path = cartPath;
+		/* Capture each dev-control JSON reply so the reload shim can relay the
+		 * runtime's reload ok/error back to the child driver (issue #165). */
+		globalThis.blyt_dev_ctrl_send = (json) => devCtrlResponses.push(json);
 		globalThis.__blyt_init_module = {
 			print: (s) => process.stdout.write(`${s}\n`),
 			printErr: (s) => process.stderr.write(`${s}\n`),
+			/* Capture the Module for the in-process reload ccall (issue #165). */
+			onRuntimeInitialized() {
+				M = this;
+			},
 			onExit: (code) => resolve(code),
 		};
 		try {
@@ -261,6 +291,93 @@ function loadWasmRuntime(wasmDir, cartPath, gdbWsPort) {
 	});
 }
 
+/* ── Dev-control TCP shim (issue #165) ──────────────────────────────────────
+ *
+ * Translate a child-driver `reload` command (JSON line over TCP, exactly the
+ * shape the native player's dev-control port accepts) into the WASM runtime's
+ * in-process reload ccall.  Returns the listening port. */
+function startDevCtrlShim() {
+	return new Promise((resolve) => {
+		const server = createTcpServer((sock) => {
+			let buf = '';
+			sock.on('data', (chunk) => {
+				buf += chunk.toString('utf8');
+				let nl;
+				while ((nl = buf.indexOf('\n')) >= 0) {
+					const line = buf.slice(0, nl).trim();
+					buf = buf.slice(nl + 1);
+					if (!line) continue;
+					let cmd;
+					try {
+						cmd = JSON.parse(line);
+					} catch {
+						continue;
+					}
+					const reply = handleDevCtrlReload(cmd);
+					sock.write(`${JSON.stringify(reply)}\n`);
+				}
+			});
+			sock.on('error', () => {});
+		});
+		server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+	});
+}
+
+/* Drive one reload into the runtime: write the rebuilt cart bytes into MEMFS,
+ * point the host-resolvable cart path at it (so lldb re-reads the new DWARF),
+ * then ccall blyt_dev_ctrl_command(reload) — synchronous, so the in-VM
+ * cart-as-library swap completes inside this call (mirrors native_reload_test.js
+ * / reload_dap_test.mjs).  Returns the runtime's reload reply object. */
+function handleDevCtrlReload(cmd) {
+	if (cmd.cmd !== 'reload') {
+		return {
+			id: cmd.id,
+			cmd: cmd.cmd,
+			status: 'error',
+			reason: 'dev-control shim only supports reload',
+		};
+	}
+	const reloadPath = cmd.path;
+	if (!reloadPath) {
+		return {
+			id: cmd.id,
+			cmd: 'reload',
+			status: 'error',
+			reason: 'no path',
+		};
+	}
+	if (!M) {
+		return {
+			id: cmd.id,
+			cmd: 'reload',
+			status: 'error',
+			reason: 'WASM runtime not initialised',
+		};
+	}
+	/* lldb must re-read the RELOADED cart's DWARF after the swap (issue #144). */
+	globalThis.__blyt_cart_path = reloadPath;
+	globalThis.blyt_dev_ctrl_fetch_cart = () => {
+		M.FS.writeFile('/cart.blyt', new Uint8Array(readFileSync(reloadPath)));
+		M.ccall('blyt_dev_ctrl_reload_fetched', null, ['int'], [1]);
+	};
+	const before = devCtrlResponses.length;
+	M.ccall(
+		'blyt_dev_ctrl_command',
+		null,
+		['string'],
+		[JSON.stringify({ id: cmd.id, cmd: 'reload' })],
+	);
+	const produced = devCtrlResponses.slice(before).map((r) => JSON.parse(r));
+	return (
+		produced.find((r) => r.cmd === 'reload') || {
+			id: cmd.id,
+			cmd: 'reload',
+			status: 'error',
+			reason: 'no reload response from runtime',
+		}
+	);
+}
+
 /* ── Main ───────────────────────────────────────────────────────────────────── */
 
 async function main() {
@@ -268,6 +385,17 @@ async function main() {
 	console.log(
 		`[run_wasm_lldb_dap] bridge: ws ${wsPort} (WASM) ↔ tcp ${tcpPort} (lldb-dap)`,
 	);
+
+	/* Reload tests (issue #165) drive a hot reload mid-session; stand up the
+	 * dev-control shim and hand its port to the child driver via the same
+	 * BLYT_DEV_CTRL_PORT env the native SDL reload tests use. */
+	if (TEST_NAME.startsWith('reload')) {
+		const shimPort = await startDevCtrlShim();
+		process.env.BLYT_DEV_CTRL_PORT = String(shimPort);
+		console.log(
+			`[run_wasm_lldb_dap] dev-control reload shim: tcp ${shimPort}`,
+		);
+	}
 
 	/* Fire-and-forget: the WASM runtime drives its own Emscripten loop in this
 	 * process.  We do NOT await its exit — after lldb-dap detaches the cart may
