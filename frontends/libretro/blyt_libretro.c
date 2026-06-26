@@ -492,6 +492,15 @@ bool blyt_libretro_reload(void) {
     return reload_impl(g_cart_path, 0u, NULL, false);
 }
 
+bool blyt_libretro_reload_at(const char *path) {
+    /* Lua-DAP reload (issue #140): reload from `path` if supplied, otherwise
+     * fall back to g_cart_path.  Same base, no solib event. */
+    const char *open_path = (path && path[0]) ? path : g_cart_path;
+    if (!open_path)
+        return false;
+    return reload_impl(open_path, 0u, NULL, false);
+}
+
 /* Reload-while-debugging (issue #119): re-map the cart at a FRESH base and
  * re-report its library entry at a unique path (`reported_path`, also the file
  * the rebuilt bytes are loaded from so the debugger reads exactly what runs),

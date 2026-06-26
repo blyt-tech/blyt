@@ -338,6 +338,20 @@ function touchRebuild(uri) {
 	fs.appendFileSync(uri.fsPath, marker);
 }
 
+/* Trigger a Lua reload-while-debugging cycle (issue #140): append a module-level
+ * local variable assignment to the Lua source so the `blyt debug` file watcher
+ * sees a change AND the rebuild produces byte-distinct luac output (the devtool
+ * only signals a reload when the cart ELF hash changes — a comment-only edit is
+ * suppressed).  `local _ = N` is exempt from luacheck unused-variable warnings;
+ * the top-level placement means it does not shift any existing line numbers for
+ * existing breakpoints.  Each call uses a different N so repeated reloads are
+ * always byte-distinct. */
+function touchRebuildLua(uri) {
+	reloadMarkerSeq += 1;
+	const marker = `\nlocal _ = ${reloadMarkerSeq} -- blyt reload marker\n`;
+	fs.appendFileSync(uri.fsPath, marker);
+}
+
 /* Stop everything and clear breakpoints between tests. */
 async function reset() {
 	try {
@@ -371,6 +385,7 @@ module.exports = {
 	breakpointResultsFor,
 	waitBreakpointBound,
 	touchRebuild,
+	touchRebuildLua,
 	reset,
 	assert,
 };

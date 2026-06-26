@@ -45,6 +45,7 @@ void blyt_libretro_reset(void);
 bool blyt_libretro_save_state(uint32_t slot);
 bool blyt_libretro_load_state(uint32_t slot);
 bool blyt_libretro_reload(void);
+bool blyt_libretro_reload_at(const char *path); /* issue #140 */
 bool blyt_libretro_reload_for_debug(const char *reported_path); /* issue #119 */
 bool blyt_libretro_update_assets(const uint32_t *ids, size_t n);
 
@@ -422,18 +423,19 @@ static void dev_ctrl_dispatch(const char *json) {
         else
             dev_ctrl_err(id, cmd, "load_state failed");
     } else if (strcmp(cmd, "reload") == 0) {
-        /* Reload-while-debugging (issue #119): when a GDB session is active, the
-         * cart must be re-mapped at a fresh base and re-reported to lldb at a
-         * unique path (`path`, the rebuilt debug ELF the devtool staged) so it
-         * re-reads the new DWARF and rebinds breakpoints, then a solib event is
-         * fired.  Without a debugger this is an ordinary in-place reload. */
+        /* Reload-while-debugging (issue #119 / #140): extract the optional
+         * staged-cart path from the command.  GDB sessions re-map the cart at a
+         * fresh base with a unique path so lldb re-reads the new DWARF and fires
+         * a solib event (issue #119).  All other sessions reload in place — same
+         * base, no solib event — but also honour the explicit `path` when the
+         * watcher supplies one (issue #140). */
+        char path[4096];
+        const char *p = dev_ctrl_str(json, "path", path, sizeof(path)) ? path : NULL;
         bool ok;
         if (g_gdb_port >= 0) {
-            char path[4096];
-            const char *p = dev_ctrl_str(json, "path", path, sizeof(path)) ? path : NULL;
             ok = blyt_libretro_reload_for_debug(p);
         } else {
-            ok = blyt_libretro_reload();
+            ok = blyt_libretro_reload_at(p);
         }
         if (ok)
             dev_ctrl_ok(id, cmd);
