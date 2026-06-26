@@ -342,6 +342,19 @@ struct blyt_session {
 static blyt_session_t *g_gdb_session = NULL;
 static pthread_mutex_t g_bp_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Issue #146: set by gdb_set_bp/gdb_clear_bp (which run on the GDB transport
+ * reader thread) to ask the CPU thread to discard rv32emu's translated-block
+ * cache before the next instruction executes.  Inserting or removing a software
+ * breakpoint patches guest memory, but a block already translated for that PC
+ * range still holds the pre-patch instructions: on insert the ebreak is never
+ * decoded (so the breakpoint is silently skipped — the core symptom of #146);
+ * on remove a stale ebreak op lingers and blyt_ebreak_handler skips it as
+ * "unregistered", advancing PC past — and so skipping — the original
+ * instruction.  block_map_clear frees blocks the dispatch loop may be walking
+ * and must run on the thread that owns rv, so the write side only raises this
+ * flag and run_frame performs the clear at a safe point. */
+static volatile bool g_gdb_block_flush_pending = false;
+
 static void gdb_read_regs(uint8_t out[33 * 4]) {
     if (!g_gdb_session)
         return;
@@ -430,6 +443,7 @@ static int gdb_set_bp(uint32_t addr) {
     s->gdb_bps[s->gdb_nbp].addr = addr;
     s->gdb_bps[s->gdb_nbp].original_word = orig_word;
     s->gdb_nbp++;
+    g_gdb_block_flush_pending = true; /* issue #146: re-translate with the ebreak */
     pthread_mutex_unlock(&g_bp_mutex);
     return 0;
 }
@@ -450,6 +464,7 @@ static int gdb_clear_bp(uint32_t addr) {
             for (int j = i; j + 1 < s->gdb_nbp; j++)
                 s->gdb_bps[j] = s->gdb_bps[j + 1];
             s->gdb_nbp--;
+            g_gdb_block_flush_pending = true; /* issue #146: drop the stale ebreak block */
             pthread_mutex_unlock(&g_bp_mutex);
             return 0;
         }
@@ -3003,6 +3018,23 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     while (!rv_has_halted(session->rv) && !session->ctx.ecall_trapped &&
            !session->ctx.ecall_aborted) {
 #ifdef BLYT_GDB
+        /* Issue #146: a GDB software breakpoint was inserted/removed on the
+         * transport thread, which patched guest memory but left rv32emu's
+         * already-translated block holding the pre-patch instructions.  Discard
+         * the translated-block cache here — on the CPU thread that owns rv —
+         * before the next rv_step, so block_find re-translates from the patched
+         * memory and the ebreak actually executes.  Mirrors the reload path
+         * (block_map_clear + rv_block_chain_reset).  The plain volatile read is
+         * the cheap common case; the mutex is taken only to perform the clear. */
+        if (session->ctx.gdb_enabled && g_gdb_block_flush_pending) {
+            pthread_mutex_lock(&g_bp_mutex);
+            if (g_gdb_block_flush_pending) {
+                block_map_clear(session->rv);
+                rv_block_chain_reset();
+                g_gdb_block_flush_pending = false;
+            }
+            pthread_mutex_unlock(&g_bp_mutex);
+        }
         uint32_t gdb_bp_step_addr = 0;
         if (session->ctx.gdb_enabled) {
             /* If already paused waiting for vCont, poll for a resume packet. */

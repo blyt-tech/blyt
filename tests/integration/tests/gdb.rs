@@ -80,6 +80,67 @@ fn sdl_gdb_breakpoint_step() {
         .success();
 }
 
+/// SDL2 GDB mid-run breakpoint into an already-translated ("hot") block
+/// (issue #146).
+///
+/// A C cart calls `blyt_hot_fn` every frame; the function carries a global
+/// `blyt_hot_mid` label partway through its single basic block, so that address
+/// is *inside* a translated block, never a block-entry PC.  The driver lets the
+/// block go hot (continue with no breakpoint, many frames), THEN interrupts and
+/// inserts a `Z0` at `blyt_hot_mid` and continues again.
+///
+/// The run loop's `check_break` only sees block-entry PCs, so a mid-block
+/// breakpoint can only fire via the in-memory `ebreak`.  Before the fix, the
+/// cached block still held the un-patched instruction and the ebreak was never
+/// executed — the breakpoint was silently skipped and the driver hung.  The fix
+/// flushes rv32emu's translated-block cache when a breakpoint is inserted, so
+/// the block re-translates with the ebreak and a `T05` stop arrives.
+///
+/// Native-only: the WASM GDB path single-steps (rv_step_debug), so check_break
+/// catches every PC and the stale-block hazard never arises there.
+///
+/// Requires: blytdebug with BLYT_GDB=ON, SDK, `readelf` on PATH.
+#[test]
+fn sdl_gdb_hot_block_breakpoint() {
+    require_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_gdb_hot_block");
+    // `blyt_hot_fn` is a single straight-line basic block; the global label
+    // `blyt_hot_mid` sits between two volatile updates, so its address is in
+    // the middle of the translated block (no branch precedes it).  The cart
+    // never quits on its own — the driver detaches/kills it.
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+             static volatile int g_acc = 0;\n\
+             __attribute__((noinline)) void blyt_hot_fn(void) {\n\
+                 g_acc = g_acc + 1;\n\
+                 __asm__ volatile(\".globl blyt_hot_mid\\nblyt_hot_mid:\" ::: \"memory\");\n\
+                 g_acc = g_acc + 2;\n\
+             }\n\
+             void blyt_cart_init(void)   {}\n\
+             void blyt_cart_update(void) { blyt_hot_fn(); }\n\
+             void blyt_cart_draw(void)   {}\n")
+        .write(&project);
+
+    let cart = build_debug_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let addr = require_symbol_addr(&cart, "blyt_hot_mid");
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_hot_block_bp_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"))
+        .assert()
+        .success();
+}
+
 /// SDL2 GDB: Rust cart — same breakpoint+step flow with a Rust source cart.
 ///
 /// The breakpoint is placed at the entry to `blyt_cart_init` (linked from the
