@@ -628,7 +628,9 @@ if(NOT EXISTS "${LUA_DIR}/lvm.c")
 else()
   file(GLOB LUA_GUEST_SRCS "${LUA_DIR}/*.c")
   # Remove standalone interpreter, bytecode compiler, and excluded sandboxed
-  # libs (no I/O, no OS access, no dlopen, no debug hooks; utf8 saves space).
+  # libs (no I/O, no OS access, no dlopen, no debug hooks).  utf8 is KEPT:
+  # ADR-0079 allows it (read-only iteration utilities; deterministic) and
+  # carts need character-level UTF-8 (issue #167).
   foreach(
     _EXCL
     "${LUA_DIR}/lua.c"
@@ -637,8 +639,7 @@ else()
     "${LUA_DIR}/liolib.c"
     "${LUA_DIR}/loslib.c"
     "${LUA_DIR}/loadlib.c"
-    "${LUA_DIR}/ldblib.c"
-    "${LUA_DIR}/lutf8lib.c")
+    "${LUA_DIR}/ldblib.c")
     list(REMOVE_ITEM LUA_GUEST_SRCS "${_EXCL}")
   endforeach()
 

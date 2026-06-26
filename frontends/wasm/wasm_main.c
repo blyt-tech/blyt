@@ -1314,6 +1314,8 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     lua_pop(g_lua, 1);
     luaL_requiref(g_lua, "coroutine", luaopen_coroutine, 1);
     lua_pop(g_lua, 1);
+    luaL_requiref(g_lua, LUA_UTF8LIBNAME, luaopen_utf8, 1);
+    lua_pop(g_lua, 1);
 
     /* Step 7: re-register core blyt API */
     lua_newtable(g_lua);
@@ -2220,6 +2222,8 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     luaL_requiref(g_lua, "table", luaopen_table, 1);
     lua_pop(g_lua, 1);
     luaL_requiref(g_lua, "coroutine", luaopen_coroutine, 1);
+    lua_pop(g_lua, 1);
+    luaL_requiref(g_lua, LUA_UTF8LIBNAME, luaopen_utf8, 1);
     lua_pop(g_lua, 1);
 
     /* Register blyt32 API */
