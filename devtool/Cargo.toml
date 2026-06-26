@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 flatbuffers = "25.12.19"
+globset = "0.4"
 notify = "8"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

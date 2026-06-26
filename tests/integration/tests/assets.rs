@@ -627,6 +627,18 @@ fn text_asset_wasm_dev_mode_hot_swap() {
 /// The caller must have already written + built the project (build_dev_elf).
 /// `context` labels the failure so callers can distinguish C vs pure-Lua legs.
 fn run_wasm_dev_hotswap(project: &std::path::Path, v1: &str, v2: &str, context: &str) {
+    run_wasm_dev_hotswap_asset(project, "greeting.txt", v1, v2, context);
+}
+
+/// As `run_wasm_dev_hotswap`, but edits `assets/<asset_rel>` instead of the
+/// default `greeting.txt` — used by the raw-resource leg, which edits a `.dat`.
+fn run_wasm_dev_hotswap_asset(
+    project: &std::path::Path,
+    asset_rel: &str,
+    v1: &str,
+    v2: &str,
+    context: &str,
+) {
     use std::process::{Command as StdCommand, Stdio};
     use std::sync::{Arc, Mutex};
 
@@ -660,7 +672,7 @@ fn run_wasm_dev_hotswap(project: &std::path::Path, v1: &str, v2: &str, context: 
 
     let url = wait_for_serving_url(&buf, Duration::from_secs(30));
     let driver = repo_root().join("tests/wasm/dev_asset_hotswap_test.mjs");
-    let asset = project.join("assets/greeting.txt");
+    let asset = project.join("assets").join(asset_rel);
     let status = std::process::Command::new("node")
         .args([
             driver.to_str().unwrap(),
@@ -1204,4 +1216,349 @@ fn on_assets_reloaded_rust_libretro_ids_payload() {
         out.contains("reloaded:7"),
         "expected Rust on_assets_reloaded to receive id [7] on libretro, got: {out}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// raw / opaque resource type (issue #162)
+//
+// A `.dat` (any non-.txt extension declared via an `include:` glob) is a `raw`
+// resource: the cart receives the exact, uninterpreted bytes.  These mirror the
+// text-asset tests above but (a) use the resource *pin* surface (size is
+// authoritative — `blyt_resource_text_get` would mishandle an embedded NUL) and
+// (b) assert the **value** across all three legs.
+// ---------------------------------------------------------------------------
+
+/// C cart that pins R_BLOB and emits its exact bytes as a deterministic hex
+/// line, so a single substring match pins identical opaque bytes across legs.
+/// The payload deliberately contains an embedded NUL and a high byte (0xFF),
+/// which a NUL-terminated text read could not round-trip.
+const RAW_HEX_LOADER_C: &str = r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+
+void blyt_cart_init(void) {
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_resource_pin(R_BLOB, &ptr, &size);
+    const unsigned char *p = (const unsigned char *)ptr;
+    char line[256];
+    int off = snprintf(line, sizeof(line), "BLOB len=%d bytes=", (int)size);
+    for (size_t i = 0; i < size && off + 2 < (int)sizeof(line); i++)
+        off += snprintf(line + off, (size_t)((int)sizeof(line) - off), "%02x", p[i]);
+    blyt_resource_unpin(R_BLOB);
+    blyt_console_debug(line);
+}
+
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#;
+
+/// C cart that caches R_BLOB's bytes via pin at init and re-emits the cached
+/// copy every frame, re-deriving ONLY in on_assets_reloaded — so a post-swap
+/// value proves the callback fired for a raw resource (not a per-frame re-read).
+/// Used with printable payloads so the swap is easy to read.
+const CACHE_AT_INIT_RAW_C: &str = r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <string.h>
+
+static char g_cached[256];
+
+static void cache_blob(void) {
+    const void *ptr = NULL;
+    size_t size = 0;
+    if (blyt_resource_pin(R_BLOB, &ptr, &size) == BLYT_OK && ptr) {
+        size_t n = size < sizeof(g_cached) - 1 ? size : sizeof(g_cached) - 1;
+        memcpy(g_cached, ptr, n);
+        g_cached[n] = '\0';
+    }
+    blyt_resource_unpin(R_BLOB);
+}
+
+void blyt_cart_init(void) { cache_blob(); }
+void blyt_cart_on_assets_reloaded(const uint32_t *ids, size_t n) {
+    (void)ids;
+    (void)n;
+    cache_blob();
+}
+void blyt_cart_update(void) { blyt_console_debug(g_cached); }
+void blyt_cart_draw(void) {}
+"#;
+
+/// C cart that re-pins R_BLOB every frame and prints it — the per-frame reader
+/// the WASM browser hot-swap harness needs (drives the live watcher path).
+const PER_FRAME_RAW_C: &str = r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <string.h>
+
+void blyt_cart_init(void) {}
+void blyt_cart_update(void) {
+    const void *ptr = NULL;
+    size_t size = 0;
+    if (blyt_resource_pin(R_BLOB, &ptr, &size) == BLYT_OK && ptr) {
+        char buf[256];
+        size_t n = size < sizeof(buf) - 1 ? size : sizeof(buf) - 1;
+        memcpy(buf, ptr, n);
+        buf[n] = '\0';
+        blyt_console_debug(buf);
+    }
+    blyt_resource_unpin(R_BLOB);
+}
+void blyt_cart_draw(void) {}
+"#;
+
+/// Packed cart: a raw `.dat` resource reaches the cart as identical opaque bytes
+/// (embedded NUL + high byte) on native, WASM, libretro.
+#[test]
+fn raw_asset_round_trips_all_legs() {
+    require_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("raw_packed");
+    let payload: &[u8] = &[0x00, 0xFF, 0x10, b'h', b'i', 0x00];
+    CartProject::new()
+        .c(RAW_HEX_LOADER_C)
+        .asset_bytes("blob.dat", payload)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    run_cart_all_legs(&cart, "BLOB len=6 bytes=00ff10686900");
+}
+
+/// Native dev leg: a raw `.dat` hot-swaps and the cache-at-init cart sees the new
+/// bytes only because on_assets_reloaded fired (update() never re-reads).
+#[test]
+fn on_assets_reloaded_raw_c_native() {
+    require_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("raw_reload_native");
+    CartProject::new()
+        .c(CACHE_AT_INIT_RAW_C)
+        .asset("blob.dat", "RAW_ONE")
+        .write(&project);
+    build_dev_elf(&project);
+
+    let out = native_update_assets_capture(&project, Some(("blob.dat", "RAW_TWO")), "[1]");
+    assert!(
+        out.contains("RAW_ONE"),
+        "expected pre-swap cached raw bytes, got: {out}"
+    );
+    assert!(
+        out.contains("RAW_TWO"),
+        "expected re-derived raw bytes after on_assets_reloaded, got: {out}"
+    );
+}
+
+/// WASM dev leg: the same raw hot-swap through the real browser path (live
+/// watcher → update_assets → refetch → reload), a per-frame raw reader observing
+/// the swapped bytes with no VM restart.
+#[test]
+fn on_assets_reloaded_raw_c_wasm() {
+    require_sdk();
+    require_wasm();
+    require_playwright();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("raw_reload_wasm");
+    CartProject::new()
+        .c(PER_FRAME_RAW_C)
+        .asset("blob.dat", "VERSION_ONE")
+        .write(&project);
+    build_dev_elf(&project);
+
+    run_wasm_dev_hotswap_asset(
+        &project,
+        "blob.dat",
+        "VERSION_ONE",
+        "VERSION_TWO",
+        "C per-frame raw hot-swap",
+    );
+}
+
+/// Libretro dev leg: load the dev ELF reading v1 raw bytes, then at frame 2
+/// repoint BLYT_RESOURCE_DIR at the v2 staging dir and fire update_assets; the
+/// cache-at-init raw cart prints RAW_ONE until the callback re-derives RAW_TWO.
+#[test]
+fn on_assets_reloaded_raw_c_libretro() {
+    require_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("raw_reload_libretro");
+    CartProject::new()
+        .c(CACHE_AT_INIT_RAW_C)
+        .asset("blob.dat", "RAW_ONE")
+        .write(&project);
+
+    build_dev_elf(&project);
+    let build_dir = project.join("build");
+    let v1_dir = tmp.path().join("res_v1");
+    copy_dir(&build_dir, &v1_dir);
+
+    std::fs::write(project.join("assets/blob.dat"), "RAW_TWO").unwrap();
+    let elf = build_dev_elf(&project); // build_dir now holds v2 staging
+
+    let out = libretro_update_assets_capture(&elf, Some(&v1_dir), Some(&build_dir), "1", 2, 6);
+    assert!(
+        out.contains("RAW_ONE"),
+        "expected pre-swap cached raw bytes on libretro, got: {out}"
+    );
+    assert!(
+        out.contains("RAW_TWO"),
+        "expected re-derived raw bytes after on_assets_reloaded on libretro, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// get_bytes — owned opaque-bytes copy (issue #162)
+//
+// The companion to text_get/:text()/text_string for binary resources: copies the
+// resource's exact bytes into guest-owned memory that outlives the frame, with no
+// NUL terminator and no UTF-8 assumption.  Each cart reads the same binary blob
+// (embedded NUL + 0xFF) and emits a deterministic hex line; asserted identical
+// across native / WASM / libretro.
+// ---------------------------------------------------------------------------
+
+const BLOB_HEX: &str = "BYTES len=6 hex=00ff10686900";
+
+/// The opaque payload all three get_bytes carts read: embedded NUL and a high
+/// byte, which a NUL-terminated text read could not round-trip.
+fn blob_payload() -> Vec<u8> {
+    vec![0x00, 0xFF, 0x10, b'h', b'i', 0x00]
+}
+
+/// C cart: blyt_resource_bytes_get → owned copy (survives unpin), hex-encode the
+/// exact bytes, free.
+const BYTES_GET_C: &str = r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+void blyt_cart_init(void) {
+    size_t len = 0;
+    unsigned char *b = (unsigned char *)blyt_resource_bytes_get(R_BLOB, &len);
+    char line[256];
+    int off = snprintf(line, sizeof(line), "BYTES len=%d hex=", (int)len);
+    for (size_t i = 0; i < len && off + 2 < (int)sizeof(line); i++)
+        off += snprintf(line + off, (size_t)((int)sizeof(line) - off), "%02x", b[i]);
+    free(b);
+    blyt_console_debug(line);
+}
+
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#;
+
+/// Rust cart: TextHandle::bytes_vec → owned Vec<u8>, hex-encode.
+const BYTES_GET_RUST: &str = r#"#![no_std]
+
+extern crate alloc;
+use alloc::format;
+use alloc::string::String;
+
+include!(env!("BLYT_CART_RESOURCES_RS"));
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {
+    let res = blyt::resource::load(R_BLOB);
+    let bytes = res.bytes_vec();
+    let mut hex = String::new();
+    for b in &bytes {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    blyt::console_debug(&format!("BYTES len={} hex={}", bytes.len(), hex));
+    res.release();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {
+    blyt::quit();
+}
+
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {}
+"#;
+
+/// Lua cart: res:bytes() → Lua string of the exact bytes (binary-safe), hex-encode
+/// via string.byte.
+const BYTES_GET_LUA: &str = r#"
+local R = require("cart_resources")
+function init()
+    local res = blyt.resource.load(R.BLOB)
+    local s = res:bytes()
+    local hex = {}
+    for i = 1, #s do
+        hex[i] = string.format("%02x", string.byte(s, i))
+    end
+    blyt.debug.print(string.format("BYTES len=%d hex=%s", #s, table.concat(hex)))
+    res:release()
+end
+function update() blyt.quit() end
+function draw() end
+"#;
+
+/// Packed C cart: blyt_resource_bytes_get returns the exact opaque bytes,
+/// identically across native / WASM / libretro.
+#[test]
+fn c_bytes_get_round_trips_all_legs() {
+    require_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("bytes_get_c");
+    CartProject::new()
+        .c(BYTES_GET_C)
+        .asset_bytes("blob.dat", &blob_payload())
+        .write(&project);
+
+    let cart = build_cart(&project);
+    run_cart_all_legs(&cart, BLOB_HEX);
+}
+
+/// Packed Rust cart: TextHandle::bytes_vec returns the exact opaque bytes,
+/// identically across native / WASM / libretro.
+#[test]
+fn rust_bytes_vec_round_trips_all_legs() {
+    require_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("bytes_get_rust");
+    CartProject::new()
+        .rust(BYTES_GET_RUST)
+        .asset_bytes("blob.dat", &blob_payload())
+        .write(&project);
+
+    let cart = build_cart(&project);
+    run_cart_all_legs(&cart, BLOB_HEX);
+}
+
+/// Packed Lua cart: res:bytes() returns the exact opaque bytes as a binary-safe
+/// Lua string, identically across native / WASM (host-Lua) / libretro.
+#[test]
+fn lua_resource_bytes_round_trips_all_legs() {
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("bytes_get_lua");
+    CartProject::new()
+        .lua(BYTES_GET_LUA)
+        .asset_bytes("blob.dat", &blob_payload())
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    run_cart_all_legs(&cart, BLOB_HEX);
 }

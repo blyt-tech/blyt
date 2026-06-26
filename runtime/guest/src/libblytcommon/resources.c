@@ -33,3 +33,22 @@ char *blyt_resource_text_get(blyt_resource_id_t id, size_t *len) {
     blyt_resource_unpin(id);
     return out;
 }
+
+void *blyt_resource_bytes_get(blyt_resource_id_t id, size_t *len) {
+    const void *ptr = 0;
+    size_t size = 0;
+    if (blyt_resource_pin(id, &ptr, &size) != BLYT_OK)
+        return 0; /* unknown id — nothing pinned, leave *len untouched */
+
+    /* Allocate at least 1 byte so success is always a non-NULL pointer, even for
+     * a zero-length resource (no NUL terminator — these are opaque bytes). */
+    void *out = malloc(size ? size : 1);
+    if (out) {
+        if (size)
+            __builtin_memcpy(out, ptr, size);
+        if (len)
+            *len = size;
+    }
+    blyt_resource_unpin(id);
+    return out;
+}

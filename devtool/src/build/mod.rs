@@ -1262,6 +1262,13 @@ fn dev_elf_output(project_dir: &Path, debug: bool) -> PathBuf {
  * Source map
  * ------------------------------------------------------------------------- */
 
+/// Absolute paths of every declared asset directory that exists — dev-mode
+/// watch targets (#162). Returns empty on a malformed `assets:` block; the
+/// build itself surfaces the config error.
+pub(crate) fn asset_watch_dirs(project_dir: &Path) -> Vec<PathBuf> {
+    assets::watch_dirs(project_dir).unwrap_or_default()
+}
+
 pub(crate) fn source_map_entries(project_dir: &Path, sdk_root: &Path) -> Vec<SourceMapEntry> {
     let mut v = vec![
         SourceMapEntry {
@@ -1446,6 +1453,12 @@ enum CartLanguage {
 struct BuildManifest {
     language: Option<String>,
     languages: Option<BTreeMap<String, Option<LanguageConfig>>>,
+    /// Asset-declaration block (#162). Parsed and consumed separately by
+    /// `assets::read_assets_config`; declared here so `deny_unknown_fields`
+    /// accepts the `assets:` key when a language declaration is also present.
+    #[serde(default)]
+    #[allow(dead_code)]
+    assets: Option<assets::AssetsConfig>,
 }
 
 #[derive(serde::Deserialize, Default)]

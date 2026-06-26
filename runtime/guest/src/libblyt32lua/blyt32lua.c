@@ -342,6 +342,11 @@ static void register_resource_module(lua_State *L) {
     lua_newtable(L); /* __index method table */
     lua_pushcfunction(L, lua_resource_text);
     lua_setfield(L, -2, "text");
+    /* :bytes() is the binary-oriented name for the same owned copy — a Lua string
+     * is already a byte buffer (lua_pushlstring is 8-bit clean), so it round-trips
+     * opaque bytes verbatim (#162).  Distinct name for self-documenting raw use. */
+    lua_pushcfunction(L, lua_resource_text);
+    lua_setfield(L, -2, "bytes");
     lua_pushcfunction(L, lua_resource_release);
     lua_setfield(L, -2, "release");
     lua_setfield(L, -2, "__index");
