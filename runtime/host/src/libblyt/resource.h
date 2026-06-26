@@ -54,3 +54,13 @@ size_t blyt_resource_table_load_from_cart(blyt_resource_table_t *t, const blyt_c
  * existing entries first. Returns 0 on success, -1 if the index is missing or
  * unreadable. Safe to call repeatedly (hot-swap re-reads the current index). */
 int blyt_resource_table_load_from_index(blyt_resource_table_t *t, const char *dir);
+
+/* Populate `t` the way a session's ctx.resources is populated: a packed cart's
+ * embedded sections, else the staging directory beside the dev ELF (or
+ * BLYT_RESOURCE_DIR). For standalone tables — the WASM pure-Lua host path lacks
+ * a session to carry ctx.resources (#93/#120). Clears existing entries first. */
+void blyt_resource_table_load_for_cart(blyt_resource_table_t *t, const blyt_cart_t *cart);
+
+/* Accessor for the WASM host-Lua resource binding: a hybrid cart's resources
+ * live in the session's run ctx (#93). */
+blyt_resource_table_t *blyt_session_resources(blyt_session_t *s);
