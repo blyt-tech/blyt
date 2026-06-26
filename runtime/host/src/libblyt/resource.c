@@ -1,7 +1,7 @@
 #include "resource.h"
 
-#include "cart_load.h" /* struct blyt_cart, Elf32_* */
-#include "elf32.h"
+#include "blyt_elf_section.h" /* runtime/shared: prefix enumerate + id parse (#141) */
+#include "cart_load.h" /* struct blyt_cart */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,36 +64,37 @@ static blyt_resource_entry_t *table_push(blyt_resource_table_t *t) {
     return e;
 }
 
+/* Context + callback for the shared `.cart.resource.<id>` section enumerator. */
+struct load_from_cart_ctx {
+    blyt_resource_table_t *t;
+    const uint8_t *map;
+};
+
+static void load_resource_section(const char *suffix, uint32_t suffix_len, uint32_t off,
+                                  uint32_t size, void *vctx) {
+    struct load_from_cart_ctx *c = (struct load_from_cart_ctx *)vctx;
+    uint32_t id;
+    if (!blyt_elf32_parse_u32(suffix, suffix_len, &id))
+        return; /* not a numeric resource section */
+    blyt_resource_entry_t *e = table_push(c->t);
+    if (!e)
+        return; /* OOM: stop adding; entries so far stay valid */
+    e->id = id;
+    e->data = c->map + off;
+    e->len = size;
+    e->owned = NULL; /* aliases the cart map */
+}
+
 size_t blyt_resource_table_load_from_cart(blyt_resource_table_t *t, const blyt_cart_t *cart) {
     blyt_resource_table_clear(t);
     if (!cart || !cart->map)
         return 0;
 
-    const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
-    const Elf32_Shdr *shdrs = (const Elf32_Shdr *)((const uint8_t *)cart->map + eh->e_shoff);
-    const Elf32_Shdr *shstrtab_hdr = &shdrs[eh->e_shstrndx];
-    const char *shstrtab = (const char *)((const uint8_t *)cart->map + shstrtab_hdr->sh_offset);
-
-    const size_t prefix_len = sizeof(RESOURCE_SECTION_PREFIX) - 1;
-    for (uint16_t i = 0; i < eh->e_shnum; i++) {
-        const Elf32_Shdr *sh = &shdrs[i];
-        const char *name = shstrtab + sh->sh_name;
-        if (strncmp(name, RESOURCE_SECTION_PREFIX, prefix_len) != 0)
-            continue;
-        const char *id_str = name + prefix_len;
-        char *end = NULL;
-        unsigned long id = strtoul(id_str, &end, 10);
-        if (end == id_str || *end != '\0' || id == 0)
-            continue; /* not a numeric resource section */
-
-        blyt_resource_entry_t *e = table_push(t);
-        if (!e)
-            break;
-        e->id = (uint32_t)id;
-        e->data = (const uint8_t *)cart->map + sh->sh_offset;
-        e->len = sh->sh_size;
-        e->owned = NULL; /* aliases the cart map */
-    }
+    /* Enumerate `.cart.resource.<id>` sections through the shared ELF walk so the
+     * host and the native bare-metal path discover resources identically (#141). */
+    struct load_from_cart_ctx ctx = {t, (const uint8_t *)cart->map};
+    blyt_elf32_for_each_section_prefix((const uint8_t *)cart->map, cart->map_size,
+                                       RESOURCE_SECTION_PREFIX, load_resource_section, &ctx);
     return t->count;
 }
 

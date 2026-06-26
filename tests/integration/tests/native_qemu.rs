@@ -1184,5 +1184,94 @@ void blyt_cart_draw(void) {}
         println!("  PASS: output = {:?}", output.trim());
     }
 
+    // ── Gate 13: >64 distinct resources on metal (#141) ──────────────
+    //
+    // The native resource table historically had a fixed 64-entry cap
+    // (NATIVE_MAX_RES), so a cart touching a 65th distinct id silently got
+    // NOT_FOUND from pin/load on metal — a native-only divergence from the
+    // emulated/WASM/libretro legs, whose table grows dynamically. This cart
+    // pins AND loads all 100 distinct ids and verifies each pin delivers the
+    // exact embedded bytes (not merely OK; the #98 anti-pattern), emitting one
+    // deterministic summary line. Ids are 1-based in sorted-name order, so the
+    // zero-padded res_<k>.txt asset maps id (k+1) -> "payload-<k>".
+    println!("Gate 13: >64 distinct resources on metal...");
+    {
+        let res_project = tmp.path().join("res_many_metal");
+        let mut proj = CartProject::new().c(r#"
+#include "blyt.h"
+#include <stdio.h>
+#include <string.h>
+
+#define N 100
+
+void blyt_cart_init(void) {
+    int pin_ok = 0, load_ok = 0, match = 0, first_bad = -1;
+    for (int k = 0; k < N; k++) {
+        blyt_resource_id_t id = (blyt_resource_id_t)(k + 1);
+        char expect[32];
+        int elen = snprintf(expect, sizeof(expect), "payload-%03d", k);
+
+        blyt_resource_h h = BLYT_RESOURCE_INVALID;
+        if (blyt_resource_load(id, &h) == BLYT_OK && h != BLYT_RESOURCE_INVALID)
+            load_ok++;
+
+        const void *ptr = NULL;
+        size_t size = 0;
+        blyt_result_t pr = blyt_resource_pin(id, &ptr, &size);
+        if (pr == BLYT_OK && ptr) {
+            pin_ok++;
+            if ((int)size == elen && memcmp(ptr, expect, (size_t)elen) == 0)
+                match++;
+            else if (first_bad < 0)
+                first_bad = k + 1;
+        } else if (first_bad < 0) {
+            first_bad = k + 1;
+        }
+        blyt_resource_unpin(id);
+        blyt_resource_release(h);
+    }
+
+    char line[128];
+    snprintf(line, sizeof(line), "RES_MANY pin_ok=%d load_ok=%d match=%d first_bad=%d", pin_ok,
+             load_ok, match, first_bad);
+    blyt_console_debug(line);
+}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#);
+        for k in 0..100 {
+            proj = proj.asset(&format!("res_{k:03}.txt"), &format!("payload-{k:03}"));
+        }
+        proj.write(&res_project);
+        let res_cart = build_cart(&res_project);
+        assert!(
+            res_cart.exists(),
+            "res_many_metal.blyt not built: {}",
+            res_cart.display()
+        );
+        assert!(
+            qemu.scp_to(&res_cart, "/tmp/blyt_gate/"),
+            "scp res_many_metal.blyt failed"
+        );
+
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/res_many_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "res_many_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("RES_MANY pin_ok=100 load_ok=100 match=100 first_bad=-1"),
+            "expected all 100 distinct resources to pin/load with exact bytes on metal \
+             (no NATIVE_MAX_RES cap)\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    }
+
     println!("Gate tests passed.");
 }
