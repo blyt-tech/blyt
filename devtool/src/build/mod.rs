@@ -3,6 +3,7 @@ mod c;
 mod cpp;
 mod external;
 mod lua;
+mod resource_pack;
 mod rust;
 
 pub(crate) use rust::{discover_rust_libs, find_rust_sdk};

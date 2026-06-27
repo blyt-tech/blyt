@@ -31,6 +31,7 @@
 #include "blyt_fp_canon.h" /* runtime/shared: blyt_canon_f32/f64 (ADR-0010) */
 #include "blyt_gen.h" /* runtime/shared: blyt_gen_next (ADR-0096) */
 #include "blyt_native_trace.h"
+#include "blyt_resource_codec.h" /* runtime/shared: per-resource compression (#157) */
 #include "blyt_resource_lifecycle.h" /* runtime/shared: load/pin refcount state (#123) */
 #include "seccomp_restricted.h"
 
@@ -669,8 +670,18 @@ done:;
  * load model (resource.c blyt_resource_table_load_from_cart). */
 typedef struct {
     uint32_t id;
-    const uint8_t *data; /* points into s_cart_map */
-    uint32_t len;
+    const uint8_t *data; /* decompressed bytes: a s_cart_map alias (none) or
+                          * `owned` (zstd); NULL until a zstd entry is decoded */
+    uint32_t len; /* decompressed length (authoritative even before decode) */
+    /* Per-resource compression for packed carts (#157, ADR-0026). For
+     * BLYT_RES_ALGO_NONE, `data` aliases the map and the fields below are
+     * unused. For BLYT_RES_ALGO_ZSTD, `cdata`/`clen` point at the compressed
+     * body in s_cart_map and `data` is NULL until first pin, when it is
+     * decompressed into `owned`. */
+    uint8_t algo;
+    const uint8_t *cdata;
+    uint32_t clen;
+    uint8_t *owned; /* malloc'd decompressed buffer (zstd), or NULL */
     blyt_rl_state_t rl;
 } native_res_t;
 
@@ -681,8 +692,11 @@ static uint32_t s_res_count;
 
 /* malloc/free come from ld-blyt.so.1 (system musl) via the DT_NEEDED chain; the
  * native libblytcommon has no other libc dependency declared, so declare them
- * here rather than pulling in <stdlib.h>. */
+ * here rather than pulling in <stdlib.h>.  mmap (222) is on the restricted
+ * seccomp allowlist, so malloc works post-filter — a compressed resource can be
+ * decompressed lazily at pin time (#157). */
 extern void *malloc(size_t);
+extern void free(void *);
 
 /* ── Shared `.cart.resource.<id>` enumeration (runtime/shared, #141) ──
  * Two-pass eager load: count the numeric resource sections, allocate exactly
@@ -715,10 +729,40 @@ static void res_fill_cb(const char *suffix, uint32_t suffix_len, uint32_t off, u
         return;
     if (c->n >= c->cap)
         return; /* defensive: the count and fill passes see the same sections */
-    c->arr[c->n].id = id;
-    c->arr[c->n].data = c->map + off;
-    c->arr[c->n].len = size;
-    c->arr[c->n].rl = (blyt_rl_state_t){0};
+    native_res_t *e = &c->arr[c->n];
+    e->id = id;
+    e->owned = NULL;
+    e->rl = (blyt_rl_state_t){0};
+
+    /* Parse the 8-byte compression header (#157): NONE aliases the body in the
+     * map (zero-copy, off+8); ZSTD keeps the compressed body for lazy decode and
+     * exposes the decompressed length up front.  A malformed/too-small section
+     * is served verbatim. Header parse is shared with the host so they can't
+     * drift. */
+    const uint8_t *section = c->map + off;
+    uint8_t algo;
+    uint32_t dsize;
+    const uint8_t *body;
+    size_t body_len;
+    if (!blyt_res_header_parse(section, size, &algo, &dsize, &body, &body_len)) {
+        e->algo = BLYT_RES_ALGO_NONE;
+        e->data = section;
+        e->len = size;
+        e->cdata = NULL;
+        e->clen = 0;
+    } else {
+        e->algo = algo;
+        e->len = dsize;
+        if (algo == BLYT_RES_ALGO_ZSTD) {
+            e->data = NULL; /* decoded lazily on first pin */
+            e->cdata = body;
+            e->clen = (uint32_t)body_len;
+        } else {
+            e->data = body; /* zero-copy alias into the cart map */
+            e->cdata = NULL;
+            e->clen = 0;
+        }
+    }
     c->n++;
 }
 
@@ -806,6 +850,27 @@ static int res_find(uint32_t id) {
     return -1;
 }
 
+/* Decompressed bytes for a resource: a NONE entry returns its zero-copy map
+ * alias; a ZSTD entry is decompressed lazily on first access into `owned`,
+ * cached for reuse (#157).  Returns NULL on OOM / decode failure.  malloc/free
+ * work post-seccomp because mmap/munmap are on the restricted allowlist. */
+static const uint8_t *native_res_data(native_res_t *e) {
+    if (e->data)
+        return e->data; /* zero-copy (none) or already-materialized (zstd) */
+    if (e->algo != BLYT_RES_ALGO_ZSTD || e->len == 0)
+        return e->data;
+    uint8_t *buf = (uint8_t *)malloc(e->len);
+    if (!buf)
+        return NULL;
+    if (blyt_res_decode(e->algo, e->cdata, e->clen, buf, e->len) != 0) {
+        free(buf);
+        return NULL;
+    }
+    e->owned = buf;
+    e->data = buf;
+    return e->data;
+}
+
 blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size) {
     int i = res_find(id);
     if (i < 0) {
@@ -813,9 +878,16 @@ blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, siz
             *out_ptr = 0;
         return BLYT_ERR_NOT_FOUND;
     }
+    /* Materialize first: a compressed resource decompresses on first pin. */
+    const uint8_t *bytes = native_res_data(&s_res[i]);
+    if (!bytes && s_res[i].len) {
+        if (out_ptr)
+            *out_ptr = 0;
+        return BLYT_ERR_IO; /* decode failed / OOM */
+    }
     blyt_rl_pin(&s_res[i].rl);
     if (out_ptr)
-        *out_ptr = s_res[i].data; /* direct pointer into the retained mmap */
+        *out_ptr = bytes; /* map alias (none) or owned decompressed buffer (zstd) */
     if (out_size)
         *out_size = s_res[i].len;
     return BLYT_OK;
