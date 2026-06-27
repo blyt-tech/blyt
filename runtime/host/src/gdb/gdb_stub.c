@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef __EMSCRIPTEN__
+#include <unistd.h> /* usleep — issue #177 forced-race test hook */
+#endif
+
 #ifdef BLYT_GDB_TCP
 #include <pthread.h>
 #endif
@@ -343,9 +347,45 @@ static void handle_M(const char *args, char *out, size_t cap) {
     snprintf(out, cap, "OK");
 }
 
+/* Issue #177 — debug/test-only forced-race hook for the hybrid first-launch
+ * ordering gate (#119, blyt_session_gdb_wait_client_continue).  When
+ * BLYT_TEST_DELAY_BP_INSERT is set (delay in ms; non-positive ⇒ 2000), stall each
+ * STARTUP breakpoint insert — i.e. every Z0 issued before the client's first
+ * continue (continue_gen == 0).  The forced-race driver releases the Lua side of
+ * a hybrid session FIRST and only then has the native client insert its init()
+ * breakpoint, so this delay makes that insert land well after init() would
+ * otherwise have run.  With the ordering gate present the cart stays halted until
+ * the delayed insert + continue land, so the init() breakpoint still stops on the
+ * FIRST launch; with the gate removed init() runs past the line before the insert
+ * lands and the first-launch stop is missed — i.e. the test fails iff the gate is
+ * absent.  Gated on continue_gen == 0 (not a one-shot) so it covers the real
+ * init() breakpoint even if lldb inserts an internal breakpoint first, while
+ * leaving every reload insert (which arrives after the first continue) untouched.
+ * Inert unless the env var is set, and only compiled into the GDB-enabled debug
+ * runtime (this whole file is debug-only); a no-op under Emscripten, where the
+ * stub is single-threaded and the gate does not apply. */
+static void test_delay_startup_bp_insert(void) {
+#ifndef __EMSCRIPTEN__
+    const char *e = getenv("BLYT_TEST_DELAY_BP_INSERT");
+    if (!e || !*e)
+        return;
+    if (g_gdb.continue_gen != 0) /* startup only — never delay a reload insert */
+        return;
+    long ms = atol(e);
+    if (ms <= 0)
+        ms = 2000;
+    blyt_tracef(BLYT_TRACE_GDB, "test: delaying startup breakpoint insert %ld ms (issue #177)", ms);
+    /* Sleep in 1 ms chunks (like blyt_session_gdb_wait_client_continue) so we
+     * never pass usleep a value ≥ 1e6, which POSIX leaves unspecified. */
+    for (long i = 0; i < ms; i++)
+        usleep(1000);
+#endif
+}
+
 static void handle_Z0(const char *args, char *out, size_t cap) {
     char *end;
     uint32_t addr = (uint32_t)strtoul(args, &end, 16);
+    test_delay_startup_bp_insert();
     if (g_gdb.n_breaks >= MAX_BREAKS) {
         snprintf(out, cap, "E01");
         return;

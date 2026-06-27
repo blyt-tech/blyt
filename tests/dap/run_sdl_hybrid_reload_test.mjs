@@ -284,7 +284,7 @@ async function main() {
 		lua.request('continue', { threadId: tid }).catch(() => {});
 	});
 
-	/* ── native: initialize, launch, setBreakpoints, configurationDone ──────── */
+	/* ── native: initialize + launch (attach to the GDB relay) ─────────────── */
 	await native.request('initialize', { adapterID: 'lldb-dap' });
 	const nativeLaunchP = native
 		.request('launch', {
@@ -296,19 +296,36 @@ async function main() {
 			],
 		})
 		.catch((e) => console.log(`[native] launch error: ${e.message}`));
-	const nbp = await native.request('setBreakpoints', {
-		source: { path: `/blyt/cart/${nativeSourceFile}` },
-		breakpoints: [{ line: nativeBreakLine }],
-	});
-	assert(
-		nbp.body?.breakpoints?.[0]?.verified === true,
-		`native breakpoint verified at attach (${nativeSourceFile}:${nativeBreakLine})`,
-	);
-	/* native configurationDone first: lldb attaches + finishes its launch
-	 * handshake (and continues) so it is fully ready to service the native
-	 * breakpoint before init() runs once the Lua side releases the gate. */
-	await native.request('configurationDone');
-	console.log('[native] configurationDone done');
+
+	/* Insert the native init() breakpoint and finish native configuration.
+	 * Factored out so the forced-race mode (issue #177) can defer it until AFTER
+	 * the Lua side has released the startup gate. */
+	const nativeConfigure = async () => {
+		const nbp = await native.request('setBreakpoints', {
+			source: { path: `/blyt/cart/${nativeSourceFile}` },
+			breakpoints: [{ line: nativeBreakLine }],
+		});
+		assert(
+			nbp.body?.breakpoints?.[0]?.verified === true,
+			`native breakpoint verified at attach (${nativeSourceFile}:${nativeBreakLine})`,
+		);
+		await native.request('configurationDone');
+		console.log('[native] configurationDone done');
+	};
+
+	/* BLYT_FORCE_RACE (issue #177): deterministically order native-bp-insert
+	 * AFTER the Lua gate release so the startup ordering gate is the only thing
+	 * that can keep init()'s native breakpoint from being missed.
+	 *
+	 * Default ordering: native configures FIRST (lldb attaches + continues) so it
+	 * is fully ready before the Lua side releases the gate — under that ordering
+	 * the native breakpoint is already in regardless of the gate, which is exactly
+	 * why the plain startup assertion can't catch a gate regression.  Forced-race
+	 * ordering: Lua releases the cart FIRST; the native breakpoint insert is
+	 * deferred and, via BLYT_TEST_DELAY_BP_INSERT, delayed in the stub so it lands
+	 * well after init() would otherwise have run. */
+	const forceRace = !!process.env.BLYT_FORCE_RACE;
+	if (!forceRace) await nativeConfigure();
 
 	/* ── Lua: initialize, launch, setBreakpoints, configurationDone ─────────── */
 	await lua.request('initialize', {
@@ -331,6 +348,12 @@ async function main() {
 	 * gate and init() runs. */
 	await lua.request('configurationDone');
 	console.log('[lua] configurationDone done');
+
+	/* Forced-race: the native breakpoint goes in only now, after the Lua gate
+	 * released the cart — the stub delay makes it land after init() would have
+	 * run, so only the ordering gate can save the first-launch stop. */
+	if (forceRace) await nativeConfigure();
+
 	await nativeLaunchP;
 	console.log('[native] launch resolved');
 
@@ -346,6 +369,20 @@ async function main() {
 		'native init() breakpoint fired at startup',
 	);
 	assert(luaHits.startup >= 1, 'Lua init() breakpoint fired at startup');
+
+	/* BLYT_SKIP_RELOAD: stop after the startup assertions (issue #177).  The
+	 * forced-race startup-gate test reuses this driver but only cares about the
+	 * first-launch ordering — both init() breakpoints firing at startup — not the
+	 * reload behaviour, so it skips the (slower) reload phase below. */
+	if (process.env.BLYT_SKIP_RELOAD) {
+		console.log('[skip-reload] startup-only run, skipping reload phase');
+		try {
+			lldb.stdin.end();
+		} catch (_) {}
+		lldb.kill();
+		luaSock.destroy();
+		return;
+	}
 
 	/* Let the cart settle into update() before reloading. */
 	await sleep(500);
