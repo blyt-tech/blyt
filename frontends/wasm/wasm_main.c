@@ -2065,8 +2065,14 @@ static void wasm_session_reload(long id) {
 
 #ifdef BLYT_GDB
         if (debug_reload) {
-            if (reported)
-                blyt_session_gdb_set_cart_path(g_session, reported);
+            /* Do NOT rename the OLD cart svr4 entry to the new path here (issue
+             * #179): the two-phase re-arm ADDS the new module alongside the old
+             * one, and lldb distinguishes them by `name=` (the host path).
+             * reload_notify_begin already gives the NEW entry `reported`, and
+             * phase 2's drop leaves the survivor at it; pre-renaming the old
+             * entry made BOTH entries share the v2 path, so lldb saw two modules
+             * with the same name, removed the stale breakpoint and never
+             * re-resolved/continued onto the new code → the reload wedged. */
             blyt_session_gdb_reload_notify_begin(g_session, new_cart, base, reported);
             free(reported);
             /* Rebuild host Lua from the new bytecode (re-binding the native
@@ -2130,8 +2136,11 @@ static void wasm_session_reload(long id) {
         }
         blyt_cart_close(g_cart);
         g_cart = new_cart;
-        if (reported)
-            blyt_session_gdb_set_cart_path(g_session, reported);
+        /* Do NOT rename the OLD cart svr4 entry to the new path (issue #179):
+         * keep the old and new entries distinct by host path so lldb re-resolves
+         * the breakpoint onto the new module instead of seeing two same-named
+         * modules and wedging.  reload_notify_begin gives the NEW entry
+         * `reported`; phase 2's drop leaves the survivor at it. */
         blyt_session_gdb_reload_notify_begin(g_session, new_cart, base, reported);
         free(reported);
         g_reload_snap = snap; /* init()+restore run under wasm_loop after re-arm */

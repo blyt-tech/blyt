@@ -208,6 +208,8 @@ function startGdbBridge() {
 			}
 			if (!wsHandshake(req, socket)) return;
 			wasmSock = socket;
+			/* see tcpServer note below (issue #179) */
+			socket.setNoDelay(true);
 			socket.on('data', (chunk) => {
 				wasmBuf = Buffer.concat([wasmBuf, chunk]);
 				wasmBuf = wsParseFrames(wasmBuf, (text) => {
@@ -230,6 +232,12 @@ function startGdbBridge() {
 
 		const tcpServer = createTcpServer((sock) => {
 			tcpSock = sock;
+			/* Disable Nagle on both relay legs (issue #179).  Forwarding small RSP
+			 * packets one at a time with Nagle on costs a ~40 ms delayed-ACK per
+			 * round-trip (occasionally a ~200 ms persist-timer stall), stacking a
+			 * fixed ~700 ms onto the post-reload breakpoint re-arm that overran the
+			 * orchestrator's waitFor under CI load and timed the test out. */
+			sock.setNoDelay(true);
 			sock.on('data', (chunk) => {
 				if (wasmSock && !wasmSock.destroyed)
 					wasmSock.write(wsFrame(chunk.toString('utf8')));
@@ -284,6 +292,8 @@ function startDapRelay() {
 			};
 		}
 		function makeSide(socket) {
+			/* no Nagle on the Lua DAP relay either (issue #179) */
+			socket.setNoDelay(true);
 			const side = {
 				socket,
 				buf: Buffer.alloc(0),

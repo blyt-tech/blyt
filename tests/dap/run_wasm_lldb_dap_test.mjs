@@ -180,6 +180,8 @@ function startBridge() {
 			}
 			if (!wsHandshake(req, socket)) return;
 			wasmSock = socket;
+			/* see tcpServer note below (issue #179) */
+			socket.setNoDelay(true);
 			socket.on('data', (chunk) => {
 				wasmBuf = Buffer.concat([wasmBuf, chunk]);
 				wasmBuf = wsParseFrames(wasmBuf, (text) => {
@@ -205,6 +207,13 @@ function startBridge() {
 
 		const tcpServer = createTcpServer((sock) => {
 			tcpSock = sock;
+			/* Disable Nagle on both relay legs (issue #179).  The relay forwards
+			 * small RSP request/response packets one at a time; with Nagle on,
+			 * each round-trip eats a ~40 ms delayed-ACK penalty (and an occasional
+			 * ~200 ms persist-timer stall), stacking a fixed ~700 ms onto the
+			 * post-reload breakpoint re-arm (~17 round-trips) that overran the
+			 * driver's 1500 ms settle window under CI load and timed the test out. */
+			sock.setNoDelay(true);
 			sock.on('data', (chunk) => flushTcpToWasm(chunk));
 			sock.on('close', () => {
 				if (wasmSock && !wasmSock.destroyed) wasmSock.destroy();
@@ -299,6 +308,8 @@ function loadWasmRuntime(wasmDir, cartPath, gdbWsPort) {
 function startDevCtrlShim() {
 	return new Promise((resolve) => {
 		const server = createTcpServer((sock) => {
+			/* no Nagle on the reload-command channel (issue #179) */
+			sock.setNoDelay(true);
 			let buf = '';
 			sock.on('data', (chunk) => {
 				buf += chunk.toString('utf8');
