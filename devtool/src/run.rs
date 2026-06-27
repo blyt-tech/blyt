@@ -379,6 +379,12 @@ fn run_relay_session(mut ws: WsConn, tcp: TcpStream) {
     use std::io::ErrorKind::WouldBlock;
     use std::sync::mpsc;
 
+    // Disable Nagle on both legs: DAP request/response packets are small and
+    // stop-and-wait, so Nagle + delayed-ACK would add a ~40 ms floor per
+    // round-trip (and ~700 ms across a post-reload breakpoint re-arm). See #183.
+    tcp.set_nodelay(true).ok();
+    ws.get_ref().set_nodelay(true).ok();
+
     // Two channels bridge the two transports:
     //   tcp_to_ws: TCP reader thread → WS I/O thread (writes to WS)
     //   ws_to_tcp: WS I/O thread (reads from WS) → TCP writer (this thread)
@@ -789,6 +795,86 @@ mod tests {
         tcp_read.read_line(&mut line).unwrap();
         assert_eq!(line.trim_end(), reload);
     }
+
+    /// Poll a stream's `TCP_NODELAY` flag, allowing for the small window between
+    /// the relay session being spawned and it setting the option. A `try_clone`d
+    /// fd shares the same underlying socket, so it observes the option the relay
+    /// set on its own handle.
+    fn assert_nodelay_eventually(stream: &TcpStream, what: &str) {
+        for _ in 0..200 {
+            if stream.nodelay().unwrap() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("relay never set TCP_NODELAY on the {what} leg");
+    }
+
+    /// Accept a WebSocket on a fresh listener, returning the server-side
+    /// `WsConn` plus a `try_clone`d handle to its raw stream for probing socket
+    /// options. Also returns the connected client so the caller keeps it alive.
+    fn ws_pair_with_probe() -> (
+        WsConn,
+        TcpStream,
+        tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    ) {
+        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws_port = ws_listener.local_addr().unwrap().port();
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = ws_listener.accept().unwrap();
+            let probe = stream.try_clone().unwrap();
+            (tungstenite::accept(stream).unwrap(), probe)
+        });
+        let (ws_client, _) = tungstenite::connect(format!("ws://127.0.0.1:{ws_port}/")).unwrap();
+        let (ws_server, probe) = server_thread.join().unwrap();
+        (ws_server, probe, ws_client)
+    }
+
+    /// Connect a TCP client to a fresh listener, returning the accepted
+    /// server-side stream, a `try_clone`d probe handle, and the live client.
+    fn tcp_pair_with_probe() -> (TcpStream, TcpStream, TcpStream) {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        let tcp_client = TcpStream::connect(format!("127.0.0.1:{tcp_port}")).unwrap();
+        let (tcp_server, _) = tcp_listener.accept().unwrap();
+        let probe = tcp_server.try_clone().unwrap();
+        (tcp_server, probe, tcp_client)
+    }
+
+    #[test]
+    fn relay_session_sets_tcp_nodelay() {
+        // Both legs of the DAP relay must disable Nagle so per-request RSP/DAP
+        // round-trips and the post-reload breakpoint re-arm don't eat the
+        // ~40 ms delayed-ACK floor (issue #183).
+        let (ws_server, ws_probe, _ws_client) = ws_pair_with_probe();
+        let (tcp_server, tcp_probe, _tcp_client) = tcp_pair_with_probe();
+        std::thread::spawn(move || run_relay_session(ws_server, tcp_server));
+        assert_nodelay_eventually(&tcp_probe, "DAP TCP");
+        assert_nodelay_eventually(&ws_probe, "DAP WebSocket");
+    }
+
+    #[test]
+    fn gdb_relay_session_sets_tcp_nodelay() {
+        let (ws_server, ws_probe, _ws_client) = ws_pair_with_probe();
+        let (tcp_server, tcp_probe, _tcp_client) = tcp_pair_with_probe();
+        std::thread::spawn(move || run_gdb_relay_session(ws_server, tcp_server));
+        assert_nodelay_eventually(&tcp_probe, "GDB TCP");
+        assert_nodelay_eventually(&ws_probe, "GDB WebSocket");
+    }
+
+    #[test]
+    fn dev_ctrl_clients_set_tcp_nodelay() {
+        let hub = DevCtrlHub::new();
+
+        let (tcp_server, tcp_probe, _tcp_client) = tcp_pair_with_probe();
+        let h = hub.clone();
+        std::thread::spawn(move || run_dev_ctrl_tcp_client(tcp_server, h));
+        assert_nodelay_eventually(&tcp_probe, "dev-control TCP");
+
+        let (ws_server, ws_probe, _ws_client) = ws_pair_with_probe();
+        std::thread::spawn(move || run_dev_ctrl_ws_client(ws_server, hub));
+        assert_nodelay_eventually(&ws_probe, "dev-control WebSocket");
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -930,6 +1016,11 @@ fn run_gdb_relay_loop(ws_listener: TcpListener, tcp_listener: TcpListener) {
 fn run_gdb_relay_session(mut ws: WsConn, tcp: TcpStream) {
     use std::io::ErrorKind::WouldBlock;
     use std::sync::mpsc;
+
+    // Disable Nagle on both legs: GDB RSP is stop-and-wait over small packets,
+    // so Nagle + delayed-ACK would add a ~40 ms floor per round-trip. See #183.
+    tcp.set_nodelay(true).ok();
+    ws.get_ref().set_nodelay(true).ok();
 
     let (tcp_to_ws_tx, tcp_to_ws_rx) = mpsc::channel::<String>();
     let (ws_to_tcp_tx, ws_to_tcp_rx) = mpsc::channel::<String>();
@@ -1142,6 +1233,10 @@ fn start_dev_ctrl_relay(ws_port: u16, tcp_port: u16) -> (u16, u16, DevCtrlHub) {
 
 /// Service one TCP client: newline-delimited JSON in both directions.
 fn run_dev_ctrl_tcp_client(tcp: TcpStream, hub: DevCtrlHub) {
+    // Disable Nagle: dev-control lines (reset/reload commands) are tiny and
+    // latency-sensitive, same rationale as the GDB/DAP relays. See #183.
+    tcp.set_nodelay(true).ok();
+
     let (id, rx) = hub.register();
 
     let write_half = match tcp.try_clone() {
@@ -1187,6 +1282,9 @@ fn run_dev_ctrl_tcp_client(tcp: TcpStream, hub: DevCtrlHub) {
 /// outbound messages drained from this client's hub queue.
 fn run_dev_ctrl_ws_client(mut ws: WsConn, hub: DevCtrlHub) {
     use std::io::ErrorKind::WouldBlock;
+
+    // Disable Nagle on the underlying stream — see #183.
+    ws.get_ref().set_nodelay(true).ok();
 
     let (id, rx) = hub.register();
     ws.get_mut().set_nonblocking(true).ok();
