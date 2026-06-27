@@ -1332,6 +1332,18 @@ static void blyt_ecall_handler(riscv_t *rv) {
             return;
         }
 
+        /* Materialize the bytes: a compressed (zstd) resource is decompressed
+         * lazily on first pin into an owned buffer, cached thereafter (#157).
+         * Uncompressed resources return their zero-copy map alias. */
+        const uint8_t *bytes = blyt_resource_entry_data(e);
+        if (!bytes && e->len) {
+            if (out_ptr_vaddr)
+                memory_write(mem, out_ptr_vaddr, (const uint8_t *)&zero, 4);
+            rv_set_reg(rv, rv_reg_a0, 3 /* BLYT_ERR_IO: decode failed */);
+            rv->PC += 4;
+            return;
+        }
+
         /* Bump-allocate room in the guest scratch region; wrap to the start if a
          * single fetch would overflow it.  out_size is authoritative — the bytes
          * are raw (no NUL terminator; the text_get helper adds its own). */
@@ -1348,7 +1360,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
             off = 0;
         uint32_t gptr = BLYT_RESOURCE_SCRATCH_BASE + off;
         if (need)
-            memory_write(mem, gptr, e->data, need);
+            memory_write(mem, gptr, bytes, need);
         g_run_ctx->resource_scratch_off = off + need;
 
         blyt_rl_pin(&e->rl);

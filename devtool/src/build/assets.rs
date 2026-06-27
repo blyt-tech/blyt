@@ -748,7 +748,19 @@ pub(super) fn plan_assets(
             is_text: a.resource_type.is_text(),
             key_str: format!("asset/{}", a.resource_name),
         }));
-        resource_sections.push((format!(".cart.resource.{}", a.id), a.data_output.clone()));
+        // The packed `.blyt` embeds the *compressed* form (#157, ADR-0026): a
+        // PackResourceTask turns the staged `.data` into a `.res` blob (8-byte
+        // header + raw|zstd body), and that blob — not the raw `.data` — becomes
+        // the `.cart.resource.<id>` section. Dev mode keeps reading the staging
+        // `.data` directly, so it stays uncompressed.
+        let packed_output = a.data_output.with_extension("res");
+        tasks.push(Box::new(super::resource_pack::PackResourceTask {
+            resource_name: a.resource_name.clone(),
+            staged_data: a.data_output.clone(),
+            packed_output: packed_output.clone(),
+            key_str: format!("pack/{}", a.resource_name),
+        }));
+        resource_sections.push((format!(".cart.resource.{}", a.id), packed_output));
     }
 
     if !assets.is_empty() {

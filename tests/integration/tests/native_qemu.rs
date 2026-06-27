@@ -1280,5 +1280,83 @@ void blyt_cart_draw(void) {}
         println!("  PASS: output = {:?}", output.trim());
     }
 
+    // ── Gate 14: zstd-compressed resource decodes on metal (#157) ────
+    //
+    // The only coverage of native bare-metal decompression: a highly
+    // compressible resource packs zstd (8-byte header + frame), and the native
+    // libblytcommon must decode it — lazily, post-seccomp (malloc works because
+    // mmap is allowlisted) — into the exact original bytes. The cart pins it and
+    // emits an FNV-1a over the full decoded content, so the value proves every
+    // byte decoded correctly and matches the other legs (assets.rs), not merely
+    // that pin returned OK (the #98 anti-pattern).
+    println!("Gate 14: zstd-compressed resource decodes on metal...");
+    {
+        // Highly compressible blob → packs zstd; FNV-1a (32-bit) over its bytes.
+        let blob: Vec<u8> = "blyt-resource-compression-test-payload\n"
+            .repeat(512)
+            .into_bytes();
+        let mut fnv: u32 = 2166136261;
+        for &b in &blob {
+            fnv ^= b as u32;
+            fnv = fnv.wrapping_mul(16777619);
+        }
+        let expected = format!("RES_ZSTD pin=0 size={} fnv={fnv:08x}", blob.len());
+
+        let zstd_project = tmp.path().join("res_zstd_metal");
+        CartProject::new()
+            .c(r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+
+void blyt_cart_init(void) {
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_result_t pr = blyt_resource_pin(R_BLOB, &ptr, &size);
+    unsigned int h = 2166136261u;
+    const unsigned char *b = (const unsigned char *)ptr;
+    for (size_t i = 0; i < size; i++) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    char line[96];
+    snprintf(line, sizeof(line), "RES_ZSTD pin=%d size=%d fnv=%08x", (int)pr, (int)size, h);
+    blyt_console_debug(line);
+}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#)
+            .asset_bytes("blob.dat", &blob)
+            .write(&zstd_project);
+        let zstd_cart = build_cart(&zstd_project);
+        assert!(
+            zstd_cart.exists(),
+            "res_zstd_metal.blyt not built: {}",
+            zstd_cart.display()
+        );
+        assert!(
+            qemu.scp_to(&zstd_cart, "/tmp/blyt_gate/"),
+            "scp res_zstd_metal.blyt failed"
+        );
+
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/res_zstd_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "res_zstd_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&expected),
+            "native bare-metal must decode the zstd resource to the exact bytes \
+             (expected {expected:?}; byte-identical to the other legs, #157)\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    }
+
     println!("Gate tests passed.");
 }

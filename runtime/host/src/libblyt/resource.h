@@ -23,9 +23,19 @@
 
 typedef struct {
     uint32_t id;
-    const uint8_t *data; /* bytes; aliases the cart map, or points at `owned` */
-    size_t len;
+    const uint8_t *data; /* decompressed bytes; aliases the cart map, points at
+                          * `owned`, or NULL until a compressed entry is decoded */
+    size_t len; /* decompressed length — authoritative even before a zstd entry
+                 * is materialized (so headroom is known up front, #156) */
     void *owned; /* heap buffer to free on clear; NULL when data aliases the map */
+    /* Per-resource compression for packed carts (#157, ADR-0026). For
+     * BLYT_RES_ALGO_NONE, `data` aliases the map at load (zero-copy) and the
+     * fields below are unused. For BLYT_RES_ALGO_ZSTD, `data` is NULL until
+     * first access (decompressed lazily into `owned`); `cdata`/`clen` point at
+     * the compressed body in the cart map. Dev-staging entries are always NONE. */
+    uint8_t algo;
+    const uint8_t *cdata;
+    size_t clen;
     blyt_rl_state_t rl; /* load/pin refcounts + load generation (#123) */
 } blyt_resource_entry_t;
 
@@ -41,6 +51,12 @@ const blyt_resource_entry_t *blyt_resource_table_find(const blyt_resource_table_
 /* Mutable lookup for the lifecycle ECALLs (pin/unpin/load/release mutate the
  * entry's refcounts). Returns NULL if `id` is absent. */
 blyt_resource_entry_t *blyt_resource_table_find_mut(blyt_resource_table_t *t, uint32_t id);
+
+/* Return the resource's decompressed bytes (length is `e->len`), decoding a
+ * compressed (zstd) entry lazily on first access into `e->owned` and caching it
+ * for reuse (#157, ADR-0026). An uncompressed entry returns its zero-copy map
+ * alias unchanged. Returns NULL on decode failure / OOM. */
+const uint8_t *blyt_resource_entry_data(blyt_resource_entry_t *e);
 /* Frame-boundary force-release: drop every entry's pin count (ADR-0027). */
 void blyt_resource_table_force_release_pins(blyt_resource_table_t *t);
 

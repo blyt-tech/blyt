@@ -319,6 +319,17 @@ if(NOT DEFINED BLYT_FLATCC_SOURCE_DIR)
 endif()
 file(GLOB FLATCCRT_SOURCES "${BLYT_FLATCC_SOURCE_DIR}/src/runtime/*.c")
 
+# zstd decode sources for per-resource decompression (#157, ADR-0026). The WASM
+# player runs the same libblyt resource path as blytplay/libretro, so it embeds
+# the same decode-only zstd (common + decompress, ASM disabled for a bit-
+# identical pure-C path). BLYT_ZSTD_SOURCE_DIR is set by blyt_sdk.cmake.
+if(NOT DEFINED BLYT_ZSTD_SOURCE_DIR)
+  set(BLYT_ZSTD_SOURCE_DIR "${BLYT_ROOT}/third_party/zstd")
+endif()
+set(ZSTD_LIB_DIR "${BLYT_ZSTD_SOURCE_DIR}/lib")
+file(GLOB ZSTD_DECODE_SOURCES "${ZSTD_LIB_DIR}/common/*.c"
+     "${ZSTD_LIB_DIR}/decompress/*.c")
+
 # -------------------------------------------------------------------------
 # blytplay executable
 # -------------------------------------------------------------------------
@@ -341,8 +352,10 @@ add_executable(
   # guest libs (issue #128), consumed by state_buffer.c / cart_load.c above.
   "${BLYT_ROOT}/runtime/shared/blyt_fp_canon.c"
   "${BLYT_ROOT}/runtime/shared/blyt_elf_section.c"
+  "${BLYT_ROOT}/runtime/shared/blyt_resource_codec.c"
   "${BLYT_ROOT}/runtime/shared/blyt_blys.c"
   ${BLYT_LUA_SOURCES}
+  ${ZSTD_DECODE_SOURCES}
   ${BLYT_DAP_SOURCES}
   ${BLYT_GDB_SOURCES})
 
@@ -383,8 +396,14 @@ if(BLYT_LUA_SOURCES)
 endif()
 
 target_compile_definitions(
-  blytplay PRIVATE ${RV32EMU_FEATURE_DEFS} BLYT_EMBED_LIBS ${_BLYT_LUA_DEFS}
-                   ${BLYT_DAP_DEFS} ${BLYT_GDB_DEFS})
+  blytplay
+  PRIVATE ${RV32EMU_FEATURE_DEFS}
+          BLYT_EMBED_LIBS
+          ${_BLYT_LUA_DEFS}
+          ${BLYT_DAP_DEFS}
+          ${BLYT_GDB_DEFS}
+          # zstd: pure-C decode path (no ASM) so it is bit-identical everywhere.
+          ZSTD_DISABLE_ASM=1)
 
 # Softfloat compile options: INLINE has a space so it must be a compile option
 # (not a cmake definition) to avoid quoting issues. Force-include rv32emu
@@ -439,6 +458,7 @@ target_include_directories(
           "${BLYT_ROOT}/runtime/host/include"
           "${BLYT_ROOT}/runtime/host/src/libblyt"
           "${BLYT_ROOT}/runtime/shared"
+          "${ZSTD_LIB_DIR}"
           ${_BLYT_LUA_INCLUDES}
           ${_BLYT_DAP_INCLUDES}
           ${_BLYT_GDB_INCLUDES})

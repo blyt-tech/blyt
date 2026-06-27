@@ -137,12 +137,25 @@ FetchContent_Declare(
 # CMakeLists.txt and we do want add_subdirectory). lua_POPULATED /
 # rv32emu_POPULATED etc. are set by FetchContent_Populate and guard against
 # double-populate across multiple include() of this file.
-foreach(_dep lua rv32emu musl libcxx libretro_common)
+foreach(_dep lua rv32emu musl libcxx libretro_common zstd)
   FetchContent_GetProperties(${_dep})
   if(NOT ${_dep}_POPULATED)
     FetchContent_Populate(${_dep})
   endif()
 endforeach()
+
+# zstd decode-only static library (#157, ADR-0026): per-resource decompression
+# is shared by every host-side leg (blytplay, libretro, WASM via the same
+# libblyt sources). We compile only lib/common + lib/decompress — the runtime
+# never compresses; the packer (devtool) owns encode. ASM is disabled so the
+# pure-C decode path is bit-identical on every platform (determinism contract).
+set(ZSTD_LIB_DIR "${zstd_SOURCE_DIR}/lib")
+file(GLOB ZSTD_DECODE_SOURCES "${ZSTD_LIB_DIR}/common/*.c"
+     "${ZSTD_LIB_DIR}/decompress/*.c")
+add_library(zstd_decode STATIC ${ZSTD_DECODE_SOURCES})
+set_target_properties(zstd_decode PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(zstd_decode PRIVATE ZSTD_DISABLE_ASM=1)
+target_include_directories(zstd_decode PUBLIC "${ZSTD_LIB_DIR}")
 
 # flatcc — pure C FlatBuffers schema compiler, built from source (ADR-0126)
 set(FLATCC_TEST
@@ -434,6 +447,7 @@ add_library(
   # native guest libs (issue #128); defined once, compiled into both.
   runtime/shared/blyt_fp_canon.c
   runtime/shared/blyt_elf_section.c
+  runtime/shared/blyt_resource_codec.c
   runtime/shared/blyt_blys.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
@@ -458,7 +472,7 @@ set_source_files_properties(
 target_link_libraries(
   libblyt
   PUBLIC flatccrt
-  PRIVATE libblytemu)
+  PRIVATE libblytemu zstd_decode)
 if(TARGET liblua_host)
   target_link_libraries(libblyt PRIVATE liblua_host)
   target_compile_definitions(libblyt PRIVATE BLYT_HAVE_HOST_LUA=1)
@@ -545,6 +559,7 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     runtime/host/src/libblyt/version.c
     runtime/shared/blyt_fp_canon.c
     runtime/shared/blyt_elf_section.c
+    runtime/shared/blyt_resource_codec.c
     runtime/shared/blyt_blys.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
@@ -557,7 +572,7 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
   target_link_libraries(
     libblyt_debug
     PUBLIC flatccrt
-    PRIVATE libblytemu)
+    PRIVATE libblytemu zstd_decode)
   if(TARGET liblua_host)
     target_link_libraries(libblyt_debug PRIVATE liblua_host)
     target_compile_definitions(libblyt_debug PRIVATE BLYT_HAVE_HOST_LUA=1)
@@ -917,6 +932,15 @@ add_executable(test_resource_lifecycle tests/unit/test_resource_lifecycle.c)
 target_include_directories(test_resource_lifecycle PRIVATE runtime/shared)
 add_test(NAME test_resource_lifecycle COMMAND test_resource_lifecycle)
 
+# test_resource_codec: the per-resource compression on-disk format + decode
+# (runtime/shared/blyt_resource_codec.c, #157, ADR-0026). Links the decode-only
+# zstd for the zstd round-trip; the encoder/threshold are devtool Rust tests.
+add_executable(test_resource_codec tests/unit/test_resource_codec.c
+                                   runtime/shared/blyt_resource_codec.c)
+target_include_directories(test_resource_codec PRIVATE runtime/shared)
+target_link_libraries(test_resource_codec PRIVATE zstd_decode)
+add_test(NAME test_resource_codec COMMAND test_resource_codec)
+
 # verify_cart: standalone tool used in CI to confirm blyt build output passes
 # load-time security checks. Not a ctest test; invoked directly with a cart.
 add_executable(verify_cart tests/tools/verify_cart.c)
@@ -977,6 +1001,7 @@ add_custom_target(
     -DBLYT_LUA_SOURCE_DIR=${lua_SOURCE_DIR}
     -DBLYT_RV32EMU_SOURCE_DIR=${rv32emu_SOURCE_DIR}
     -DBLYT_FLATCC_SOURCE_DIR=${flatcc_SOURCE_DIR}
+    -DBLYT_ZSTD_SOURCE_DIR=${zstd_SOURCE_DIR}
     -DBLYT_LIBRETRO_COMMON_SOURCE_DIR=${libretro_common_SOURCE_DIR} -P
     ${CMAKE_SOURCE_DIR}/cmake/blyt_sdk.cmake
   USES_TERMINAL

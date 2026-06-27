@@ -1,6 +1,7 @@
 #include "resource.h"
 
 #include "blyt_elf_section.h" /* runtime/shared: prefix enumerate + id parse (#141) */
+#include "blyt_resource_codec.h" /* runtime/shared: per-resource compression (#157) */
 #include "cart_load.h" /* struct blyt_cart */
 
 #include <stdio.h>
@@ -60,8 +61,31 @@ static blyt_resource_entry_t *table_push(blyt_resource_table_t *t) {
     e->data = NULL;
     e->len = 0;
     e->owned = NULL;
+    e->algo = BLYT_RES_ALGO_NONE;
+    e->cdata = NULL;
+    e->clen = 0;
     e->rl = (blyt_rl_state_t){0};
     return e;
+}
+
+const uint8_t *blyt_resource_entry_data(blyt_resource_entry_t *e) {
+    if (!e)
+        return NULL;
+    if (e->data)
+        return e->data; /* zero-copy (none) or already-materialized (zstd) */
+    if (e->algo != BLYT_RES_ALGO_ZSTD)
+        return NULL; /* a NONE entry always has data set; nothing to decode */
+    /* Decompress the cart-map frame into an owned buffer, cached for reuse. */
+    uint8_t *buf = malloc(e->len ? e->len : 1);
+    if (!buf)
+        return NULL;
+    if (blyt_res_decode(e->algo, e->cdata, e->clen, buf, e->len) != 0) {
+        free(buf);
+        return NULL;
+    }
+    e->owned = buf;
+    e->data = buf;
+    return e->data;
 }
 
 /* Context + callback for the shared `.cart.resource.<id>` section enumerator. */
@@ -80,9 +104,36 @@ static void load_resource_section(const char *suffix, uint32_t suffix_len, uint3
     if (!e)
         return; /* OOM: stop adding; entries so far stay valid */
     e->id = id;
-    e->data = c->map + off;
-    e->len = size;
-    e->owned = NULL; /* aliases the cart map */
+    e->owned = NULL;
+
+    /* Each packed section carries an 8-byte compression header (#157). Parse it:
+     * NONE serves the body zero-copy (data aliases the map at off+8); ZSTD keeps
+     * the compressed body for lazy decode and exposes the decompressed length up
+     * front. A malformed/too-small section falls back to serving it verbatim. */
+    const uint8_t *section = c->map + off;
+    uint8_t algo;
+    uint32_t dsize;
+    const uint8_t *body;
+    size_t body_len;
+    if (!blyt_res_header_parse(section, size, &algo, &dsize, &body, &body_len)) {
+        e->algo = BLYT_RES_ALGO_NONE;
+        e->data = section;
+        e->len = size;
+        e->cdata = NULL;
+        e->clen = 0;
+        return;
+    }
+    e->algo = algo;
+    e->len = dsize;
+    if (algo == BLYT_RES_ALGO_ZSTD) {
+        e->data = NULL; /* decoded lazily on first access */
+        e->cdata = body;
+        e->clen = body_len;
+    } else {
+        e->data = body; /* zero-copy alias into the cart map */
+        e->cdata = NULL;
+        e->clen = 0;
+    }
 }
 
 size_t blyt_resource_table_load_from_cart(blyt_resource_table_t *t, const blyt_cart_t *cart) {

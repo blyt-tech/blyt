@@ -882,15 +882,41 @@ if(BLYT_BUILD_NATIVE)
     "${LIBBLYTCOMMON_NATIVE_DIR}/blytcommon.c"
     "${SHARED_DIR}/blyt_fp_canon.c"
     "${SHARED_DIR}/blyt_elf_section.c"
+    "${SHARED_DIR}/blyt_resource_codec.c" # per-resource decode (#157)
     "${SHARED_DIR}/blyt_blys.c"
+    # zstd decode-only (common + decompress) cross-compiled into the native lib
+    # so a compressed resource decodes bit-identically on bare metal (#157,
+    # ADR-0026).  Its libc calls (memcpy/malloc/free/…) resolve as dynamic
+    # undefs against system musl over the DT_NEEDED chain, like the rest of this
+    # lib.  ASM disabled + NDEBUG: pure-C, assert-free decode.
+    ${ZSTD_DECODE_SOURCES}
     CFLAGS
     -O0
+    # NB: do NOT add -DNDEBUG here — this lib's FCSR determinism check is
+    # `#ifndef NDEBUG` (warn vs abort), and the native variant must warn (#157
+    # regression: a global -DNDEBUG for zstd's asserts flipped it to abort).
+    # zstd's own asserts resolve __assert_fail via musl and never fire on valid
+    # frames.
+    -DZSTD_DISABLE_ASM=1
     -I
     "${LIBBLYTCOMMON_NATIVE_DIR}"
     -I
     "${LIBBLYT32_NATIVE_INC}" # seccomp_restricted.h
     -I
     "${SHARED_DIR}"
+    -I
+    "${ZSTD_LIB_DIR}"
+    # musl headers (string.h/stdlib.h) for the bundled zstd decode sources —
+    # same RV32 set the libc++ cross-build uses (blyt_sdk.cmake).  The other TUs
+    # in this lib don't include libc headers, so this only feeds zstd.
+    -isystem
+    "${MUSL_DIR}/include"
+    -isystem
+    "${MUSL_DIR}/arch/riscv32"
+    -isystem
+    "${MUSL_DIR}/arch/generic"
+    -isystem
+    "${LIBBLYTC_BITS_DIR}/.."
     LINK_ARGS
     -Wl,-soname,libblytcommon.so)
 

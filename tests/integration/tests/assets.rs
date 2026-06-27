@@ -1752,3 +1752,198 @@ fn rust_text_accessor_on_bytes_is_compile_error() {
         "expected a compile error about the missing text_string method, got: {out}"
     );
 }
+
+/* -------------------------------------------------------------------------
+ * Per-resource zstd compression (#157, ADR-0026)
+ *
+ * The packer compresses a resource body (zstd) only when it saves >5%, writing
+ * an 8-byte uncompressed header [algo|0|0|0|dsize_le] ahead of the body in the
+ * `.cart.resource.<id>` section; the runtime decodes on first access into an
+ * owned buffer (uncompressed bodies stay zero-copy). A compressed resource must
+ * yield byte-identical bytes on every leg — the determinism contract.
+ * ------------------------------------------------------------------------- */
+
+/// A short phrase repeated — highly compressible, so it packs zstd. ~20 KiB,
+/// well under the 16 MiB resource scratch the pin path copies through.
+fn compressible_blob() -> Vec<u8> {
+    "blyt-resource-compression-test-payload\n"
+        .repeat(512)
+        .into_bytes()
+}
+
+/// Deterministic high-entropy bytes (splitmix64) — uniformly random, so zstd
+/// cannot beat the 5% threshold and the packer must ship `none`.
+fn random_blob(n: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) as u8
+        })
+        .collect()
+}
+
+/// FNV-1a (32-bit) over `bytes`, matching the C cart's loop exactly — a
+/// full-content fingerprint, so the cross-leg assertion proves every decoded
+/// byte is correct (not merely the length: the #98 anti-pattern).
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 2166136261;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
+/// Dump a `.cart.resource.<id>` section (header + body) from a packed cart via
+/// the SDK's objcopy, leaving the cart untouched (writes a throwaway output).
+fn dump_resource_section(cart: &std::path::Path, id: u32) -> Vec<u8> {
+    let dir = cart.parent().unwrap();
+    let sec_out = dir.join(format!("dump-section-{id}.bin"));
+    let throwaway = dir.join(format!("dump-throwaway-{id}.elf"));
+    let status = std::process::Command::new(sdk_dir().join("bin/blyt-objcopy"))
+        .arg("--dump-section")
+        .arg(format!(".cart.resource.{id}={}", sec_out.display()))
+        .arg(cart)
+        .arg(&throwaway)
+        .status()
+        .expect("run blyt-objcopy --dump-section");
+    assert!(
+        status.success(),
+        "objcopy --dump-section failed for id {id}"
+    );
+    std::fs::read(&sec_out).expect("read dumped section")
+}
+
+/// C cart that pins R_BLOB and prints a deterministic line: the pin result, the
+/// byte length, and an FNV-1a over every byte — so a single substring match
+/// pins identical *content* across all three legs.
+const C_BLOB_FNV: &str = r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+
+void blyt_cart_init(void) {
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_result_t pr = blyt_resource_pin(R_BLOB, &ptr, &size);
+    unsigned int h = 2166136261u;
+    const unsigned char *b = (const unsigned char *)ptr;
+    for (size_t i = 0; i < size; i++) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    char line[96];
+    snprintf(line, sizeof(line), "BLOB pin=%d size=%d fnv=%08x", (int)pr, (int)size, h);
+    blyt_console_debug(line);
+}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#;
+
+/// A compressed resource decodes to the exact original bytes — asserted
+/// **identical across native / WASM / libretro** (the determinism contract),
+/// proven by an FNV over the full decoded content, not per-leg smoke.
+#[test]
+fn compressed_resource_round_trips_all_legs() {
+    require_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let blob = compressible_blob();
+    let expected = format!("BLOB pin=0 size={} fnv={:08x}", blob.len(), fnv1a(&blob));
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("compressed_resource");
+    CartProject::new()
+        .c(C_BLOB_FNV)
+        .asset_bytes("blob.dat", &blob)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    // Guard: the resource genuinely compressed (the test would be vacuous on the
+    // `none` path), so this exercises the zstd decode on every leg.
+    assert_eq!(
+        dump_resource_section(&cart, 1)[0],
+        1,
+        "blob.dat should have packed zstd"
+    );
+
+    run_cart_all_legs(&cart, &expected);
+}
+
+/// The packed section of a compressible resource is zstd-flagged, smaller than
+/// the raw bytes, records the true decompressed size, and repacks
+/// byte-identically (acceptance criteria: compress, dsize-in-index, reproducible).
+#[test]
+fn compressed_resource_section_is_zstd_with_dsize_and_reproducible() {
+    require_sdk();
+
+    let blob = compressible_blob();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("zstd_section");
+    CartProject::new()
+        .c(C_BLOB_FNV)
+        .asset_bytes("blob.dat", &blob)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    let section = dump_resource_section(&cart, 1);
+
+    assert_eq!(section[0], 1, "algo byte should be zstd");
+    assert!(
+        section.len() < blob.len(),
+        "on-disk section {} not smaller than raw {}",
+        section.len(),
+        blob.len()
+    );
+    let dsize = u32::from_le_bytes(section[4..8].try_into().unwrap()) as usize;
+    assert_eq!(
+        dsize,
+        blob.len(),
+        "header dsize must equal the decompressed length"
+    );
+
+    // Reproducibility: an independent repack of the same input yields
+    // byte-identical section bytes.
+    let project2 = tmp.path().join("zstd_section_repeat");
+    CartProject::new()
+        .c(C_BLOB_FNV)
+        .asset_bytes("blob.dat", &blob)
+        .write(&project2);
+    let section2 = dump_resource_section(&build_cart(&project2), 1);
+    assert_eq!(
+        section, section2,
+        "repacking must produce byte-identical section bytes"
+    );
+}
+
+/// An incompressible resource (or one below the 5% threshold) packs `none`: the
+/// algo flag is none and the body is byte-exact (no growth beyond the header).
+#[test]
+fn incompressible_resource_packs_none() {
+    require_sdk();
+
+    let raw = random_blob(4096);
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("none_section");
+    CartProject::new()
+        .c(C_BLOB_FNV)
+        .asset_bytes("blob.dat", &raw)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    let section = dump_resource_section(&cart, 1);
+
+    assert_eq!(section[0], 0, "incompressible data should pack none");
+    assert_eq!(
+        &section[8..],
+        &raw[..],
+        "none body must equal the raw bytes (no growth)"
+    );
+    let dsize = u32::from_le_bytes(section[4..8].try_into().unwrap()) as usize;
+    assert_eq!(dsize, raw.len());
+}
