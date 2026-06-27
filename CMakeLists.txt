@@ -1232,8 +1232,19 @@ add_custom_target(
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   USES_TERMINAL VERBATIM
   COMMENT "Running C unit tests (ctest) and Rust devtool unit tests")
-add_dependencies(test-unit test_cart_load test_cart_run test_blys
-                 test_resource_lifecycle test_resource_eviction)
+# test_resource_codec is an unconditional ctest (CMakeLists.txt above) but
+# builds only under the default `all` target, so a fresh worktree (or a tree set
+# up via test-prereqs) fails the ctest leg with a misleading "Could not find
+# executable" unless it is an explicit dependency (issue #185, same class as
+# #150/#172).
+add_dependencies(
+  test-unit
+  test_cart_load
+  test_cart_run
+  test_blys
+  test_resource_lifecycle
+  test_resource_codec
+  test_resource_eviction)
 if(TARGET test_gdb_stub)
   add_dependencies(test-unit test_gdb_stub)
 endif()
@@ -1266,6 +1277,11 @@ add_custom_target(
   USES_TERMINAL VERBATIM
   COMMENT "Running Rust integration tests (cargo nextest -p integration)")
 add_dependencies(test-integration sdk)
+# test_session_api exercises blyt_session_t directly from the Rust integration
+# suite (require_session_api guard), but builds only under the default `all`
+# target, not `sdk` — so a fresh worktree fast-fails the session/emulator tests
+# at setup unless it is an explicit dependency (issue #185, same class as #172).
+add_dependencies(test-integration test_session_api)
 # The libretro all-legs tests dlopen blyt_libretro.so from a test_libretro_core
 # harness; neither is part of `sdk` (they build under the default `all` target),
 # so depend on them explicitly or a fresh worktree fails the libretro leg at
@@ -1352,6 +1368,10 @@ add_dependencies(test-integration test-vscode)
 #
 add_custom_target(test-prereqs)
 add_dependencies(test-prereqs sdk npm_ci wasm_test_deps vscode_ext_deps)
+# test_session_api is needed by the Rust integration suite but builds only under
+# the default `all` target, not `sdk` — without it, session-warmup leaves the
+# session/emulator leg un-runnable and test-integration fast-fails (issue #185).
+add_dependencies(test-prereqs test_session_api)
 # blyt_native_riscv64 is a host-only convenience target that *invokes* the
 # riscv64 cross build; it is not defined in the cross-compile tree itself (its
 # definition is guarded by `NOT CMAKE_CROSSCOMPILING`), so only depend on it
