@@ -706,14 +706,18 @@ int main(int argc, char *argv[]) {
      * registered (DAP configurationDone received above).  Wait for the native
      * side (lldb-dap) to finish ITS initial configuration too — fetch the svr4
      * library list, insert its breakpoints, and issue its first continue —
-     * before releasing the cart, so a native breakpoint's ebreak is patched in
-     * before any cart code runs (issue #119).  Otherwise an early native call
-     * (e.g. on_new_state → a Lua-exported C function) executes first and caches a
-     * translated block with no ebreak that the later insertion never
-     * re-translates (rv32emu single-VM block cache, cf. #42), so the breakpoint
-     * silently never fires — observed only on slow hosts where the insert loses
-     * the race.  Fall back to force-clearing the halt if the native client never
-     * continues (e.g. no lldb on the native side), so boot cannot wedge. */
+     * before releasing the cart, so the native breakpoints are in place before
+     * any cart code runs (issue #119).  This preserves first-launch ORDERING: a
+     * breakpoint in blyt_cart_init() (the first place most authors set one) stops
+     * on the very first launch, not only the next time its line runs.  Without it
+     * the Lua-first gate would release the cart the instant lldb-dap connects,
+     * letting init() run past the breakpoint line before the insert lands.  This
+     * is no longer a correctness barrier — #146 made breakpoint inserts flush
+     * rv32emu's translated-block cache, so a late insert always fires on its next
+     * execution; the gate only buys the first-launch stop.  Fall back to
+     * force-clearing the halt if the native client never continues (e.g. no lldb
+     * on the native side) so boot cannot wedge — a lost race now costs at most one
+     * launch's ordering, never a silently missed breakpoint. */
     if (g_dap_port >= 0 && g_gdb_port >= 0) {
         if (!blyt_libretro_gdb_wait_client_continue())
             blyt_libretro_gdb_continue_initial_halt();
