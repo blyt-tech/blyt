@@ -1177,9 +1177,11 @@ void blyt_cart_draw(void) {}
             out.status.code()
         );
         assert!(
-            output.contains("R[Hello from metal!] load=0 h=1 pin=0 bytes=17 rel1=0 rel2=1"),
+            output.contains("R[Hello from metal!] load=0 h=1 pin=0 bytes=18 rel1=0 rel2=1"),
             "expected the resource-lifecycle line on metal (pin delivers exact bytes; \
-             load ok with non-zero handle; valid then stale release)\noutput: {output}"
+             load ok with non-zero handle; valid then stale release; bytes=18 = the \
+             17-char greeting + the build-appended trailing NUL the byte-blind pin \
+             reports, #166)\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
     }
@@ -1193,7 +1195,9 @@ void blyt_cart_draw(void) {}
     // pins AND loads all 100 distinct ids and verifies each pin delivers the
     // exact embedded bytes (not merely OK; the #98 anti-pattern), emitting one
     // deterministic summary line. Ids are 1-based in sorted-name order, so the
-    // zero-padded res_<k>.txt asset maps id (k+1) -> "payload-<k>".
+    // zero-padded res_<k>.dat asset maps id (k+1) -> "payload-<k>". Raw `.dat`
+    // (not text) so the pinned size is exactly the payload length — a text
+    // resource's build-appended trailing NUL (#166) would make size == elen+1.
     println!("Gate 13: >64 distinct resources on metal...");
     {
         let res_project = tmp.path().join("res_many_metal");
@@ -1240,7 +1244,10 @@ void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void) {}
 "#);
         for k in 0..100 {
-            proj = proj.asset(&format!("res_{k:03}.txt"), &format!("payload-{k:03}"));
+            proj = proj.asset_bytes(
+                &format!("res_{k:03}.dat"),
+                format!("payload-{k:03}").as_bytes(),
+            );
         }
         proj.write(&res_project);
         let res_cart = build_cart(&res_project);

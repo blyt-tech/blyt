@@ -20,8 +20,11 @@ pub use buffer::{
     BLYT_INVALID_SLOT,
 };
 // Re-exported at the crate root so the packer-generated `cart_resources.rs` can
-// name the type as `blyt::ResourceHandle` (issue #94).
-pub use resource::ResourceHandle;
+// name the typed constants as `blyt::TextResource` / `blyt::BytesResource`
+// (issues #94, #166).
+pub use resource::{
+    BytesResource, LoadedBytes, LoadedText, PinnedBytes, PinnedText, TextResource,
+};
 
 // -------------------------------------------------------------------------
 // Raw C API

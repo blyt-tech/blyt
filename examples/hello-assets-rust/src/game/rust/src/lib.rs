@@ -3,7 +3,7 @@
 // Identical player-movement behaviour to examples/hello-rust (so it satisfies
 // the shared examples smoke-test), plus it loads the `greeting` text resource
 // through the typed Rust API and prints its contents.  The R_GREETING constant
-// (a blyt::ResourceHandle) comes from the packer-generated cart_resources.rs,
+// (a blyt::TextResource, #166) comes from the packer-generated cart_resources.rs,
 // pulled in via include!(env!("BLYT_CART_RESOURCES_RS")); the bytes come from
 // assets/greeting.txt via the content-addressed staging directory (dev) or a
 // bundled ELF section (packed).
@@ -51,7 +51,7 @@ pub extern "C" fn blyt_cart_init() {
 
     // Load the text asset by handle and print its contents.  text_string()
     // returns an owned, cross-frame copy (pin -> copy -> unpin).
-    let greeting = blyt::resource::load(R_GREETING);
+    let greeting = R_GREETING.load();
     blyt::console_debug(&greeting.text_string());
     // greeting drops here -> release.
 }

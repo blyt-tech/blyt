@@ -1,8 +1,11 @@
 language: lua
 
-# Assets must be declared explicitly (ADR-0088 amendment, #162): nothing is
-# auto-scanned. `assets/greeting.txt` is a `.txt`, so it ships as a `text`
-# resource (R_GREETING / R.GREETING).
+# Assets must be declared explicitly (ADR-0088 amendment, #162): the `include:`
+# glob below controls membership — nothing is auto-scanned. A resource's *type*
+# is decided by extension via `assets.text_extensions` (default ["txt"], #166):
+# `.txt` is in the default set, so `assets/greeting.txt` ships as a `text`
+# resource (R_GREETING / R.GREETING). Add `text_extensions: [...]` only to
+# override that default.
 assets:
   dirs:
     - dir: assets/

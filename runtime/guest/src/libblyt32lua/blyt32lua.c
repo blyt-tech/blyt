@@ -240,17 +240,33 @@ static int lua_buf_ref_slot(lua_State *L) {
 }
 
 /* -------------------------------------------------------------------------
- * blyt.resource.* — text resource API (#93; ADR-0027, ADR-0068, ADR-0086,
+ * blyt.resource.* — typed resource API (#93/#166; ADR-0027, ADR-0068, ADR-0086,
  * ADR-0120).  Thin Lua layer over the resource lifecycle ECALLs (#123):
- *   blyt.resource.load(id)  -> handle object (userdata) | nil
- *   blyt.resource.pin(id)   -> ptr, size | nil   (frame-scoped raw bytes)
+ *   blyt.resource.text_resource(id)  -> text constant object
+ *   blyt.resource.bytes_resource(id) -> bytes constant object
+ *   blyt.resource.pin(id)            -> ptr, size | nil  (frame-scoped raw bytes,
+ *                                       kind-agnostic id-based escape hatch)
  *   blyt.resource.unpin(id)
- *   handle:text()           -> owned Lua string (pin -> copy -> unpin)
- *   handle:release()        -> advisory release (also run by __gc)
- * Handle metamethods: __gc (release), __eq (by handle+id), __tostring.
+ *   const:load() -> kind-specific handle object | nil
+ *   const:id()   -> integer id
+ *   text_handle:text()   -> owned Lua string, trailing storage NUL stripped (#166)
+ *   bytes_handle:bytes() -> owned Lua string of the exact bytes (verbatim)
+ *   handle:release()     -> advisory release (also run by __gc)
+ * The typed-ness (ADR-0068 amendment 2026-06-27) is the metatable: :text() is
+ * absent from the bytes handle and vice-versa, so the wrong accessor raises
+ * "attempt to call a nil value".  Handle metamethods: __gc, __eq, __tostring.
+ * Mirrored identically in the WASM host-Lua fast path (wasm_main.c).
  * ------------------------------------------------------------------------- */
 
-#define BLYT_RESOURCE_HANDLE_MT "blyt.resource.handle"
+#define BLYT_RESOURCE_CONST_MT "blyt.resource.const"
+#define BLYT_RESOURCE_TEXT_HANDLE_MT "blyt.resource.text_handle"
+#define BLYT_RESOURCE_BYTES_HANDLE_MT "blyt.resource.bytes_handle"
+
+/* A typed resource constant (the generated R.<NAME>): an id plus its kind. */
+typedef struct {
+    blyt_resource_id_t id;
+    int is_text;
+} lua_resource_const_t;
 
 typedef struct {
     blyt_resource_id_t id;
@@ -258,23 +274,88 @@ typedef struct {
     int released; /* 1 once release has run (explicit or __gc) — avoids double release */
 } lua_resource_handle_t;
 
-static int lua_resource_load(lua_State *L) {
+/* A loaded handle is either metatable; release/__gc/__eq/__tostring are shared. */
+static lua_resource_handle_t *lua_opt_handle(lua_State *L, int idx) {
+    void *p = luaL_testudata(L, idx, BLYT_RESOURCE_TEXT_HANDLE_MT);
+    if (!p)
+        p = luaL_testudata(L, idx, BLYT_RESOURCE_BYTES_HANDLE_MT);
+    return (lua_resource_handle_t *)p;
+}
+
+static int lua_text_resource(lua_State *L) {
     blyt_resource_id_t id = (blyt_resource_id_t)luaL_checkinteger(L, 1);
+    lua_resource_const_t *c = (lua_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = id;
+    c->is_text = 1;
+    luaL_setmetatable(L, BLYT_RESOURCE_CONST_MT);
+    return 1;
+}
+
+static int lua_bytes_resource(lua_State *L) {
+    blyt_resource_id_t id = (blyt_resource_id_t)luaL_checkinteger(L, 1);
+    lua_resource_const_t *c = (lua_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = id;
+    c->is_text = 0;
+    luaL_setmetatable(L, BLYT_RESOURCE_CONST_MT);
+    return 1;
+}
+
+static int lua_const_load(lua_State *L) {
+    lua_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_CONST_MT);
     blyt_resource_h h = BLYT_RESOURCE_INVALID;
-    if (blyt_resource_load(id, &h) != BLYT_OK || h == BLYT_RESOURCE_INVALID) {
+    if (blyt_resource_load(c->id, &h) != BLYT_OK || h == BLYT_RESOURCE_INVALID) {
         lua_pushnil(L);
         return 1;
     }
     lua_resource_handle_t *uh = (lua_resource_handle_t *)lua_newuserdatauv(L, sizeof(*uh), 0);
-    uh->id = id;
+    uh->id = c->id;
     uh->handle = h;
     uh->released = 0;
-    luaL_setmetatable(L, BLYT_RESOURCE_HANDLE_MT);
+    luaL_setmetatable(L, c->is_text ? BLYT_RESOURCE_TEXT_HANDLE_MT : BLYT_RESOURCE_BYTES_HANDLE_MT);
     return 1;
 }
 
-static int lua_resource_text(lua_State *L) {
-    lua_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+static int lua_const_id(lua_State *L) {
+    lua_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_CONST_MT);
+    lua_pushinteger(L, (lua_Integer)c->id);
+    return 1;
+}
+
+static int lua_const_eq(lua_State *L) {
+    lua_resource_const_t *a = luaL_checkudata(L, 1, BLYT_RESOURCE_CONST_MT);
+    lua_resource_const_t *b = luaL_checkudata(L, 2, BLYT_RESOURCE_CONST_MT);
+    lua_pushboolean(L, a->id == b->id && a->is_text == b->is_text);
+    return 1;
+}
+
+static int lua_const_tostring(lua_State *L) {
+    lua_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_CONST_MT);
+    lua_pushfstring(L, c->is_text ? "text_resource<%d>" : "bytes_resource<%d>", (int)c->id);
+    return 1;
+}
+
+/* text handle :text() — owned copy with the trailing storage NUL stripped (#166)
+ * so #s == content length.  The build guarantees the only NUL is the trailing
+ * one, so reporting size-1 is exact; this is also the "is it really text" check. */
+static int lua_handle_text(lua_State *L) {
+    lua_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_TEXT_HANDLE_MT);
+    const void *ptr = NULL;
+    size_t size = 0;
+    if (blyt_resource_pin(uh->id, &ptr, &size) != BLYT_OK || !ptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+    size_t content = (size >= 1 && ((const char *)ptr)[size - 1] == '\0') ? size - 1 : size;
+    lua_pushlstring(L, (const char *)ptr, content);
+    blyt_resource_unpin(uh->id);
+    return 1;
+}
+
+/* bytes handle :bytes() — owned copy of the exact bytes (verbatim).  A Lua string
+ * is an 8-bit-clean byte buffer, so it round-trips opaque bytes (embedded NULs,
+ * high bytes) faithfully (#162). */
+static int lua_handle_bytes(lua_State *L) {
+    lua_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_BYTES_HANDLE_MT);
     const void *ptr = NULL;
     size_t size = 0;
     if (blyt_resource_pin(uh->id, &ptr, &size) != BLYT_OK || !ptr) {
@@ -286,8 +367,9 @@ static int lua_resource_text(lua_State *L) {
     return 1;
 }
 
-static int lua_resource_release(lua_State *L) {
-    lua_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+static int lua_handle_release(lua_State *L) {
+    lua_resource_handle_t *uh = lua_opt_handle(L, 1);
+    luaL_argcheck(L, uh != NULL, 1, "resource handle expected");
     if (!uh->released) {
         blyt_resource_release(uh->handle);
         uh->released = 1;
@@ -295,21 +377,23 @@ static int lua_resource_release(lua_State *L) {
     return 0;
 }
 
-static int lua_resource_eq(lua_State *L) {
-    lua_resource_handle_t *a = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
-    lua_resource_handle_t *b = luaL_checkudata(L, 2, BLYT_RESOURCE_HANDLE_MT);
-    lua_pushboolean(L, a->handle == b->handle && a->id == b->id);
+static int lua_handle_eq(lua_State *L) {
+    lua_resource_handle_t *a = lua_opt_handle(L, 1);
+    lua_resource_handle_t *b = lua_opt_handle(L, 2);
+    lua_pushboolean(L, a && b && a->handle == b->handle && a->id == b->id);
     return 1;
 }
 
-static int lua_resource_tostring(lua_State *L) {
-    lua_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_HANDLE_MT);
+static int lua_handle_tostring(lua_State *L) {
+    lua_resource_handle_t *uh = lua_opt_handle(L, 1);
+    luaL_argcheck(L, uh != NULL, 1, "resource handle expected");
     lua_pushfstring(L, "resource<%d>", (int)uh->id);
     return 1;
 }
 
 /* Module-level pin/unpin take the integer id directly (ADR-0120): pin returns a
- * lightuserdata pointer + size, valid only within the current frame. */
+ * lightuserdata pointer + size, valid only within the current frame.  These stay
+ * kind-agnostic — the raw escape hatch for hybrid carts (#166). */
 static int lua_resource_pin(lua_State *L) {
     blyt_resource_id_t id = (blyt_resource_id_t)luaL_checkinteger(L, 1);
     const void *ptr = NULL;
@@ -328,33 +412,53 @@ static int lua_resource_unpin(lua_State *L) {
     return 0;
 }
 
-/* Build the handle metatable and the blyt.resource module table, aliasing
- * blyt32.resource == blyt.resource (ADR-0086 shared module).  Call after the
- * blyt and blyt32 globals exist. */
-static void register_resource_module(lua_State *L) {
-    luaL_newmetatable(L, BLYT_RESOURCE_HANDLE_MT); /* mt */
-    lua_pushcfunction(L, lua_resource_release); /* __gc: idempotent release */
+/* Build a loaded-handle metatable carrying the kind-specific accessor (`text` or
+ * `bytes`) plus the shared release/__gc/__eq/__tostring.  Leaves nothing on the
+ * stack. */
+static void register_handle_mt(lua_State *L, const char *mt_name, lua_CFunction accessor,
+                               const char *accessor_name) {
+    luaL_newmetatable(L, mt_name);
+    lua_pushcfunction(L, lua_handle_release); /* __gc: idempotent release */
     lua_setfield(L, -2, "__gc");
-    lua_pushcfunction(L, lua_resource_eq);
+    lua_pushcfunction(L, lua_handle_eq);
     lua_setfield(L, -2, "__eq");
-    lua_pushcfunction(L, lua_resource_tostring);
+    lua_pushcfunction(L, lua_handle_tostring);
     lua_setfield(L, -2, "__tostring");
     lua_newtable(L); /* __index method table */
-    lua_pushcfunction(L, lua_resource_text);
-    lua_setfield(L, -2, "text");
-    /* :bytes() is the binary-oriented name for the same owned copy — a Lua string
-     * is already a byte buffer (lua_pushlstring is 8-bit clean), so it round-trips
-     * opaque bytes verbatim (#162).  Distinct name for self-documenting raw use. */
-    lua_pushcfunction(L, lua_resource_text);
-    lua_setfield(L, -2, "bytes");
-    lua_pushcfunction(L, lua_resource_release);
+    lua_pushcfunction(L, accessor);
+    lua_setfield(L, -2, accessor_name);
+    lua_pushcfunction(L, lua_handle_release);
     lua_setfield(L, -2, "release");
     lua_setfield(L, -2, "__index");
     lua_pop(L, 1); /* pop mt */
+}
+
+/* Build the constant + handle metatables and the blyt.resource module table,
+ * aliasing blyt32.resource == blyt.resource (ADR-0086 shared module).  Call after
+ * the blyt and blyt32 globals exist. */
+static void register_resource_module(lua_State *L) {
+    /* Resource-constant metatable: :load(), :id(), __eq, __tostring. */
+    luaL_newmetatable(L, BLYT_RESOURCE_CONST_MT);
+    lua_pushcfunction(L, lua_const_eq);
+    lua_setfield(L, -2, "__eq");
+    lua_pushcfunction(L, lua_const_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_newtable(L); /* __index */
+    lua_pushcfunction(L, lua_const_load);
+    lua_setfield(L, -2, "load");
+    lua_pushcfunction(L, lua_const_id);
+    lua_setfield(L, -2, "id");
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop const mt */
+
+    register_handle_mt(L, BLYT_RESOURCE_TEXT_HANDLE_MT, lua_handle_text, "text");
+    register_handle_mt(L, BLYT_RESOURCE_BYTES_HANDLE_MT, lua_handle_bytes, "bytes");
 
     lua_newtable(L); /* resource module */
-    lua_pushcfunction(L, lua_resource_load);
-    lua_setfield(L, -2, "load");
+    lua_pushcfunction(L, lua_text_resource);
+    lua_setfield(L, -2, "text_resource");
+    lua_pushcfunction(L, lua_bytes_resource);
+    lua_setfield(L, -2, "bytes_resource");
     lua_pushcfunction(L, lua_resource_pin);
     lua_setfield(L, -2, "pin");
     lua_pushcfunction(L, lua_resource_unpin);
