@@ -102,6 +102,34 @@ static void test_frame_boundary_force_releases_pins_only(void) {
     assert(blyt_rl_release(&s, h) == 1); /* handle still valid next frame */
 }
 
+/* Eviction eligibility (ADR-0027 v2, #137): the refcount predicate that decides
+ * whether an entry's owned/decompressed bytes may be reclaimed. Eligible exactly
+ * when no load residency and no within-frame pin reference it; persistence
+ * (ADR-0028, #160) is a separate property the caller AND-checks. */
+static void test_is_evictable_predicate(void) {
+    blyt_rl_state_t s = {0};
+    assert(blyt_rl_is_evictable(&s)); /* never-loaded, never-pinned: evictable */
+
+    uint32_t h = blyt_rl_load(&s, 1);
+    assert(!blyt_rl_is_evictable(&s)); /* a live load pins residency */
+    assert(blyt_rl_release(&s, h) == 1);
+    assert(blyt_rl_is_evictable(&s)); /* released back to zero: evictable again */
+
+    blyt_rl_pin(&s);
+    assert(!blyt_rl_is_evictable(&s)); /* a within-frame pin blocks eviction */
+    assert(blyt_rl_unpin(&s) == 1);
+    assert(blyt_rl_is_evictable(&s));
+
+    /* Both refs held: still not evictable until both drop. */
+    uint32_t h2 = blyt_rl_load(&s, 1);
+    blyt_rl_pin(&s);
+    assert(!blyt_rl_is_evictable(&s));
+    blyt_rl_force_release_pins(&s);
+    assert(!blyt_rl_is_evictable(&s)); /* load still outstanding */
+    assert(blyt_rl_release(&s, h2) == 1);
+    assert(blyt_rl_is_evictable(&s));
+}
+
 int main(void) {
     test_handle_packing();
     test_load_idempotent_refcounted();
@@ -109,6 +137,7 @@ int main(void) {
     test_generation_wraps_skipping_zero();
     test_pin_unpin_counter();
     test_frame_boundary_force_releases_pins_only();
+    test_is_evictable_predicate();
     printf("test_resource_lifecycle: all passed\n");
     return 0;
 }

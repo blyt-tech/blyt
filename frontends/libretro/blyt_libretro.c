@@ -382,6 +382,15 @@ void retro_reset_every_frame_cycle(void) {
         blyt_reset_every_frame_cycle(g_session);
 }
 
+/* Force-evict every evictable resource (ADR-0027 v2, #137): the per-frame test
+ * hook behind blytplay's --evict-every-frame and test_libretro_core's flag,
+ * mirroring retro_reset_every_frame_cycle. Proves rehydration is byte-identical
+ * and that eviction never changes cart-visible output. */
+void retro_resource_evict_all(void) {
+    if (g_session)
+        blyt_session_resource_evict_all(g_session);
+}
+
 /* -------------------------------------------------------------------------
  * Dev control channel operations (issue #87)
  *

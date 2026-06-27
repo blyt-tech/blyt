@@ -10,6 +10,10 @@
 
 #define RESOURCE_SECTION_PREFIX ".cart.resource."
 
+/* Forward decl: dev-staging rehydration (#137) re-reads the staging file from
+ * blyt_resource_entry_data(); the definition lives with the dev-index loader. */
+static uint8_t *read_whole_file(const char *path, size_t *len_out);
+
 void blyt_resource_table_init(blyt_resource_table_t *t) {
     t->entries = NULL;
     t->count = 0;
@@ -19,6 +23,7 @@ void blyt_resource_table_init(blyt_resource_table_t *t) {
 void blyt_resource_table_clear(blyt_resource_table_t *t) {
     for (size_t i = 0; i < t->count; i++) {
         free(t->entries[i].owned);
+        free(t->entries[i].src_path);
     }
     free(t->entries);
     t->entries = NULL;
@@ -64,8 +69,13 @@ static blyt_resource_entry_t *table_push(blyt_resource_table_t *t) {
     e->algo = BLYT_RES_ALGO_NONE;
     e->cdata = NULL;
     e->clen = 0;
+    e->src_path = NULL;
     e->rl = (blyt_rl_state_t){0};
     return e;
+}
+
+blyt_resource_entry_t *blyt_resource_table_test_push(blyt_resource_table_t *t) {
+    return table_push(t);
 }
 
 const uint8_t *blyt_resource_entry_data(blyt_resource_entry_t *e) {
@@ -73,8 +83,21 @@ const uint8_t *blyt_resource_entry_data(blyt_resource_entry_t *e) {
         return NULL;
     if (e->data)
         return e->data; /* zero-copy (none) or already-materialized (zstd) */
+    /* Not resident. Rehydrate from the entry's source (#137): a dev-staging
+     * entry re-reads its staging file (the only copy of its bytes), a packed
+     * zstd entry re-decodes from the still-mapped frame. */
+    if (e->src_path) {
+        size_t len = 0;
+        uint8_t *buf = read_whole_file(e->src_path, &len);
+        if (!buf)
+            return NULL;
+        e->owned = buf;
+        e->data = buf;
+        e->len = len;
+        return e->data;
+    }
     if (e->algo != BLYT_RES_ALGO_ZSTD)
-        return NULL; /* a NONE entry always has data set; nothing to decode */
+        return NULL; /* a NONE packed entry always has data set; nothing to decode */
     /* Decompress the cart-map frame into an owned buffer, cached for reuse. */
     uint8_t *buf = malloc(e->len ? e->len : 1);
     if (!buf)
@@ -86,6 +109,29 @@ const uint8_t *blyt_resource_entry_data(blyt_resource_entry_t *e) {
     e->owned = buf;
     e->data = buf;
     return e->data;
+}
+
+size_t blyt_resource_entry_evict(blyt_resource_entry_t *e) {
+    if (!e)
+        return 0;
+    /* The refcount predicate is the hard gate (single-sourced in runtime/shared);
+     * persistence (ADR-0028, #160) will AND in here once it lands. */
+    if (!blyt_rl_is_evictable(&e->rl))
+        return 0;
+    if (!e->owned)
+        return 0; /* no owned bytes: map-aliased uncompressed, or already evicted */
+    size_t reclaimed = e->len;
+    free(e->owned);
+    e->owned = NULL;
+    e->data = NULL; /* not resident; next blyt_resource_entry_data() rehydrates */
+    return reclaimed;
+}
+
+size_t blyt_resource_table_evict_all_evictable(blyt_resource_table_t *t) {
+    size_t total = 0;
+    for (size_t i = 0; i < t->count; i++)
+        total += blyt_resource_entry_evict(&t->entries[i]);
+    return total;
 }
 
 /* Context + callback for the shared `.cart.resource.<id>` section enumerator. */
@@ -226,6 +272,10 @@ int blyt_resource_table_load_from_index(blyt_resource_table_t *t, const char *di
         e->data = bytes;
         e->len = len;
         e->owned = bytes;
+        /* Remember the staging path so eviction can re-read it (#137): for a
+         * dev-staging entry `owned` is the only copy of the bytes. strdup may
+         * fail under OOM — then the entry simply stays non-rehydratable. */
+        e->src_path = strdup(data_path);
         ok = 1;
     }
     fclose(f);

@@ -932,6 +932,16 @@ add_executable(test_resource_lifecycle tests/unit/test_resource_lifecycle.c)
 target_include_directories(test_resource_lifecycle PRIVATE runtime/shared)
 add_test(NAME test_resource_lifecycle COMMAND test_resource_lifecycle)
 
+# test_resource_eviction: the host resource eviction mechanism + rehydration
+# (runtime/host/src/libblyt/resource.c, ADR-0027 v2, #137). Links libblyt for
+# the table/entry API + the shared codec; constructs entries directly via the
+# test_push hook and drives evict -> rehydrate on a real zstd frame.
+add_executable(test_resource_eviction tests/unit/test_resource_eviction.c)
+target_include_directories(test_resource_eviction
+                           PRIVATE runtime/host/src/libblyt runtime/shared)
+target_link_libraries(test_resource_eviction PRIVATE libblyt)
+add_test(NAME test_resource_eviction COMMAND test_resource_eviction)
+
 # test_resource_codec: the per-resource compression on-disk format + decode
 # (runtime/shared/blyt_resource_codec.c, #157, ADR-0026). Links the decode-only
 # zstd for the zstd round-trip; the encoder/threshold are devtool Rust tests.
@@ -1227,8 +1237,14 @@ add_custom_target(
 # up via test-prereqs) fails the ctest leg with a misleading "Could not find
 # executable" unless it is an explicit dependency (issue #185, same class as
 # #150/#172).
-add_dependencies(test-unit test_cart_load test_cart_run test_blys
-                 test_resource_lifecycle test_resource_codec)
+add_dependencies(
+  test-unit
+  test_cart_load
+  test_cart_run
+  test_blys
+  test_resource_lifecycle
+  test_resource_codec
+  test_resource_eviction)
 if(TARGET test_gdb_stub)
   add_dependencies(test-unit test_gdb_stub)
 endif()

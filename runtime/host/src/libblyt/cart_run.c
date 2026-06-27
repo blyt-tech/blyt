@@ -2599,6 +2599,12 @@ blyt_resource_table_t *blyt_session_resources(blyt_session_t *s) {
     return &s->ctx.resources;
 }
 
+size_t blyt_session_resource_evict_all(blyt_session_t *s) {
+    if (!s)
+        return 0;
+    return blyt_resource_table_evict_all_evictable(&s->ctx.resources);
+}
+
 bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart) {
     if (!session)
         return false;

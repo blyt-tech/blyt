@@ -54,6 +54,7 @@ bool blyt_libretro_update_assets(const uint32_t *ids, size_t n);
 bool blyt_libretro_is_done(void);
 blyt_cart_run_err_t blyt_libretro_run_err(void);
 void retro_reset_every_frame_cycle(void);
+void retro_resource_evict_all(void); /* --evict-every-frame (#137) */
 #ifdef BLYT_DAP
 bool blyt_libretro_dap_wait_ready(void);
 #endif
@@ -166,6 +167,8 @@ static const char *g_trace = NULL; /* --trace: BLYT_TRACE channel list */
 static int g_quit_after = -1; /* -1 = disabled; >=0 = exit after N frames */
 static bool g_reset_every_frame =
     false; /* --reset-every-frame: run a save/clear/restore cycle after each frame */
+static bool g_evict_every_frame =
+    false; /* --evict-every-frame: force-evict all evictable resources after each frame (#137) */
 /* --dev-ctrl-port: dev control channel TCP port (issue #87).
  * -1 = disabled, 0 = OS-assigned (actual port announced on stdout), >0 = fixed.
  * The player listens on this port for newline-delimited JSON lifecycle commands
@@ -279,6 +282,8 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
             g_trace = argv[i] + 8;
         } else if (strcmp(argv[i], "--reset-every-frame") == 0) {
             g_reset_every_frame = true;
+        } else if (strcmp(argv[i], "--evict-every-frame") == 0) {
+            g_evict_every_frame = true;
         } else if (strcmp(argv[i], "--dev-ctrl-port") == 0 && i + 1 < argc) {
             g_dev_ctrl_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dev-ctrl-connect") == 0 && i + 1 < argc) {
@@ -759,6 +764,8 @@ int main(int argc, char *argv[]) {
             g_quit = true;
         if (g_reset_every_frame && !g_quit)
             retro_reset_every_frame_cycle();
+        if (g_evict_every_frame && !g_quit)
+            retro_resource_evict_all();
         if (g_sdl_ready) {
             uint32_t elapsed = SDL_GetTicks() - t0;
             if (elapsed < frame_ms)

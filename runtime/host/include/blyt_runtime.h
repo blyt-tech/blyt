@@ -499,6 +499,14 @@ int blyt_session_gdb_wait_client_continue(blyt_session_t *s);
  */
 void blyt_reset_every_frame_cycle(blyt_session_t *s);
 
+/* Force-evict every eviction-eligible resource in the session's table (ADR-0027
+ * v2, #137): the "evict all evictable now" forcing primitive behind the
+ * per-leg --evict-every-frame / BLYT_RESOURCE_EVICT_EVERY_FRAME test hook. Frees
+ * the owned/decompressed bytes of entries with no load/pin reference; the next
+ * access rehydrates byte-identically. Returns the total bytes reclaimed. This is
+ * a deterministic test trigger; real pressure-driven eviction is wired in #158. */
+size_t blyt_session_resource_evict_all(blyt_session_t *s);
+
 /* --- Dev control channel host operations (issue #87) ----------------------
  *
  * Drive runtime lifecycle from a frontend's dev control server without
