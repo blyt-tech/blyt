@@ -769,18 +769,38 @@ fn spawn_blytdebug_hybrid_ports(
     u16,
     std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 ) {
-    let mut proc = std::process::Command::new(blytdebug())
-        .args([
-            "--debug",
-            "0",
-            "--gdb",
-            "0",
-            "--dev-ctrl-port",
-            "0",
-            "--headless",
-            cart.to_str().unwrap(),
-        ])
-        .env("BLYT_TRACE", "gdb,dap,lifecycle,frame")
+    spawn_blytdebug_hybrid_ports_env(cart, &[])
+}
+
+/// As `spawn_blytdebug_hybrid_ports` but with extra environment variables passed
+/// to the blytdebug process (e.g. `BLYT_TEST_DELAY_BP_INSERT` for the forced-race
+/// startup-gate test, issue #177).
+fn spawn_blytdebug_hybrid_ports_env(
+    cart: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> (
+    std::process::Child,
+    u16,
+    u16,
+    u16,
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    let mut cmd = std::process::Command::new(blytdebug());
+    cmd.args([
+        "--debug",
+        "0",
+        "--gdb",
+        "0",
+        "--dev-ctrl-port",
+        "0",
+        "--headless",
+        cart.to_str().unwrap(),
+    ])
+    .env("BLYT_TRACE", "gdb,dap,lifecycle,frame");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut proc = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -921,6 +941,97 @@ fn sdl_hybrid_lldb_dap_reload_fires_both_init_breakpoints() {
         .env("BLYT_NATIVE_SOURCE_FILE", NATIVE_SOURCE_FILE)
         .env("BLYT_LUA_BREAK_LINE", LUA_BREAK_LINE.to_string())
         .env("BLYT_LUA_SOURCE", "/blyt/cart/src/game/lua/main.lua")
+        .env(
+            "BLYT_STUB_PROGRAM",
+            repo_root().join("build/sdk/lib/debug/blyt-debug-stub.elf"),
+        )
+        .timeout(Duration::from_secs(90))
+        .assert();
+
+    let out = result.get_output().clone();
+    std::thread::sleep(Duration::from_millis(300));
+    let trace = String::from_utf8_lossy(&dbg_stderr.lock().unwrap()).to_string();
+    let _ = proc.kill();
+
+    if let Err(e) = result.try_success() {
+        eprintln!(
+            "--- driver stdout ---\n{}\n--- driver stderr ---\n{}\n--- blytdebug stderr ---\n{trace}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        panic!("{e}");
+    }
+}
+
+/// LLDB-DAP (issue #177): the hybrid first-launch ordering gate (#119,
+/// `blyt_session_gdb_wait_client_continue`) is regression-proof under a FORCED
+/// race.  `sdl_hybrid_lldb_dap_reload_fires_both_init_breakpoints` proves both
+/// init() breakpoints fire at startup, but that is a *timing* assertion: on a
+/// fast host the native breakpoint insert wins the race against init() even if
+/// the gate were removed, so it can stay green against a regressed gate (exactly
+/// the host-sensitivity #119 documented — Linux CI lost the race, macOS won it).
+///
+/// This test removes the host-timing dependency: it sets
+/// `BLYT_TEST_DELAY_BP_INSERT` so the stub stalls the FIRST native breakpoint
+/// insert (and, the stub being serial, the whole startup packet pipeline) well
+/// past the point where the Lua-first gate would otherwise release the cart.
+/// With the gate present the cart stays halted until the delayed insert lands, so
+/// the native init() breakpoint still fires on the first launch and the driver
+/// passes.  With the gate removed, init() would run past the line before the
+/// insert lands and the native startup hit would be missed — so this test fails
+/// iff the gate is absent.  (Verified during development by temporarily bypassing
+/// the gate in `frontends/player/main.c`: the driver's "native init() breakpoint
+/// fired at startup" assertion then fails.)
+///
+/// Reuses the hybrid reload driver in startup-only mode (`BLYT_SKIP_RELOAD`); no
+/// v2 cart is needed, so v1 is passed for the (unused) reload slot.
+///
+/// Requires: blytdebug with BLYT_DAP=ON and BLYT_GDB=ON, Lua SDK, lldb-dap.
+#[test]
+fn sdl_hybrid_startup_gate_forced_race() {
+    require_sdk();
+    require_lua_sdk();
+    require_gdb();
+    require_lldb_dap();
+
+    const NATIVE_BREAK_LINE: u32 = 6;
+    const NATIVE_SOURCE_FILE: &str = "src/game/c/main.c";
+    const LUA_BREAK_LINE: u32 = 3;
+    // Delay the first native breakpoint insert long enough that, absent the gate,
+    // init() would run to completion first — but comfortably under the gate's own
+    // ~5 s wait timeout so the gate itself never gives up.
+    const DELAY_MS: &str = "2000";
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("cart");
+    CartProject::new()
+        .c(&reload_hybrid_c("g_counter += 1;"))
+        .lua(RELOAD_HYBRID_LUA)
+        .write(&dir);
+    let cart = build_debug_lua_cart(&dir);
+
+    let (mut proc, gdb_port, dap_port, dev_port, dbg_stderr) =
+        spawn_blytdebug_hybrid_ports_env(&cart, &[("BLYT_TEST_DELAY_BP_INSERT", DELAY_MS)]);
+
+    let lldb_dap = lldb_dap_bin().expect("lldb-dap not found");
+    let driver = repo_root().join("tests/dap/run_sdl_hybrid_reload_test.mjs");
+    let result = Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            lldb_dap.to_str().unwrap(),
+            &gdb_port.to_string(),
+            &dap_port.to_string(),
+            &dev_port.to_string(),
+            cart.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            cart.to_str().unwrap(), // unused v2 slot — reload phase is skipped
+        ])
+        .env("BLYT_NATIVE_BREAK_LINE", NATIVE_BREAK_LINE.to_string())
+        .env("BLYT_NATIVE_SOURCE_FILE", NATIVE_SOURCE_FILE)
+        .env("BLYT_LUA_BREAK_LINE", LUA_BREAK_LINE.to_string())
+        .env("BLYT_LUA_SOURCE", "/blyt/cart/src/game/lua/main.lua")
+        .env("BLYT_SKIP_RELOAD", "1")
+        .env("BLYT_FORCE_RACE", "1")
         .env(
             "BLYT_STUB_PROGRAM",
             repo_root().join("build/sdk/lib/debug/blyt-debug-stub.elf"),
