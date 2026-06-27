@@ -689,6 +689,10 @@ static const uint8_t *s_cart_map; /* retained read-only cart mapping, or NULL */
 static uint32_t s_cart_size;
 static native_res_t *s_res; /* malloc'd array of s_res_count entries, or NULL */
 static uint32_t s_res_count;
+/* BLYT_RESOURCE_EVICT_EVERY_FRAME test hook (#137): force-evict every evictable
+ * resource at each frame boundary so the next frame rehydrates from scratch.
+ * Read once at startup (getenv reads environ, no syscall — safe post-seccomp). */
+static int s_evict_every_frame; /* 0/1, set in blyt_runtime_startup */
 
 /* malloc/free come from ld-blyt.so.1 (system musl) via the DT_NEEDED chain; the
  * native libblytcommon has no other libc dependency declared, so declare them
@@ -871,6 +875,34 @@ static const uint8_t *native_res_data(native_res_t *e) {
     return e->data;
 }
 
+/* Evict one entry's owned/decompressed bytes if it is eviction-eligible
+ * (load_count==0 && pin_count==0, not persistent — ADR-0027 v2, #137). Frees
+ * `owned` and re-points the entry to its not-resident state; the next pin
+ * re-decodes from the still-mapped frame, byte-identically (native_res_data).
+ * A no-op for an uncompressed map-aliased entry (owned == NULL) or one that is
+ * not eligible. Mirrors the host blyt_resource_entry_evict (single-sourced
+ * eligibility predicate, ADR-0007). Returns the bytes reclaimed. */
+static uint32_t native_res_evict(native_res_t *e) {
+    if (!blyt_rl_is_evictable(&e->rl))
+        return 0;
+    if (!e->owned)
+        return 0;
+    uint32_t reclaimed = e->len;
+    free(e->owned);
+    e->owned = NULL;
+    e->data = NULL; /* not resident; next pin rehydrates via native_res_data */
+    return reclaimed;
+}
+
+/* Force-evict every evictable resource: the "evict all evictable" forcing
+ * primitive behind the BLYT_RESOURCE_EVICT_EVERY_FRAME test hook (#137). */
+static uint32_t native_resources_evict_all_evictable(void) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < s_res_count; i++)
+        total += native_res_evict(&s_res[i]);
+    return total;
+}
+
 blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size) {
     int i = res_find(id);
     if (i < 0) {
@@ -931,6 +963,7 @@ static void resources_force_release_pins(void) {
 void blyt_runtime_startup(void) {
     load_cart_buf_counts(); /* must precede restricted filter (uses statx/mmap) */
     resources_init(); /* same: retains a cart mmap before the filter (#123) */
+    s_evict_every_frame = (getenv("BLYT_RESOURCE_EVICT_EVERY_FRAME") != 0); /* #137 */
     if (blyt_install_restricted_filter() != 0) {
         static const char msg[] = "libblytcommon: FATAL: seccomp install failed\n";
         blyt_rs_write(2, msg, sizeof(msg) - 1);
@@ -991,6 +1024,10 @@ void blyt_frame_done(void) {
     /* Force-release any resource pins still held: a pin is valid only within the
      * frame it was taken (ADR-0027 frame-scope amendment, #123). */
     resources_force_release_pins();
+    /* Test hook (#137): force-evict all evictable resources so the next frame
+     * rehydrates from scratch — proves the bare-metal evict/rehydrate path. */
+    if (s_evict_every_frame)
+        native_resources_evict_all_evictable();
     if (blyt32_trace_api_enabled()) {
         static const char msg[] = "[blyt:api] frame_done()\n";
         blyt32_trace_write(msg, sizeof(msg) - 1);

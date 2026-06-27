@@ -91,6 +91,7 @@ static blyt_cart_t *g_cart = NULL;
 static blyt_session_t *g_session = NULL;
 static uint32_t g_xrgb[BLYT_FRAME_W * BLYT_FRAME_H];
 static bool g_reset_every_frame = false; /* BLYT_RESET_EVERY_FRAME=1 */
+static bool g_evict_every_frame = false; /* BLYT_RESOURCE_EVICT_EVERY_FRAME=1 (#137) */
 
 #ifdef BLYT_LUA
 /* Lua-direct path state (used when the cart contains a .cart.lua section).
@@ -2753,6 +2754,11 @@ static void wasm_loop(void) {
     if (err == BLYT_RUN_FRAME_DONE && g_reset_every_frame)
         blyt_reset_every_frame_cycle(g_session);
 
+    /* Force-evict all evictable resources after the frame's reads so the next
+     * frame rehydrates from scratch — the byte-identity oracle (#137). */
+    if (err == BLYT_RUN_FRAME_DONE && g_evict_every_frame)
+        blyt_session_resource_evict_all(g_session);
+
     bool done = (err != BLYT_RUN_FRAME_DONE);
 
     int headless_dump = blyt_js_dump_frame0_if_headless(g_xrgb, BLYT_FRAME_W * BLYT_FRAME_H);
@@ -2791,6 +2797,7 @@ int main(void) {
 #endif
 
     g_reset_every_frame = (getenv("BLYT_RESET_EVERY_FRAME") != NULL);
+    g_evict_every_frame = (getenv("BLYT_RESOURCE_EVICT_EVERY_FRAME") != NULL);
 
     blyt_cart_err_t cerr = blyt_cart_open("/cart.blyt", &g_cart);
     if (cerr != BLYT_CART_OK) {

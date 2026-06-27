@@ -1358,5 +1358,94 @@ void blyt_cart_draw(void) {}
         println!("  PASS: output = {:?}", output.trim());
     }
 
+    // ── Gate 15: resource eviction + rehydration on metal (#137) ─────
+    //
+    // The only coverage of the native bare-metal evict/rehydrate path: with
+    // BLYT_RESOURCE_EVICT_EVERY_FRAME=1 the runtime force-evicts every evictable
+    // resource at each frame boundary, freeing the owned decompressed bytes. A
+    // cart that re-pins the zstd resource each frame therefore rehydrates it from
+    // the cart section (re-decode, post-seccomp) on every frame after the first —
+    // the FNV-1a must stay byte-identical, proving rehydration yields the original
+    // bytes and eviction is cart-invisible. The launcher execve's `environ`
+    // through, so the env var reaches the cart process.
+    println!("Gate 15: resource eviction + rehydration on metal...");
+    {
+        let blob: Vec<u8> = "blyt-resource-compression-test-payload\n"
+            .repeat(512)
+            .into_bytes();
+        let mut fnv: u32 = 2166136261;
+        for &b in &blob {
+            fnv ^= b as u32;
+            fnv = fnv.wrapping_mul(16777619);
+        }
+        let expected = format!("RES_EVICT pin=0 size={} fnv={fnv:08x}", blob.len());
+
+        let evict_project = tmp.path().join("res_evict_metal");
+        CartProject::new()
+            .c(r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+
+static int g_frames = 0;
+
+static void read_and_print(void) {
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_result_t pr = blyt_resource_pin(R_BLOB, &ptr, &size);
+    unsigned int h = 2166136261u;
+    const unsigned char *b = (const unsigned char *)ptr;
+    for (size_t i = 0; i < size; i++) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    blyt_resource_unpin(R_BLOB);
+    char line[96];
+    snprintf(line, sizeof(line), "RES_EVICT pin=%d size=%d fnv=%08x", (int)pr, (int)size, h);
+    blyt_console_debug(line);
+}
+
+void blyt_cart_init(void) { read_and_print(); }
+void blyt_cart_update(void) {
+    read_and_print(); /* frames after the first re-read a rehydrated resource */
+    if (++g_frames >= 3)
+        blyt_quit();
+}
+void blyt_cart_draw(void) {}
+"#)
+            .asset_bytes("blob.dat", &blob)
+            .write(&evict_project);
+        let evict_cart = build_cart(&evict_project);
+        assert!(
+            evict_cart.exists(),
+            "res_evict_metal.blyt not built: {}",
+            evict_cart.display()
+        );
+        assert!(
+            qemu.scp_to(&evict_cart, "/tmp/blyt_gate/"),
+            "scp res_evict_metal.blyt failed"
+        );
+
+        let out = qemu.ssh(
+            "BLYT_RESOURCE_EVICT_EVERY_FRAME=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/res_evict_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "res_evict_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        // The line must appear for every frame (init + 3 updates); the updates
+        // after the first read a rehydrated resource. Identical FNV throughout.
+        assert!(
+            output.matches(&expected).count() >= 3,
+            "native bare-metal must rehydrate the evicted zstd resource to the exact \
+             bytes on every frame (expected {expected:?} repeated; #137)\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    }
+
     println!("Gate tests passed.");
 }

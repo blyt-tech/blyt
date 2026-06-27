@@ -84,6 +84,7 @@ static int16_t input_state(unsigned p, unsigned d, unsigned i, unsigned id) {
 
 int main(int argc, char *argv[]) {
     bool reset_every_frame = false;
+    bool evict_every_frame = false; /* #137: force-evict all evictable each frame */
     /* Dev-mode asset hot-swap trigger (issue #122): at frame `update_assets_after`
      * point BLYT_RESOURCE_DIR at `resource_dir_v2` (if given) and drive the core's
      * blyt_libretro_update_assets() with `asset_ids`, simulating the update_assets
@@ -100,6 +101,9 @@ int main(int argc, char *argv[]) {
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
         if (strcmp(argv[argi], "--reset-every-frame") == 0) {
             reset_every_frame = true;
+            argi++;
+        } else if (strcmp(argv[argi], "--evict-every-frame") == 0) {
+            evict_every_frame = true;
             argi++;
         } else if (strcmp(argv[argi], "--run-frames") == 0 && argi + 1 < argc) {
             run_frames = strtol(argv[argi + 1], NULL, 10);
@@ -126,7 +130,7 @@ int main(int argc, char *argv[]) {
         }
     }
     if (argc - argi < 2) {
-        fprintf(stderr, "usage: test_libretro_core [--reset-every-frame] "
+        fprintf(stderr, "usage: test_libretro_core [--reset-every-frame] [--evict-every-frame] "
                         "[--update-assets-after N --resource-dir-v2 DIR --asset-ids a,b,c] "
                         "<blyt_libretro.so> <cart.blyt>\n");
         return 1;
@@ -182,6 +186,18 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* retro_resource_evict_all: blyt-private force-evict hook, same role as
+     * blytplay --evict-every-frame (ADR-0027 v2, #137). */
+    void (*p_evict_all)(void) = NULL;
+    if (evict_every_frame) {
+        p_evict_all = (void (*)(void))dlsym(lib, "retro_resource_evict_all");
+        if (!p_evict_all) {
+            fprintf(stderr, "dlsym(retro_resource_evict_all): %s\n", dlerror());
+            dlclose(lib);
+            return 1;
+        }
+    }
+
     /* blyt_libretro_update_assets: blyt-private dev-mode asset hot-swap (#122). */
     bool (*p_update_assets)(const uint32_t *, size_t) = NULL;
     if (update_assets_after >= 0) {
@@ -221,6 +237,10 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "blyt_libretro_update_assets failed\n");
         }
         p_retro_run();
+        /* Force-evict after each frame's reads so the *next* frame rehydrates
+         * from scratch — the byte-identity / no-cart-visible-change oracle (#137). */
+        if (p_evict_all)
+            p_evict_all();
         if (p_is_done()) {
             rc = 0;
             break;

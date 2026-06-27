@@ -96,6 +96,18 @@ static inline int blyt_rl_unpin(blyt_rl_state_t *s) {
     return 1;
 }
 
+/* Eviction eligibility (ADR-0027 v2, #137): an entry's owned/decompressed bytes
+ * may be reclaimed only when nothing references it — no outstanding load
+ * residency and no within-frame pin.  This is the refcount half of the
+ * predicate; persistence (ADR-0028, #160) is a separate per-entry property the
+ * caller AND-checks.  Single-sourced here so the host eviction sweep and the
+ * native bare-metal path can never disagree about what is evictable (ADR-0007).
+ * Recency-ordered victim *selection* under partial pressure is advisory and
+ * lives in the budget-aware caller (#158); this predicate is the hard gate. */
+static inline int blyt_rl_is_evictable(const blyt_rl_state_t *s) {
+    return s->load_count == 0 && s->pin_count == 0;
+}
+
 /* Frame-boundary force-release: any pin still held at the frame boundary is
  * dropped (ADR-0027 frame-scope amendment).  load_count is deliberately left
  * untouched — residency outlives the frame; only the raw-access window is

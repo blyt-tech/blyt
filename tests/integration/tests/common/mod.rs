@@ -882,6 +882,19 @@ pub fn run_cart_all_legs_reset_every_frame(cart: &std::path::Path, expected: &st
     run_cart_libretro_with_flags(cart, &["--reset-every-frame"], expected);
 }
 
+/// Like [`run_cart_all_legs`], but force-evicts every evictable resource after
+/// each frame (ADR-0027 v2, #137), translating the per-leg knob (blytplay
+/// `--evict-every-frame` flag / `BLYT_RESOURCE_EVICT_EVERY_FRAME` env / driver
+/// flag). A cart that re-reads a resource each frame thus rehydrates it from
+/// scratch every frame; asserting the same `expected` here and under plain
+/// [`run_cart_all_legs`] proves eviction is cart-invisible (bytes byte-identical
+/// after rehydration, output unchanged). The cart must terminate itself.
+pub fn run_cart_all_legs_evict_every_frame(cart: &std::path::Path, expected: &str) {
+    run_cart_native_with_flags(cart, &["--evict-every-frame"], expected);
+    run_cart_wasm_with_env(cart, &[("BLYT_RESOURCE_EVICT_EVERY_FRAME", "1")], expected);
+    run_cart_libretro_with_flags(cart, &["--evict-every-frame"], expected);
+}
+
 /// Like [`run_cart_all_legs`], but for carts that do disk-backed
 /// `save_write`/`save_read`: each leg is given a `BLYT_SAVE_DIR`. Native and
 /// libretro share a fresh host tempdir; WASM uses `/tmp` (the only path that

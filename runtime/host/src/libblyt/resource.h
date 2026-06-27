@@ -36,6 +36,13 @@ typedef struct {
     uint8_t algo;
     const uint8_t *cdata;
     size_t clen;
+    /* Dev-staging rehydration source (#137): for a project-dir entry, `owned` is
+     * the *only* copy of the bytes (read from a content-addressed staging file),
+     * so eviction would lose them unless they can be re-read. `src_path` is the
+     * strdup'd staging path the entry was read from; eviction frees `owned` and
+     * the next access re-reads this file. NULL for packed entries (which
+     * rehydrate from `cdata`/the cart map instead). */
+    char *src_path;
     blyt_rl_state_t rl; /* load/pin refcounts + load generation (#123) */
 } blyt_resource_entry_t;
 
@@ -59,6 +66,26 @@ blyt_resource_entry_t *blyt_resource_table_find_mut(blyt_resource_table_t *t, ui
 const uint8_t *blyt_resource_entry_data(blyt_resource_entry_t *e);
 /* Frame-boundary force-release: drop every entry's pin count (ADR-0027). */
 void blyt_resource_table_force_release_pins(blyt_resource_table_t *t);
+
+/* Evict one entry's owned/decompressed bytes if it is eviction-eligible
+ * (load_count==0 && pin_count==0, not persistent — ADR-0027 v2, #137). Frees
+ * `e->owned` and re-points the entry to its not-resident state so the next
+ * blyt_resource_entry_data() rehydrates byte-identically (zstd re-decode from
+ * `cdata`, or dev-staging re-read from `src_path`). A no-op (returns 0) for an
+ * uncompressed map-aliased entry (no owned bytes) or one that is not eligible.
+ * Returns the number of owned bytes reclaimed. Never invalidates a live handle
+ * — by construction it only touches entries with no load/pin reference. */
+size_t blyt_resource_entry_evict(blyt_resource_entry_t *e);
+
+/* Sweep the table, evicting every eligible entry (#137). The "evict all
+ * evictable" forcing primitive behind the test hook, and the terminal fallback
+ * of evict-before-fail (#158). Returns the total owned bytes reclaimed. */
+size_t blyt_resource_table_evict_all_evictable(blyt_resource_table_t *t);
+
+/* Append a zero-initialised entry and return it (grows the table). Exposed for
+ * unit tests that construct entries directly (test_resource_eviction.c); the
+ * production loaders use it internally. Returns NULL on OOM. */
+blyt_resource_entry_t *blyt_resource_table_test_push(blyt_resource_table_t *t);
 
 /* Release: populate from a packed cart's `.cart.resource.<id>` sections. Entry
  * data aliases the cart map. Clears existing entries first. Returns the number

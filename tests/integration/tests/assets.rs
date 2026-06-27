@@ -14,7 +14,7 @@ use common::{
     CartProject, blyt_bin, blytplay, build_cart, build_cart_expect_failure, build_dev_elf,
     build_lua_cart, find_wasm_dir, libretro_so, repo_root, require_libretro_core, require_lua_sdk,
     require_playwright, require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs,
-    sdk_dir, test_libretro_core,
+    run_cart_all_legs_evict_every_frame, sdk_dir, test_libretro_core,
 };
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -1872,6 +1872,77 @@ fn compressed_resource_round_trips_all_legs() {
         "blob.dat should have packed zstd"
     );
 
+    run_cart_all_legs(&cart, &expected);
+}
+
+/// C cart that pins R_BLOB and prints its FNV-1a every frame (init + each
+/// update), quitting after a few frames. Under `--evict-every-frame` the owned
+/// decompressed bytes are freed after every frame, so each subsequent read
+/// rehydrates from the cart section — the line must stay byte-identical, proving
+/// rehydration yields the original bytes and eviction is cart-invisible (#137).
+const EVICT_REHYDRATE_FNV_C: &str = r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+
+static int g_frames = 0;
+
+static void read_and_print(void) {
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_result_t pr = blyt_resource_pin(R_BLOB, &ptr, &size);
+    unsigned int h = 2166136261u;
+    const unsigned char *b = (const unsigned char *)ptr;
+    for (size_t i = 0; i < size; i++) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    blyt_resource_unpin(R_BLOB);
+    char line[96];
+    snprintf(line, sizeof(line), "BLOB pin=%d size=%d fnv=%08x", (int)pr, (int)size, h);
+    blyt_console_debug(line);
+}
+
+void blyt_cart_init(void) { read_and_print(); }
+void blyt_cart_update(void) {
+    read_and_print(); /* frames after the first re-read a rehydrated resource */
+    if (++g_frames >= 3)
+        blyt_quit();
+}
+void blyt_cart_draw(void) {}
+"#;
+
+/// AC #1/#4: load → release a compressed resource, force eviction every frame,
+/// re-access → bytes are identical to the first access, across all three legs;
+/// and the cart-visible output is identical whether or not eviction occurred.
+#[test]
+fn evicted_resource_rehydrates_byte_identical_all_legs() {
+    require_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let blob = compressible_blob();
+    let expected = format!("BLOB pin=0 size={} fnv={:08x}", blob.len(), fnv1a(&blob));
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("evict_rehydrate");
+    CartProject::new()
+        .c(EVICT_REHYDRATE_FNV_C)
+        .asset_bytes("blob.dat", &blob)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    // Guard: the resource genuinely compressed, so eviction has owned bytes to
+    // reclaim and rehydration exercises the zstd re-decode on every leg.
+    assert_eq!(
+        dump_resource_section(&cart, 1)[0],
+        1,
+        "blob.dat should have packed zstd"
+    );
+
+    // Forced eviction after every frame: each re-read rehydrates from scratch.
+    run_cart_all_legs_evict_every_frame(&cart, &expected);
+    // No eviction: identical cart-visible output — eviction never changes it.
     run_cart_all_legs(&cart, &expected);
 }
 
