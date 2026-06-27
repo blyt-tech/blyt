@@ -3757,18 +3757,32 @@ void blyt_session_gdb_continue_initial_halt(blyt_session_t *s) {
 
 /* Block until the GDB client finishes its initial configuration — i.e. fetches
  * the svr4 library list, inserts its breakpoints, and issues its first continue
- * (vCont;c) — so a native breakpoint's ebreak is patched into guest memory BEFORE
- * any cart code runs (issue #119).  A hybrid session would otherwise be released
+ * (vCont;c) — so the native client's breakpoints are in place BEFORE any cart
+ * code runs (issue #119).  This is purely an ORDERING gate: it guarantees a
+ * breakpoint set before launch — notably one in blyt_cart_init(), the first
+ * place most authors set one — stops on the FIRST launch rather than only the
+ * next time its address executes.  A hybrid session would otherwise be released
  * by the Lua-first gate (blyt_session_gdb_continue_initial_halt) the instant the
- * client connects, so an early native call — e.g. a hybrid cart's on_new_state →
- * a Lua-exported C function — can execute first and cache a translated block with
- * no ebreak; the later breakpoint insertion does not re-translate that cached
- * block (rv32emu single-VM block cache, cf. #42), so the breakpoint silently
- * never fires.  Pure-native sessions already wait for the client's continue
+ * client connects, letting an early native call — a hybrid cart's on_new_state →
+ * a Lua-exported C function, or init() itself — run past a breakpoint line before
+ * the insert lands.  Pure-native sessions already wait for the client's continue
  * implicitly (they never force-clear the initial halt); this gives hybrid the
- * same guarantee.  Returns 1 once the client has continued, 0 on timeout (the
- * caller then force-clears the halt so a client that never continues — e.g. no
- * lldb attached on the native side — cannot wedge boot). */
+ * same guarantee.
+ *
+ * Correctness no longer rests on this gate.  It originally also guarded the
+ * rv32emu single-VM stale-translated-block hazard (cf. #42): an early native call
+ * could cache a block with no ebreak that the later insert never re-translated,
+ * so the breakpoint silently never fired (on slow hosts only — Linux CI lost the
+ * race, macOS won it).  #146 fixes that directly — inserting or removing a
+ * breakpoint now flushes the translated-block cache (g_gdb_block_flush_pending),
+ * so a late insert re-translates and fires the next time its address executes.
+ * The gate therefore only buys first-launch ordering, never eventual firing.
+ *
+ * Returns 1 once the client has continued, 0 on timeout — best-effort: the caller
+ * then force-clears the halt so a client that never continues (e.g. no lldb on
+ * the native side) cannot wedge boot.  A lost race now costs at most one launch's
+ * ordering (a breakpoint in init() may not stop until init() next runs), never a
+ * silent permanent miss, so the bound need not be conservative. */
 int blyt_session_gdb_wait_client_continue(blyt_session_t *s) {
 #ifdef BLYT_GDB
     if (!s || !s->ctx.gdb_enabled)
