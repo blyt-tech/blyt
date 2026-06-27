@@ -551,6 +551,36 @@ pub fn build_cart(project_dir: &std::path::Path) -> PathBuf {
     ))
 }
 
+/// Run `blyt build <project_dir>` expecting it to FAIL, returning combined
+/// stdout+stderr so the caller can assert on the build-error message (#166:
+/// invalid-text build errors, Rust typed-handle compile failures). Mirrors
+/// `build_cart`'s full env (clang/clang++/ar/luac) so the failure is a real
+/// build error, not a missing tool.
+pub fn build_cart_expect_failure(project_dir: &std::path::Path) -> String {
+    use assert_cmd::Command;
+    let sdk = sdk_dir();
+    let mut cmd = Command::new(blyt_bin());
+    cmd.args(["build", project_dir.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_RUST_SDK", repo_root().join("sdk/rust/blyt"));
+    for (var, rel) in [
+        ("BLYT_CLANG", "bin/blyt-clang"),
+        ("BLYT_CLANGPP", "bin/blyt-clang++"),
+        ("BLYT_AR", "bin/blyt-llvm-ar"),
+        ("BLYT_LUAC", "bin/blyt-luac"),
+    ] {
+        let p = sdk.join(rel);
+        if p.exists() {
+            cmd.env(var, &p);
+        }
+    }
+    let out = cmd.assert().failure().get_output().clone();
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    s
+}
+
 /// Build a dev ELF (`build/.elf`) via `blyt build code <project_dir>`.
 /// Requires the SDK; does not require the WASM runtime.
 pub fn build_dev_elf(project_dir: &std::path::Path) -> PathBuf {

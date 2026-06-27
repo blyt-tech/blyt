@@ -14,9 +14,10 @@ local frame
 
 function init()
     frame = 0
-    -- res:text() returns an owned Lua string (pin -> copy -> unpin), safe to
-    -- keep beyond the frame.  Explicit release is advisory; __gc also releases.
-    local res = blyt.resource.load(R.GREETING)
+    -- R.GREETING is a typed text-resource constant (#166); :load() yields a text
+    -- handle whose :text() returns an owned Lua string (pin -> copy -> unpin),
+    -- safe to keep beyond the frame.  Explicit release is advisory; __gc too.
+    local res = R.GREETING:load()
     blyt.debug.print(res:text())
     res:release()
 end

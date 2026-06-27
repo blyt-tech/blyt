@@ -120,8 +120,20 @@ blyt_result_t blyt_save_read(uint32_t slot);
  *     across frames); release tells the runtime the cart is done with it.
  * ------------------------------------------------------------------------- */
 
-/* Packer-assigned integer resource id (the R_<NAME> constants). */
+/* Packer-assigned integer resource id (the kind-agnostic id used by the
+ * lifecycle ECALLs: load/release/pin/unpin). */
 typedef uint32_t blyt_resource_id_t;
+
+/* Typed resource-constant aliases (ADR-0068 amendment 2026-06-27, #166). The
+ * packer-generated cart_resources.h emits each R_<NAME> as one of these by the
+ * resource's kind: a `text` resource is a blyt_text_resource_t, a `raw` one a
+ * blyt_bytes_resource_t. Both are uint32_t, so C gives no compile enforcement —
+ * the typing documents intent and steers callers to the matching accessor
+ * (blyt_resource_text_get vs blyt_resource_bytes_get). The text accessor's
+ * trailing-NUL check (below) is the runtime guard against feeding a raw
+ * resource to the text path. */
+typedef uint32_t blyt_text_resource_t;
+typedef uint32_t blyt_bytes_resource_t;
 
 /* Opaque load handle returned by blyt_resource_load (encodes id + load epoch). */
 typedef uint32_t blyt_resource_h;
@@ -147,21 +159,26 @@ blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_han
  * a previous load epoch). */
 blyt_result_t blyt_resource_release(blyt_resource_h handle);
 
-/* text_get: convenience over pin -> copy -> unpin.  Returns a freshly allocated,
- * NUL-terminated copy of the resource's bytes (the caller owns it and must
- * free() it) and writes the byte length to *len.  Unlike a pinned pointer this
- * copy outlives the frame.  Returns NULL (leaving *len untouched) on an unknown
- * id or allocation failure.  Not its own ECALL — a guest-side helper. */
-char *blyt_resource_text_get(blyt_resource_id_t id, size_t *len);
+/* text_get: convenience over pin -> copy -> unpin for *text* resources.  Returns
+ * a freshly allocated, NUL-terminated copy of the resource's content bytes (the
+ * caller owns it and must free() it) and writes the *content* length to *len —
+ * the build-appended trailing NUL is excluded, so *len == strlen (ADR-0088
+ * amendment 2026-06-27, #166).  Unlike a pinned pointer this copy outlives the
+ * frame.  Returns NULL (leaving *len untouched) on an unknown id, an allocation
+ * failure, or a resource whose stored bytes lack the trailing NUL — i.e. a raw
+ * resource fed to the text path (this trailing-NUL check is the C error path,
+ * since the typedef gives no compile enforcement).  Not its own ECALL — a
+ * guest-side helper. */
+char *blyt_resource_text_get(blyt_text_resource_t id, size_t *len);
 
 /* bytes_get: the opaque-bytes companion to text_get (#162).  Returns a freshly
  * allocated copy of the resource's *exact* bytes (the caller owns it and must
  * free() it) and writes the byte length to *len.  Unlike text_get it appends no
- * NUL terminator and makes no text assumption, so it round-trips binary blobs
- * (embedded NULs, high bytes) faithfully — *len is authoritative.  Returns NULL
- * (leaving *len untouched) on an unknown id or allocation failure.  Not its own
- * ECALL — a guest-side helper. */
-void *blyt_resource_bytes_get(blyt_resource_id_t id, size_t *len);
+ * NUL terminator, strips nothing, and makes no text assumption, so it
+ * round-trips binary blobs (embedded NULs, high bytes) faithfully — *len is
+ * authoritative.  Returns NULL (leaving *len untouched) on an unknown id or
+ * allocation failure.  Not its own ECALL — a guest-side helper. */
+void *blyt_resource_bytes_get(blyt_bytes_resource_t id, size_t *len);
 
 /* -------------------------------------------------------------------------
  * Cart lifecycle types for save/load callbacks (ADR-0087 amendment)

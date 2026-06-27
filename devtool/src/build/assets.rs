@@ -4,12 +4,16 @@
 //! Membership is explicit (ADR-0088 amendment, #162): nothing is auto-scanned —
 //! every asset a cart ships is declared via an `include:` glob in the
 //! `assets:` block of `blyt.build.yaml`. A resource's *type* is decided by its
-//! extension independent of how it was included: `.txt` → text, everything else
-//! → `raw` (opaque bytes). `text` and `raw` are both identity-copy transforms
-//! today; future typed transforms (sprite/audio/...) add a real transform here
-//! and become auto-scanned. The resource model follows ADR-0040 (names in
-//! source, integer handles at runtime) and ADR-0088 (two-phase build; dev mode
-//! runs Phase 1 only and the runtime reads the staging directory).
+//! extension independent of how it was included: an extension in the global
+//! `assets.text_extensions` list (default `["txt"]`) → text, everything else →
+//! `raw` (opaque bytes) (ADR-0088 amendment 2026-06-27, #166). The two share a
+//! near-identity transform, differing only in text's C-string hardening: a text
+//! resource is validated (valid UTF-8, no embedded NUL) and a single trailing
+//! `\0` is appended to its staged bytes, while raw stays byte-exact. The type
+//! flows codegen-only into the generated constants (typed by kind); the runtime
+//! stays byte-blind. The resource model follows ADR-0040 (names in source,
+//! integer handles at runtime) and ADR-0088 (two-phase build; dev mode runs
+//! Phase 1 only and the runtime reads the staging directory).
 //!
 //! Staging is content-addressed (`resources/<name>-<fp>.data`) so files are
 //! never overwritten in place — a changed asset gets a new file alongside the
@@ -25,11 +29,12 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::{BuildError, Task, TaskInput, build_err};
 
-/// A resource's type, decided by its file extension (ADR-0088 amendment). Both
-/// variants are an identity copy today; the distinction is recorded in the
-/// `.meta` `type=` field (descriptive only — the runtime serves `.data` bytes
-/// and never reads `.meta`). `blyt_resource_text_get` works for either, since
-/// its length out-param is authoritative.
+/// A resource's type, decided by its file extension (ADR-0088 amendment). The
+/// distinction is recorded in the `.meta` `type=` field (descriptive only — the
+/// runtime serves `.data` bytes and never reads `.meta`) and, since #166, drives
+/// the typed generated constants and text-only NUL termination. `text` resources
+/// are validated (UTF-8, no embedded NUL) and gain a trailing `\0`; `raw` stays
+/// byte-exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResourceType {
     Text,
@@ -37,12 +42,13 @@ pub(super) enum ResourceType {
 }
 
 impl ResourceType {
-    /// `.txt` is text; every other extension is opaque `raw` bytes. When a real
-    /// transform for an extension lands (sprite/audio/...), it gets its own
-    /// variant here and becomes auto-scanned.
-    fn from_extension(ext: Option<&str>) -> Self {
+    /// An extension listed in `text_extensions` (default `["txt"]`) is text;
+    /// every other extension is opaque `raw` bytes (ADR-0088 amendment
+    /// 2026-06-27). When a real transform for an extension lands
+    /// (sprite/audio/...), it gets its own variant here.
+    fn from_extension(ext: Option<&str>, text_extensions: &[String]) -> Self {
         match ext {
-            Some("txt") => ResourceType::Text,
+            Some(e) if text_extensions.iter().any(|t| t == e) => ResourceType::Text,
             _ => ResourceType::Raw,
         }
     }
@@ -53,6 +59,41 @@ impl ResourceType {
             ResourceType::Raw => "raw",
         }
     }
+
+    fn is_text(self) -> bool {
+        matches!(self, ResourceType::Text)
+    }
+}
+
+/// Default `assets.text_extensions` when the manifest omits it (ADR-0088
+/// amendment 2026-06-27): `.txt` is the only built-in text extension.
+fn default_text_extensions() -> Vec<String> {
+    vec!["txt".to_string()]
+}
+
+/// Validate a `text` resource's source bytes (ADR-0088 amendment 2026-06-27,
+/// #166): must be valid UTF-8 with no embedded NUL (`0x00`). `0x00` is itself
+/// valid UTF-8 (U+0000) but never appears inside a multi-byte sequence, so the
+/// two checks are orthogonal. Honest-cart correctness, not a security boundary
+/// (the runtime is byte-blind; defense lives at string-consuming API
+/// boundaries). Returns a build error naming the file on failure.
+fn validate_text_bytes(source: &Path, bytes: &[u8]) -> Result<(), BuildError> {
+    if let Some(pos) = bytes.iter().position(|&b| b == 0) {
+        return Err(build_err(format!(
+            "text asset {} contains an embedded NUL (0x00) byte at offset {pos}; \
+             text resources must be NUL-free (declare it as a non-text extension \
+             for opaque bytes)",
+            source.display()
+        )));
+    }
+    if std::str::from_utf8(bytes).is_err() {
+        return Err(build_err(format!(
+            "text asset {} is not valid UTF-8; text resources must be valid UTF-8 \
+             (declare it as a non-text extension for opaque bytes)",
+            source.display()
+        )));
+    }
+    Ok(())
 }
 
 /// A scanned asset resolved to its resource name, content fingerprint, and
@@ -174,11 +215,26 @@ fn c_constant(name: &str) -> String {
 // derived resource name (empty default for assets/, required otherwise).
 // -------------------------------------------------------------------------
 
-#[derive(serde::Deserialize, Default, Debug, Clone)]
+#[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AssetsConfig {
+    /// Extensions whose resources are `text` (default `["txt"]`); everything
+    /// else is `raw` opaque bytes (ADR-0088 amendment 2026-06-27, #166).
+    #[serde(default = "default_text_extensions")]
+    pub text_extensions: Vec<String>,
     #[serde(default)]
     pub dirs: Vec<AssetDir>,
+}
+
+impl Default for AssetsConfig {
+    fn default() -> Self {
+        // A manifest with no `assets:` block (or no file at all) still gets the
+        // default text-extension set, matching a present-but-empty block.
+        Self {
+            text_extensions: default_text_extensions(),
+            dirs: Vec::new(),
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -404,6 +460,7 @@ pub(super) fn scan_assets(
                 meta_output,
                 resource_type: ResourceType::from_extension(
                     rel.extension().and_then(OsStr::to_str),
+                    &config.text_extensions,
                 ),
             });
         }
@@ -449,33 +506,51 @@ pub(super) fn resource_index_contents(assets: &[AssetInfo]) -> String {
 }
 
 /// Generated C header (`cart_resources.h`): one `R_<NAME>` constant per
-/// resource (ADR-0040). Always includes `<blyt.h>` for `blyt_resource_h`.
+/// resource (ADR-0040), typed by kind (ADR-0068 amendment 2026-06-27, #166): a
+/// text resource is a `blyt_text_resource_t`, a raw one a `blyt_bytes_resource_t`
+/// (both `uint32_t` aliases — the typing steers callers to the matching
+/// accessor, not a compile barrier). Always includes `<blyt.h>` for the
+/// typedefs.
 pub(super) fn generate_c_header(assets: &[AssetInfo]) -> String {
     let mut s = String::new();
     s.push_str("/* Generated by `blyt build` — do not edit. */\n");
     s.push_str("#pragma once\n");
     s.push_str("#include <blyt.h>\n\n");
     for a in assets {
+        let ty = if a.resource_type.is_text() {
+            "blyt_text_resource_t"
+        } else {
+            "blyt_bytes_resource_t"
+        };
         s.push_str(&format!(
-            "#define {} ((blyt_resource_h){})\n",
+            "#define {} (({}){})\n",
             c_constant(&a.resource_name),
+            ty,
             a.id
         ));
     }
     s
 }
 
-/// Generated Lua module (`cart_resources.lua`): `require`-able table mapping
-/// upper-cased resource names to integer IDs (ADR-0040). Consumed by the Lua
-/// resource API (#93); emitted now to establish the pattern.
+/// Generated Lua module (`cart_resources.lua`): a `require`-able table mapping
+/// upper-cased resource names to typed constant objects (ADR-0040, ADR-0068
+/// amendment 2026-06-27): `GREETING = blyt.resource.text_resource(1)` for text,
+/// `BLOB = blyt.resource.bytes_resource(2)` for raw. `R.X:load()` yields a
+/// kind-specific handle (`:text()` vs `:bytes()`).
 pub(super) fn generate_lua_module(assets: &[AssetInfo]) -> String {
     let mut s = String::new();
     s.push_str("-- Generated by `blyt build` — do not edit.\n");
     s.push_str("return {\n");
     for a in assets {
+        let ctor = if a.resource_type.is_text() {
+            "blyt.resource.text_resource"
+        } else {
+            "blyt.resource.bytes_resource"
+        };
         s.push_str(&format!(
-            "    {} = {},\n",
+            "    {} = {}({}),\n",
             a.resource_name.to_ascii_uppercase(),
+            ctor,
             a.id
         ));
     }
@@ -483,17 +558,23 @@ pub(super) fn generate_lua_module(assets: &[AssetInfo]) -> String {
     s
 }
 
-/// Generated Rust module (`cart_resources.rs`): one `R_<NAME>` `ResourceHandle`
-/// constant per resource (ADR-0040), mirroring the C header (#94). The cart
-/// pulls it in with `include!(env!("BLYT_CART_RESOURCES_RS"))`, the same
-/// mechanism `cart_state.rs` uses. `blyt::ResourceHandle::new` is a const fn,
-/// so each constant is usable in const context.
+/// Generated Rust module (`cart_resources.rs`): one `R_<NAME>` constant per
+/// resource (ADR-0040), typed by kind (ADR-0068 amendment 2026-06-27, #166):
+/// `TextResource` for text, `BytesResource` for raw. Misusing the text accessor
+/// on a bytes resource is a compile error. The cart pulls it in with
+/// `include!(env!("BLYT_CART_RESOURCES_RS"))`; both `::new` constructors are
+/// const fns, so each constant is usable in const context.
 pub(super) fn generate_rust_module(assets: &[AssetInfo]) -> String {
     let mut s = String::new();
     s.push_str("// Generated by `blyt build` — do not edit.\n");
     for a in assets {
+        let ty = if a.resource_type.is_text() {
+            "TextResource"
+        } else {
+            "BytesResource"
+        };
         s.push_str(&format!(
-            "pub const {}: blyt::ResourceHandle = blyt::ResourceHandle::new({});\n",
+            "pub const {}: blyt::{ty} = blyt::{ty}::new({});\n",
             c_constant(&a.resource_name),
             a.id
         ));
@@ -506,14 +587,19 @@ pub(super) fn generate_rust_module(assets: &[AssetInfo]) -> String {
  * ------------------------------------------------------------------------- */
 
 /// Phase 1 transform for a single asset: write the content-addressed `.data`
-/// (raw bytes for text) and its `.meta`. A no-op when the content-addressed
-/// outputs already exist (handled by the engine via the content fingerprint).
+/// and its `.meta`. A no-op when the content-addressed outputs already exist
+/// (handled by the engine via the content fingerprint). A `text` resource is
+/// validated (UTF-8, no embedded NUL) and gets a single trailing `\0` appended
+/// to its staged bytes (ADR-0088 amendment 2026-06-27, #166); `raw` is copied
+/// byte-exact.
 pub(super) struct AssetTask {
     pub resource_name: String,
     pub source: PathBuf,
     pub data_output: PathBuf,
     pub meta_output: PathBuf,
     pub meta: String,
+    /// Text resources are validated and NUL-terminated; raw is byte-exact.
+    pub is_text: bool,
     pub key_str: String,
 }
 
@@ -534,9 +620,18 @@ impl Task for AssetTask {
         if let Some(parent) = self.data_output.parent() {
             fs::create_dir_all(parent)?;
         }
-        // text and raw both pass through verbatim; the transform is the
-        // identity copy. Typed transforms (sprite/audio/...) will branch here.
-        fs::copy(&self.source, &self.data_output)?;
+        if self.is_text {
+            // Text: validate (UTF-8, no embedded NUL) then append one trailing
+            // `\0` for C-string safety (ADR-0088 amendment 2026-06-27, #166).
+            // The reported length will include the NUL; only the guest text
+            // accessors strip it. Raw stays byte-exact below.
+            let mut bytes = fs::read(&self.source)?;
+            validate_text_bytes(&self.source, &bytes)?;
+            bytes.push(0);
+            fs::write(&self.data_output, &bytes)?;
+        } else {
+            fs::copy(&self.source, &self.data_output)?;
+        }
         fs::write(&self.meta_output, &self.meta)?;
         Ok(())
     }
@@ -650,6 +745,7 @@ pub(super) fn plan_assets(
             data_output: a.data_output.clone(),
             meta_output: a.meta_output.clone(),
             meta: meta_contents(a),
+            is_text: a.resource_type.is_text(),
             key_str: format!("asset/{}", a.resource_name),
         }));
         resource_sections.push((format!(".cart.resource.{}", a.id), a.data_output.clone()));
@@ -737,6 +833,10 @@ mod tests {
     }
 
     fn asset(id: u32, n: &str, fp: &str) -> AssetInfo {
+        asset_of(id, n, fp, ResourceType::Text)
+    }
+
+    fn asset_of(id: u32, n: &str, fp: &str, ty: ResourceType) -> AssetInfo {
         AssetInfo {
             id,
             resource_name: n.to_string(),
@@ -745,7 +845,7 @@ mod tests {
             rel_data: format!("resources/{n}-{fp}.data"),
             data_output: PathBuf::from(format!("build/resources/{n}-{fp}.data")),
             meta_output: PathBuf::from(format!("build/resources/{n}-{fp}.meta")),
-            resource_type: ResourceType::Text,
+            resource_type: ty,
         }
     }
 
@@ -762,38 +862,41 @@ mod tests {
     }
 
     #[test]
-    fn c_header_constants() {
-        let assets = vec![asset(1, "greeting", "abc123")];
+    fn c_header_constants_typed_by_kind() {
+        // text -> blyt_text_resource_t, raw -> blyt_bytes_resource_t (#166).
+        let assets = vec![
+            asset_of(1, "greeting", "abc123", ResourceType::Text),
+            asset_of(2, "blob", "def456", ResourceType::Raw),
+        ];
         let h = generate_c_header(&assets);
         assert!(h.contains("#include <blyt.h>"));
-        assert!(h.contains("#define R_GREETING ((blyt_resource_h)1)"));
+        assert!(h.contains("#define R_GREETING ((blyt_text_resource_t)1)"));
+        assert!(h.contains("#define R_BLOB ((blyt_bytes_resource_t)2)"));
     }
 
     #[test]
-    fn lua_module_table() {
+    fn lua_module_typed_constants() {
         let assets = vec![
-            asset(1, "greeting", "abc123"),
-            asset(2, "hero_idle", "def456"),
+            asset_of(1, "greeting", "abc123", ResourceType::Text),
+            asset_of(2, "blob", "def456", ResourceType::Raw),
         ];
         let m = generate_lua_module(&assets);
         assert!(m.contains("return {"));
-        assert!(m.contains("GREETING = 1,"));
-        assert!(m.contains("HERO_IDLE = 2,"));
+        assert!(m.contains("GREETING = blyt.resource.text_resource(1),"));
+        assert!(m.contains("BLOB = blyt.resource.bytes_resource(2),"));
     }
 
     #[test]
-    fn rust_module_constants() {
+    fn rust_module_typed_constants() {
         let assets = vec![
-            asset(1, "greeting", "abc123"),
-            asset(2, "hero_idle", "def456"),
+            asset_of(1, "greeting", "abc123", ResourceType::Text),
+            asset_of(2, "blob", "def456", ResourceType::Raw),
         ];
         let m = generate_rust_module(&assets);
-        assert!(m.contains(
-            "pub const R_GREETING: blyt::ResourceHandle = blyt::ResourceHandle::new(1);"
-        ));
-        assert!(m.contains(
-            "pub const R_HERO_IDLE: blyt::ResourceHandle = blyt::ResourceHandle::new(2);"
-        ));
+        assert!(
+            m.contains("pub const R_GREETING: blyt::TextResource = blyt::TextResource::new(1);")
+        );
+        assert!(m.contains("pub const R_BLOB: blyt::BytesResource = blyt::BytesResource::new(2);"));
     }
 
     /* --- include-driven membership + type-by-extension (#162) --- */
@@ -930,5 +1033,123 @@ mod tests {
         assert_eq!(names(&assets), vec!["blob"]);
         assert_eq!(assets[0].resource_type, ResourceType::Raw);
         assert_eq!(assets[0].fingerprint, format!("{:016x}", xxh3_64(raw)));
+    }
+
+    /* --- text_extensions + text validation + NUL termination (#166) --- */
+
+    #[test]
+    fn from_extension_consults_text_extensions() {
+        let txt = vec!["txt".to_string()];
+        assert_eq!(
+            ResourceType::from_extension(Some("txt"), &txt),
+            ResourceType::Text
+        );
+        assert_eq!(
+            ResourceType::from_extension(Some("dat"), &txt),
+            ResourceType::Raw
+        );
+        assert_eq!(ResourceType::from_extension(None, &txt), ResourceType::Raw);
+        // A custom list makes `.md` text and demotes `.txt` to raw.
+        let md = vec!["md".to_string()];
+        assert_eq!(
+            ResourceType::from_extension(Some("md"), &md),
+            ResourceType::Text
+        );
+        assert_eq!(
+            ResourceType::from_extension(Some("txt"), &md),
+            ResourceType::Raw
+        );
+    }
+
+    #[test]
+    fn default_text_extensions_when_block_present_but_omits_it() {
+        // An `assets:` block that omits `text_extensions` still defaults to
+        // ["txt"]; `.txt` stays text.
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: assets/\n      include: [\"**/*.txt\"]\n";
+        let assets = scan(yaml, &[("assets/greeting.txt", b"hi")]).unwrap();
+        assert_eq!(assets[0].resource_type, ResourceType::Text);
+    }
+
+    #[test]
+    fn custom_text_extensions_retypes_resources() {
+        // Declaring text_extensions: [md] makes .md text and .txt raw.
+        let yaml = "language: lua\n\
+                    assets:\n  text_extensions: [md]\n  dirs:\n    - dir: assets/\n      include: [\"**/*.md\", \"**/*.txt\"]\n";
+        let assets = scan(
+            yaml,
+            &[("assets/readme.md", b"# hi"), ("assets/note.txt", b"hi")],
+        )
+        .unwrap();
+        let md = assets.iter().find(|a| a.resource_name == "readme").unwrap();
+        let txt = assets.iter().find(|a| a.resource_name == "note").unwrap();
+        assert_eq!(md.resource_type, ResourceType::Text);
+        assert_eq!(txt.resource_type, ResourceType::Raw);
+    }
+
+    #[test]
+    fn validate_text_bytes_accepts_valid_utf8() {
+        assert!(validate_text_bytes(Path::new("a.txt"), "héllo 🎉".as_bytes()).is_ok());
+        assert!(validate_text_bytes(Path::new("a.txt"), b"").is_ok());
+    }
+
+    #[test]
+    fn validate_text_bytes_rejects_embedded_nul() {
+        let err = validate_text_bytes(Path::new("a.txt"), b"hi\x00there")
+            .err()
+            .expect("embedded NUL must be rejected");
+        assert!(err.to_string().contains("NUL"), "{err}");
+        assert!(err.to_string().contains("a.txt"), "{err}");
+    }
+
+    #[test]
+    fn validate_text_bytes_rejects_invalid_utf8() {
+        let err = validate_text_bytes(Path::new("bad.txt"), &[0xFF, 0xFE])
+            .err()
+            .expect("invalid UTF-8 must be rejected");
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+        assert!(err.to_string().contains("bad.txt"), "{err}");
+    }
+
+    /// Run an `AssetTask` over `bytes` and return the staged `.data` contents.
+    fn run_asset_task(bytes: &[u8], is_text: bool) -> Result<Vec<u8>, BuildError> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("in.dat");
+        fs::write(&src, bytes).unwrap();
+        let data_output = dir.path().join("out.data");
+        let meta_output = dir.path().join("out.meta");
+        let task = AssetTask {
+            resource_name: "r".into(),
+            source: src,
+            data_output: data_output.clone(),
+            meta_output,
+            meta: "type=x\nname=r\n".into(),
+            is_text,
+            key_str: "asset/r".into(),
+        };
+        task.run()?;
+        Ok(fs::read(&data_output).unwrap())
+    }
+
+    #[test]
+    fn asset_task_nul_terminates_text() {
+        // Text gets exactly one trailing NUL; the reported/stored length is
+        // content+1 (#166).
+        let out = run_asset_task(b"hi", true).unwrap();
+        assert_eq!(out, b"hi\x00");
+    }
+
+    #[test]
+    fn asset_task_raw_is_byte_exact() {
+        // Raw is copied verbatim — no trailing NUL, even when the bytes already
+        // end in 0x00.
+        let raw: &[u8] = &[0x00, 0xFF, b'h', b'i', 0x00];
+        let out = run_asset_task(raw, false).unwrap();
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn asset_task_text_validation_fails_on_embedded_nul() {
+        assert!(run_asset_task(b"hi\x00bye", true).is_err());
     }
 }
