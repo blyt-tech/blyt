@@ -836,28 +836,34 @@ if(BLYT_BUILD_NATIVE)
     DEPENDS
     "${LD_BLYT_STUB_SRC}")
 
-  # Native libblytc.so: thin wrapper whose only job is to carry DT_NEEDED:
-  # ld-blyt.so.1 so carts and libblyt32.so can resolve stdlib symbols from the
-  # system musl interpreter at runtime on QEMU.
+  # Native libblytc.so: carries DT_NEEDED ld-blyt.so.1 so carts and libblyt32.so
+  # resolve stdlib symbols from the system musl interpreter at runtime on QEMU,
+  # and now defines the cart-heap malloc family backed by the runtime/shared
+  # arena hosted in libblytcommon.so (#158) — hence DT_NEEDED libblytcommon.so to
+  # resolve blyt_cart_heap_*.  libblytcommon.so is built later in this file; the
+  # DEPENDS on its output orders the build (ninja is dependency- not
+  # declaration-ordered).
   set(LIBBLYTC_NATIVE_SRC
       "${CMAKE_SOURCE_DIR}/frontends/native/src/libblytc/libblytc_native.c")
   blyt_guest_so(
     "${SDK_LIB_NATIVE}/libblytc.so"
     FALSE
-    "Cross-compiling libblytc.so (native, DT_NEEDED: ld-blyt.so.1)"
+    "Cross-compiling libblytc.so (native, DT_NEEDED: ld-blyt.so.1 + libblytcommon.so)"
     ARGS
     -O2
     -Wl,-soname,libblytc.so
     -Wl,-Bdynamic
     -Wl,--no-as-needed
     "${LD_BLYT_STUB_OUT}"
+    "${SDK_LIB_NATIVE}/libblytcommon.so"
     -Wl,--as-needed
     -o
     "${SDK_LIB_NATIVE}/libblytc.so"
     "${LIBBLYTC_NATIVE_SRC}"
     DEPENDS
     "${LIBBLYTC_NATIVE_SRC}"
-    "${LD_BLYT_STUB_OUT}")
+    "${LD_BLYT_STUB_OUT}"
+    "${SDK_LIB_NATIVE}/libblytcommon.so")
 
   set(LIBBLYT32_NATIVE_INC "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32")
   set(LIBBLYTCOMMON_NATIVE_DIR
@@ -886,6 +892,7 @@ if(BLYT_BUILD_NATIVE)
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/resources.c"
     "${LIBBLYTCOMMON_NATIVE_DIR}/blytcommon.c"
+    "${SHARED_DIR}/blyt_arena.c" # single-sourced cart-heap arena (#158)
     "${SHARED_DIR}/blyt_fp_canon.c"
     "${SHARED_DIR}/blyt_elf_section.c"
     "${SHARED_DIR}/blyt_resource_codec.c" # per-resource decode (#157)
@@ -1129,11 +1136,17 @@ if(BLYT_BUILD_NATIVE)
       "${_LIBC_STUB}"
       -Wl,--as-needed
       "${SDK_LIB_NATIVE}/libblyt32.so"
+      # DT_NEEDED libblytcommon.so so the Lua VM's malloc family (lua_native_malloc.c)
+      # resolves the cart-heap arena entry points (blyt_cart_heap_*) directly,
+      # rather than relying on the cart transitively pulling libblytcommon via
+      # libblyt32.so (#158).  --as-needed keeps it: blyt_cart_heap_* is referenced.
+      "${SDK_LIB_NATIVE}/libblytcommon.so"
       LINK_DEPENDS
       "${_LIBBLYTC_NATIVE_OBJ}"
       "${LUA32_SYM}"
       "${_LIBC_STUB}"
-      "${SDK_LIB_NATIVE}/libblyt32.so")
+      "${SDK_LIB_NATIVE}/libblyt32.so"
+      "${SDK_LIB_NATIVE}/libblytcommon.so")
     list(APPEND _native_outputs "${SDK_LIB_NATIVE}/libblyt32lua.so")
   endif()
 
