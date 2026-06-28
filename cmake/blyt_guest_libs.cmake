@@ -138,18 +138,26 @@ endfunction()
 # /blyt/sdk/src/blyt-dap.
 file(RELATIVE_PATH _rel_guest "${CMAKE_BINARY_DIR}"
      "${CMAKE_SOURCE_DIR}/runtime/guest")
+file(RELATIVE_PATH _rel_shared "${CMAKE_BINARY_DIR}"
+     "${CMAKE_SOURCE_DIR}/runtime/shared")
 file(RELATIVE_PATH _rel_musl "${CMAKE_BINARY_DIR}" "${musl_SOURCE_DIR}")
 file(RELATIVE_PATH _rel_lua "${CMAKE_BINARY_DIR}" "${lua_SOURCE_DIR}")
 file(RELATIVE_PATH _rel_rv32 "${CMAKE_BINARY_DIR}" "${rv32emu_SOURCE_DIR}")
 file(RELATIVE_PATH _rel_dap "${CMAKE_BINARY_DIR}"
      "${CMAKE_SOURCE_DIR}/runtime/host/src/dap")
+# runtime/shared is a sibling of runtime/guest (neither a prefix of the other),
+# so it needs its own map: the unified-budget arena (blyt_arena.c, #158) is the
+# first runtime/shared TU pulled into an emulated guest lib (libblytc), and
+# without this its DWARF would leak the build machine path (source_paths.rs §4).
 set(RV32_PREFIX_MAP
     "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/guest=/blyt/sdk/src/blyt"
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/shared=/blyt/sdk/src/blyt-shared"
     "-ffile-prefix-map=${musl_SOURCE_DIR}=/blyt/sdk/src/musl"
     "-ffile-prefix-map=${lua_SOURCE_DIR}=/blyt/sdk/src/lua"
     "-ffile-prefix-map=${rv32emu_SOURCE_DIR}=/blyt/sdk/src/rv32emu"
     "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/host/src/dap=/blyt/sdk/src/blyt-dap"
     "-ffile-prefix-map=${_rel_guest}=/blyt/sdk/src/blyt"
+    "-ffile-prefix-map=${_rel_shared}=/blyt/sdk/src/blyt-shared"
     "-ffile-prefix-map=${_rel_musl}=/blyt/sdk/src/musl"
     "-ffile-prefix-map=${_rel_lua}=/blyt/sdk/src/lua"
     "-ffile-prefix-map=${_rel_rv32}=/blyt/sdk/src/rv32emu"
@@ -167,7 +175,13 @@ set(RV32_COMPILE_BASE
     -fsemantic-interposition
     ${RV32_PREFIX_MAP}
     -I
-    "${CMAKE_SOURCE_DIR}/runtime/guest/include")
+    "${CMAKE_SOURCE_DIR}/runtime/guest/include"
+    # runtime/shared carries the freestanding determinism core (blyt_arena.h,
+    # blyt_mem_budget.h). libblytcommon_emu reads the unified accounting block to
+    # serve blyt_mem_stats without an ECALL (#159), so every guest TU can reach
+    # these headers; the matching -ffile-prefix-map is already global above.
+    -I
+    "${CMAKE_SOURCE_DIR}/runtime/shared")
 
 set(GUEST_OBJ_ROOT "${CMAKE_BINARY_DIR}/guest-obj")
 
@@ -289,8 +303,8 @@ endforeach()
 set(LIBBLYTCOMMON_OUT "${SDK_LIB}/libblytcommon.so")
 
 # ── blyt-debug-stub.elf — lldb-dap `program` stub (issue #119) ───────────────
-# A minimal riscv32 ELF that lldb-dap loads as its `program` so the cart is never
-# the main executable (and so stays a cleanly unloadable/reloadable shared
+# A minimal riscv32 ELF that lldb-dap loads as its `program` so the cart is
+# never the main executable (and so stays a cleanly unloadable/reloadable shared
 # library across a hot reload — Spike W §5d/§5e).  Debug-only; never run.
 #
 # Built as a STATIC ET_EXEC linked at a fixed high base (0x40000000) so its
@@ -318,7 +332,8 @@ add_custom_command(
   DEPENDS "${CMAKE_SOURCE_DIR}/runtime/guest/src/debug-stub/blyt_debug_stub.c"
   COMMENT "Linking blyt-debug-stub.elf (lldb-dap program stub, issue #119)"
   VERBATIM)
-add_custom_target(blyt_debug_stub ALL DEPENDS "${SDK_LIB_DEBUG}/blyt-debug-stub.elf")
+add_custom_target(blyt_debug_stub ALL
+                  DEPENDS "${SDK_LIB_DEBUG}/blyt-debug-stub.elf")
 
 # ── musl bits/ generation (configure time) ──────────────────────────────────
 set(MUSL_DIR "${musl_SOURCE_DIR}")
@@ -431,6 +446,7 @@ set(LIBBLYTC_SRCS
     "${MUSL_DIR}/src/stdio/__uflow.c"
     "${MUSL_DIR}/src/stdio/__fmodeflags.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_arena.c"
+    "${CMAKE_SOURCE_DIR}/runtime/shared/blyt_arena.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytc/blytc_stubs.c"
     "${MUSL_DIR}/src/malloc/posix_memalign.c"
     "${MUSL_DIR}/src/stdio/sscanf.c"
@@ -440,6 +456,9 @@ set(LIBBLYTC_SRCS
     "${MUSL_DIR}/src/setjmp/riscv32/longjmp.S")
 
 set(LIBBLYTC_INCLUDES
+    -I
+    "${CMAKE_SOURCE_DIR}/runtime/shared" # blyt_arena.h / blyt_mem_budget.h
+                                         # (#158)
     -I
     "${MUSL_DIR}/src/include" # defines `hidden` and other internal macros
     -I
@@ -629,8 +648,8 @@ else()
   file(GLOB LUA_GUEST_SRCS "${LUA_DIR}/*.c")
   # Remove standalone interpreter, bytecode compiler, and excluded sandboxed
   # libs (no I/O, no OS access, no dlopen, no debug hooks).  utf8 is KEPT:
-  # ADR-0079 allows it (read-only iteration utilities; deterministic) and
-  # carts need character-level UTF-8 (issue #167).
+  # ADR-0079 allows it (read-only iteration utilities; deterministic) and carts
+  # need character-level UTF-8 (issue #167).
   foreach(
     _EXCL
     "${LUA_DIR}/lua.c"
@@ -778,8 +797,8 @@ else()
     list(APPEND _guest_lib_outputs "${_VDIR}/libblyt32lua-bridge.so")
   endforeach()
 
-  # blyt-luac — host-native Lua bytecode compiler (BLYT_LUA_I32_F64=1 to match the
-  # guest VMs' 4-byte lua_Integer / lua_Number).
+  # blyt-luac — host-native Lua bytecode compiler (BLYT_LUA_I32_F64=1 to match
+  # the guest VMs' 4-byte lua_Integer / lua_Number).
   file(GLOB LUA_HOST_SRCS "${LUA_DIR}/*.c")
   foreach(_EXCL "${LUA_DIR}/lua.c" "${LUA_DIR}/onelua.c" "${LUA_DIR}/ltests.c")
     list(REMOVE_ITEM LUA_HOST_SRCS "${_EXCL}")
@@ -787,9 +806,10 @@ else()
   add_custom_command(
     OUTPUT "${SDK_BIN}/blyt-luac"
     COMMAND
-      "${BLYT_RV32_CLANG}" -DBLYT_LUA_I32_F64=1 ${LUA_SEED_DEF} -O2 -I "${LUA_DIR}"
-      -Wno-unused-parameter -Wno-sign-compare -Wno-implicit-fallthrough
-      -Wno-deprecated-non-prototype -o "${SDK_BIN}/blyt-luac" ${LUA_HOST_SRCS}
+      "${BLYT_RV32_CLANG}" -DBLYT_LUA_I32_F64=1 ${LUA_SEED_DEF} -O2 -I
+      "${LUA_DIR}" -Wno-unused-parameter -Wno-sign-compare
+      -Wno-implicit-fallthrough -Wno-deprecated-non-prototype -o
+      "${SDK_BIN}/blyt-luac" ${LUA_HOST_SRCS}
       "${CMAKE_SOURCE_DIR}/runtime/tools/blyt-luac.c" -lm
     DEPENDS ${LUA_HOST_SRCS} "${CMAKE_SOURCE_DIR}/runtime/tools/blyt-luac.c"
     COMMENT "Compiling blyt-luac (host-native, BLYT_LUA_I32_F64=1)"
@@ -830,28 +850,34 @@ if(BLYT_BUILD_NATIVE)
     DEPENDS
     "${LD_BLYT_STUB_SRC}")
 
-  # Native libblytc.so: thin wrapper whose only job is to carry DT_NEEDED:
-  # ld-blyt.so.1 so carts and libblyt32.so can resolve stdlib symbols from the
-  # system musl interpreter at runtime on QEMU.
+  # Native libblytc.so: carries DT_NEEDED ld-blyt.so.1 so carts and libblyt32.so
+  # resolve stdlib symbols from the system musl interpreter at runtime on QEMU,
+  # and now defines the cart-heap malloc family backed by the runtime/shared
+  # arena hosted in libblytcommon.so (#158) — hence DT_NEEDED libblytcommon.so to
+  # resolve blyt_cart_heap_*.  libblytcommon.so is built later in this file; the
+  # DEPENDS on its output orders the build (ninja is dependency- not
+  # declaration-ordered).
   set(LIBBLYTC_NATIVE_SRC
       "${CMAKE_SOURCE_DIR}/frontends/native/src/libblytc/libblytc_native.c")
   blyt_guest_so(
     "${SDK_LIB_NATIVE}/libblytc.so"
     FALSE
-    "Cross-compiling libblytc.so (native, DT_NEEDED: ld-blyt.so.1)"
+    "Cross-compiling libblytc.so (native, DT_NEEDED: ld-blyt.so.1 + libblytcommon.so)"
     ARGS
     -O2
     -Wl,-soname,libblytc.so
     -Wl,-Bdynamic
     -Wl,--no-as-needed
     "${LD_BLYT_STUB_OUT}"
+    "${SDK_LIB_NATIVE}/libblytcommon.so"
     -Wl,--as-needed
     -o
     "${SDK_LIB_NATIVE}/libblytc.so"
     "${LIBBLYTC_NATIVE_SRC}"
     DEPENDS
     "${LIBBLYTC_NATIVE_SRC}"
-    "${LD_BLYT_STUB_OUT}")
+    "${LD_BLYT_STUB_OUT}"
+    "${SDK_LIB_NATIVE}/libblytcommon.so")
 
   set(LIBBLYT32_NATIVE_INC "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32")
   set(LIBBLYTCOMMON_NATIVE_DIR
@@ -864,12 +890,12 @@ if(BLYT_BUILD_NATIVE)
   # — plus the portable lifecycle driver (blyt_common.c, shared with the
   # emulated variant) and the freestanding runtime/shared determinism
   # primitives.  Keep -O0: the native impls use hand-rolled helpers and raw
-  # inline-asm syscalls; -O0 avoids loop-idiom rewrites into libcalls.  Built via
-  # the multi-source path so each TU (incl. runtime/shared) is its own cacheable,
-  # depfile-tracked rule.  Strong definitions in this variant are what the cart
-  # resolves over the DT_NEEDED chain (-fsemantic-interposition in RV32_BASE
-  # keeps intra-module calls like blyt_main → blyt_frame_done routing through the
-  # PLT, ADR-0129).
+  # inline-asm syscalls; -O0 avoids loop-idiom rewrites into libcalls.  Built
+  # via the multi-source path so each TU (incl. runtime/shared) is its own
+  # cacheable, depfile-tracked rule.  Strong definitions in this variant are
+  # what the cart resolves over the DT_NEEDED chain (-fsemantic-interposition in
+  # RV32_BASE keeps intra-module calls like blyt_main → blyt_frame_done routing
+  # through the PLT, ADR-0129).
   blyt_guest_so_objs(
     "${SDK_LIB_NATIVE}/libblytcommon.so"
     FALSE
@@ -880,6 +906,7 @@ if(BLYT_BUILD_NATIVE)
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/resources.c"
     "${LIBBLYTCOMMON_NATIVE_DIR}/blytcommon.c"
+    "${SHARED_DIR}/blyt_arena.c" # single-sourced cart-heap arena (#158)
     "${SHARED_DIR}/blyt_fp_canon.c"
     "${SHARED_DIR}/blyt_elf_section.c"
     "${SHARED_DIR}/blyt_resource_codec.c" # per-resource decode (#157)
@@ -1148,11 +1175,17 @@ if(BLYT_BUILD_NATIVE)
       "${_LIBC_STUB}"
       -Wl,--as-needed
       "${SDK_LIB_NATIVE}/libblyt32.so"
+      # DT_NEEDED libblytcommon.so so the Lua VM's malloc family (lua_native_malloc.c)
+      # resolves the cart-heap arena entry points (blyt_cart_heap_*) directly,
+      # rather than relying on the cart transitively pulling libblytcommon via
+      # libblyt32.so (#158).  --as-needed keeps it: blyt_cart_heap_* is referenced.
+      "${SDK_LIB_NATIVE}/libblytcommon.so"
       LINK_DEPENDS
       "${_LIBBLYTC_NATIVE_OBJ}"
       "${LUA32_SYM}"
       "${_LIBC_STUB}"
-      "${SDK_LIB_NATIVE}/libblyt32.so")
+      "${SDK_LIB_NATIVE}/libblyt32.so"
+      "${SDK_LIB_NATIVE}/libblytcommon.so")
     list(APPEND _native_outputs "${SDK_LIB_NATIVE}/libblyt32lua.so")
   endif()
 

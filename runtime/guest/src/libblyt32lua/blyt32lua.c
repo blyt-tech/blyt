@@ -502,6 +502,65 @@ static void register_resource_module(lua_State *L) {
     lua_pop(L, 1); /* pop resource module */
 }
 
+/* Cap on the resources_loaded list the Lua/host helpers enumerate (advisory; a
+ * cart with more loaded resources than this sees the list truncated, never the
+ * scalar totals or count). 256 covers any realistic working set. */
+#define BLYT_LUA_MEM_RES_MAX 256
+
+/* blyt32.mem.stats() — memory introspection (ADR-0029, #159). Returns a table:
+ *   { resource_cache_used, cart_allocations, total_used, budget_cap,
+ *     resources_loaded = { {id=, size=}, ... } }
+ * The deterministic-vs-advisory contract is documented on blyt_mem_stats in
+ * blyt.h: only budget_cap (and allocation outcomes) are safe to branch game
+ * logic on; the cache figures and residency list are advisory. */
+static int lua_mem_stats(lua_State *L) {
+    blyt_mem_stats_t s = {0};
+    blyt_mem_stats(&s); /* scalars from the accounting block (no ECALL) */
+    blyt_mem_resource_t res[BLYT_LUA_MEM_RES_MAX];
+    uint32_t n = blyt_mem_resources(res, BLYT_LUA_MEM_RES_MAX); /* list on demand */
+
+    lua_createtable(L, 0, 5);
+    lua_pushinteger(L, (lua_Integer)s.resource_cache_used);
+    lua_setfield(L, -2, "resource_cache_used");
+    lua_pushinteger(L, (lua_Integer)s.cart_allocations);
+    lua_setfield(L, -2, "cart_allocations");
+    lua_pushinteger(L, (lua_Integer)s.total_used);
+    lua_setfield(L, -2, "total_used");
+    lua_pushinteger(L, (lua_Integer)s.budget_cap);
+    lua_setfield(L, -2, "budget_cap");
+
+    uint32_t shown = n < BLYT_LUA_MEM_RES_MAX ? n : BLYT_LUA_MEM_RES_MAX;
+    lua_createtable(L, (int)shown, 0); /* resources_loaded array */
+    for (uint32_t i = 0; i < shown; i++) {
+        lua_createtable(L, 0, 2);
+        lua_pushinteger(L, (lua_Integer)res[i].id);
+        lua_setfield(L, -2, "id");
+        lua_pushinteger(L, (lua_Integer)res[i].size);
+        lua_setfield(L, -2, "size");
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    lua_setfield(L, -2, "resources_loaded");
+    return 1;
+}
+
+/* Build the blyt.mem module table and alias blyt32.mem == blyt.mem (ADR-0086
+ * shared module, #93). Call after the blyt and blyt32 globals exist. */
+static void register_mem_module(lua_State *L) {
+    lua_newtable(L); /* mem module */
+    lua_pushcfunction(L, lua_mem_stats);
+    lua_setfield(L, -2, "stats");
+
+    lua_getglobal(L, "blyt");
+    lua_pushvalue(L, -2); /* mem */
+    lua_setfield(L, -2, "mem");
+    lua_pop(L, 1); /* pop blyt */
+    lua_getglobal(L, "blyt32");
+    lua_pushvalue(L, -2); /* mem */
+    lua_setfield(L, -2, "mem");
+    lua_pop(L, 1); /* pop blyt32 */
+    lua_pop(L, 1); /* pop mem module */
+}
+
 static void register_blyt32(lua_State *L) {
     /* --- shared: blyt.debug subtable --- */
     lua_newtable(L); /* idx A: blyt.debug */
@@ -601,6 +660,7 @@ static void register_blyt32(lua_State *L) {
     lua_pop(L, 1); /* pop blyt.debug (idx A) */
 
     register_resource_module(L); /* blyt.resource.* + blyt32.resource.* (#93) */
+    register_mem_module(L); /* blyt.mem.* + blyt32.mem.* (ADR-0029, #159) */
 
     lua_pushcfunction(L, lua_blyt_require);
     lua_setglobal(L, "require");

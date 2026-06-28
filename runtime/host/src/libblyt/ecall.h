@@ -81,6 +81,27 @@
 #define BLYT_ECALL_RESOURCE_LOAD 63
 #define BLYT_ECALL_RESOURCE_RELEASE 64
 
+/* Memory introspection: loaded-resource enumeration (ADR-0029, issue #159,
+ * epic #156 child 4).
+ *
+ * The SCALAR memory totals (cart_allocations, resource_cache_used, total_used,
+ * budget_cap) are NOT an ECALL — they are published sums in the guest-readable
+ * accounting block (blyt_mem_acct, #158) that blyt_mem_stats reads directly. The
+ * only thing that needs the host is the variable-length list of currently-loaded
+ * resources, which is host-owned table data the guest cannot reconstruct from a
+ * fixed block — and it is resolved ON DEMAND here, never published per-mutation.
+ *
+ * MEM_RESOURCES: a0=out array vaddr (array of {u32 id, u32 size}) or 0; a1=cap
+ *   (max pairs the array holds).  Writes up to `cap` {id,size} pairs for the
+ *   currently-loaded resources and returns the *total* loaded count in a0 (may
+ *   exceed `cap`; the array is truncated, the count is not).
+ *
+ * Determinism tiers (ADR-0029 amendment, #159): only budget_cap and the
+ * success/failure outcome of an allocation are deterministic/safe to branch game
+ * logic on.  resource_cache_used, total_used and the loaded-resource residency
+ * are advisory (LRU/history-dependent) — a tuning signal, never game state. */
+#define BLYT_ECALL_MEM_RESOURCES 70
+
 /* Graphics ECALLs (100–199, ADR-0052/0086; issue #188 / Spike X).
  *
  * The paletted 2D drawing surface is Blyt32-specific; its primitives are
@@ -109,7 +130,6 @@
  *     sets cart_has_drawn (displacing the test card). */
 #define BLYT_ECALL_GFX_ACQUIRE 104
 #define BLYT_ECALL_GFX_PRESENT 105
-
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1

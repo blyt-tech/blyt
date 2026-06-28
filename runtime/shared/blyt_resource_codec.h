@@ -40,8 +40,18 @@ int blyt_res_header_parse(const uint8_t *section, size_t section_len, uint8_t *a
  * dsize). For `none`, copies the body verbatim (requires body_len == out_len);
  * for `zstd`, decompresses the frame and verifies the produced length is
  * exactly out_len. Returns 0 on success, -1 on any error (bad algo, size
- * mismatch, corrupt frame). Pure function of its inputs — no allocation. */
+ * mismatch, corrupt frame). The decoded bytes are a pure function of the inputs;
+ * the only allocation is zstd's transient decode scratch, drawn from the
+ * (overridable) hooks below — never the cart-heap arena (#158). */
 int blyt_res_decode(uint8_t algo, const uint8_t *body, size_t body_len, uint8_t *out,
                     size_t out_len);
+
+/* Decode-scratch allocator hooks (#158, ADR-0008): zstd's working memory for a
+ * decompress. Weak defaults forward to stdlib malloc/free; the native bare-metal
+ * libblytcommon overrides them (strong defs) so zstd scratch comes from a raw
+ * mmap allocator rather than the cart-heap arena that interposes `malloc` there.
+ * Signatures match ZSTD_allocFunction / ZSTD_freeFunction. */
+void *blyt_res_scratch_alloc(void *opaque, size_t size);
+void blyt_res_scratch_free(void *opaque, void *address);
 
 #endif /* BLYT_SHARED_RESOURCE_CODEC_H */

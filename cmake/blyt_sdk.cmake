@@ -336,6 +336,11 @@ file(MAKE_DIRECTORY "${SDK_SRC}")
 # First-party guest libraries: runtime/guest → src/blyt (src/ + include/).
 file(COPY "${BLYT_SOURCE_DIR}/runtime/guest/" DESTINATION "${SDK_SRC}/blyt")
 
+# Freestanding shared sources (runtime/shared) compiled into guest libs — e.g.
+# the unified-budget arena (blyt_arena.c, #158) in libblytc → src/blyt-shared,
+# matching the -ffile-prefix-map so the debug libs' DWARF resolves.
+file(COPY "${BLYT_SOURCE_DIR}/runtime/shared/" DESTINATION "${SDK_SRC}/blyt-shared")
+
 # Debug-only DAP master hook, compiled into the debug libblyt32lua →
 # src/blyt-dap.
 file(COPY "${BLYT_SOURCE_DIR}/runtime/host/src/dap/master_hook.c"

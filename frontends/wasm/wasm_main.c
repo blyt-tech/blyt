@@ -38,6 +38,8 @@
 #include "blyt_trace.h"
 
 #ifdef BLYT_LUA
+#include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
+#include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "resource.h"
 #include "save.h"
 #include "state_buffer.h"
@@ -132,6 +134,93 @@ static char g_lua_cart_name[64];
  * reads this instead (#93/#120).  Hybrid carts use the session's table. */
 static blyt_resource_table_t g_lua_resources;
 static bool g_lua_resources_loaded = false;
+
+/* ── Host-Lua fast-path cart heap: the unified 16 MB budget (ADR-0008 #158) ────
+ * The pure-Lua fast path runs the Lua VM natively as wasm32 (S proxy + state
+ * buffers) instead of through rv32emu. For determinism the VM's heap must be
+ * accounted byte-identically to the rv32 path: a Lua cart has to hit the 16 MB
+ * cap at the same logical point on every leg. So the VM allocates through the
+ * SAME runtime/shared arena the emulated/native libblytc runs — one arena, one
+ * accounting block — rather than the default Lua allocator. This is structural
+ * parity (the identical allocator implementation), not a per-allocator match;
+ * it holds because wasm32 shares rv32's numeric model (BLYT_LUA_I32_F64) and
+ * 32-bit pointer width, so every Lua object is the same size on both. The
+ * resource cache stays on the host (emscripten) allocator — its bytes never
+ * enter guest_heap_used; only loaded/pinned footprint gates the budget. */
+_Static_assert(sizeof(void *) == 4, "host-Lua fast path must be wasm32 (32-bit ptr) "
+                                    "for Lua object sizes to match rv32 (#158)");
+_Static_assert(sizeof(lua_Integer) == 4 && sizeof(lua_Number) == 8,
+               "host-Lua fast path must use the i32/f64 numeric model "
+               "(BLYT_LUA_I32_F64) so guest_heap_used matches rv32 (#158)");
+
+static blyt_mem_accounting_t g_lua_mem_acct; /* {guest_heap_used, non_evictable_footprint} */
+static blyt_arena_t g_lua_arena;
+
+/* The arena over a one-time 16 MB region from the host heap (the physical pool
+ * the logical budget spans). Lazily obtained on first allocation. */
+static blyt_arena_t *lua_cart_arena(void) {
+    if (!g_lua_arena.base) {
+        void *region = malloc(BLYT_MEM_BUDGET_BYTES);
+        if (!region)
+            return NULL;
+        g_lua_arena.base = region;
+        g_lua_arena.size = BLYT_MEM_BUDGET_BYTES;
+        g_lua_arena.acct = &g_lua_mem_acct;
+    }
+    return &g_lua_arena;
+}
+
+/* lua_Alloc backed by the shared arena. Lua's contract: nsize==0 frees and
+ * returns NULL; otherwise (re)allocates to nsize (ptr==NULL ⇒ fresh alloc,
+ * osize is then a type tag, ignored). Shrinks never fail (the block already
+ * fits), so a GC-driven realloc-down can't error; a grow past the 16 MB budget
+ * returns NULL and Lua handles the allocation failure (nil/error). */
+static void *wasm_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    (void)ud;
+    (void)osize;
+    blyt_arena_t *a = lua_cart_arena();
+    if (!a)
+        return NULL;
+    if (nsize == 0) {
+        blyt_arena_free(a, ptr);
+        return NULL;
+    }
+    return blyt_arena_realloc(a, ptr, nsize);
+}
+
+/* Reset the cart heap to a fresh-load-identical state (VM recreate on reload):
+ * empties the arena and zeroes the whole accounting block (guest_heap_used AND
+ * the stale non_evictable_footprint from the previous cart, whose resource table
+ * is cleared on reload) so a reloaded Lua cart's allocations are bit-identical to
+ * a first load (mirrors the native/host hot-swap, which zeroes the block). Keeps
+ * the 16 MB region mapped. No-op before the region exists. */
+static void wasm_lua_arena_reset(void) {
+    if (g_lua_arena.base)
+        blyt_arena_reset(&g_lua_arena); /* zeroes guest_heap_used + empties arena */
+    g_lua_mem_acct.non_evictable_footprint = 0;
+}
+
+/* Recompute the non-evictable footprint from the active resource table and
+ * publish it into the cart-heap accounting block, then bound the resident
+ * evictable cache to the room it leaves — the host-Lua mirror of the host
+ * mem_acct_publish_footprint (#158). Call after any load/release. */
+static void wasm_lua_publish_footprint(blyt_resource_table_t *t) {
+    if (!t)
+        return;
+    uint32_t footprint = blyt_resource_table_footprint(t);
+    g_lua_mem_acct.non_evictable_footprint = footprint;
+    blyt_resource_table_evict_to_fit(
+        t, blyt_mem_cache_room(g_lua_mem_acct.guest_heap_used, footprint));
+}
+
+/* Would newly loading/pinning `e` (adding e->len to the footprint when it is so
+ * far evictable) still fit the unified budget? Mirrors mem_acct_reference_fits. */
+static int wasm_lua_reference_fits(blyt_resource_table_t *t, const blyt_resource_entry_t *e,
+                                   int was_evictable) {
+    uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
+    return blyt_mem_alloc_fits(g_lua_mem_acct.guest_heap_used, blyt_resource_table_footprint(t),
+                               incoming);
+}
 #ifdef BLYT_DAP
 static bool g_lua_dap_paused = false; /* hook yielded, waiting for DAP */
 static bool g_lua_needs_start = false; /* waiting for configurationDone */
@@ -1204,10 +1293,19 @@ static int wasm_const_load(lua_State *L) {
         lua_pushnil(L);
         return 1;
     }
+    /* A fresh load reserves e->len of footprint up front (#157/#158). Refuse it
+     * if that would cross the 16 MB budget — :load() returns nil, the same
+     * observable result as the rv32 path's BUFFER_FULL → invalid handle. */
+    if (!wasm_lua_reference_fits(t, e, blyt_rl_is_evictable(&e->rl))) {
+        lua_pushnil(L);
+        return 1;
+    }
     wasm_resource_handle_t *uh = (wasm_resource_handle_t *)lua_newuserdatauv(L, sizeof(*uh), 0);
     uh->id = c->id;
     uh->handle = blyt_rl_load(&e->rl, c->id);
     uh->released = 0;
+    blyt_resource_table_touch(t, e); /* recency for LRU (#158) */
+    wasm_lua_publish_footprint(t); /* footprint grew */
     luaL_setmetatable(L, c->is_text ? BLYT_RESOURCE_TEXT_HANDLE_MT : BLYT_RESOURCE_BYTES_HANDLE_MT);
     return 1;
 }
@@ -1269,8 +1367,12 @@ static int wasm_handle_release(lua_State *L) {
     if (!uh->released) {
         blyt_resource_table_t *t = active_resource_table();
         blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, uh->id) : NULL;
-        if (e)
+        if (e) {
             blyt_rl_release(&e->rl, uh->handle);
+            /* Residency dropped; if now unreferenced its bytes leave the
+             * footprint — republish so the freed budget is visible (#158). */
+            wasm_lua_publish_footprint(t);
+        }
         uh->released = 1;
     }
     return 0;
@@ -1299,7 +1401,15 @@ static int wasm_resource_pin(lua_State *L) {
         lua_pushnil(L);
         return 1;
     }
+    /* Pinning a so-far-evictable resource adds its bytes to the footprint; refuse
+     * if that crosses the 16 MB budget (nil), matching the rv32 pin (#158). */
+    if (!wasm_lua_reference_fits(t, e, blyt_rl_is_evictable(&e->rl))) {
+        lua_pushnil(L);
+        return 1;
+    }
     blyt_rl_pin(&e->rl);
+    blyt_resource_table_touch(t, e); /* recency for LRU (#158) */
+    wasm_lua_publish_footprint(t); /* footprint grew */
     lua_pushlightuserdata(L, (void *)(uintptr_t)e->data);
     lua_pushinteger(L, (lua_Integer)e->len);
     return 2;
@@ -1309,8 +1419,10 @@ static int wasm_resource_unpin(lua_State *L) {
     uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
     blyt_resource_table_t *t = active_resource_table();
     blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, id) : NULL;
-    if (e)
+    if (e) {
         blyt_rl_unpin(&e->rl);
+        wasm_lua_publish_footprint(t); /* footprint may have shrunk (#158) */
+    }
     return 0;
 }
 
@@ -1375,6 +1487,67 @@ static void wasm_register_resource_api(lua_State *L) {
     }
     lua_pop(L, 1);
     lua_pop(L, 1); /* pop resource module */
+}
+
+/* blyt32.mem.stats() for the WASM host-Lua fast path (ADR-0029, #159). Mirrors
+ * the guest lua_mem_stats / host MEM_STATS ECALL byte-for-byte behaviourally,
+ * reading the host accounting block + resource table directly (no ECALL). The
+ * deterministic-vs-advisory contract is documented on blyt_mem_stats in blyt.h.
+ * Note: this path never decompresses (it reads e->data / e->owned as-is), so
+ * resource_cache_used reflects only already-owned buffers — advisory, and not
+ * cross-leg identical by design. */
+static int wasm_mem_stats(lua_State *L) {
+    blyt_resource_table_t *t = active_resource_table();
+    uint32_t cache_used = t ? blyt_resource_table_resident_decompressed(t) : 0u;
+    uint32_t heap_used = g_lua_mem_acct.guest_heap_used;
+
+    lua_createtable(L, 0, 5);
+    lua_pushinteger(L, (lua_Integer)cache_used);
+    lua_setfield(L, -2, "resource_cache_used");
+    lua_pushinteger(L, (lua_Integer)heap_used);
+    lua_setfield(L, -2, "cart_allocations");
+    lua_pushinteger(L, (lua_Integer)(heap_used + cache_used));
+    lua_setfield(L, -2, "total_used");
+    lua_pushinteger(L, (lua_Integer)BLYT_MEM_BUDGET_BYTES);
+    lua_setfield(L, -2, "budget_cap");
+
+    lua_newtable(L); /* resources_loaded */
+    uint32_t shown = 0;
+    if (t) {
+        for (size_t i = 0; i < t->count; i++) {
+            const blyt_resource_entry_t *e = &t->entries[i];
+            if (e->rl.load_count == 0)
+                continue;
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, (lua_Integer)e->id);
+            lua_setfield(L, -2, "id");
+            lua_pushinteger(L, (lua_Integer)(uint32_t)e->len);
+            lua_setfield(L, -2, "size");
+            lua_rawseti(L, -2, (lua_Integer)(++shown));
+        }
+    }
+    lua_setfield(L, -2, "resources_loaded");
+    return 1;
+}
+
+/* Register blyt.mem.* + blyt32.mem.* into g_lua, mirroring the guest
+ * register_mem_module.  Call after the blyt/blyt32 globals exist. */
+static void wasm_register_mem_api(lua_State *L) {
+    lua_newtable(L); /* mem module */
+    lua_pushcfunction(L, wasm_mem_stats);
+    lua_setfield(L, -2, "stats");
+
+    lua_getglobal(L, "blyt");
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, "mem");
+    lua_pop(L, 1);
+    lua_getglobal(L, "blyt32");
+    if (lua_istable(L, -1)) {
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, "mem");
+    }
+    lua_pop(L, 1);
+    lua_pop(L, 1); /* pop mem module */
 }
 
 /* Derive a require()-able module name from a loaded chunk's embedded source
@@ -1505,8 +1678,13 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     lua_close(g_lua);
     g_lua = NULL;
 
-    /* Step 5: create fresh Lua VM */
-    g_lua = luaL_newstate();
+    /* Step 5: create fresh Lua VM on the shared cart-heap arena. Reset the arena
+     * first so the reloaded cart's allocations (and guest_heap_used) are
+     * bit-identical to a fresh load (#158, mirrors the native hot-swap reset). */
+    wasm_lua_arena_reset();
+    /* luaL_makeseed(NULL) is the fixed blyt hash seed (luai_makeseed override) —
+     * the same deterministic seed luaL_newstate uses, kept for determinism. */
+    g_lua = lua_newstate(wasm_lua_alloc, NULL, luaL_makeseed(NULL));
     if (!g_lua) {
         if (snap)
             blyt_state_snapshot_free(snap);
@@ -1557,6 +1735,7 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     wasm_register_s_proxy(g_lua);
     wasm_register_resource_api(g_lua);
     wasm_register_gfx_api(g_lua); /* blyt32.gfx.* (#188) */
+    wasm_register_mem_api(g_lua);
 
     /* Step 8b: for hybrid carts, recreate the Lua↔native exchange thread and
      * register the native export modules BEFORE the bytecode runs — the cart's
@@ -2590,7 +2769,10 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     g_lua_bytecode = bytecode;
     g_lua_bytecode_size = bytecode_size;
 
-    g_lua = luaL_newstate();
+    /* The Lua VM allocates through the shared cart-heap arena so a pure-Lua cart's
+     * guest_heap_used (and the 16 MB cap) matches rv32 byte-for-byte (#158). */
+    wasm_lua_arena_reset();
+    g_lua = lua_newstate(wasm_lua_alloc, NULL, luaL_makeseed(NULL));
     if (!g_lua) {
         blyt_js_error("failed to create Lua state");
         return 1;
@@ -2703,6 +2885,7 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         wasm_register_s_proxy(g_lua);
         wasm_register_resource_api(g_lua);
         wasm_register_gfx_api(g_lua); /* blyt32.gfx.* (#188) */
+        wasm_register_mem_api(g_lua);
     }
 
     /* Load and execute the bytecode (single chunk or BLMC; registers bundled

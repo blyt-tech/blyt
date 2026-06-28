@@ -181,6 +181,60 @@ char *blyt_resource_text_get(blyt_text_resource_t id, size_t *len);
 void *blyt_resource_bytes_get(blyt_bytes_resource_t id, size_t *len);
 
 /* -------------------------------------------------------------------------
+ * Memory introspection API (ADR-0029, issue #159)
+ *
+ * blyt_mem_stats reports cart-visible working-memory usage so a cart can make
+ * informed release decisions near the 16 MB budget.
+ *
+ * DETERMINISM CONTRACT (ADR-0029 amendment, #159) — read before branching on
+ * any of these.  The fields are TIERED, and mixing the tiers is a bug:
+ *
+ *   Deterministic — bit-identical across every peer/platform, SAFE to branch
+ *   game logic on:
+ *     - budget_cap (always 16 MB)
+ *     - the *outcome* of an allocation: a blyt_resource_load / malloc returning
+ *       BLYT_RESOURCE_INVALID / NULL at the cap (see ADR-0008 / #158).
+ *
+ *   Advisory — history-dependent (LRU/eviction order differs across platforms),
+ *   MUST NOT feed deterministic game state.  They are a *tuning* signal for
+ *   "should I proactively release something", which is itself a memory decision,
+ *   not game state:
+ *     - resource_cache_used, total_used
+ *     - the resources[] residency snapshot (which resources are loaded, and the
+ *       loaded count returned)
+ * ------------------------------------------------------------------------- */
+
+/* Scalar memory stats.  total_used == cart_allocations + resource_cache_used. */
+typedef struct {
+    uint32_t resource_cache_used; /* advisory: resident decompressed resource bytes */
+    uint32_t cart_allocations; /* live cart heap bytes (guest_heap_used) */
+    uint32_t total_used; /* advisory: cart_allocations + resource_cache_used */
+    uint32_t budget_cap; /* deterministic: 16 MB working-memory cap */
+} blyt_mem_stats_t;
+
+/* One currently-loaded resource and its (decompressed) size, for the
+ * enumeration filled by blyt_mem_resources. */
+typedef struct {
+    blyt_resource_id_t id;
+    uint32_t size;
+} blyt_mem_resource_t;
+
+/* Fill *out with the current scalar memory stats.  These are published running
+ * totals read straight from the guest-visible accounting block (#158) — no host
+ * round-trip, no allocation, no traversal (ADR-0029). */
+void blyt_mem_stats(blyt_mem_stats_t *out);
+
+/* Enumerate the currently-loaded resources: fill up to `cap` entries of
+ * `resources` with their ids and (decompressed) sizes, and return the *total*
+ * loaded count — which may exceed `cap` (the array is truncated; the count is
+ * not), so a caller can size a follow-up buffer.  Pass `resources == NULL` /
+ * `cap == 0` to query just the count.  Unlike blyt_mem_stats this needs the
+ * host (the loaded set is host-owned, variable-length table data), so it is the
+ * on-demand half of the API — call it only when the per-resource breakdown is
+ * actually wanted, not on a hot budget-polling path. */
+uint32_t blyt_mem_resources(blyt_mem_resource_t *resources, uint32_t cap);
+
+/* -------------------------------------------------------------------------
  * Cart lifecycle types for save/load callbacks (ADR-0087 amendment)
  * ------------------------------------------------------------------------- */
 typedef enum {

@@ -44,12 +44,18 @@ typedef struct {
      * rehydrate from `cdata`/the cart map instead). */
     char *src_path;
     blyt_rl_state_t rl; /* load/pin refcounts + load generation (#123) */
+    /* Recency stamp for LRU victim selection under budget pressure (#158).
+     * Bumped from the table's monotonic clock on each load/pin/access; advisory
+     * (not cross-platform identical — only the non-evictable footprint carries
+     * determinism), so the LRU order it imposes never affects alloc success. */
+    uint32_t last_access;
 } blyt_resource_entry_t;
 
 typedef struct {
     blyt_resource_entry_t *entries;
     size_t count;
     size_t cap;
+    uint32_t lru_clock; /* monotonic access counter; stamps entry->last_access (#158) */
 } blyt_resource_table_t;
 
 void blyt_resource_table_init(blyt_resource_table_t *t);
@@ -81,6 +87,39 @@ size_t blyt_resource_entry_evict(blyt_resource_entry_t *e);
  * evictable" forcing primitive behind the test hook, and the terminal fallback
  * of evict-before-fail (#158). Returns the total owned bytes reclaimed. */
 size_t blyt_resource_table_evict_all_evictable(blyt_resource_table_t *t);
+
+/* ── Unified-budget accounting + eviction policy (ADR-0008/0027 #158) ──────── */
+
+/* The non-evictable footprint: Sum of decompressed length (e->len) over every
+ * loaded/pinned (and, later, persistent) entry. This is the determinism-bearing
+ * figure — the host publishes it to the guest so a `malloc`/`load` succeeds or
+ * fails at the same logical point on every leg. Counts e->len up front, whether
+ * or not the entry is currently materialized (a load reserves the budget). */
+uint32_t blyt_resource_table_footprint(const blyt_resource_table_t *t);
+
+/* Currently-resident *evictable* (reclaimable) cache bytes: Sum of e->len over
+ * evictable entries that hold owned bytes. Advisory — bounded by eviction but
+ * not part of any determinism contract. */
+uint32_t blyt_resource_table_resident_evictable(const blyt_resource_table_t *t);
+
+/* Currently-resident *decompressed* cache bytes — the `resource_cache_used`
+ * figure for the introspection API (ADR-0029, #159): Sum of e->len over every
+ * entry that holds an owned decompressed buffer (e->owned != NULL), whether or
+ * not it is currently evictable. Zero-copy map-aliased (uncompressed) entries
+ * have no owned bytes and never count — only *decompressed* resources occupy
+ * cache. Advisory/history-dependent (residency follows LRU eviction), never a
+ * determinism surface. */
+uint32_t blyt_resource_table_resident_decompressed(const blyt_resource_table_t *t);
+
+/* Stamp an entry as most-recently-used (advisory recency for LRU selection).
+ * Call on each load/pin/access. */
+void blyt_resource_table_touch(blyt_resource_table_t *t, blyt_resource_entry_t *e);
+
+/* LRU-incremental evict-to-fit: evict evictable resident entries, least-recently
+ * accessed first, until the resident evictable cache is <= max_resident_evictable
+ * (or none remain). Frees the MINIMUM needed and stops the instant it fits
+ * (#158, ADR-0027 — the pressure response). Returns the total bytes reclaimed. */
+size_t blyt_resource_table_evict_to_fit(blyt_resource_table_t *t, uint32_t max_resident_evictable);
 
 /* Append a zero-initialised entry and return it (grows the table). Exposed for
  * unit tests that construct entries directly (test_resource_eviction.c); the

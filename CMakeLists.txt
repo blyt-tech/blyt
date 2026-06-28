@@ -936,6 +936,20 @@ add_executable(test_resource_lifecycle tests/unit/test_resource_lifecycle.c)
 target_include_directories(test_resource_lifecycle PRIVATE runtime/shared)
 add_test(NAME test_resource_lifecycle COMMAND test_resource_lifecycle)
 
+# test_mem_budget: pins the shared unified-memory-budget accounting primitives
+# (runtime/shared/blyt_mem_budget.h, ADR-0008 #158). Header-only and
+# freestanding, so the test just needs the include dir.
+add_executable(test_mem_budget tests/unit/test_mem_budget.c)
+target_include_directories(test_mem_budget PRIVATE runtime/shared)
+add_test(NAME test_mem_budget COMMAND test_mem_budget)
+
+# test_arena: pins the single-sourced cart-heap arena allocator
+# (runtime/shared/blyt_arena.c, ADR-0008 #158) — first-fit/split/coalesce
+# behaviour plus guest_heap_used accounting and the 16 MB logical cap.
+add_executable(test_arena tests/unit/test_arena.c runtime/shared/blyt_arena.c)
+target_include_directories(test_arena PRIVATE runtime/shared)
+add_test(NAME test_arena COMMAND test_arena)
+
 # test_resource_eviction: the host resource eviction mechanism + rehydration
 # (runtime/host/src/libblyt/resource.c, ADR-0027 v2, #137). Links libblyt for
 # the table/entry API + the shared codec; constructs entries directly via the
@@ -945,6 +959,16 @@ target_include_directories(test_resource_eviction
                            PRIVATE runtime/host/src/libblyt runtime/shared)
 target_link_libraries(test_resource_eviction PRIVATE libblyt)
 add_test(NAME test_resource_eviction COMMAND test_resource_eviction)
+
+# test_resource_budget: the host resource-side budget accounting +
+# LRU-incremental eviction policy (runtime/host/src/libblyt/resource.c,
+# ADR-0008/0027 #158) — footprint, resident-evictable, recency stamp,
+# evict-to-fit (minimum, LRU-first).
+add_executable(test_resource_budget tests/unit/test_resource_budget.c)
+target_include_directories(test_resource_budget PRIVATE runtime/host/src/libblyt
+                                                        runtime/shared)
+target_link_libraries(test_resource_budget PRIVATE libblyt)
+add_test(NAME test_resource_budget COMMAND test_resource_budget)
 
 # test_resource_codec: the per-resource compression on-disk format + decode
 # (runtime/shared/blyt_resource_codec.c, #157, ADR-0026). Links the decode-only
@@ -1247,8 +1271,11 @@ add_dependencies(
   test_cart_run
   test_blys
   test_resource_lifecycle
+  test_mem_budget
+  test_arena
   test_resource_codec
-  test_resource_eviction)
+  test_resource_eviction
+  test_resource_budget)
 if(TARGET test_gdb_stub)
   add_dependencies(test-unit test_gdb_stub)
 endif()

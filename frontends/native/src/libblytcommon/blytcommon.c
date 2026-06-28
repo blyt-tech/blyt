@@ -26,10 +26,12 @@
 #include <stdint.h>
 
 #include "blyt.h"
+#include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
 #include "blyt_blys.h" /* runtime/shared: shared BLYS save format (ADR-0125, #129) */
 #include "blyt_elf_section.h" /* runtime/shared: blyt_elf32_find_section */
 #include "blyt_fp_canon.h" /* runtime/shared: blyt_canon_f32/f64 (ADR-0010) */
 #include "blyt_gen.h" /* runtime/shared: blyt_gen_next (ADR-0096) */
+#include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "blyt_native_trace.h"
 #include "blyt_resource_codec.h" /* runtime/shared: per-resource compression (#157) */
 #include "blyt_resource_lifecycle.h" /* runtime/shared: load/pin refcount state (#123) */
@@ -661,6 +663,127 @@ done:;
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
 }
 
+/* ── Anonymous mmap helpers (raw allocator + cart-heap arena) ─────────────────
+ * mmap (222) / munmap (215) are on the restricted seccomp allowlist, so both run
+ * post-filter. Used by the private raw allocator (resource scratch) and to back
+ * the cart-heap arena region (#158). */
+static void *native_mmap_anon(size_t len) {
+    register long a0 __asm__("a0") = 0; /* addr   = NULL */
+    register long a1 __asm__("a1") = (long)len;
+    register long a2 __asm__("a2") = 3; /* PROT_READ | PROT_WRITE */
+    register long a3 __asm__("a3") = 34; /* MAP_PRIVATE | MAP_ANONYMOUS */
+    register long a4 __asm__("a4") = -1; /* fd = -1 */
+    register long a5 __asm__("a5") = 0; /* offset = 0 */
+    register long a7 __asm__("a7") = 222; /* SYS_mmap */
+    __asm__ volatile("ecall"
+                     : "+r"(a0)
+                     : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
+                     : "memory");
+    if ((unsigned long)(long)a0 > (unsigned long)-4096UL) /* -errno */
+        return (void *)0;
+    return (void *)(long)a0;
+}
+
+static void native_munmap_anon(void *ptr, size_t len) {
+    register long a0 __asm__("a0") = (long)ptr;
+    register long a1 __asm__("a1") = (long)len;
+    register long a7 __asm__("a7") = 215; /* SYS_munmap */
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+}
+
+/* ── Private raw allocator (resource cache + decode scratch, #158) ────────────
+ * The resource subsystem (the table, decompressed buffers, and zstd's decode
+ * scratch) must NOT draw on the cart-heap arena: its bytes are accounted as the
+ * non-evictable footprint / advisory cache, never in guest_heap_used (ADR-0008
+ * "the resource cache uses a separate raw allocator"). On bare metal the cart's
+ * `malloc` is the arena (interposed via libblytc), so these allocations use a
+ * private mmap-per-block allocator instead of `malloc`. Layout: a 16-byte header
+ * holding the total mmap length, then 16-byte-aligned user data. */
+#define NATIVE_RAW_HDR 16u
+
+static void *raw_malloc(size_t n) {
+    if (!n)
+        n = 1;
+    size_t total = n + NATIVE_RAW_HDR;
+    void *m = native_mmap_anon(total);
+    if (!m)
+        return (void *)0;
+    *(size_t *)m = total;
+    return (char *)m + NATIVE_RAW_HDR;
+}
+
+static void raw_free(void *p) {
+    if (!p)
+        return;
+    char *m = (char *)p - NATIVE_RAW_HDR;
+    size_t total = *(size_t *)m;
+    native_munmap_anon(m, total);
+}
+
+/* zstd decode-scratch hooks (runtime/shared codec, #158): STRONG overrides of
+ * the codec's weak defaults so a compressed resource's transient zstd workspace
+ * comes from the raw allocator, never the cart arena. */
+void *blyt_res_scratch_alloc(void *opaque, size_t size) {
+    (void)opaque;
+    return raw_malloc(size);
+}
+void blyt_res_scratch_free(void *opaque, void *address) {
+    (void)opaque;
+    raw_free(address);
+}
+
+/* ── Cart-heap arena + unified 16 MB budget (ADR-0008/0027 #158) ──────────────
+ * The single cart-visible heap allocator on the native path — the same
+ * runtime/shared arena the emulated libblytc runs, so guest_heap_used (and the
+ * point at which an allocation hits the 16 MB cap) is byte-identical native↔
+ * emulated for every cart language (the determinism contract). One instance,
+ * one accounting block, shared in-process by: the native libblytc malloc family
+ * (C/Rust/C++ carts), the native Lua VM allocator (lua_native_malloc.c), and the
+ * resource table below (which writes non_evictable_footprint and reads
+ * guest_heap_used). libblytc / libblyt32lua reach it through the exported
+ * blyt_cart_heap_* entry points over the DT_NEEDED chain. Unlike the emulated
+ * path there is no host to stamp the region, so it is lazily mmap'd on first use
+ * (post-seccomp; mmap is allowlisted). */
+static blyt_mem_accounting_t g_mem_acct; /* {guest_heap_used, non_evictable_footprint} */
+static blyt_arena_t g_cart_arena;
+
+static blyt_arena_t *cart_arena(void) {
+    if (!g_cart_arena.base) {
+        void *region = native_mmap_anon(BLYT_MEM_BUDGET_BYTES);
+        if (!region)
+            return (void *)0; /* OOM: malloc returns NULL until a region is obtained */
+        g_cart_arena.base = region;
+        g_cart_arena.size = BLYT_MEM_BUDGET_BYTES;
+        g_cart_arena.acct = &g_mem_acct;
+    }
+    return &g_cart_arena;
+}
+
+void *blyt_cart_heap_malloc(size_t n) {
+    blyt_arena_t *a = cart_arena();
+    return a ? blyt_arena_malloc(a, n) : (void *)0;
+}
+void blyt_cart_heap_free(void *p) {
+    blyt_arena_t *a = cart_arena();
+    if (a)
+        blyt_arena_free(a, p);
+}
+void *blyt_cart_heap_realloc(void *p, size_t n) {
+    blyt_arena_t *a = cart_arena();
+    return a ? blyt_arena_realloc(a, p, n) : (void *)0;
+}
+void *blyt_cart_heap_calloc(size_t nmemb, size_t sz) {
+    blyt_arena_t *a = cart_arena();
+    return a ? blyt_arena_calloc(a, nmemb, sz) : (void *)0;
+}
+void *blyt_cart_heap_aligned_alloc(size_t alignment, size_t size) {
+    /* Every arena block is 16-byte aligned, satisfying alignments up to 16
+     * (matches the emulated libblytc aligned_alloc). Larger is unsupported. */
+    if (alignment > 16u)
+        return (void *)0;
+    return blyt_cart_heap_malloc(size);
+}
+
 /* ── Resource lifecycle (ADR-0027, #123) ─────────────────────────────────────
  *
  * Native bare-metal serves resources from the cart's own packed ELF: the cart
@@ -690,26 +813,30 @@ typedef struct {
     uint8_t algo;
     const uint8_t *cdata;
     uint32_t clen;
-    uint8_t *owned; /* malloc'd decompressed buffer (zstd), or NULL */
+    uint8_t *owned; /* raw_malloc'd decompressed buffer (zstd), or NULL */
     blyt_rl_state_t rl;
+    /* Recency stamp for LRU victim selection under budget pressure (#158).
+     * Advisory (never cross-platform identical — only the footprint carries
+     * determinism), so the LRU order it imposes never affects alloc success. */
+    uint32_t last_access;
 } native_res_t;
 
 static const uint8_t *s_cart_map; /* retained read-only cart mapping, or NULL */
 static uint32_t s_cart_size;
-static native_res_t *s_res; /* malloc'd array of s_res_count entries, or NULL */
+static native_res_t *s_res; /* raw_malloc'd array of s_res_count entries, or NULL */
 static uint32_t s_res_count;
+static uint32_t s_lru_clock; /* monotonic access counter; stamps e->last_access (#158) */
 /* BLYT_RESOURCE_EVICT_EVERY_FRAME test hook (#137): force-evict every evictable
  * resource at each frame boundary so the next frame rehydrates from scratch.
  * Read once at startup (getenv reads environ, no syscall — safe post-seccomp). */
 static int s_evict_every_frame; /* 0/1, set in blyt_runtime_startup */
 
-/* malloc/free come from ld-blyt.so.1 (system musl) via the DT_NEEDED chain; the
- * native libblytcommon has no other libc dependency declared, so declare them
- * here rather than pulling in <stdlib.h>.  mmap (222) is on the restricted
- * seccomp allowlist, so malloc works post-filter — a compressed resource can be
- * decompressed lazily at pin time (#157). */
-extern void *malloc(size_t);
-extern void free(void *);
+/* The resource table, decompressed buffers, and zstd decode scratch use the
+ * private raw allocator (raw_malloc/raw_free, mmap-backed) — NOT the cart-heap
+ * arena that `malloc` resolves to on this path — so resource bytes never enter
+ * guest_heap_used (#158, ADR-0008). mmap (222)/munmap (215) are on the restricted
+ * seccomp allowlist, so it works post-filter; a compressed resource decompresses
+ * lazily at pin time into a raw_malloc buffer (#157). */
 
 /* ── Shared `.cart.resource.<id>` enumeration (runtime/shared, #141) ──
  * Two-pass eager load: count the numeric resource sections, allocate exactly
@@ -746,6 +873,7 @@ static void res_fill_cb(const char *suffix, uint32_t suffix_len, uint32_t off, u
     e->id = id;
     e->owned = NULL;
     e->rl = (blyt_rl_state_t){0};
+    e->last_access = 0;
 
     /* Parse the 8-byte compression header (#157): NONE aliases the body in the
      * map (zero-copy, off+8); ZSTD keeps the compressed body for lazy decode and
@@ -845,7 +973,7 @@ static void resources_init(void) {
                                        &n);
     if (n == 0)
         return;
-    native_res_t *arr = (native_res_t *)malloc((size_t)n * sizeof(native_res_t));
+    native_res_t *arr = (native_res_t *)raw_malloc((size_t)n * sizeof(native_res_t));
     if (!arr)
         return;
     struct res_fill_ctx fc = {arr, n, 0, s_cart_map};
@@ -872,11 +1000,11 @@ static const uint8_t *native_res_data(native_res_t *e) {
         return e->data; /* zero-copy (none) or already-materialized (zstd) */
     if (e->algo != BLYT_RES_ALGO_ZSTD || e->len == 0)
         return e->data;
-    uint8_t *buf = (uint8_t *)malloc(e->len);
+    uint8_t *buf = (uint8_t *)raw_malloc(e->len);
     if (!buf)
         return NULL;
     if (blyt_res_decode(e->algo, e->cdata, e->clen, buf, e->len) != 0) {
-        free(buf);
+        raw_free(buf);
         return NULL;
     }
     e->owned = buf;
@@ -897,7 +1025,7 @@ static uint32_t native_res_evict(native_res_t *e) {
     if (!e->owned)
         return 0;
     uint32_t reclaimed = e->len;
-    free(e->owned);
+    raw_free(e->owned);
     e->owned = NULL;
     e->data = NULL; /* not resident; next pin rehydrates via native_res_data */
     return reclaimed;
@@ -912,12 +1040,109 @@ static uint32_t native_resources_evict_all_evictable(void) {
     return total;
 }
 
+/* ── Unified-budget accounting + eviction policy (ADR-0008/0027 #158) ──────────
+ * The native mirror of the host's cart_run.c bridge: direct in-process struct
+ * access (no ECALL). The resource table writes g_mem_acct.non_evictable_footprint
+ * and reads g_mem_acct.guest_heap_used (which the cart-heap arena maintains), so
+ * a guest malloc and a resource load/pin draw on the one 16 MB budget exactly as
+ * on the emulated path. The policy functions below are deliberately the same
+ * shape as resource.c so the two cannot drift. */
+
+/* Σ e->len over loaded/pinned (non-evictable) entries — the determinism-bearing
+ * footprint (counted up front, materialized or not, #157). */
+static uint32_t native_res_footprint(void) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < s_res_count; i++)
+        if (!blyt_rl_is_evictable(&s_res[i].rl))
+            total += s_res[i].len;
+    return total;
+}
+
+/* Σ e->len over currently-resident evictable entries — advisory cache size. */
+static uint32_t native_res_resident_evictable(void) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < s_res_count; i++)
+        if (s_res[i].owned && blyt_rl_is_evictable(&s_res[i].rl))
+            total += s_res[i].len;
+    return total;
+}
+
+/* Σ e->len over entries holding an owned decompressed buffer — the advisory
+ * resource_cache_used figure (#159, ADR-0029; mirrors
+ * blyt_resource_table_resident_decompressed). Zero-copy map-aliased entries have
+ * no owned bytes and never count. */
+static uint32_t native_res_resident_decompressed(void) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < s_res_count; i++)
+        if (s_res[i].owned)
+            total += s_res[i].len;
+    return total;
+}
+
+/* Stamp an entry most-recently-used (advisory recency for LRU selection). */
+static void native_res_touch(native_res_t *e) {
+    e->last_access = ++s_lru_clock;
+}
+
+/* LRU-incremental evict-to-fit: evict resident evictable entries, oldest first,
+ * until the resident evictable cache is <= max_resident_evictable (or none
+ * remain). Frees the minimum and stops the instant it fits (#158, ADR-0027). */
+static void native_res_evict_to_fit(uint32_t max_resident_evictable) {
+    for (;;) {
+        if (native_res_resident_evictable() <= max_resident_evictable)
+            return;
+        native_res_t *victim = NULL;
+        for (uint32_t i = 0; i < s_res_count; i++) {
+            native_res_t *e = &s_res[i];
+            if (!e->owned || !blyt_rl_is_evictable(&e->rl))
+                continue;
+            if (!victim || e->last_access < victim->last_access)
+                victim = e;
+        }
+        if (!victim)
+            return;
+        native_res_evict(victim);
+    }
+}
+
+/* Publish the footprint into the shared accounting block and bound the resident
+ * evictable cache to the room it leaves (the housekeeping eviction site). Mirrors
+ * mem_acct_publish_footprint; call after any load/pin/unpin/release and at the
+ * frame boundary. */
+static void native_mem_publish_footprint(void) {
+    uint32_t footprint = native_res_footprint();
+    g_mem_acct.non_evictable_footprint = footprint;
+    native_res_evict_to_fit(blyt_mem_cache_room(g_mem_acct.guest_heap_used, footprint));
+    /* Publish the advisory resident-decompressed cache total for the
+     * introspection API (#159) — after eviction, so it reflects what is resident.
+     * blyt_mem_stats reads it back from g_mem_acct, mirroring the emulated path. */
+    g_mem_acct.resource_cache_used = native_res_resident_decompressed();
+}
+
+/* Would newly referencing `e` (a load/pin that makes a so-far-evictable entry
+ * non-evictable, adding e->len to the footprint) still fit the unified budget?
+ * Eviction is NOT attempted — evictable cache is not in the predicate, so
+ * evicting it cannot change the decision (mirrors mem_acct_reference_fits). */
+static int native_mem_reference_fits(const native_res_t *e, int was_evictable) {
+    uint32_t incoming = was_evictable ? e->len : 0u;
+    return blyt_mem_alloc_fits(g_mem_acct.guest_heap_used, native_res_footprint(), incoming);
+}
+
 blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size) {
     int i = res_find(id);
     if (i < 0) {
         if (out_ptr)
             *out_ptr = 0;
         return BLYT_ERR_NOT_FOUND;
+    }
+    /* Unified-budget gate (#158): pinning a so-far-evictable resource adds its
+     * bytes to the non-evictable footprint. Refuse with BUFFER_FULL if that
+     * would exceed the 16 MB budget (heap + footprint); eviction can't help. */
+    int pin_was_evictable = blyt_rl_is_evictable(&s_res[i].rl);
+    if (!native_mem_reference_fits(&s_res[i], pin_was_evictable)) {
+        if (out_ptr)
+            *out_ptr = 0;
+        return BLYT_ERR_BUFFER_FULL;
     }
     /* Materialize first: a compressed resource decompresses on first pin. */
     const uint8_t *bytes = native_res_data(&s_res[i]);
@@ -927,6 +1152,8 @@ blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, siz
         return BLYT_ERR_IO; /* decode failed / OOM */
     }
     blyt_rl_pin(&s_res[i].rl);
+    native_res_touch(&s_res[i]); /* recency for LRU (#158) */
+    native_mem_publish_footprint(); /* footprint grew; bound cache */
     if (out_ptr)
         *out_ptr = bytes; /* map alias (none) or owned decompressed buffer (zstd) */
     if (out_size)
@@ -938,7 +1165,11 @@ blyt_result_t blyt_resource_unpin(blyt_resource_id_t id) {
     int i = res_find(id);
     if (i < 0)
         return BLYT_ERR_NOT_FOUND;
-    return blyt_rl_unpin(&s_res[i].rl) ? BLYT_OK : BLYT_ERR_INVALID_ARG;
+    if (!blyt_rl_unpin(&s_res[i].rl))
+        return BLYT_ERR_INVALID_ARG;
+    /* The pin dropped; if now unreferenced its bytes leave the footprint. */
+    native_mem_publish_footprint();
+    return BLYT_OK;
 }
 
 blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_handle) {
@@ -948,7 +1179,16 @@ blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_han
             *out_handle = BLYT_RESOURCE_INVALID;
         return BLYT_ERR_NOT_FOUND;
     }
+    /* A fresh load reserves e->len of footprint up front (#157/#158). Refuse it
+     * if that would exceed the 16 MB budget — the caller maps !OK to nil. */
+    if (!native_mem_reference_fits(&s_res[i], blyt_rl_is_evictable(&s_res[i].rl))) {
+        if (out_handle)
+            *out_handle = BLYT_RESOURCE_INVALID;
+        return BLYT_ERR_BUFFER_FULL;
+    }
     blyt_resource_h h = blyt_rl_load(&s_res[i].rl, id);
+    native_res_touch(&s_res[i]); /* recency for LRU (#158) */
+    native_mem_publish_footprint(); /* footprint grew */
     if (out_handle)
         *out_handle = h;
     return BLYT_OK;
@@ -960,7 +1200,40 @@ blyt_result_t blyt_resource_release(blyt_resource_h handle) {
     int i = res_find(handle & 0xFFFFu);
     if (i < 0)
         return BLYT_ERR_INVALID_ARG;
-    return blyt_rl_release(&s_res[i].rl, handle) ? BLYT_OK : BLYT_ERR_INVALID_ARG;
+    if (!blyt_rl_release(&s_res[i].rl, handle))
+        return BLYT_ERR_INVALID_ARG;
+    /* Residency dropped; if now unreferenced its bytes leave the footprint. */
+    native_mem_publish_footprint();
+    return BLYT_OK;
+}
+
+/* Memory introspection (ADR-0029, #159): the native counterparts of the guest
+ * blyt_mem_stats / blyt_mem_resources. Scalars come from the same accounting
+ * block g_mem_acct (no syscall); the loaded-resource list is enumerated on
+ * demand from the resource table. */
+void blyt_mem_stats(blyt_mem_stats_t *out) {
+    if (!out)
+        return;
+    uint32_t cache = g_mem_acct.resource_cache_used;
+    uint32_t heap = g_mem_acct.guest_heap_used;
+    out->resource_cache_used = cache;
+    out->cart_allocations = heap;
+    out->total_used = heap + cache;
+    out->budget_cap = BLYT_MEM_BUDGET_BYTES;
+}
+
+uint32_t blyt_mem_resources(blyt_mem_resource_t *resources, uint32_t cap) {
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < s_res_count; i++) {
+        if (s_res[i].rl.load_count == 0)
+            continue;
+        if (resources && loaded < cap) {
+            resources[loaded].id = s_res[i].id;
+            resources[loaded].size = s_res[i].len;
+        }
+        loaded++;
+    }
+    return loaded;
 }
 
 /* Frame-boundary force-release: drop every pin (ADR-0027 frame-scope). */
@@ -1037,6 +1310,10 @@ void blyt_frame_done(void) {
      * rehydrates from scratch — proves the bare-metal evict/rehydrate path. */
     if (s_evict_every_frame)
         native_resources_evict_all_evictable();
+    /* Frame-boundary housekeeping (#158): pins just dropped, so the footprint may
+     * have shrunk — republish it and bound the resident cache to the room the
+     * current heap+footprint leaves (mirrors the host frame-boundary sweep). */
+    native_mem_publish_footprint();
     if (blyt32_trace_api_enabled()) {
         static const char msg[] = "[blyt:api] frame_done()\n";
         blyt32_trace_write(msg, sizeof(msg) - 1);
