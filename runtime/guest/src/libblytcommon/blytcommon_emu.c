@@ -18,6 +18,8 @@
 
 #include "blyt.h"
 
+#include "blyt_mem_budget.h" /* runtime/shared: blyt_mem_accounting_t + budget cap */
+
 /* ECALL numbers (must match runtime/host/src/libblyt/ecall.h). */
 #define ECALL_CONSOLE_DEBUG 1
 #define ECALL_FRAME_DONE 2
@@ -25,6 +27,7 @@
 #define ECALL_RESOURCE_UNPIN 62
 #define ECALL_RESOURCE_LOAD 63
 #define ECALL_RESOURCE_RELEASE 64
+#define ECALL_MEM_RESOURCES 70
 
 static unsigned int blytcommon_strlen(const char *s) {
     const char *p = s;
@@ -109,4 +112,32 @@ blyt_result_t blyt_resource_release(blyt_resource_h handle) {
     register long a7 __asm__("a7") = ECALL_RESOURCE_RELEASE;
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
     return (blyt_result_t)a0;
+}
+
+/* ── Memory introspection (ADR-0029, #159) ──────────────────────────────────
+ *
+ * The scalar totals are published sums in the guest-readable accounting block
+ * (blyt_mem_acct, exported by libblytc, #158): blyt_mem_stats reads them with NO
+ * ECALL — the "running totals" ADR-0029 calls for. Only the variable-length
+ * loaded-resource list needs the host, resolved on demand via ECALL. The native
+ * libblytcommon variant overrides both with direct implementations. */
+extern blyt_mem_accounting_t blyt_mem_acct;
+
+void blyt_mem_stats(blyt_mem_stats_t *out) {
+    if (!out)
+        return;
+    uint32_t heap = blyt_mem_acct.guest_heap_used;
+    uint32_t cache = blyt_mem_acct.resource_cache_used;
+    out->resource_cache_used = cache;
+    out->cart_allocations = heap;
+    out->total_used = heap + cache;
+    out->budget_cap = BLYT_MEM_BUDGET_BYTES;
+}
+
+uint32_t blyt_mem_resources(blyt_mem_resource_t *resources, uint32_t cap) {
+    register long a0 __asm__("a0") = (long)resources;
+    register long a1 __asm__("a1") = (long)cap;
+    register long a7 __asm__("a7") = ECALL_MEM_RESOURCES;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    return (uint32_t)a0;
 }

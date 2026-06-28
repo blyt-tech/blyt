@@ -543,6 +543,11 @@ static void mem_acct_publish_footprint(blyt_run_ctx_t *ctx, memory_t *mem) {
     memory_write(mem, ctx->mem_acct_vaddr + 4u, b, 4);
     uint32_t heap_used = mem_acct_guest_heap_used(ctx, mem);
     blyt_resource_table_evict_to_fit(&ctx->resources, blyt_mem_cache_room(heap_used, footprint));
+    /* Publish the advisory resident-decompressed cache total for the
+     * introspection API (#159) — after eviction, so it reflects what is actually
+     * resident. The guest reads it from blyt_mem_acct without an ECALL. */
+    write_u32_le(b, blyt_resource_table_resident_decompressed(&ctx->resources));
+    memory_write(mem, ctx->mem_acct_vaddr + 8u, b, 4);
 }
 
 /* Would making `id` non-evictable (a load/pin that adds e->len to the footprint)
@@ -1518,6 +1523,40 @@ static void blyt_ecall_handler(riscv_t *rv) {
         }
         blyt_tracef(BLYT_TRACE_API, "resource_release(handle=%u) -> %u", handle, res);
         rv_set_reg(rv, rv_reg_a0, res);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_MEM_RESOURCES: {
+        /* a0=out resources array vaddr (or 0); a1=cap pairs. Enumerates the
+         * currently-loaded (load_count>0) resources, writing up to `cap`
+         * {u32 id, u32 size} pairs, and returns the full loaded count — the
+         * on-demand half of the introspection API (the scalars are read from the
+         * accounting block, no ECALL; #159, ADR-0029). */
+        uint32_t out_res_vaddr = rv_get_reg(rv, rv_reg_a0);
+        uint32_t cap = rv_get_reg(rv, rv_reg_a1);
+        vm_attr_t *attr = PRIV(rv);
+        memory_t *mem = attr->mem;
+
+        uint32_t loaded = 0;
+        if (g_run_ctx) {
+            const blyt_resource_table_t *t = &g_run_ctx->resources;
+            for (size_t i = 0; i < t->count; i++) {
+                const blyt_resource_entry_t *e = &t->entries[i];
+                if (e->rl.load_count == 0)
+                    continue;
+                if (out_res_vaddr && loaded < cap) {
+                    uint8_t pair[8];
+                    write_u32_le(pair + 0, e->id);
+                    write_u32_le(pair + 4, (uint32_t)e->len);
+                    memory_write(mem, out_res_vaddr + loaded * 8u, pair, sizeof(pair));
+                }
+                loaded++;
+            }
+        }
+
+        blyt_tracef(BLYT_TRACE_API, "mem_resources() -> loaded=%u", loaded);
+        rv_set_reg(rv, rv_reg_a0, loaded);
         rv->PC += 4;
         return;
     }
@@ -2710,7 +2749,12 @@ blyt_resource_table_t *blyt_session_resources(blyt_session_t *s) {
 size_t blyt_session_resource_evict_all(blyt_session_t *s) {
     if (!s)
         return 0;
-    return blyt_resource_table_evict_all_evictable(&s->ctx.resources);
+    size_t freed = blyt_resource_table_evict_all_evictable(&s->ctx.resources);
+    /* Forced eviction freed owned bytes — republish the accounting block so the
+     * advisory resource_cache_used the guest reads is current immediately, not
+     * only after the next frame-boundary publish (#159). */
+    mem_acct_publish_footprint(&s->ctx, s->attr.mem);
+    return freed;
 }
 
 bool blyt_session_reload_resources(blyt_session_t *session, blyt_cart_t *cart) {

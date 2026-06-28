@@ -102,6 +102,15 @@ uint32_t blyt_resource_table_footprint(const blyt_resource_table_t *t);
  * not part of any determinism contract. */
 uint32_t blyt_resource_table_resident_evictable(const blyt_resource_table_t *t);
 
+/* Currently-resident *decompressed* cache bytes — the `resource_cache_used`
+ * figure for the introspection API (ADR-0029, #159): Sum of e->len over every
+ * entry that holds an owned decompressed buffer (e->owned != NULL), whether or
+ * not it is currently evictable. Zero-copy map-aliased (uncompressed) entries
+ * have no owned bytes and never count — only *decompressed* resources occupy
+ * cache. Advisory/history-dependent (residency follows LRU eviction), never a
+ * determinism surface. */
+uint32_t blyt_resource_table_resident_decompressed(const blyt_resource_table_t *t);
+
 /* Stamp an entry as most-recently-used (advisory recency for LRU selection).
  * Call on each load/pin/access. */
 void blyt_resource_table_touch(blyt_resource_table_t *t, blyt_resource_entry_t *e);
