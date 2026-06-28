@@ -1394,6 +1394,67 @@ static void wasm_register_resource_api(lua_State *L) {
     lua_pop(L, 1); /* pop resource module */
 }
 
+/* blyt32.mem.stats() for the WASM host-Lua fast path (ADR-0029, #159). Mirrors
+ * the guest lua_mem_stats / host MEM_STATS ECALL byte-for-byte behaviourally,
+ * reading the host accounting block + resource table directly (no ECALL). The
+ * deterministic-vs-advisory contract is documented on blyt_mem_stats in blyt.h.
+ * Note: this path never decompresses (it reads e->data / e->owned as-is), so
+ * resource_cache_used reflects only already-owned buffers — advisory, and not
+ * cross-leg identical by design. */
+static int wasm_mem_stats(lua_State *L) {
+    blyt_resource_table_t *t = active_resource_table();
+    uint32_t cache_used = t ? blyt_resource_table_resident_decompressed(t) : 0u;
+    uint32_t heap_used = g_lua_mem_acct.guest_heap_used;
+
+    lua_createtable(L, 0, 5);
+    lua_pushinteger(L, (lua_Integer)cache_used);
+    lua_setfield(L, -2, "resource_cache_used");
+    lua_pushinteger(L, (lua_Integer)heap_used);
+    lua_setfield(L, -2, "cart_allocations");
+    lua_pushinteger(L, (lua_Integer)(heap_used + cache_used));
+    lua_setfield(L, -2, "total_used");
+    lua_pushinteger(L, (lua_Integer)BLYT_MEM_BUDGET_BYTES);
+    lua_setfield(L, -2, "budget_cap");
+
+    lua_newtable(L); /* resources_loaded */
+    uint32_t shown = 0;
+    if (t) {
+        for (size_t i = 0; i < t->count; i++) {
+            const blyt_resource_entry_t *e = &t->entries[i];
+            if (e->rl.load_count == 0)
+                continue;
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, (lua_Integer)e->id);
+            lua_setfield(L, -2, "id");
+            lua_pushinteger(L, (lua_Integer)(uint32_t)e->len);
+            lua_setfield(L, -2, "size");
+            lua_rawseti(L, -2, (lua_Integer)(++shown));
+        }
+    }
+    lua_setfield(L, -2, "resources_loaded");
+    return 1;
+}
+
+/* Register blyt.mem.* + blyt32.mem.* into g_lua, mirroring the guest
+ * register_mem_module.  Call after the blyt/blyt32 globals exist. */
+static void wasm_register_mem_api(lua_State *L) {
+    lua_newtable(L); /* mem module */
+    lua_pushcfunction(L, wasm_mem_stats);
+    lua_setfield(L, -2, "stats");
+
+    lua_getglobal(L, "blyt");
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, "mem");
+    lua_pop(L, 1);
+    lua_getglobal(L, "blyt32");
+    if (lua_istable(L, -1)) {
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, "mem");
+    }
+    lua_pop(L, 1);
+    lua_pop(L, 1); /* pop mem module */
+}
+
 /* Derive a require()-able module name from a loaded chunk's embedded source
  * (basename minus ".lua"); the chunk function must be on the stack top and is
  * left untouched.  Mirrors chunk_module_name in libblyt32lua. */
@@ -1578,6 +1639,7 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
         wasm_register_state_api(g_lua, g_session);
     wasm_register_s_proxy(g_lua);
     wasm_register_resource_api(g_lua);
+    wasm_register_mem_api(g_lua);
 
     /* Step 8b: for hybrid carts, recreate the Lua↔native exchange thread and
      * register the native export modules BEFORE the bytecode runs — the cart's
@@ -2724,6 +2786,7 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
             wasm_register_state_api(g_lua, g_session);
         wasm_register_s_proxy(g_lua);
         wasm_register_resource_api(g_lua);
+        wasm_register_mem_api(g_lua);
     }
 
     /* Load and execute the bytecode (single chunk or BLMC; registers bundled

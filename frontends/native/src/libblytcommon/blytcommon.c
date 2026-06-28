@@ -1058,6 +1058,18 @@ static uint32_t native_res_resident_evictable(void) {
     return total;
 }
 
+/* Σ e->len over entries holding an owned decompressed buffer — the advisory
+ * resource_cache_used figure (#159, ADR-0029; mirrors
+ * blyt_resource_table_resident_decompressed). Zero-copy map-aliased entries have
+ * no owned bytes and never count. */
+static uint32_t native_res_resident_decompressed(void) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < s_res_count; i++)
+        if (s_res[i].owned)
+            total += s_res[i].len;
+    return total;
+}
+
 /* Stamp an entry most-recently-used (advisory recency for LRU selection). */
 static void native_res_touch(native_res_t *e) {
     e->last_access = ++s_lru_clock;
@@ -1092,6 +1104,10 @@ static void native_mem_publish_footprint(void) {
     uint32_t footprint = native_res_footprint();
     g_mem_acct.non_evictable_footprint = footprint;
     native_res_evict_to_fit(blyt_mem_cache_room(g_mem_acct.guest_heap_used, footprint));
+    /* Publish the advisory resident-decompressed cache total for the
+     * introspection API (#159) — after eviction, so it reflects what is resident.
+     * blyt_mem_stats reads it back from g_mem_acct, mirroring the emulated path. */
+    g_mem_acct.resource_cache_used = native_res_resident_decompressed();
 }
 
 /* Would newly referencing `e` (a load/pin that makes a so-far-evictable entry
@@ -1180,6 +1196,35 @@ blyt_result_t blyt_resource_release(blyt_resource_h handle) {
     /* Residency dropped; if now unreferenced its bytes leave the footprint. */
     native_mem_publish_footprint();
     return BLYT_OK;
+}
+
+/* Memory introspection (ADR-0029, #159): the native counterparts of the guest
+ * blyt_mem_stats / blyt_mem_resources. Scalars come from the same accounting
+ * block g_mem_acct (no syscall); the loaded-resource list is enumerated on
+ * demand from the resource table. */
+void blyt_mem_stats(blyt_mem_stats_t *out) {
+    if (!out)
+        return;
+    uint32_t cache = g_mem_acct.resource_cache_used;
+    uint32_t heap = g_mem_acct.guest_heap_used;
+    out->resource_cache_used = cache;
+    out->cart_allocations = heap;
+    out->total_used = heap + cache;
+    out->budget_cap = BLYT_MEM_BUDGET_BYTES;
+}
+
+uint32_t blyt_mem_resources(blyt_mem_resource_t *resources, uint32_t cap) {
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < s_res_count; i++) {
+        if (s_res[i].rl.load_count == 0)
+            continue;
+        if (resources && loaded < cap) {
+            resources[loaded].id = s_res[i].id;
+            resources[loaded].size = s_res[i].len;
+        }
+        loaded++;
+    }
+    return loaded;
 }
 
 /* Frame-boundary force-release: drop every pin (ADR-0027 frame-scope). */

@@ -175,7 +175,13 @@ set(RV32_COMPILE_BASE
     -fsemantic-interposition
     ${RV32_PREFIX_MAP}
     -I
-    "${CMAKE_SOURCE_DIR}/runtime/guest/include")
+    "${CMAKE_SOURCE_DIR}/runtime/guest/include"
+    # runtime/shared carries the freestanding determinism core (blyt_arena.h,
+    # blyt_mem_budget.h). libblytcommon_emu reads the unified accounting block to
+    # serve blyt_mem_stats without an ECALL (#159), so every guest TU can reach
+    # these headers; the matching -ffile-prefix-map is already global above.
+    -I
+    "${CMAKE_SOURCE_DIR}/runtime/shared")
 
 set(GUEST_OBJ_ROOT "${CMAKE_BINARY_DIR}/guest-obj")
 

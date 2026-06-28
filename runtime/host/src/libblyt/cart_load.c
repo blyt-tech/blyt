@@ -112,6 +112,12 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_resource_text_get",
     "blyt_resource_bytes_get",
 
+    /* blyt memory introspection (ADR-0029, #159): blyt_mem_stats reads the
+     * guest-visible accounting block (no ECALL); blyt_mem_resources is the
+     * on-demand loaded-list ECALL stub. Both live in libblytcommon. */
+    "blyt_mem_stats",
+    "blyt_mem_resources",
+
     /* libblytc.so — allocator (ADR-0120) */
     "malloc",
     "free",

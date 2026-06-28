@@ -159,6 +159,16 @@ uint32_t blyt_resource_table_resident_evictable(const blyt_resource_table_t *t) 
     return total;
 }
 
+uint32_t blyt_resource_table_resident_decompressed(const blyt_resource_table_t *t) {
+    uint32_t total = 0;
+    for (size_t i = 0; i < t->count; i++) {
+        const blyt_resource_entry_t *e = &t->entries[i];
+        if (e->owned) /* owned == materialized decompressed/staged buffer */
+            total += (uint32_t)e->len;
+    }
+    return total;
+}
+
 void blyt_resource_table_touch(blyt_resource_table_t *t, blyt_resource_entry_t *e) {
     e->last_access = ++t->lru_clock;
 }

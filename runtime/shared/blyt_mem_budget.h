@@ -37,15 +37,30 @@
  * physical pools the single logical budget spans). */
 #define BLYT_MEM_BUDGET_BYTES (16u * 1024u * 1024u)
 
-/* The unified-budget shared accounting counters (ADR-0008 #158). One instance is
- * shared between the two writers: the guest arena allocator owns
- * `guest_heap_used`; the resource subsystem owns `non_evictable_footprint`.
- * 32-bit fields: every term is bounded by the 16 MB budget, and a 32-bit width
- * keeps the layout identical across wasm32 and rv32 (determinism). */
+/* The deterministic tier of the introspection API (ADR-0029, #159) promises
+ * budget_cap is 16 MB bit-identically on every leg. Pin that here so the promise
+ * cannot silently rot if the cap is ever retuned without revisiting the API. */
+_Static_assert(BLYT_MEM_BUDGET_BYTES == 16u * 1024u * 1024u, "budget_cap is the 16 MB cap");
+
+/* The unified-budget shared accounting counters (ADR-0008 #158, ADR-0029 #159).
+ * One instance is shared between the writers: the guest arena allocator owns
+ * `guest_heap_used`; the resource subsystem owns `non_evictable_footprint` and
+ * `resource_cache_used`. 32-bit fields: every term is bounded by the 16 MB
+ * budget, and a 32-bit width keeps the layout identical across wasm32 and rv32
+ * (determinism). The block is guest-readable so the introspection API
+ * (blyt_mem_stats, #159) reads the scalar totals directly — no ECALL, no
+ * traversal — exactly the "running totals" ADR-0029 calls for.
+ *
+ * Only `non_evictable_footprint` (with guest_heap_used) bears determinism: it is
+ * the budget predicate's term. `resource_cache_used` is ADVISORY — resident
+ * decompressed bytes, history/LRU-dependent — published for display only and
+ * never fed back into any allocation decision. */
 typedef struct {
     uint32_t guest_heap_used; /* live guest heap bytes; guest-written, host-read */
-    uint32_t non_evictable_footprint; /* loaded/pinned/persistent resident bytes;
-                                       * host-written, guest-read */
+    uint32_t non_evictable_footprint; /* loaded/pinned/persistent reserved bytes
+                                       * (deterministic); host-written, guest-read */
+    uint32_t resource_cache_used; /* resident decompressed cache bytes (advisory,
+                                   * #159); host-written, guest-read */
 } blyt_mem_accounting_t;
 
 /* Does an allocation of `incoming` bytes fit the unified budget, given the
