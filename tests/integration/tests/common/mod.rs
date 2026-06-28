@@ -76,6 +76,27 @@ pub mod gfx {
         Line(i32, i32, i32, i32, u8),
     }
 
+    /// Emit a Lua `draw()` body that issues `ops` via the `blyt32.gfx.*`
+    /// primitives — the Lua-cart counterpart of [`c_draw_body`], drawing the
+    /// identical frame so a Lua cart hashes to the same golden across the
+    /// emulated-Lua legs (native/libretro) and the host-Lua fast path (wasm).
+    pub fn lua_draw_body(ops: &[Op]) -> String {
+        let mut s = String::new();
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  blyt32.gfx.clear({c})\n"),
+                Op::Pixel(x, y, c) => s += &format!("  blyt32.gfx.pixel({x}, {y}, {c})\n"),
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  blyt32.gfx.rect_fill({x}, {y}, {w}, {h}, {c})\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  blyt32.gfx.line({x0}, {y0}, {x1}, {y1}, {c})\n")
+                }
+            }
+        }
+        s
+    }
+
     /// Emit the C `blyt_cart_draw` body that issues `ops` via the gfx primitives.
     pub fn c_draw_body(ops: &[Op]) -> String {
         let mut s = String::new();

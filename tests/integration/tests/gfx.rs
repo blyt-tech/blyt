@@ -17,7 +17,7 @@ mod common;
 
 use common::gfx;
 use common::{
-    build_cart, require_sdk, run_cart_libretro_with_env, run_cart_native_with_env,
+    CartProject, build_cart, require_sdk, run_cart_libretro_with_env, run_cart_native_with_env,
     run_cart_wasm_with_env, write_c_cart_project,
 };
 
@@ -130,6 +130,39 @@ fn gfx_acquire_present_raw_framebuffer_hashes_identically_across_legs() {
     );
 
     let expected = gfx::expected_hash_line(&gfx::raw_pattern_frame());
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Q1 across execution models — the **host-Lua fast path** (the third model).  A
+/// pure-Lua cart draws the torture frame via `blyt32.gfx.*`; on wasm it runs on
+/// the host Lua VM with no emulator (the fast path's own `blyt32.gfx` binding +
+/// shared rasterizer), while blytplay and libretro run the same cart through the
+/// emulator (the guest `blyt32lua.c` binding → host primitives).  All three must
+/// emit the SAME `[blyt:fbhash]` golden the C carts produce — proving one gfx
+/// contract spans emulated-C, emulated-Lua, host-Lua (and, via the QEMU gate,
+/// native), and that the host-Lua fast path stays pixel-identical to the
+/// emulated path it shadows.
+#[test]
+fn gfx_torture_frame_lua_hashes_identically_across_legs() {
+    require_sdk();
+    let ops = gfx::torture_frame();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("gfx-lua-torture");
+    CartProject::new()
+        .lua(&format!(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n{}end\n",
+            gfx::lua_draw_body(&ops)
+        ))
+        .write(&project);
+    let cart = build_cart(&project);
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
     let env = [("BLYT_FRAME_HASH", "1")];
     run_cart_native_with_env(&cart, &env, &expected);
     run_cart_wasm_with_env(&cart, &env, &expected);

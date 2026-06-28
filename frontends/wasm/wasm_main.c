@@ -32,6 +32,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
+#include "blyt_raster.h" /* runtime/shared: integer rasterizer core (#188) */
 #include "blyt_runtime.h"
 #include "blyt_trace.h"
 
@@ -572,10 +574,38 @@ static void maybe_inject_lifecycle_cb(lua_State *L, const char *lua_name, uint32
     lua_setglobal(L, lua_name);
 }
 
-/* Set by host-provided blyt32 drawing functions; cleared each frame before draw(). */
+/* Set true by the blyt32.gfx.* drawing functions; cleared each frame before
+ * draw().  When set, the frame loop presents g_lua_pixels instead of the test
+ * card. */
 static bool g_lua_drawn = false;
 
-/* Render testcard into g_xrgb — used when draw() produces no output. */
+/* The host-Lua fast path's paletted back buffer (#188 / Spike X): blyt32.gfx.*
+ * rasterize into it directly (the host-Lua equivalent of the emulated path's
+ * session->pixels[]), using the SAME runtime/shared integer rasterizer, so the
+ * fast-path pixels are bit-identical to every emulated leg. */
+static uint8_t g_lua_pixels[BLYT_FRAME_W * BLYT_FRAME_H];
+static uint32_t g_lua_gfx_palette[256];
+static bool g_lua_gfx_palette_init = false;
+
+/* Expand a paletted frame to g_xrgb for presentation and, when BLYT_FRAME_HASH
+ * is set, emit the cross-leg "[blyt:fbhash] <hex>" line — the host-Lua fast
+ * path's equivalent of the host runtime's frame_done emit (cart_run.c), over the
+ * same paletted bytes so every leg's hash matches (#188). */
+static void lua_present_paletted(const uint8_t *pixels, const uint32_t *palette) {
+    for (int i = 0; i < BLYT_FRAME_W * BLYT_FRAME_H; i++)
+        g_xrgb[i] = palette[pixels[i]];
+    static int s_hash_on = -1;
+    if (s_hash_on < 0)
+        s_hash_on = getenv("BLYT_FRAME_HASH") != NULL ? 1 : 0;
+    if (s_hash_on) {
+        uint64_t h = blyt_frame_hash(pixels, (size_t)BLYT_FRAME_W * (size_t)BLYT_FRAME_H);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[blyt:fbhash] %016llx", (unsigned long long)h);
+        blyt_js_log(buf);
+    }
+}
+
+/* Render testcard into g_xrgb — used when draw() produces no gfx output. */
 static void render_testcard(void) {
     static uint8_t s_pixels[BLYT_FRAME_W * BLYT_FRAME_H];
     static uint32_t s_palette[256];
@@ -586,8 +616,73 @@ static void render_testcard(void) {
         s_tc_init = true;
     }
     blyt_testcard_draw(s_frame++, s_pixels);
-    for (int i = 0; i < BLYT_FRAME_W * BLYT_FRAME_H; i++)
-        g_xrgb[i] = s_palette[s_pixels[i]];
+    lua_present_paletted(s_pixels, s_palette);
+}
+
+/* blyt32.gfx.* host-Lua bindings (#188).  Each rasterizes into g_lua_pixels via
+ * the shared integer core and flags g_lua_drawn; the frame loop then presents +
+ * hashes it.  Mirror of the guest binding in blyt32lua.c and the host ECALL
+ * handlers in cart_run.c — same primitives, same back-buffer geometry. */
+static int lua_wasm_gfx_clear(lua_State *L) {
+    blyt_raster_clear(g_lua_pixels, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                      (uint8_t)luaL_checkinteger(L, 1));
+    g_lua_drawn = true;
+    return 0;
+}
+static int lua_wasm_gfx_pixel(lua_State *L) {
+    blyt_raster_pixel(g_lua_pixels, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                      (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                      (uint8_t)luaL_checkinteger(L, 3));
+    g_lua_drawn = true;
+    return 0;
+}
+static int lua_wasm_gfx_rect_fill(lua_State *L) {
+    blyt_raster_rect_fill(g_lua_pixels, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                          (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                          (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                          (uint8_t)luaL_checkinteger(L, 5));
+    g_lua_drawn = true;
+    return 0;
+}
+static int lua_wasm_gfx_line(lua_State *L) {
+    blyt_raster_line(g_lua_pixels, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                     (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                     (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                     (uint8_t)luaL_checkinteger(L, 5));
+    g_lua_drawn = true;
+    return 0;
+}
+
+/* Register blyt32.gfx.* onto the existing blyt32 global.  Called from both the
+ * initial run_lua_cart setup and the reset/reload re-register, like the state
+ * and resource API helpers. */
+static void wasm_register_gfx_api(lua_State *L) {
+    if (!g_lua_gfx_palette_init) {
+        blyt_testcard_init_palette(g_lua_gfx_palette);
+        g_lua_gfx_palette_init = true;
+    }
+    lua_getglobal(L, "blyt32");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_newtable(L); /* blyt32.gfx */
+    static const struct {
+        const char *name;
+        lua_CFunction fn;
+    } gfx_fns[] = {
+        {"clear", lua_wasm_gfx_clear},
+        {"pixel", lua_wasm_gfx_pixel},
+        {"rect_fill", lua_wasm_gfx_rect_fill},
+        {"line", lua_wasm_gfx_line},
+        {NULL, NULL},
+    };
+    for (int i = 0; gfx_fns[i].name; i++) {
+        lua_pushcfunction(L, gfx_fns[i].fn);
+        lua_setfield(L, -2, gfx_fns[i].name);
+    }
+    lua_setfield(L, -2, "gfx"); /* blyt32.gfx = gfx */
+    lua_pop(L, 1); /* pop blyt32 */
 }
 
 /* Release all Lua and cart resources. */
@@ -1461,6 +1556,7 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
         wasm_register_state_api(g_lua, g_session);
     wasm_register_s_proxy(g_lua);
     wasm_register_resource_api(g_lua);
+    wasm_register_gfx_api(g_lua); /* blyt32.gfx.* (#188) */
 
     /* Step 8b: for hybrid carts, recreate the Lua↔native exchange thread and
      * register the native export modules BEFORE the bytecode runs — the cart's
@@ -2467,6 +2563,8 @@ static void wasm_lua_loop(void) {
 
     if (!g_lua_drawn)
         render_testcard();
+    else
+        lua_present_paletted(g_lua_pixels, g_lua_gfx_palette);
 
     if (trace_frame_open) {
         blyt_tracef(BLYT_TRACE_FRAME, "end");
@@ -2604,6 +2702,7 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
             wasm_register_state_api(g_lua, g_session);
         wasm_register_s_proxy(g_lua);
         wasm_register_resource_api(g_lua);
+        wasm_register_gfx_api(g_lua); /* blyt32.gfx.* (#188) */
     }
 
     /* Load and execute the bytecode (single chunk or BLMC; registers bundled

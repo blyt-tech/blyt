@@ -88,6 +88,33 @@ static int lua_blyt_quit(lua_State *L) {
     return 0;
 }
 
+/* Graphics primitives (blyt32.gfx.*, ADR-0086; issue #188 / Spike X).  The
+ * paletted 2D surface is variant-specific, so these live under blyt32, not blyt.
+ * Each forwards to the libblyt32.so primitive (an ECALL into the host runtime on
+ * the emulated path); the host-Lua fast path (wasm_main.c) registers its own
+ * same-named binding over the shared rasterizer.  Colours are palette indices. */
+static int lua_blyt_gfx_clear(lua_State *L) {
+    blyt_gfx_clear((uint8_t)luaL_checkinteger(L, 1));
+    return 0;
+}
+static int lua_blyt_gfx_pixel(lua_State *L) {
+    blyt_gfx_pixel((int32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                   (uint8_t)luaL_checkinteger(L, 3));
+    return 0;
+}
+static int lua_blyt_gfx_rect_fill(lua_State *L) {
+    blyt_gfx_rect_fill((int32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                       (int32_t)luaL_checkinteger(L, 3), (int32_t)luaL_checkinteger(L, 4),
+                       (uint8_t)luaL_checkinteger(L, 5));
+    return 0;
+}
+static int lua_blyt_gfx_line(lua_State *L) {
+    blyt_gfx_line((int32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                  (int32_t)luaL_checkinteger(L, 3), (int32_t)luaL_checkinteger(L, 4),
+                  (uint8_t)luaL_checkinteger(L, 5));
+    return 0;
+}
+
 static int lua_blyt_save_write(lua_State *L) {
     lua_pushinteger(L, blyt_save_write((uint32_t)luaL_checkinteger(L, 1)));
     return 1;
@@ -548,6 +575,25 @@ static void register_blyt32(lua_State *L) {
     lua_getfield(L, -1, "buf"); /* blyt.buf */
     lua_setfield(L, -3, "buf"); /* blyt32.buf = blyt.buf */
     lua_pop(L, 1); /* pop blyt */
+
+    /* --- blyt32.gfx subtable (variant-specific paletted 2D, #188) --- */
+    lua_newtable(L); /* blyt32.gfx */
+    static const struct {
+        const char *name;
+        lua_CFunction fn;
+    } gfx_fns[] = {
+        {"clear", lua_blyt_gfx_clear},
+        {"pixel", lua_blyt_gfx_pixel},
+        {"rect_fill", lua_blyt_gfx_rect_fill},
+        {"line", lua_blyt_gfx_line},
+        {NULL, NULL},
+    };
+    for (int i = 0; gfx_fns[i].name; i++) {
+        lua_pushcfunction(L, gfx_fns[i].fn);
+        lua_setfield(L, -2, gfx_fns[i].name);
+    }
+    lua_setfield(L, -2, "gfx"); /* blyt32.gfx = gfx; pops gfx */
+
     lua_setglobal(L, "blyt32"); /* pops blyt32 */
 
     lua_pop(L, 1); /* pop blyt.buf (idx B) */
