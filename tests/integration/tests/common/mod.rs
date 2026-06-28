@@ -49,6 +49,172 @@ pub fn blyt_bin() -> PathBuf {
 }
 
 // -------------------------------------------------------------------------
+// Spike X graphics reference (issue #188)
+//
+// One op list + reference rasterizer drives BOTH the generated C carts (which
+// call the runtime's integer rasterizer — over the ECALL boundary on the
+// emulated legs, natively on the bare-metal leg) AND the reference golden.  The
+// cart's emitted framebuffer hash must equal the reference's hash, so the test
+// catches a wrong rasterizer rather than self-confirming a captured value, and
+// is palette-independent (it operates on palette indices).  The reference
+// mirrors runtime/shared/blyt_raster.c primitive-for-primitive.
+//
+// Shared here (rather than per-suite) so the emulated trio (gfx.rs) and the
+// native QEMU gate (native_qemu.rs) hash against ONE golden and cannot drift.
+// -------------------------------------------------------------------------
+pub mod gfx {
+    pub const FRAME_W: usize = 320;
+    pub const FRAME_H: usize = 240;
+    /// XRGB8888 byte length of one expanded frame.
+    pub const FRAME_BYTES: usize = FRAME_W * FRAME_H * 4;
+
+    #[derive(Clone, Copy)]
+    pub enum Op {
+        Clear(u8),
+        Pixel(i32, i32, u8),
+        Rect(i32, i32, i32, i32, u8),
+        Line(i32, i32, i32, i32, u8),
+    }
+
+    /// Emit the C `blyt_cart_draw` body that issues `ops` via the gfx primitives.
+    pub fn c_draw_body(ops: &[Op]) -> String {
+        let mut s = String::new();
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  blyt_gfx_clear({c});\n"),
+                Op::Pixel(x, y, c) => s += &format!("  blyt_gfx_pixel({x}, {y}, {c});\n"),
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  blyt_gfx_rect_fill({x}, {y}, {w}, {h}, {c});\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  blyt_gfx_line({x0}, {y0}, {x1}, {y1}, {c});\n")
+                }
+            }
+        }
+        s
+    }
+
+    fn put(fb: &mut [u8], x: i32, y: i32, c: u8) {
+        if x >= 0 && (x as usize) < FRAME_W && y >= 0 && (y as usize) < FRAME_H {
+            fb[y as usize * FRAME_W + x as usize] = c;
+        }
+    }
+
+    /// Render the op list to a paletted framebuffer, mirroring blyt_raster.c.
+    pub fn render(ops: &[Op]) -> Vec<u8> {
+        let mut fb = vec![0u8; FRAME_W * FRAME_H];
+        for op in ops {
+            match *op {
+                Op::Clear(c) => fb.iter_mut().for_each(|p| *p = c),
+                Op::Pixel(x, y, c) => put(&mut fb, x, y, c),
+                Op::Rect(x, y, w, h, c) => {
+                    if w > 0 && h > 0 {
+                        let x0 = x.max(0) as i64;
+                        let y0 = y.max(0) as i64;
+                        let x1 = (x as i64 + w as i64).min(FRAME_W as i64);
+                        let y1 = (y as i64 + h as i64).min(FRAME_H as i64);
+                        for yy in y0..y1 {
+                            for xx in x0..x1 {
+                                put(&mut fb, xx as i32, yy as i32, c);
+                            }
+                        }
+                    }
+                }
+                Op::Line(mut x0, mut y0, x1, y1, c) => {
+                    let dx = (x1 - x0).abs();
+                    let dy = (y1 - y0).abs();
+                    let sx = if x0 < x1 { 1 } else { -1 };
+                    let sy = if y0 < y1 { 1 } else { -1 };
+                    let mut err = dx - dy;
+                    loop {
+                        put(&mut fb, x0, y0, c);
+                        if x0 == x1 && y0 == y1 {
+                            break;
+                        }
+                        let e2 = 2 * err;
+                        if e2 > -dy {
+                            err -= dy;
+                            x0 += sx;
+                        }
+                        if e2 < dx {
+                            err += dx;
+                            y0 += sy;
+                        }
+                    }
+                }
+            }
+        }
+        fb
+    }
+
+    /// FNV-1a 64, matching runtime/shared/blyt_frame_hash.c.
+    pub fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    /// The `[blyt:fbhash] <hex>` line the runtime emits for a paletted frame —
+    /// the substring every leg's harness asserts on captured stdout.
+    pub fn expected_hash_line(fb: &[u8]) -> String {
+        format!("[blyt:fbhash] {:016x}", fnv1a(fb))
+    }
+
+    /// A frame exercising every primitive plus edge cases the brief calls out:
+    /// off-screen clipping, zero size, negative coords, and i32-overflowing extents.
+    pub fn torture_frame() -> Vec<Op> {
+        vec![
+            Op::Clear(3),
+            Op::Rect(10, 20, 40, 30, 5),    // wholly on-screen
+            Op::Rect(-20, -10, 50, 40, 7),  // negative origin, top-left clip
+            Op::Rect(300, 220, 40, 40, 9),  // bottom-right clip
+            Op::Rect(400, 400, 10, 10, 11), // wholly off-screen -> no-op
+            Op::Rect(50, 50, 0, 10, 13),    // zero width -> no-op
+            Op::Rect(2_000_000_000, 0, 2_000_000_000, 10, 200), // x+w overflows i32 -> clipped no-op
+            Op::Pixel(0, 0, 1),                                 // corner
+            Op::Pixel(319, 239, 2),                             // opposite corner
+            Op::Pixel(-5, 5, 4),                                // off-screen -> no-op
+            Op::Pixel(320, 0, 6),                               // just off the right edge -> no-op
+            Op::Line(0, 0, 319, 239, 8),                        // full diagonal
+            Op::Line(319, 0, 0, 239, 10),                       // anti-diagonal
+            Op::Line(-50, 120, 400, 120, 12),                   // horizontal, off-screen endpoints
+            Op::Line(160, -30, 160, 300, 14),                   // vertical, off-screen endpoints
+            Op::Line(5, 5, 5, 5, 15),                           // degenerate single point
+        ]
+    }
+
+    /// The deterministic per-pixel pattern the acquire/present probe writes
+    /// directly into the runtime-reserved framebuffer region.  A function of
+    /// (x, y) chosen so every byte differs from its neighbours (catches stride /
+    /// byte-order bugs in the present copy).  Mirrored exactly by the C loop in
+    /// [`raw_present_c_draw`].
+    pub fn raw_pattern_frame() -> Vec<u8> {
+        let mut fb = vec![0u8; FRAME_W * FRAME_H];
+        for y in 0..FRAME_H {
+            for x in 0..FRAME_W {
+                fb[y * FRAME_W + x] = (x as i32 * 31 + y as i32 * 17) as u8;
+            }
+        }
+        fb
+    }
+
+    /// The C `blyt_cart_draw` body that acquires the raw framebuffer pointer,
+    /// writes [`raw_pattern_frame`] straight into it, and presents.
+    pub fn raw_present_c_draw() -> String {
+        format!(
+            "  unsigned char *fb = blyt_gfx_acquire();\n\
+             \x20 for (int y = 0; y < {FRAME_H}; y++)\n\
+             \x20   for (int x = 0; x < {FRAME_W}; x++)\n\
+             \x20     fb[y * {FRAME_W} + x] = (unsigned char)(x * 31 + y * 17);\n\
+             \x20 blyt_gfx_present();\n"
+        )
+    }
+}
+
+// -------------------------------------------------------------------------
 // Cart project fixture builder
 // -------------------------------------------------------------------------
 

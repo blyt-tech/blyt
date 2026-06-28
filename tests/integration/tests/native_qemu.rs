@@ -376,6 +376,29 @@ function draw() end
         None
     };
 
+    // ── Build the gfx carts (gates 16 & 17, #188 / Spike X) ───────────
+    // Two probes drawing the SAME frames the emulated legs draw: the torture
+    // frame via the gfx primitives (which rasterize natively on bare metal, no
+    // ECALL), and the acquire/present raw-write path.  Both must emit the SAME
+    // `[blyt:fbhash]` golden the host/wasm/libretro legs produce — the
+    // bare-metal Q2 proof that the RV32-compiled rasterizer matches.
+    let gfx_cart = |name: &str, draw_body: String| -> PathBuf {
+        let project = tmp.path().join(name);
+        let src = format!(
+            "#include \"blyt.h\"\n\
+             void blyt_cart_init(void) {{}}\n\
+             void blyt_cart_update(void) {{ blyt_quit(); }}\n\
+             void blyt_cart_draw(void) {{\n{draw_body}}}\n"
+        );
+        write_c_cart_project(&project, &src);
+        build_cart(&project)
+    };
+    let gfx_torture_cart = gfx_cart(
+        "gfx_torture",
+        common::gfx::c_draw_body(&common::gfx::torture_frame()),
+    );
+    let gfx_raw_cart = gfx_cart("gfx_raw", common::gfx::raw_present_c_draw());
+
     // ── Start QEMU ────────────────────────────────────────────────────
     let ssh_port = free_port();
     println!("Starting QEMU (SSH port {ssh_port})...");
@@ -473,6 +496,14 @@ function draw() end
             "scp hybrid_metal.blyt failed"
         );
     }
+    assert!(
+        qemu.scp_to(&gfx_torture_cart, "/tmp/blyt_gate/"),
+        "scp gfx_torture.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&gfx_raw_cart, "/tmp/blyt_gate/"),
+        "scp gfx_raw.blyt failed"
+    );
 
     // ── Diagnostics ───────────────────────────────────────────────────
     // Print environment info before the gate test to help diagnose failures.
@@ -1445,6 +1476,64 @@ void blyt_cart_draw(void) {}
              bytes on every frame (expected {expected:?} repeated; #137)\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
+    }
+
+    // ── Gate 16: gfx torture frame hashes to the golden on metal (#188) ──
+    //
+    // The torture frame drawn via the gfx primitives, which rasterize natively
+    // on bare metal (no ECALL) using the SAME runtime/shared integer core the
+    // host/wasm/libretro legs compile.  The emitted framebuffer hash must equal
+    // the reference golden — proving the RV32-compiled rasterizer is
+    // bit-identical to every other target (Q2's highest-value assertion).
+    {
+        println!("Gate 16: gfx torture frame hashes to golden on metal...");
+        let expected =
+            common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/gfx_torture.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "gfx_torture.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&expected),
+            "native bare-metal rasterizer must hash the torture frame identically \
+             to the emulated legs (expected {expected:?}; #188)\noutput: {output}"
+        );
+        println!("  PASS: {expected}");
+    }
+
+    // ── Gate 17: gfx acquire/present raw write hashes to golden (#188) ──
+    //
+    // The acquire/present contract on bare metal: acquire returns the live back
+    // buffer, the cart writes the pattern directly, present flushes.  Same
+    // golden as the emulated legs — proving one direct-framebuffer mechanism
+    // spans every execution model (Q1) and round-trips byte-exactly.
+    {
+        println!("Gate 17: gfx acquire/present raw write hashes to golden on metal...");
+        let expected = common::gfx::expected_hash_line(&common::gfx::raw_pattern_frame());
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/gfx_raw.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "gfx_raw.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&expected),
+            "native bare-metal acquire/present must hash identically to the \
+             emulated legs (expected {expected:?}; #188)\noutput: {output}"
+        );
+        println!("  PASS: {expected}");
     }
 
     println!("Gate tests passed.");

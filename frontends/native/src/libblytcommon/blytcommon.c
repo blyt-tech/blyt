@@ -37,6 +37,15 @@
 
 /* getenv is declared in blyt_native_trace.h (provided by ld-blyt.so.1). */
 
+/* Graphics frame-boundary hook (issue #188 / Spike X).  Strongly defined by the
+ * native libblyt32 graphics variant; weak here so libblytcommon links and runs
+ * without graphics (resolves to the libblyt32 definition over the global symbol
+ * scope at load time, or to NULL if absent — the same cross-lib weak-reference
+ * pattern the Lua stubs use for blyt_console_debug).  Called at each frame
+ * boundary so the variant can emit the framebuffer-hash determinism line without
+ * libblytcommon knowing anything about the graphics surface. */
+extern void blyt_gfx_on_frame_boundary(void) __attribute__((weak));
+
 /* ── Linux ABI constants (inline — no linux/fcntl.h dependency) ─────────── */
 
 #define NATIVE_AT_FDCWD (-100)
@@ -1032,6 +1041,11 @@ void blyt_frame_done(void) {
         static const char msg[] = "[blyt:api] frame_done()\n";
         blyt32_trace_write(msg, sizeof(msg) - 1);
     }
+    /* Graphics variant frame-boundary hook (#188): emits the framebuffer-hash
+     * determinism line when present.  Weak ref → NULL when no graphics variant
+     * is loaded. */
+    if (blyt_gfx_on_frame_boundary)
+        blyt_gfx_on_frame_boundary();
 }
 
 /* blyt_exit — clean process exit after the cart main loop.
