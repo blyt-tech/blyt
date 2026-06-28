@@ -1447,5 +1447,144 @@ void blyt_cart_draw(void) {}
         println!("  PASS: output = {:?}", output.trim());
     }
 
+    // ── Gate 16: unified 16 MB budget enforcement on metal (#158) ─────
+    //
+    // The only bare-metal coverage of the unified-budget backend (ADR-0008/0027):
+    // a guest `malloc` and a resource `load` draw on ONE 16 MB budget, enforced by
+    // the single runtime/shared arena that now backs the native cart heap
+    // (libblytc) plus the native libblytcommon footprint/budget mirror. The two
+    // sub-carts are byte-for-byte the emulated mem_budget.rs carts; the metal
+    // counts MUST equal the emulated legs' (a=255, b=191; ok=4, first_fail=5) —
+    // that identity IS the determinism contract (#158): a native cart and a
+    // desktop cart hit the cap at the same logical point. Anything resident in the
+    // cart heap at init (e.g. musl-internal allocations leaking into the arena)
+    // would shift these counts, so an exact match also proves the heap starts
+    // clean on metal.
+    println!("Gate 16: unified 16 MB budget enforcement on metal...");
+    {
+        // 16a: heap headroom shrinks by a resident resource's footprint.
+        let budget_project = tmp.path().join("budget_metal");
+        CartProject::new()
+            .c(r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+#define CHUNK (64 * 1024)
+#define MAXP 512
+static void *g_ptrs[MAXP];
+
+static int fill_heap(void) {
+    int n = 0;
+    void *p;
+    while (n < MAXP && (p = malloc(CHUNK)) != NULL)
+        g_ptrs[n++] = p;
+    for (int i = 0; i < n; i++)
+        free(g_ptrs[i]);
+    return n;
+}
+
+void blyt_cart_init(void) {
+    int a = fill_heap(); /* full 16 MB available to the heap */
+    blyt_resource_h h = BLYT_RESOURCE_INVALID;
+    blyt_result_t lr = blyt_resource_load(R_BIG, &h); /* reserve 4 MiB footprint */
+    int b = fill_heap(); /* only ~12 MB now available to the heap */
+    char line[128];
+    snprintf(line, sizeof(line), "BUDGET a=%d b=%d lr=%d shrank=%d", a, b, (int)lr,
+             (int)(b > 0 && b < a));
+    blyt_console_debug(line);
+}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#)
+            .asset_bytes("big.bin", &[0u8; 4 * 1024 * 1024])
+            .write(&budget_project);
+        let budget_cart = build_cart(&budget_project);
+        assert!(
+            budget_cart.exists(),
+            "budget_metal.blyt not built: {}",
+            budget_cart.display()
+        );
+        assert!(
+            qemu.scp_to(&budget_cart, "/tmp/blyt_gate/"),
+            "scp budget_metal.blyt failed"
+        );
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/budget_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "budget_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("BUDGET a=255 b=191 lr=0 shrank=1"),
+            "native heap budget must shrink by the resident resource's footprint at \
+             the identical logical point as the emulated legs (a=255 full, b=191 after \
+             a 4 MiB load, load ok, shrank) — the #158 determinism contract\noutput: {output}"
+        );
+        println!("  PASS (16a): output = {:?}", output.trim());
+
+        // 16b: resource loads fail deterministically at the cap.
+        let cap_project = tmp.path().join("loadcap_metal");
+        let mut p = CartProject::new().c(r#"
+#include "blyt.h"
+#include <stdio.h>
+
+void blyt_cart_init(void) {
+    int ok = 0, first_fail = -1;
+    for (int id = 1; id <= 5; id++) {
+        blyt_resource_h h = BLYT_RESOURCE_INVALID;
+        blyt_result_t r = blyt_resource_load((blyt_resource_id_t)id, &h);
+        if (r == BLYT_OK && h != BLYT_RESOURCE_INVALID)
+            ok++;
+        else if (first_fail < 0)
+            first_fail = id;
+    }
+    char line[96];
+    snprintf(line, sizeof(line), "LOADCAP ok=%d first_fail=%d", ok, first_fail);
+    blyt_console_debug(line);
+}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#);
+        for k in 0..5 {
+            p = p.asset_bytes(&format!("big{k}.bin"), &[0u8; 4 * 1024 * 1024]);
+        }
+        p.write(&cap_project);
+        let cap_cart = build_cart(&cap_project);
+        assert!(
+            cap_cart.exists(),
+            "loadcap_metal.blyt not built: {}",
+            cap_cart.display()
+        );
+        assert!(
+            qemu.scp_to(&cap_cart, "/tmp/blyt_gate/"),
+            "scp loadcap_metal.blyt failed"
+        );
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/loadcap_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "loadcap_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("LOADCAP ok=4 first_fail=5"),
+            "native must refuse the resource load that crosses the 16 MB cap at the \
+             identical point as the emulated legs (four 4 MiB loads fit exactly, the \
+             fifth fails) — the #158 determinism contract\noutput: {output}"
+        );
+        println!("  PASS (16b): output = {:?}", output.trim());
+    }
+
     println!("Gate tests passed.");
 }
