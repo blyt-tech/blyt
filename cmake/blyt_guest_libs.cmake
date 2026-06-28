@@ -138,18 +138,26 @@ endfunction()
 # /blyt/sdk/src/blyt-dap.
 file(RELATIVE_PATH _rel_guest "${CMAKE_BINARY_DIR}"
      "${CMAKE_SOURCE_DIR}/runtime/guest")
+file(RELATIVE_PATH _rel_shared "${CMAKE_BINARY_DIR}"
+     "${CMAKE_SOURCE_DIR}/runtime/shared")
 file(RELATIVE_PATH _rel_musl "${CMAKE_BINARY_DIR}" "${musl_SOURCE_DIR}")
 file(RELATIVE_PATH _rel_lua "${CMAKE_BINARY_DIR}" "${lua_SOURCE_DIR}")
 file(RELATIVE_PATH _rel_rv32 "${CMAKE_BINARY_DIR}" "${rv32emu_SOURCE_DIR}")
 file(RELATIVE_PATH _rel_dap "${CMAKE_BINARY_DIR}"
      "${CMAKE_SOURCE_DIR}/runtime/host/src/dap")
+# runtime/shared is a sibling of runtime/guest (neither a prefix of the other),
+# so it needs its own map: the unified-budget arena (blyt_arena.c, #158) is the
+# first runtime/shared TU pulled into an emulated guest lib (libblytc), and
+# without this its DWARF would leak the build machine path (source_paths.rs §4).
 set(RV32_PREFIX_MAP
     "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/guest=/blyt/sdk/src/blyt"
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/shared=/blyt/sdk/src/blyt-shared"
     "-ffile-prefix-map=${musl_SOURCE_DIR}=/blyt/sdk/src/musl"
     "-ffile-prefix-map=${lua_SOURCE_DIR}=/blyt/sdk/src/lua"
     "-ffile-prefix-map=${rv32emu_SOURCE_DIR}=/blyt/sdk/src/rv32emu"
     "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/runtime/host/src/dap=/blyt/sdk/src/blyt-dap"
     "-ffile-prefix-map=${_rel_guest}=/blyt/sdk/src/blyt"
+    "-ffile-prefix-map=${_rel_shared}=/blyt/sdk/src/blyt-shared"
     "-ffile-prefix-map=${_rel_musl}=/blyt/sdk/src/musl"
     "-ffile-prefix-map=${_rel_lua}=/blyt/sdk/src/lua"
     "-ffile-prefix-map=${_rel_rv32}=/blyt/sdk/src/rv32emu"
