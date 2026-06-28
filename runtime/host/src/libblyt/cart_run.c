@@ -15,6 +15,8 @@
 #include "cart_load.h"
 #include "ecall.h"
 #include "resource.h"
+
+#include "blyt_mem_budget.h" /* runtime/shared: unified-budget predicate (#158) */
 #include "save.h"
 #include "state_buffer.h"
 #ifdef BLYT_DAP
@@ -194,6 +196,11 @@ typedef struct {
      * returned by blyt_resource_text_get stays valid for that whole frame. */
     blyt_resource_table_t resources;
     uint32_t resource_scratch_off;
+    /* Guest vaddr of libblytc's exported blyt_mem_acct (blyt_mem_accounting_t),
+     * resolved at cart load (#158). field 0 = guest_heap_used (guest-written,
+     * host-read); field 4 = non_evictable_footprint (host-written, guest-read).
+     * 0 if the cart has no libblytc (then the budget is unenforced host-side). */
+    uint32_t mem_acct_vaddr;
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -503,6 +510,54 @@ static void write_u32_le(uint8_t *dst, uint32_t val) {
     dst[1] = (uint8_t)(val >> 8);
     dst[2] = (uint8_t)(val >> 16);
     dst[3] = (uint8_t)(val >> 24);
+}
+
+/* ── Unified-budget shared accounting block bridge (ADR-0008 #158) ───────────
+ * libblytc exports blyt_mem_acct: field 0 = guest_heap_used (the guest arena
+ * writes it), field 4 = non_evictable_footprint (the host writes it). The guest
+ * arena's malloc reads the footprint to cap the heap; the host reads the heap
+ * total when deciding whether a resource load/pin fits the unified 16 MB budget,
+ * and publishes the footprint after every refcount change. */
+static uint32_t mem_acct_read_u32(memory_t *mem, uint32_t vaddr) {
+    uint8_t b[4];
+    memory_read(mem, b, vaddr, 4);
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static uint32_t mem_acct_guest_heap_used(const blyt_run_ctx_t *ctx, memory_t *mem) {
+    if (!ctx->mem_acct_vaddr)
+        return 0;
+    return mem_acct_read_u32(mem, ctx->mem_acct_vaddr);
+}
+
+/* Recompute the non-evictable footprint from the resource table, publish it into
+ * the guest-visible accounting block, and bound the resident evictable cache to
+ * the room the new footprint leaves (the housekeeping eviction site, #158). Call
+ * after any load/pin/unpin/release and at the frame boundary. */
+static void mem_acct_publish_footprint(blyt_run_ctx_t *ctx, memory_t *mem) {
+    if (!ctx->mem_acct_vaddr)
+        return;
+    uint32_t footprint = blyt_resource_table_footprint(&ctx->resources);
+    uint8_t b[4];
+    write_u32_le(b, footprint);
+    memory_write(mem, ctx->mem_acct_vaddr + 4u, b, 4);
+    uint32_t heap_used = mem_acct_guest_heap_used(ctx, mem);
+    blyt_resource_table_evict_to_fit(&ctx->resources, blyt_mem_cache_room(heap_used, footprint));
+}
+
+/* Would making `id` non-evictable (a load/pin that adds e->len to the footprint)
+ * still fit the unified budget? incoming is e->len only when this op newly
+ * references a so-far-evictable entry; an already-referenced entry adds nothing.
+ * Eviction is NOT attempted here — evictable cache is not in the predicate, so
+ * evicting it cannot change the decision (ADR-0027 #158). */
+static int mem_acct_reference_fits(blyt_run_ctx_t *ctx, memory_t *mem,
+                                   const blyt_resource_entry_t *e, int was_evictable) {
+    if (!ctx->mem_acct_vaddr)
+        return 1; /* no accounting block: budget unenforced host-side */
+    uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
+    uint32_t heap_used = mem_acct_guest_heap_used(ctx, mem);
+    uint32_t footprint = blyt_resource_table_footprint(&ctx->resources);
+    return blyt_mem_alloc_fits(heap_used, footprint, incoming);
 }
 
 static bool inject_exit_trampoline(memory_t *mem) {
@@ -1332,6 +1387,19 @@ static void blyt_ecall_handler(riscv_t *rv) {
             return;
         }
 
+        /* Unified-budget gate (#158): pinning a so-far-evictable resource adds
+         * its bytes to the non-evictable footprint. Fail with BUFFER_FULL if that
+         * would exceed the 16 MB budget (heap + footprint). Eviction can't help —
+         * evictable cache is not in the predicate — so it is not attempted. */
+        int pin_was_evictable = blyt_rl_is_evictable(&e->rl);
+        if (!mem_acct_reference_fits(g_run_ctx, mem, e, pin_was_evictable)) {
+            if (out_ptr_vaddr)
+                memory_write(mem, out_ptr_vaddr, (const uint8_t *)&zero, 4);
+            rv_set_reg(rv, rv_reg_a0, 2 /* BLYT_ERR_BUFFER_FULL: over budget */);
+            rv->PC += 4;
+            return;
+        }
+
         /* Materialize the bytes: a compressed (zstd) resource is decompressed
          * lazily on first pin into an owned buffer, cached thereafter (#157).
          * Uncompressed resources return their zero-copy map alias. */
@@ -1364,6 +1432,8 @@ static void blyt_ecall_handler(riscv_t *rv) {
         g_run_ctx->resource_scratch_off = off + need;
 
         blyt_rl_pin(&e->rl);
+        blyt_resource_table_touch(&g_run_ctx->resources, e); /* recency for LRU (#158) */
+        mem_acct_publish_footprint(g_run_ctx, mem); /* footprint grew; bound cache */
         if (out_ptr_vaddr)
             memory_write(mem, out_ptr_vaddr, (const uint8_t *)&gptr, 4);
         if (out_size_vaddr) {
@@ -1380,8 +1450,18 @@ static void blyt_ecall_handler(riscv_t *rv) {
         uint32_t id = rv_get_reg(rv, rv_reg_a0);
         blyt_resource_entry_t *e =
             g_run_ctx ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
-        uint32_t res =
-            !e ? 4u /* NOT_FOUND */ : (blyt_rl_unpin(&e->rl) ? 0u : 1u /* INVALID_ARG */);
+        uint32_t res;
+        if (!e) {
+            res = 4u; /* NOT_FOUND */
+        } else if (blyt_rl_unpin(&e->rl)) {
+            /* The pin dropped; if the entry is now unreferenced its bytes leave
+             * the footprint — republish so the guest sees the freed budget (#158). */
+            vm_attr_t *attr = PRIV(rv);
+            mem_acct_publish_footprint(g_run_ctx, attr->mem);
+            res = 0u;
+        } else {
+            res = 1u; /* INVALID_ARG: nothing pinned */
+        }
         blyt_tracef(BLYT_TRACE_API, "resource_unpin(id=%u) -> %u", id, res);
         rv_set_reg(rv, rv_reg_a0, res);
         rv->PC += 4;
@@ -1397,11 +1477,25 @@ static void blyt_ecall_handler(riscv_t *rv) {
 
         blyt_resource_entry_t *e =
             g_run_ctx ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
-        uint32_t handle = e ? blyt_rl_load(&e->rl, id) : 0u;
+        uint32_t handle = 0u;
+        uint32_t res;
+        if (!e) {
+            res = 4u; /* NOT_FOUND */
+        } else if (!mem_acct_reference_fits(g_run_ctx, mem, e, blyt_rl_is_evictable(&e->rl))) {
+            /* A fresh load reserves e->len of footprint up front (#157/#158).
+             * Refuse it if that would exceed the 16 MB budget; the guest stub
+             * maps a non-OK result to an invalid handle (nil). */
+            res = 2u; /* BLYT_ERR_BUFFER_FULL: over budget */
+        } else {
+            handle = blyt_rl_load(&e->rl, id);
+            blyt_resource_table_touch(&g_run_ctx->resources, e); /* recency for LRU (#158) */
+            mem_acct_publish_footprint(g_run_ctx, mem); /* footprint grew */
+            res = 0u; /* OK */
+        }
         if (out_handle_vaddr)
             memory_write(mem, out_handle_vaddr, (const uint8_t *)&handle, 4);
         blyt_tracef(BLYT_TRACE_API, "resource_load(id=%u) -> handle=%u", id, handle);
-        rv_set_reg(rv, rv_reg_a0, e ? 0u /* OK */ : 4u /* NOT_FOUND */);
+        rv_set_reg(rv, rv_reg_a0, res);
         rv->PC += 4;
         return;
     }
@@ -1412,7 +1506,16 @@ static void blyt_ecall_handler(riscv_t *rv) {
         uint32_t id = handle & 0xFFFFu;
         blyt_resource_entry_t *e =
             (g_run_ctx && handle) ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
-        uint32_t res = (e && blyt_rl_release(&e->rl, handle)) ? 0u /* OK */ : 1u /* INVALID_ARG */;
+        uint32_t res;
+        if (e && blyt_rl_release(&e->rl, handle)) {
+            /* Residency dropped; if now unreferenced the bytes leave the footprint
+             * — republish so the guest sees the freed budget (#158). */
+            vm_attr_t *attr = PRIV(rv);
+            mem_acct_publish_footprint(g_run_ctx, attr->mem);
+            res = 0u; /* OK */
+        } else {
+            res = 1u; /* INVALID_ARG: stale/invalid handle */
+        }
         blyt_tracef(BLYT_TRACE_API, "resource_release(handle=%u) -> %u", handle, res);
         rv_set_reg(rv, rv_reg_a0, res);
         rv->PC += 4;
@@ -2542,6 +2645,11 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
             write_u32_le(v, BLYT_ARENA_SIZE);
             memory_write(mem, sym_size, v, 4);
         }
+        /* Resolve the unified-budget accounting block (ADR-0008 #158) so the
+         * resource ECALLs can publish the footprint + read the heap total. Its
+         * .data is zero-initialised in the freshly mapped lib (footprint 0,
+         * matching "nothing loaded yet"), so no stamp is needed at fresh load. */
+        s->ctx.mem_acct_vaddr = symtab_lookup(all_syms, "blyt_mem_acct");
     }
 
     /* Retain the lib images on the session (issue #119) so a hot swap can
@@ -2725,6 +2833,16 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
         uint8_t v[4];
         write_u32_le(v, 0);
         memory_write(mem, sym_ready, v, 4);
+    }
+    /* Re-resolve and zero the unified-budget accounting block (#158): libblytc
+     * persists across the in-VM swap, so its blyt_mem_acct still holds the old
+     * cart's counters. The guest arena re-zeros guest_heap_used on its next
+     * malloc (via the ready lever above); clear both fields now so there is no
+     * stale-footprint window before the reloaded cart republishes. */
+    s->ctx.mem_acct_vaddr = symtab_lookup(all, "blyt_mem_acct");
+    if (s->ctx.mem_acct_vaddr) {
+        uint8_t z[8] = {0};
+        memory_write(mem, s->ctx.mem_acct_vaddr, z, 8);
     }
 
     /* 4. Re-resolve the cart's lifecycle entry points (and WASM hybrid exports)
@@ -3017,6 +3135,12 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
      * the frame it was taken in (ADR-0027 frame-scope amendment, #123). */
     session->ctx.resource_scratch_off = 0;
     blyt_resource_table_force_release_pins(&session->ctx.resources);
+    /* Frame-boundary housekeeping (#158): pins just dropped, so the footprint may
+     * have shrunk — republish it and bound the resident evictable cache to the
+     * room the current heap+footprint leaves. Covers the "heap grew mid-frame
+     * with no resource ECALL" case; not load-bearing for the allocation decision
+     * (the counters are always current), purely RSS/mem.stats hygiene. */
+    mem_acct_publish_footprint(&session->ctx, session->attr.mem);
 
     /* BLYT_TRACE frame channel: open a frame unless this run_frame call is
      * driving a host-initiated fn call (begin_fn_call) or resuming a frame

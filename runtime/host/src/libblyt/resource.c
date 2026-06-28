@@ -18,6 +18,7 @@ void blyt_resource_table_init(blyt_resource_table_t *t) {
     t->entries = NULL;
     t->count = 0;
     t->cap = 0;
+    t->lru_clock = 0;
 }
 
 void blyt_resource_table_clear(blyt_resource_table_t *t) {
@@ -71,6 +72,7 @@ static blyt_resource_entry_t *table_push(blyt_resource_table_t *t) {
     e->clen = 0;
     e->src_path = NULL;
     e->rl = (blyt_rl_state_t){0};
+    e->last_access = 0;
     return e;
 }
 
@@ -132,6 +134,56 @@ size_t blyt_resource_table_evict_all_evictable(blyt_resource_table_t *t) {
     for (size_t i = 0; i < t->count; i++)
         total += blyt_resource_entry_evict(&t->entries[i]);
     return total;
+}
+
+/* ── Unified-budget accounting + eviction policy (ADR-0008/0027 #158) ──────── */
+
+uint32_t blyt_resource_table_footprint(const blyt_resource_table_t *t) {
+    uint32_t total = 0;
+    for (size_t i = 0; i < t->count; i++) {
+        /* Non-evictable = referenced (loaded/pinned); persistence (#160) ANDs in
+         * here later. Count e->len up front, materialized or not (#157). */
+        if (!blyt_rl_is_evictable(&t->entries[i].rl))
+            total += (uint32_t)t->entries[i].len;
+    }
+    return total;
+}
+
+uint32_t blyt_resource_table_resident_evictable(const blyt_resource_table_t *t) {
+    uint32_t total = 0;
+    for (size_t i = 0; i < t->count; i++) {
+        const blyt_resource_entry_t *e = &t->entries[i];
+        if (e->owned && blyt_rl_is_evictable(&e->rl))
+            total += (uint32_t)e->len;
+    }
+    return total;
+}
+
+void blyt_resource_table_touch(blyt_resource_table_t *t, blyt_resource_entry_t *e) {
+    e->last_access = ++t->lru_clock;
+}
+
+size_t blyt_resource_table_evict_to_fit(blyt_resource_table_t *t, uint32_t max_resident_evictable) {
+    size_t freed = 0;
+    /* Repeatedly evict the least-recently-used evictable resident entry until the
+     * resident evictable cache fits, or none remain. LRU-incremental: the inner
+     * scan picks the single oldest victim each pass, so we free the minimum and
+     * stop the instant we fit (ADR-0027 #158). */
+    for (;;) {
+        if (blyt_resource_table_resident_evictable(t) <= max_resident_evictable)
+            return freed;
+        blyt_resource_entry_t *victim = NULL;
+        for (size_t i = 0; i < t->count; i++) {
+            blyt_resource_entry_t *e = &t->entries[i];
+            if (!e->owned || !blyt_rl_is_evictable(&e->rl))
+                continue;
+            if (!victim || e->last_access < victim->last_access)
+                victim = e;
+        }
+        if (!victim)
+            return freed; /* nothing left to reclaim */
+        freed += blyt_resource_entry_evict(victim);
+    }
 }
 
 /* Context + callback for the shared `.cart.resource.<id>` section enumerator. */
