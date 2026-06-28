@@ -102,6 +102,34 @@
  * are advisory (LRU/history-dependent) — a tuning signal, never game state. */
 #define BLYT_ECALL_MEM_RESOURCES 70
 
+/* Graphics ECALLs (100–199, ADR-0052/0086; issue #188 / Spike X).
+ *
+ * The paletted 2D drawing surface is Blyt32-specific; its primitives are
+ * host-side (reached by ECALL on the emulated path) and back the runtime's
+ * session->pixels[] via the shared integer rasterizer (runtime/shared/
+ * blyt_raster.c).  The first handler to run sets cart_has_drawn, displacing the
+ * PM5544 test card.
+ *
+ * Coordinates are signed i32 passed in the argument registers; primitives clip
+ * to the 320x240 surface.
+ *   GFX_CLEAR:     a0=color (palette index); fills the whole framebuffer.
+ *   GFX_PIXEL:     a0=x, a1=y, a2=color.
+ *   GFX_RECT_FILL: a0=x, a1=y, a2=w, a3=h, a4=color.
+ *   GFX_LINE:      a0=x0, a1=y0, a2=x1, a3=y1, a4=color. */
+#define BLYT_ECALL_GFX_CLEAR 100
+#define BLYT_ECALL_GFX_PIXEL 101
+#define BLYT_ECALL_GFX_RECT_FILL 102
+#define BLYT_ECALL_GFX_LINE 103
+
+/* Raw-framebuffer acquire/present (issue #188 / Spike X, Q1).  The mechanism
+ * under test for direct pixel access: the runtime reserves a fixed guest region
+ * the size of the paletted framebuffer (BLYT_GFX_FB_BASE in cart_run.c).
+ *   GFX_ACQUIRE: no args; returns the guest VA of that region in a0.  The cart
+ *     writes palette indices directly into it (no per-pixel ECALL).
+ *   GFX_PRESENT: no args; copies the whole region into session->pixels[] and
+ *     sets cart_has_drawn (displacing the test card). */
+#define BLYT_ECALL_GFX_ACQUIRE 104
+#define BLYT_ECALL_GFX_PRESENT 105
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1

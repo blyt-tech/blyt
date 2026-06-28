@@ -947,29 +947,54 @@ if(BLYT_BUILD_NATIVE)
     LINK_ARGS
     -Wl,-soname,libblytcommon.so)
 
-  # Native libblyt32.so: variant-specific only (currently no symbols — graphics
-  # not yet implemented; issue #128).  Still built and shipped: it is the cart's
-  # direct DT_NEEDED and carries DT_NEEDED libblytcommon.so + libblytc.so so the
-  # cart resolves the relocated symbols and the system C library over the chain.
+  # Native libblyt32.so: the Blyt32 variant-specific graphics surface (issue
+  # #188).  Compiles the SAME shared integer rasterizer + frame-hash sources
+  # (runtime/shared) the host and wasm legs use, so the bare-metal pixels are
+  # bit-identical (the Q2 proof).  Built via the multi-source path so each TU
+  # (incl. runtime/shared) is its own cacheable, depfile-tracked rule.  It is the
+  # cart's direct DT_NEEDED and carries DT_NEEDED libblytcommon.so + libblytc.so
+  # so the cart resolves the relocated symbols and the system C library over the
+  # chain.  -O2 like the host raster compile; the rasterizer avoids signed
+  # overflow via int64 intermediates (no -fwrapv needed — same as host/wasm).
   set(LIBBLYT32_NATIVE_SRC
       "${CMAKE_SOURCE_DIR}/frontends/native/src/libblyt32/blyt32.c")
-  blyt_guest_so(
+  blyt_guest_so_objs(
     "${SDK_LIB_NATIVE}/libblyt32.so"
     FALSE
-    "Cross-compiling libblyt32.so (native)"
-    ARGS
+    "Linking libblyt32.so (native)"
+    OBJNS
+    libblyt32-native
+    SRCS
+    "${LIBBLYT32_NATIVE_SRC}"
+    "${SHARED_DIR}/blyt_raster.c"
+    "${SHARED_DIR}/blyt_frame_hash.c"
+    CFLAGS
     -O2
+    -I
+    "${LIBBLYT32_NATIVE_INC}"
+    -I
+    "${LIBBLYTCOMMON_NATIVE_DIR}" # blyt_native_trace.h (getenv + write helpers)
+    -I
+    "${SHARED_DIR}"
+    # musl headers for blyt_raster.c's <string.h> (memset); memset resolves as a
+    # dynamic undef against libblytc/musl over the DT_NEEDED chain, like the
+    # bundled zstd decode sources in libblytcommon.  Same RV32 musl header set.
+    -isystem
+    "${MUSL_DIR}/include"
+    -isystem
+    "${MUSL_DIR}/arch/riscv32"
+    -isystem
+    "${MUSL_DIR}/arch/generic"
+    -isystem
+    "${LIBBLYTC_BITS_DIR}/.."
+    LINK_ARGS
     -Wl,-soname,libblyt32.so
     -Wl,-Bdynamic
     -Wl,--no-as-needed
     "${SDK_LIB_NATIVE}/libblytcommon.so"
     "${SDK_LIB_NATIVE}/libblytc.so"
     -Wl,--as-needed
-    -o
-    "${SDK_LIB_NATIVE}/libblyt32.so"
-    "${LIBBLYT32_NATIVE_SRC}"
-    DEPENDS
-    "${LIBBLYT32_NATIVE_SRC}"
+    LINK_DEPENDS
     "${BLYT_H}"
     "${SDK_LIB_NATIVE}/libblytcommon.so"
     "${SDK_LIB_NATIVE}/libblytc.so")
