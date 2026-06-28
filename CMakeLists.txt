@@ -448,7 +448,9 @@ add_library(
   runtime/shared/blyt_fp_canon.c
   runtime/shared/blyt_elf_section.c
   runtime/shared/blyt_resource_codec.c
-  runtime/shared/blyt_blys.c)
+  runtime/shared/blyt_blys.c
+  runtime/shared/blyt_raster.c
+  runtime/shared/blyt_frame_hash.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
 # same static library is usable in both executables and shared objects.
@@ -560,7 +562,9 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     runtime/shared/blyt_fp_canon.c
     runtime/shared/blyt_elf_section.c
     runtime/shared/blyt_resource_codec.c
-    runtime/shared/blyt_blys.c)
+    runtime/shared/blyt_blys.c
+    runtime/shared/blyt_raster.c
+    runtime/shared/blyt_frame_hash.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
   target_include_directories(

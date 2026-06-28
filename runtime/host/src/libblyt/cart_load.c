@@ -112,6 +112,13 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_resource_text_get",
     "blyt_resource_bytes_get",
 
+    /* blyt graphics API (ADR-0052/0086, issue #188 / Spike X).  Paletted 2D
+     * primitives exported by libblyt32.so; host-side on the emulated path. */
+    "blyt_gfx_clear",
+    "blyt_gfx_pixel",
+    "blyt_gfx_rect_fill",
+    "blyt_gfx_line",
+
     /* libblytc.so — allocator (ADR-0120) */
     "malloc",
     "free",

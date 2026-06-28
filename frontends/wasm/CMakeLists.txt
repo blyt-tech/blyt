@@ -354,6 +354,8 @@ add_executable(
   "${BLYT_ROOT}/runtime/shared/blyt_elf_section.c"
   "${BLYT_ROOT}/runtime/shared/blyt_resource_codec.c"
   "${BLYT_ROOT}/runtime/shared/blyt_blys.c"
+  "${BLYT_ROOT}/runtime/shared/blyt_raster.c"
+  "${BLYT_ROOT}/runtime/shared/blyt_frame_hash.c"
   ${BLYT_LUA_SOURCES}
   ${ZSTD_DECODE_SOURCES}
   ${BLYT_DAP_SOURCES}

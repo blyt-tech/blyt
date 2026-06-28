@@ -21,6 +21,10 @@
 #define ECALL_SAVE_WRITE 11
 #define ECALL_SAVE_READ 12
 #define ECALL_BUF_OP 50
+#define ECALL_GFX_CLEAR 100
+#define ECALL_GFX_PIXEL 101
+#define ECALL_GFX_RECT_FILL 102
+#define ECALL_GFX_LINE 103
 
 /* BUF_OP sub-opcodes */
 #define BUF_OP_GET_F32 1
@@ -86,6 +90,49 @@
 /* The resource API (pin/unpin/load/release ECALL stubs + the text_get helper)
  * moved to libblytcommon (blytcommon_emu.c / resources.c) in #123 — it is
  * variant-agnostic, not part of the libblyt32 transport surface. */
+
+/* -------------------------------------------------------------------------
+ * Graphics primitives (ADR-0052/0086, issue #188 / Spike X)
+ *
+ * The paletted 2D surface is Blyt32-specific, so its ECALL stubs live here.
+ * On the emulated path the host services the ecall and rasterizes into
+ * session->pixels[]; the native variant (frontends/native/src/libblyt32)
+ * implements the same entry points against the shared rasterizer directly.
+ * ------------------------------------------------------------------------- */
+
+void blyt_gfx_clear(uint8_t color) {
+    register long a0 __asm__("a0") = (long)color;
+    register long a7 __asm__("a7") = ECALL_GFX_CLEAR;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
+}
+
+void blyt_gfx_pixel(int32_t x, int32_t y, uint8_t color) {
+    register long a0 __asm__("a0") = (long)x;
+    register long a1 __asm__("a1") = (long)y;
+    register long a2 __asm__("a2") = (long)color;
+    register long a7 __asm__("a7") = ECALL_GFX_PIXEL;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a7) : "memory");
+}
+
+void blyt_gfx_rect_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t color) {
+    register long a0 __asm__("a0") = (long)x;
+    register long a1 __asm__("a1") = (long)y;
+    register long a2 __asm__("a2") = (long)w;
+    register long a3 __asm__("a3") = (long)h;
+    register long a4 __asm__("a4") = (long)color;
+    register long a7 __asm__("a7") = ECALL_GFX_RECT_FILL;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7) : "memory");
+}
+
+void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color) {
+    register long a0 __asm__("a0") = (long)x0;
+    register long a1 __asm__("a1") = (long)y0;
+    register long a2 __asm__("a2") = (long)x1;
+    register long a3 __asm__("a3") = (long)y1;
+    register long a4 __asm__("a4") = (long)color;
+    register long a7 __asm__("a7") = ECALL_GFX_LINE;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7) : "memory");
+}
 
 /* -------------------------------------------------------------------------
  * State buffer typed get/set stubs (ADR-0009, ADR-0010, ADR-0057)

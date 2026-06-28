@@ -246,6 +246,30 @@ void blyt_frame_done(void);
 void blyt_console_debug(const char *s);
 
 /* -------------------------------------------------------------------------
+ * Graphics (Blyt32 variant, ADR-0052/0086; issue #188 / Spike X)
+ *
+ * The 320x240 256-colour paletted drawing surface.  Primitives are host-side
+ * (reached by ECALL on the emulated path; implemented natively in the native
+ * libblyt32 variant) and write the runtime-owned back buffer.  Colours are
+ * palette indices.  The first draw call of a frame displaces the boot test
+ * card.
+ * ------------------------------------------------------------------------- */
+
+/* Fill the entire framebuffer with one palette index. */
+void blyt_gfx_clear(uint8_t color);
+
+/* Set one pixel at (x,y) to a palette index.  Off-screen coordinates are
+ * silently clipped (ADR-0048: no clip rect / camera). */
+void blyt_gfx_pixel(int32_t x, int32_t y, uint8_t color);
+
+/* Fill a w x h rectangle with top-left at (x,y); top/left inclusive,
+ * bottom/right exclusive.  Clipped to the framebuffer. */
+void blyt_gfx_rect_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t color);
+
+/* Draw a line between (x0,y0) and (x1,y1) inclusive (integer Bresenham). */
+void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color);
+
+/* -------------------------------------------------------------------------
  * Lua export macros (ADR-0111) — hybrid Lua+C carts
  *
  * Usage:

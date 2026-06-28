@@ -81,6 +81,25 @@
 #define BLYT_ECALL_RESOURCE_LOAD 63
 #define BLYT_ECALL_RESOURCE_RELEASE 64
 
+/* Graphics ECALLs (100–199, ADR-0052/0086; issue #188 / Spike X).
+ *
+ * The paletted 2D drawing surface is Blyt32-specific; its primitives are
+ * host-side (reached by ECALL on the emulated path) and back the runtime's
+ * session->pixels[] via the shared integer rasterizer (runtime/shared/
+ * blyt_raster.c).  The first handler to run sets cart_has_drawn, displacing the
+ * PM5544 test card.
+ *
+ * Coordinates are signed i32 passed in the argument registers; primitives clip
+ * to the 320x240 surface.
+ *   GFX_CLEAR:     a0=color (palette index); fills the whole framebuffer.
+ *   GFX_PIXEL:     a0=x, a1=y, a2=color.
+ *   GFX_RECT_FILL: a0=x, a1=y, a2=w, a3=h, a4=color.
+ *   GFX_LINE:      a0=x0, a1=y0, a2=x1, a3=y1, a4=color. */
+#define BLYT_ECALL_GFX_CLEAR 100
+#define BLYT_ECALL_GFX_PIXEL 101
+#define BLYT_ECALL_GFX_RECT_FILL 102
+#define BLYT_ECALL_GFX_LINE 103
+
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1

@@ -29,6 +29,8 @@
 #include "gdb_transport_tcp.h"
 #endif
 #endif
+#include "blyt_frame_hash.h"
+#include "blyt_raster.h"
 #include "elf32.h"
 #include "testcard.h"
 
@@ -194,6 +196,12 @@ typedef struct {
      * returned by blyt_resource_text_get stays valid for that whole frame. */
     blyt_resource_table_t resources;
     uint32_t resource_scratch_off;
+    /* Graphics back buffer (issue #188) — pointers into the owning
+     * blyt_session_t so the gfx ECALL handlers can draw into session->pixels[]
+     * and flip cart_has_drawn (displacing the test card) without a session
+     * handle.  Mirrors the state_ctx "pointer into the owning session" idiom. */
+    uint8_t *fb; /* = session->pixels */
+    bool *cart_has_drawn; /* = &session->cart_has_drawn */
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -1301,6 +1309,74 @@ static void blyt_ecall_handler(riscv_t *rv) {
         if (g_run_ctx && g_run_ctx->log_fn)
             g_run_ctx->log_fn(buf);
 
+        rv->PC += 4;
+        return;
+    }
+
+    /* Graphics primitives (ADR-0052/0086, issue #188 / Spike X).  Host-side
+     * rasterization into session->pixels[] via the shared integer core; the
+     * first such call flips cart_has_drawn so the runtime stops compositing the
+     * PM5544 test card. */
+    case BLYT_ECALL_GFX_CLEAR: {
+        uint32_t color = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "gfx_clear(color=%u)", color);
+        if (g_run_ctx && g_run_ctx->fb) {
+            blyt_raster_clear(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                              (uint8_t)color);
+            if (g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_GFX_PIXEL: {
+        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a0);
+        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        uint32_t color = rv_get_reg(rv, rv_reg_a2);
+        blyt_tracef(BLYT_TRACE_API, "gfx_pixel(x=%d, y=%d, color=%u)", x, y, color);
+        if (g_run_ctx && g_run_ctx->fb) {
+            blyt_raster_pixel(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x, y,
+                              (uint8_t)color);
+            if (g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_GFX_RECT_FILL: {
+        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a0);
+        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        int32_t w = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        int32_t h = (int32_t)rv_get_reg(rv, rv_reg_a3);
+        uint32_t color = rv_get_reg(rv, rv_reg_a4);
+        blyt_tracef(BLYT_TRACE_API, "gfx_rect_fill(x=%d, y=%d, w=%d, h=%d, color=%u)", x, y, w, h,
+                    color);
+        if (g_run_ctx && g_run_ctx->fb) {
+            blyt_raster_rect_fill(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x, y, w,
+                                  h, (uint8_t)color);
+            if (g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_GFX_LINE: {
+        int32_t x0 = (int32_t)rv_get_reg(rv, rv_reg_a0);
+        int32_t y0 = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        int32_t x1 = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        int32_t y1 = (int32_t)rv_get_reg(rv, rv_reg_a3);
+        uint32_t color = rv_get_reg(rv, rv_reg_a4);
+        blyt_tracef(BLYT_TRACE_API, "gfx_line(x0=%d, y0=%d, x1=%d, y1=%d, color=%u)", x0, y0, x1,
+                    y1, color);
+        if (g_run_ctx && g_run_ctx->fb) {
+            blyt_raster_line(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x0, y0, x1,
+                             y1, (uint8_t)color);
+            if (g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
         rv->PC += 4;
         return;
     }
@@ -2907,6 +2983,12 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     s->ctx.resource_scratch_off = 0;
     load_session_resources(&s->ctx, cart);
 
+    /* Graphics back buffer (issue #188): the gfx ECALL handlers draw into the
+     * session's paletted framebuffer and flip cart_has_drawn via these pointers.
+     * The session address is stable across hot swaps, so this is set once. */
+    s->ctx.fb = s->pixels;
+    s->ctx.cart_has_drawn = &s->cart_has_drawn;
+
     /* Resolve save directory: BLYT_SAVE_DIR env var or ~/.local/share/blyt */
     {
         const char *env_dir = getenv("BLYT_SAVE_DIR");
@@ -3006,6 +3088,24 @@ static void trace_fn_return(blyt_session_t *session) {
             blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret fn@0x%x a0=0x%x", session->trace_fn_addr, a0);
     }
     session->trace_fn_addr = 0;
+}
+
+/* Emit a deterministic hash of the final paletted framebuffer to the cart log
+ * when BLYT_FRAME_HASH is set (issue #188 / Spike X).  Every execution leg runs
+ * this same host runtime, so the line is identical across legs for identical
+ * pixels — the integration harness asserts cross-leg framebuffer equality (and
+ * a checked-in golden) straight from captured stdout, the one channel every leg
+ * shares.  Off by default; zero cost when the env var is unset. */
+static void blyt_emit_frame_hash(blyt_session_t *session) {
+    static int s_on = -1;
+    if (s_on < 0)
+        s_on = getenv("BLYT_FRAME_HASH") != NULL ? 1 : 0;
+    if (!s_on || !g_run_ctx || !g_run_ctx->log_fn)
+        return;
+    uint64_t h = blyt_frame_hash(session->pixels, (size_t)BLYT_FRAME_W * (size_t)BLYT_FRAME_H);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "[blyt:fbhash] %016llx", (unsigned long long)h);
+    g_run_ctx->log_fn(buf);
 }
 
 blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
@@ -3258,6 +3358,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
         if (session->ctx.frame_done) {
             if (!session->cart_has_drawn)
                 blyt_testcard_draw(session->frame_count++, session->pixels);
+            blyt_emit_frame_hash(session);
             if (session->trace_frame_open) {
                 blyt_tracef(BLYT_TRACE_FRAME, "end");
                 session->trace_frame_open = false;
