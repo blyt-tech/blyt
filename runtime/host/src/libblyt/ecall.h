@@ -100,6 +100,16 @@
 #define BLYT_ECALL_GFX_RECT_FILL 102
 #define BLYT_ECALL_GFX_LINE 103
 
+/* Raw-framebuffer acquire/present (issue #188 / Spike X, Q1).  The mechanism
+ * under test for direct pixel access: the runtime reserves a fixed guest region
+ * the size of the paletted framebuffer (BLYT_GFX_FB_BASE in cart_run.c).
+ *   GFX_ACQUIRE: no args; returns the guest VA of that region in a0.  The cart
+ *     writes palette indices directly into it (no per-pixel ECALL).
+ *   GFX_PRESENT: no args; copies the whole region into session->pixels[] and
+ *     sets cart_has_drawn (displacing the test card). */
+#define BLYT_ECALL_GFX_ACQUIRE 104
+#define BLYT_ECALL_GFX_PRESENT 105
+
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1

@@ -25,6 +25,8 @@
 #define ECALL_GFX_PIXEL 101
 #define ECALL_GFX_RECT_FILL 102
 #define ECALL_GFX_LINE 103
+#define ECALL_GFX_ACQUIRE 104
+#define ECALL_GFX_PRESENT 105
 
 /* BUF_OP sub-opcodes */
 #define BUF_OP_GET_F32 1
@@ -132,6 +134,18 @@ void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color
     register long a4 __asm__("a4") = (long)color;
     register long a7 __asm__("a7") = ECALL_GFX_LINE;
     __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7) : "memory");
+}
+
+uint8_t *blyt_gfx_acquire(void) {
+    register long a0 __asm__("a0");
+    register long a7 __asm__("a7") = ECALL_GFX_ACQUIRE;
+    __asm__ volatile("ecall" : "=r"(a0) : "r"(a7) : "memory");
+    return (uint8_t *)a0;
+}
+
+void blyt_gfx_present(void) {
+    register long a7 __asm__("a7") = ECALL_GFX_PRESENT;
+    __asm__ volatile("ecall" : : "r"(a7) : "memory");
 }
 
 /* -------------------------------------------------------------------------

@@ -112,6 +112,21 @@ fn render(ops: &[Op]) -> Vec<u8> {
     fb
 }
 
+/// The deterministic per-pixel pattern the acquire/present probe writes directly
+/// into the runtime-reserved framebuffer region.  A function of (x, y) chosen so
+/// every byte differs from its neighbours (catches stride / byte-order bugs in
+/// the present copy).  Mirrored exactly by the C cart loop in
+/// [`build_raw_present_cart`].
+fn raw_pattern_frame() -> Vec<u8> {
+    let mut fb = vec![0u8; FRAME_W * FRAME_H];
+    for y in 0..FRAME_H {
+        for x in 0..FRAME_W {
+            fb[y * FRAME_W + x] = (x as i32 * 31 + y as i32 * 17) as u8;
+        }
+    }
+    fb
+}
+
 /// FNV-1a 64, matching runtime/shared/blyt_frame_hash.c.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
@@ -143,6 +158,29 @@ fn torture_frame() -> Vec<Op> {
         Op::Line(160, -30, 160, 300, 14), // vertical, off-screen endpoints
         Op::Line(5, 5, 5, 5, 15),       // degenerate single point
     ]
+}
+
+/// Build a C cart that acquires the raw framebuffer pointer, writes the
+/// [`raw_pattern_frame`] pattern straight into that runtime-reserved guest
+/// region, presents it, then quits.  Exercises the Q1 acquire/present contract:
+/// a guest-VA pointer the cart writes directly (no per-pixel ECALL), flushed to
+/// the host framebuffer by one present call.
+fn build_raw_present_cart(dir: &std::path::Path) -> std::path::PathBuf {
+    let src = format!(
+        r#"#include "blyt.h"
+void blyt_cart_init(void) {{}}
+void blyt_cart_update(void) {{ blyt_quit(); }}
+void blyt_cart_draw(void) {{
+  unsigned char *fb = blyt_gfx_acquire();
+  for (int y = 0; y < {FRAME_H}; y++)
+    for (int x = 0; x < {FRAME_W}; x++)
+      fb[y * {FRAME_W} + x] = (unsigned char)(x * 31 + y * 17);
+  blyt_gfx_present();
+}}
+"#
+    );
+    write_c_cart_project(dir, &src);
+    build_cart(dir)
 }
 
 /// Build a C cart that draws `ops` once then quits.
@@ -242,6 +280,28 @@ fn gfx_torture_frame_hashes_identically_across_legs() {
     let cart = build_drawing_cart(&tmp.path().join("gfx-torture"), &ops);
 
     let expected = format!("[blyt:fbhash] {:016x}", fnv1a(&render(&ops)));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Q1 — the acquire/present raw-framebuffer contract.  `blyt_gfx_acquire()`
+/// returns a guest-VA pointer to a runtime-reserved framebuffer region; the cart
+/// writes a deterministic per-pixel pattern straight into it (no per-pixel ECALL)
+/// and `blyt_gfx_present()` flushes the region into the host framebuffer and
+/// displaces the test card.  The presented frame must hash bit-identically across
+/// all three emulated legs and match the reference pattern's golden — proving the
+/// one acquire/present mechanism is consistent across execution models and the
+/// region round-trips byte-exactly.
+#[test]
+fn gfx_acquire_present_raw_framebuffer_hashes_identically_across_legs() {
+    require_sdk();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_raw_present_cart(&tmp.path().join("gfx-raw-present"));
+
+    let expected = format!("[blyt:fbhash] {:016x}", fnv1a(&raw_pattern_frame()));
     let env = [("BLYT_FRAME_HASH", "1")];
     run_cart_native_with_env(&cart, &env, &expected);
     run_cart_wasm_with_env(&cart, &env, &expected);

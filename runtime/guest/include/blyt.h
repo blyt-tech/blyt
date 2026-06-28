@@ -269,6 +269,15 @@ void blyt_gfx_rect_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t colo
 /* Draw a line between (x0,y0) and (x1,y1) inclusive (integer Bresenham). */
 void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color);
 
+/* Direct framebuffer access (issue #188 / Spike X, Q1).  blyt_gfx_acquire()
+ * returns a pointer to the 320x240 paletted back buffer (one byte per pixel,
+ * row-major); the cart may write palette indices straight into it without a
+ * per-pixel ECALL.  blyt_gfx_present() flushes those writes to the runtime
+ * framebuffer and displaces the boot test card.  The pointer is valid for the
+ * lifetime of the cart; present after each batch of direct writes. */
+uint8_t *blyt_gfx_acquire(void);
+void blyt_gfx_present(void);
+
 /* -------------------------------------------------------------------------
  * Lua export macros (ADR-0111) — hybrid Lua+C carts
  *

@@ -118,6 +118,8 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_gfx_pixel",
     "blyt_gfx_rect_fill",
     "blyt_gfx_line",
+    "blyt_gfx_acquire",
+    "blyt_gfx_present",
 
     /* libblytc.so — allocator (ADR-0120) */
     "malloc",

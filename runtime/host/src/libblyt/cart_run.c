@@ -85,6 +85,15 @@
 #define BLYT_RESOURCE_SCRATCH_BASE 0x06000000u /* 96 MiB */
 #define BLYT_RESOURCE_SCRATCH_SIZE (16u * 1024u * 1024u) /* 16 MiB */
 
+/* Raw framebuffer region (issue #188 / Spike X, Q1): blyt_gfx_acquire() returns
+ * this guest VA so the cart can write palette indices directly into a
+ * runtime-reserved region, and blyt_gfx_present() copies it into
+ * session->pixels[].  Sits in the free 32 MiB gap between the exit trampoline
+ * (16 MiB) and the arena (64 MiB); the cart image itself is capped at 16 MiB and
+ * the guest stack lives near the 256 MiB top, so nothing else maps here.  Only
+ * the framebuffer's 320x240 = 75 KiB is touched. */
+#define BLYT_GFX_FB_BASE 0x02000000u /* 32 MiB */
+
 /* Debug hot-reload cart bases (issue #119).  On a reload-while-debugging the
  * cart is re-mapped at a FRESH base each time so lldb sees a relocated module
  * (combined with a unique reported path, this makes it re-read the rebuilt
@@ -1374,6 +1383,30 @@ static void blyt_ecall_handler(riscv_t *rv) {
         if (g_run_ctx && g_run_ctx->fb) {
             blyt_raster_line(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x0, y0, x1,
                              y1, (uint8_t)color);
+            if (g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    /* Raw framebuffer acquire/present (issue #188 / Spike X, Q1).  ACQUIRE hands
+     * the cart the guest VA of the runtime-reserved framebuffer region so it can
+     * write palette indices directly; PRESENT copies that region into
+     * session->pixels[] and flips cart_has_drawn. */
+    case BLYT_ECALL_GFX_ACQUIRE: {
+        blyt_tracef(BLYT_TRACE_API, "gfx_acquire() -> 0x%08x", BLYT_GFX_FB_BASE);
+        rv_set_reg(rv, rv_reg_a0, BLYT_GFX_FB_BASE);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_GFX_PRESENT: {
+        blyt_tracef(BLYT_TRACE_API, "gfx_present()");
+        if (g_run_ctx && g_run_ctx->fb) {
+            vm_attr_t *attr = PRIV(rv);
+            memory_read(attr->mem, g_run_ctx->fb, BLYT_GFX_FB_BASE,
+                        (uint32_t)(BLYT_FRAME_W * BLYT_FRAME_H));
             if (g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
