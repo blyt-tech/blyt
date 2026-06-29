@@ -296,6 +296,8 @@ pub struct CartProject {
     config_yaml: Option<String>,
     /// (relative_path_within_assets, bytes) pairs for assets/ (issue #91/#162).
     asset_files: Vec<(String, Vec<u8>)>,
+    /// Resource names declared `persistent_resources` in blyt.build.yaml (#160).
+    persistent_resources: Vec<String>,
 }
 
 impl CartProject {
@@ -309,7 +311,18 @@ impl CartProject {
             lib_files: Vec::new(),
             rust_lib_names: Vec::new(),
             asset_files: Vec::new(),
+            persistent_resources: Vec::new(),
         }
+    }
+
+    /// Declare `names` as `persistent_resources` in blyt.build.yaml (#160,
+    /// ADR-0028): the runtime pre-loads them before init() and never evicts them.
+    /// Names are resource names (the packer-derived names, e.g. `big` for
+    /// `assets/big.bin`).
+    pub fn persistent(mut self, names: &[&str]) -> Self {
+        self.persistent_resources
+            .extend(names.iter().map(|s| s.to_string()));
+        self
     }
 
     /// Add `content` as `assets/<rel_path>` (issue #91). The packer derives the
@@ -464,6 +477,11 @@ impl CartProject {
             }
         }
         manifest.push_str(&assets_include_block(&self.asset_files));
+        if !self.persistent_resources.is_empty() {
+            manifest.push_str("persistent_resources: [");
+            manifest.push_str(&self.persistent_resources.join(", "));
+            manifest.push_str("]\n");
+        }
         if !manifest.is_empty() {
             fs::write(dir.join("blyt.build.yaml"), manifest).unwrap();
         }

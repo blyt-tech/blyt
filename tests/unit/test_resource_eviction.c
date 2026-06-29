@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "blyt_mem_budget.h" /* BLYT_MEM_BUDGET_BYTES (#160 preload guard) */
 #include "blyt_resource_codec.h" /* BLYT_RES_ALGO_* */
 #include "resource.h"
 
@@ -183,6 +184,127 @@ static void test_uncompressed_evict_is_noop(void) {
     blyt_resource_table_clear(&t);
 }
 
+/* ── Persistent resources (#160, ADR-0028) ─────────────────────────────────── */
+
+/* A persistent entry is excluded from eviction even when nothing references it
+ * (load_count==0 && pin_count==0): the refcount predicate says evictable, but
+ * persistence overrides it — entry_evict and the all-evictable sweep both skip
+ * it, so its bytes stay resident for the cart's whole lifetime. */
+static void test_persistent_entry_is_not_evicted(void) {
+    blyt_resource_table_t t;
+    make_zstd_table(&t, 1);
+    blyt_resource_entry_t *e = blyt_resource_table_find_mut(&t, 1);
+    assert(blyt_resource_entry_data(e) != NULL);
+    assert(e->owned != NULL);
+
+    e->persistent = true; /* declared persistent */
+    assert(blyt_rl_is_evictable(&e->rl)); /* refcount: nothing references it */
+    assert(blyt_resource_entry_evict(e) == 0); /* but persistence overrides */
+    assert(e->owned != NULL); /* bytes intact */
+    assert(blyt_resource_table_evict_all_evictable(&t) == 0); /* sweep skips it too */
+    assert(e->owned != NULL);
+
+    blyt_resource_table_clear(&t);
+}
+
+/* A persistent entry is part of the non-evictable footprint from cart start —
+ * counted even with refcount 0 — but never counted as reclaimable cache. */
+static void test_persistent_counts_in_footprint_not_cache(void) {
+    blyt_resource_table_t t;
+    make_zstd_table(&t, 1);
+    blyt_resource_entry_t *e = blyt_resource_table_find_mut(&t, 1);
+    e->persistent = true;
+
+    /* Footprint reserves the decompressed length up front, materialised or not. */
+    assert(blyt_resource_table_footprint(&t) == strlen(PAYLOAD));
+
+    assert(blyt_resource_entry_data(e) != NULL); /* materialise */
+    /* Resident, but NOT reclaimable cache (persistent is non-evictable). */
+    assert(blyt_resource_table_resident_evictable(&t) == 0);
+    assert(blyt_resource_table_resident_decompressed(&t) == strlen(PAYLOAD));
+
+    blyt_resource_table_clear(&t);
+}
+
+/* Marking from a `.cart.persistent` section body (u32-LE ids) sets the bit on the
+ * matching entries only; preload then materialises exactly the persistent set. */
+static void test_mark_and_preload_persistent(void) {
+    blyt_resource_table_t t;
+    blyt_resource_table_init(&t);
+    for (uint32_t id = 1; id <= 2; id++) {
+        blyt_resource_entry_t *e = blyt_resource_table_test_push(&t);
+        assert(e);
+        e->id = id;
+        e->algo = BLYT_RES_ALGO_ZSTD;
+        e->cdata = FRAME;
+        e->clen = sizeof(FRAME);
+        e->len = strlen(PAYLOAD);
+        e->data = NULL;
+        e->owned = NULL;
+    }
+    const uint8_t ids_le[4] = {1, 0, 0, 0}; /* id 1, little-endian */
+    blyt_resource_table_mark_persistent(&t, ids_le, sizeof(ids_le));
+    assert(blyt_resource_table_find_mut(&t, 1)->persistent == true);
+    assert(blyt_resource_table_find_mut(&t, 2)->persistent == false);
+
+    assert(blyt_resource_table_preload_persistent(&t) == 0);
+    assert(blyt_resource_table_find_mut(&t, 1)->owned != NULL); /* preloaded */
+    assert(blyt_resource_table_find_mut(&t, 2)->owned == NULL); /* untouched */
+
+    blyt_resource_table_clear(&t);
+}
+
+/* evict_to_fit (the LRU pressure response) never selects a persistent entry as a
+ * victim: a persistent resident entry survives even when asked to free everything,
+ * while a non-persistent sibling is reclaimed. */
+static void test_evict_to_fit_skips_persistent(void) {
+    blyt_resource_table_t t;
+    blyt_resource_table_init(&t);
+    for (uint32_t id = 1; id <= 2; id++) {
+        blyt_resource_entry_t *e = blyt_resource_table_test_push(&t);
+        assert(e);
+        e->id = id;
+        e->algo = BLYT_RES_ALGO_ZSTD;
+        e->cdata = FRAME;
+        e->clen = sizeof(FRAME);
+        e->len = strlen(PAYLOAD);
+        e->data = NULL;
+        e->owned = NULL;
+        assert(blyt_resource_entry_data(e) != NULL);
+        blyt_resource_table_touch(&t, e);
+    }
+    blyt_resource_table_find_mut(&t, 1)->persistent = true;
+
+    /* Ask to free everything (max_resident_evictable = 0): only #2 is eligible. */
+    size_t freed = blyt_resource_table_evict_to_fit(&t, 0);
+    assert(freed == strlen(PAYLOAD)); /* only the non-persistent #2 */
+    assert(blyt_resource_table_find_mut(&t, 1)->owned != NULL); /* persistent survives */
+    assert(blyt_resource_table_find_mut(&t, 2)->owned == NULL);
+
+    blyt_resource_table_clear(&t);
+}
+
+/* Preload enforces the runtime budget guard (Layer 2, #160): a persistent set
+ * whose decompressed total exceeds the 16 MiB budget is rejected — preload
+ * fails, so the runtime refuses to start the cart rather than over-subscribing.
+ * (An honestly-built cart never reaches this; the packer's build guard caught it.) */
+static void test_preload_over_budget_is_rejected(void) {
+    blyt_resource_table_t t;
+    blyt_resource_table_init(&t);
+    blyt_resource_entry_t *e = blyt_resource_table_test_push(&t);
+    assert(e);
+    e->id = 1;
+    e->algo = BLYT_RES_ALGO_NONE;
+    e->data = (const uint8_t *)PAYLOAD; /* map-aliased; len is the footprint unit */
+    e->len = (size_t)BLYT_MEM_BUDGET_BYTES + 1; /* one byte over the cap */
+    e->owned = NULL;
+    e->persistent = true;
+
+    assert(blyt_resource_table_preload_persistent(&t) == -1);
+
+    blyt_resource_table_clear(&t);
+}
+
 int main(void) {
     test_zstd_evict_then_rehydrate_identical();
     test_loaded_entry_is_not_evicted();
@@ -190,6 +312,11 @@ int main(void) {
     test_evict_all_evictable_sweeps_only_eligible();
     test_reload_after_evict_mints_fresh_generation();
     test_uncompressed_evict_is_noop();
+    test_persistent_entry_is_not_evicted();
+    test_persistent_counts_in_footprint_not_cache();
+    test_mark_and_preload_persistent();
+    test_evict_to_fit_skips_persistent();
+    test_preload_over_budget_is_rejected();
     printf("test_resource_eviction: all passed\n");
     return 0;
 }

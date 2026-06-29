@@ -1638,10 +1638,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
 
     case BLYT_ECALL_MEM_RESOURCES: {
         /* a0=out resources array vaddr (or 0); a1=cap pairs. Enumerates the
-         * currently-loaded (load_count>0) resources, writing up to `cap`
-         * {u32 id, u32 size} pairs, and returns the full loaded count — the
-         * on-demand half of the introspection API (the scalars are read from the
-         * accounting block, no ECALL; #159, ADR-0029). */
+         * resident resources — currently-loaded (load_count>0) AND persistent
+         * (#160: resident from frame 0 with load_count==0) — writing up to `cap`
+         * {u32 id, u32 size} pairs, and returns the full count. The on-demand half
+         * of the introspection API (the scalars are read from the accounting
+         * block, no ECALL; #159, ADR-0029). */
         uint32_t out_res_vaddr = rv_get_reg(rv, rv_reg_a0);
         uint32_t cap = rv_get_reg(rv, rv_reg_a1);
         vm_attr_t *attr = PRIV(rv);
@@ -1652,8 +1653,8 @@ static void blyt_ecall_handler(riscv_t *rv) {
             const blyt_resource_table_t *t = &g_run_ctx->resources;
             for (size_t i = 0; i < t->count; i++) {
                 const blyt_resource_entry_t *e = &t->entries[i];
-                if (e->rl.load_count == 0)
-                    continue;
+                if (e->rl.load_count == 0 && !e->persistent)
+                    continue; /* persistent counts as resident from frame 0 (#160) */
                 if (out_res_vaddr && loaded < cap) {
                     uint8_t pair[8];
                     write_u32_le(pair + 0, e->id);
@@ -3041,6 +3042,12 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
     blyt_resource_table_clear(&s->ctx.resources);
     s->ctx.resource_scratch_off = 0;
     load_session_resources(&s->ctx, new_cart);
+    /* Re-apply the reloaded cart's persistent set (#160): mark + pre-load so the
+     * swapped-in resources are resident before the reloaded cart's init() reruns,
+     * matching a fresh load. (A reload's footprint is republished by the caller's
+     * subsequent frame; preload here keeps the bytes resident meanwhile.) */
+    blyt_resource_table_load_persistent_from_cart(&s->ctx.resources, new_cart);
+    blyt_resource_table_preload_persistent(&s->ctx.resources);
     snprintf(s->ctx.cart_name, sizeof(s->ctx.cart_name), "%s", new_cart->id);
     s->ctx.save_version = new_cart->save_version;
 
@@ -3220,6 +3227,25 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
      * and set/clear software breakpoints via ebreak patches. */
     fc_gdb_stub_set_cpu_ops(&gdb_cpu_ops);
 #endif
+
+    /* Persistent resources (ADR-0028, #160): mark the declared set and pre-load
+     * it BEFORE init() runs, so its bytes are resident from frame 0 and reserved
+     * in the non-evictable footprint. This runs at guest_heap_used == 0 (no guest
+     * code has executed yet), so the reservation always fits a budget the build
+     * guard already validated. An over-budget set (only reachable via a
+     * hand-crafted cart — the packer rejects it at build) or a decode failure on
+     * a declared-essential resource fails cart start deterministically. */
+    blyt_resource_table_load_persistent_from_cart(&s->ctx.resources, cart);
+    if (blyt_resource_table_preload_persistent(&s->ctx.resources) != 0) {
+        if (log_fn)
+            log_fn("session create: persistent resources exceed the 16 MB budget "
+                   "(or failed to load)");
+        blyt_session_destroy(s);
+        return NULL;
+    }
+    /* Publish the persistent footprint now so the guest's very first allocation
+     * in init() already sees the reserved budget (no under-enforced window). */
+    mem_acct_publish_footprint(&s->ctx, s->attr.mem);
 
     return s;
 }

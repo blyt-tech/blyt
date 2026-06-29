@@ -1675,5 +1675,173 @@ void blyt_cart_draw(void) {}
         println!("  PASS: {expected}");
     }
 
+    // ── Gate 19: persistent resources on metal (#160, ADR-0028) ──────────
+    //
+    // The only bare-metal coverage of the native persistent path (mark from
+    // `.cart.persistent`, pre-load before init, footprint reservation, eviction
+    // exclusion, mem_resources residency). Two sub-carts are byte-for-byte the
+    // emulated persistent_resources.rs carts; the metal output MUST equal the
+    // emulated legs' — that identity is the determinism contract.
+    println!("Gate 19: persistent resources on metal...");
+    {
+        // 19a: a persistent resource is resident from frame 0, usable without a
+        // prior load, and release/unpin are no-ops on residency.
+        let usable_project = tmp.path().join("pers_usable_metal");
+        CartProject::new()
+            .c(r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stddef.h>
+#include <stdio.h>
+
+static int is_resident(blyt_resource_id_t id) {
+    blyt_mem_resource_t buf[8];
+    uint32_t n = blyt_mem_resources(buf, 8);
+    for (uint32_t i = 0; i < n; i++)
+        if (buf[i].id == id)
+            return 1;
+    return 0;
+}
+static unsigned sum_bytes(const void *p, size_t n) {
+    unsigned s = 0;
+    for (size_t i = 0; i < n; i++)
+        s += ((const unsigned char *)p)[i];
+    return s;
+}
+void blyt_cart_init(void) {
+    blyt_resource_id_t pid = (blyt_resource_id_t)R_PERS;
+    int r0 = is_resident(pid);
+    const void *p = NULL;
+    size_t sz = 0;
+    unsigned sum = 0;
+    if (blyt_resource_pin(pid, &p, &sz) == BLYT_OK && p)
+        sum = sum_bytes(p, sz);
+    blyt_resource_unpin(pid);
+    blyt_resource_h h = BLYT_RESOURCE_INVALID;
+    blyt_resource_load(pid, &h);
+    blyt_resource_release(h);
+    int r1 = is_resident(pid);
+    const void *p2 = NULL;
+    size_t sz2 = 0;
+    unsigned sum2 = 0;
+    if (blyt_resource_pin(pid, &p2, &sz2) == BLYT_OK && p2)
+        sum2 = sum_bytes(p2, sz2);
+    blyt_resource_unpin(pid);
+    char line[128];
+    snprintf(line, sizeof(line), "PERS r0=%d sum=%u sz=%u r1=%d sum2=%u", r0, sum, (unsigned)sz, r1,
+             sum2);
+    blyt_console_debug(line);
+}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#)
+            .asset_bytes("pers.bin", &[0x10, 0x20, 0x30, 0x40, 0x50])
+            .persistent(&["pers"])
+            .write(&usable_project);
+        let usable_cart = build_cart(&usable_project);
+        assert!(
+            usable_cart.exists(),
+            "pers_usable_metal.blyt not built: {}",
+            usable_cart.display()
+        );
+        assert!(
+            qemu.scp_to(&usable_cart, "/tmp/blyt_gate/"),
+            "scp pers_usable_metal.blyt failed"
+        );
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/pers_usable_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "pers_usable_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("PERS r0=1 sum=240 sz=5 r1=1 sum2=240"),
+            "native persistent resource must be resident from frame 0, usable without \
+             load, and survive release/unpin — identical to the emulated legs (#160)\n\
+             output: {output}"
+        );
+        println!("  PASS (19a): output = {:?}", output.trim());
+
+        // 19b: under pressure the persistent resource reserves budget (not evicted)
+        // while a non-persistent sibling does not (evictable) — the deterministic
+        // budget signature of "persistent is not evicted, sibling is".
+        let evict_project = tmp.path().join("pers_evict_metal");
+        CartProject::new()
+            .c(r#"
+#include "blyt.h"
+#include "cart_resources.h"
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define CHUNK (64 * 1024)
+#define MAXP 512
+static void *g_ptrs[MAXP];
+static int fill_heap(void) {
+    int n = 0;
+    void *p;
+    while (n < MAXP && (p = malloc(CHUNK)) != NULL)
+        g_ptrs[n++] = p;
+    for (int i = 0; i < n; i++)
+        free(g_ptrs[i]);
+    return n;
+}
+void blyt_cart_init(void) {
+    const void *p = NULL;
+    size_t s = 0;
+    blyt_resource_pin((blyt_resource_id_t)R_TRANS4, &p, &s);
+    blyt_resource_unpin((blyt_resource_id_t)R_TRANS4);
+    int n = fill_heap();
+    const void *pp = NULL;
+    size_t ps = 0;
+    int pers_ok = (blyt_resource_pin((blyt_resource_id_t)R_PERS4, &pp, &ps) == BLYT_OK && pp &&
+                   ps == 4u * 1024u * 1024u);
+    blyt_resource_unpin((blyt_resource_id_t)R_PERS4);
+    char line[96];
+    snprintf(line, sizeof(line), "PERSEVICT n=%d pers_ok=%d", n, pers_ok);
+    blyt_console_debug(line);
+}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {}
+"#)
+            .asset_bytes("pers4.bin", &[0u8; 4 * 1024 * 1024])
+            .asset_bytes("trans4.bin", &[0u8; 4 * 1024 * 1024])
+            .persistent(&["pers4"])
+            .write(&evict_project);
+        let evict_cart = build_cart(&evict_project);
+        assert!(
+            evict_cart.exists(),
+            "pers_evict_metal.blyt not built: {}",
+            evict_cart.display()
+        );
+        assert!(
+            qemu.scp_to(&evict_cart, "/tmp/blyt_gate/"),
+            "scp pers_evict_metal.blyt failed"
+        );
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/pers_evict_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "pers_evict_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains("PERSEVICT n=191 pers_ok=1"),
+            "native persistent resource must reserve 4 MiB of budget (12 MiB headroom -> \
+             191) while the non-persistent sibling stays evictable, identical to the \
+             emulated legs (#160)\noutput: {output}"
+        );
+        println!("  PASS (19b): output = {:?}", output.trim());
+    }
+
     println!("Gate tests passed.");
 }
