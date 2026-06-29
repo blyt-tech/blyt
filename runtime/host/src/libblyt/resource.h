@@ -44,6 +44,14 @@ typedef struct {
      * rehydrate from `cdata`/the cart map instead). */
     char *src_path;
     blyt_rl_state_t rl; /* load/pin refcounts + load generation (#123) */
+    /* Persistent (ADR-0028, #160): declared always-needed in the manifest. A
+     * persistent entry is pre-loaded before init() and excluded from eviction
+     * regardless of refcounts — the eviction predicate AND-checks this on top of
+     * blyt_rl_is_evictable — and is part of the non-evictable footprint from cart
+     * start. release/unpin on it are no-ops by construction (eviction never frees
+     * it). Set by blyt_resource_table_mark_persistent from the `.cart.persistent`
+     * section; zero (false) for an ordinary resource. */
+    bool persistent;
     /* Recency stamp for LRU victim selection under budget pressure (#158).
      * Bumped from the table's monotonic clock on each load/pin/access; advisory
      * (not cross-platform identical — only the non-evictable footprint carries
@@ -125,6 +133,31 @@ size_t blyt_resource_table_evict_to_fit(blyt_resource_table_t *t, uint32_t max_r
  * unit tests that construct entries directly (test_resource_eviction.c); the
  * production loaders use it internally. Returns NULL on OOM. */
 blyt_resource_entry_t *blyt_resource_table_test_push(blyt_resource_table_t *t);
+
+/* ── Persistent resources (ADR-0028, #160) ──────────────────────────────────── */
+
+/* Mark every entry whose id appears in a `.cart.persistent` section body as
+ * persistent. `ids_le` is `n_bytes` of little-endian u32 ids (n_bytes/4 ids);
+ * ids not present in the table are ignored (defensive — the packer resolves
+ * names to ids and validates them). Sets the per-entry `persistent` bit that
+ * eviction and the footprint both honour. */
+void blyt_resource_table_mark_persistent(blyt_resource_table_t *t, const uint8_t *ids_le,
+                                         size_t n_bytes);
+
+/* Find and apply the cart's `.cart.persistent` section (if any), marking the
+ * declared entries persistent. No-op when the section is absent. */
+void blyt_resource_table_load_persistent_from_cart(blyt_resource_table_t *t,
+                                                   const blyt_cart_t *cart);
+
+/* Pre-load the persistent set before init() runs (#160): materialise every
+ * persistent entry's bytes so they are resident from cart start. Also enforces
+ * the runtime budget guard (Layer 2): if the persistent set's decompressed total
+ * exceeds the 16 MiB budget, no bytes are materialised and it returns -1 so the
+ * caller refuses to start the cart (deterministic, never over-subscribes). An
+ * honestly-built cart never trips this — the packer's build-time guard caught an
+ * over-budget set already. Returns 0 on success, -1 on over-budget or a decode/
+ * OOM failure materialising a persistent entry. */
+int blyt_resource_table_preload_persistent(blyt_resource_table_t *t);
 
 /* Release: populate from a packed cart's `.cart.resource.<id>` sections. Entry
  * data aliases the cart map. Clears existing entries first. Returns the number

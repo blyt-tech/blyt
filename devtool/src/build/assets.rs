@@ -113,6 +113,10 @@ pub(super) struct AssetInfo {
     /// Resource type, derived from the source extension (`.txt` → text, else
     /// raw). Drives the `.meta` `type=` field only.
     pub resource_type: ResourceType,
+    /// Staged (decompressed) byte length — the source size, plus one for the
+    /// text NUL terminator. Equals the runtime entry's `e->len` (footprint unit),
+    /// so the persistent-budget guard (#160) sums this field.
+    pub staged_len: usize,
 }
 
 /// Map a path relative to a resource dir to a resource name per ADR-0088's
@@ -450,6 +454,14 @@ pub(super) fn scan_assets(
             let rel_data = format!("resources/{resource_name}-{fingerprint}.data");
             let data_output = resources_dir.join(format!("{resource_name}-{fingerprint}.data"));
             let meta_output = resources_dir.join(format!("{resource_name}-{fingerprint}.meta"));
+            let resource_type = ResourceType::from_extension(
+                rel.extension().and_then(OsStr::to_str),
+                &config.text_extensions,
+            );
+            // The staged `.data` is the source bytes, plus one NUL for text
+            // (AssetTask). This is the runtime entry's `e->len`, so the
+            // persistent-budget guard (#160) sums it.
+            let staged_len = bytes.len() + usize::from(resource_type.is_text());
             assets.push(AssetInfo {
                 id: 0, // assigned below
                 resource_name,
@@ -458,10 +470,8 @@ pub(super) fn scan_assets(
                 rel_data,
                 data_output,
                 meta_output,
-                resource_type: ResourceType::from_extension(
-                    rel.extension().and_then(OsStr::to_str),
-                    &config.text_extensions,
-                ),
+                resource_type,
+                staged_len,
             });
         }
     }
@@ -858,6 +868,7 @@ mod tests {
             data_output: PathBuf::from(format!("build/resources/{n}-{fp}.data")),
             meta_output: PathBuf::from(format!("build/resources/{n}-{fp}.meta")),
             resource_type: ty,
+            staged_len: 0,
         }
     }
 

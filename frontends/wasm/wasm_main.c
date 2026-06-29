@@ -1516,8 +1516,8 @@ static int wasm_mem_stats(lua_State *L) {
     if (t) {
         for (size_t i = 0; i < t->count; i++) {
             const blyt_resource_entry_t *e = &t->entries[i];
-            if (e->rl.load_count == 0)
-                continue;
+            if (e->rl.load_count == 0 && !e->persistent)
+                continue; /* persistent counts as resident from frame 0 (#160) */
             lua_createtable(L, 0, 2);
             lua_pushinteger(L, (lua_Integer)e->id);
             lua_setfield(L, -2, "id");
@@ -2251,6 +2251,11 @@ void blyt_dev_ctrl_assets_fetched(int ok) {
      * the cart's Lua callback with the changed ids. */
     if (g_lua_resources_loaded) {
         blyt_resource_table_load_for_cart(&g_lua_resources, g_cart);
+        /* Re-apply the reloaded cart's persistent set (#160), mirroring the
+         * initial load and the session reload path. */
+        blyt_resource_table_load_persistent_from_cart(&g_lua_resources, g_cart);
+        blyt_resource_table_preload_persistent(&g_lua_resources);
+        wasm_lua_publish_footprint(&g_lua_resources);
         wasm_lua_notify_assets_reloaded(g_dev_ctrl_assets_ids, g_dev_ctrl_assets_n);
         dev_ctrl_respond_ok(id, "update_assets");
     } else {
@@ -2877,7 +2882,19 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         if (!g_session) {
             blyt_resource_table_init(&g_lua_resources);
             blyt_resource_table_load_for_cart(&g_lua_resources, g_cart);
+            /* Persistent resources (#160): mark + pre-load before the cart's
+             * init() runs, then publish the footprint so it is reserved from
+             * frame 0 — the host-Lua mirror of blyt_session_create's preload. */
+            blyt_resource_table_load_persistent_from_cart(&g_lua_resources, g_cart);
+            if (blyt_resource_table_preload_persistent(&g_lua_resources) != 0) {
+                blyt_js_error("persistent resources exceed the 16 MB budget (or failed to load)");
+                blyt_resource_table_clear(&g_lua_resources);
+                lua_close(g_lua);
+                g_lua = NULL;
+                return 1;
+            }
             g_lua_resources_loaded = true;
+            wasm_lua_publish_footprint(&g_lua_resources);
         }
         /* Register state buffer + save/load + resource API. */
         if (active_state_ctx())

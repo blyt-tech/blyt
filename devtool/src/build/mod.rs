@@ -3,6 +3,7 @@ mod c;
 mod cpp;
 mod external;
 mod lua;
+mod persistent;
 mod resource_pack;
 mod rust;
 
@@ -1460,6 +1461,12 @@ struct BuildManifest {
     #[serde(default)]
     #[allow(dead_code)]
     assets: Option<assets::AssetsConfig>,
+    /// Persistent-resource declaration (#160). Parsed and consumed separately by
+    /// `persistent::read_persistent_resources`; declared here so
+    /// `deny_unknown_fields` accepts the `persistent_resources:` key.
+    #[serde(default)]
+    #[allow(dead_code)]
+    persistent_resources: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -1906,6 +1913,13 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     );
     tasks.extend(asset_tasks);
 
+    // Persistent resources (#160, ADR-0028): resolve the manifest's
+    // `persistent_resources` names to ids against the scanned assets. This also
+    // enforces the build-time budget guard (Layer 1) — an over-budget or
+    // unknown-name set fails the build here, before any cart is produced.
+    let persistent_names = persistent::read_persistent_resources(project_dir)?;
+    let persistent_ids = persistent::resolve_persistent_ids(&persistent_names, &scanned_assets)?;
+
     if needs_c && buffers_present {
         tasks.push(Box::new(GenerateCHeaderTask {
             project_dir: project_dir.to_path_buf(),
@@ -2315,6 +2329,17 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
             ".cart.layouts".to_string(),
             build_dir.join("cart.layouts.bin"),
         ));
+    }
+    // .cart.persistent (#160): the sorted persistent resource-id list, emitted
+    // into both the packed `.blyt` and the dev ELF (so the emulated dev path
+    // pre-loads the same set). Omitted entirely when the cart declares none.
+    if !persistent_ids.is_empty() {
+        let persistent_file = build_dir.join("cart.persistent.bin");
+        tasks.push(Box::new(persistent::WritePersistentSectionTask {
+            output: persistent_file.clone(),
+            ids: persistent_ids,
+        }));
+        extra_sections.push((".cart.persistent".to_string(), persistent_file));
     }
 
     Ok(PreBuild {

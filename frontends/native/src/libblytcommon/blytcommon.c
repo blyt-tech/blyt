@@ -819,6 +819,10 @@ typedef struct {
      * Advisory (never cross-platform identical — only the footprint carries
      * determinism), so the LRU order it imposes never affects alloc success. */
     uint32_t last_access;
+    /* Persistent (ADR-0028, #160): pre-loaded before init, never evicted, part of
+     * the non-evictable footprint from cart start. The native mirror of the host
+     * entry's `persistent` bit; the eviction predicate AND-checks it. */
+    uint8_t persistent;
 } native_res_t;
 
 static const uint8_t *s_cart_map; /* retained read-only cart mapping, or NULL */
@@ -874,6 +878,7 @@ static void res_fill_cb(const char *suffix, uint32_t suffix_len, uint32_t off, u
     e->owned = NULL;
     e->rl = (blyt_rl_state_t){0};
     e->last_access = 0;
+    e->persistent = 0;
 
     /* Parse the 8-byte compression header (#157): NONE aliases the body in the
      * map (zero-copy, off+8); ZSTD keeps the compressed body for lazy decode and
@@ -1020,8 +1025,8 @@ static const uint8_t *native_res_data(native_res_t *e) {
  * not eligible. Mirrors the host blyt_resource_entry_evict (single-sourced
  * eligibility predicate, ADR-0007). Returns the bytes reclaimed. */
 static uint32_t native_res_evict(native_res_t *e) {
-    if (!blyt_rl_is_evictable(&e->rl))
-        return 0;
+    if (e->persistent || !blyt_rl_is_evictable(&e->rl))
+        return 0; /* persistence (#160) overrides the refcount predicate */
     if (!e->owned)
         return 0;
     uint32_t reclaimed = e->len;
@@ -1053,7 +1058,8 @@ static uint32_t native_resources_evict_all_evictable(void) {
 static uint32_t native_res_footprint(void) {
     uint32_t total = 0;
     for (uint32_t i = 0; i < s_res_count; i++)
-        if (!blyt_rl_is_evictable(&s_res[i].rl))
+        /* Non-evictable = referenced OR persistent (#160), counted up front. */
+        if (s_res[i].persistent || !blyt_rl_is_evictable(&s_res[i].rl))
             total += s_res[i].len;
     return total;
 }
@@ -1062,7 +1068,8 @@ static uint32_t native_res_footprint(void) {
 static uint32_t native_res_resident_evictable(void) {
     uint32_t total = 0;
     for (uint32_t i = 0; i < s_res_count; i++)
-        if (s_res[i].owned && blyt_rl_is_evictable(&s_res[i].rl))
+        /* Persistent entries hold owned bytes but are non-evictable (#160). */
+        if (s_res[i].owned && !s_res[i].persistent && blyt_rl_is_evictable(&s_res[i].rl))
             total += s_res[i].len;
     return total;
 }
@@ -1094,7 +1101,9 @@ static void native_res_evict_to_fit(uint32_t max_resident_evictable) {
         native_res_t *victim = NULL;
         for (uint32_t i = 0; i < s_res_count; i++) {
             native_res_t *e = &s_res[i];
-            if (!e->owned || !blyt_rl_is_evictable(&e->rl))
+            /* Persistent entries are never victims (#160), which also keeps this
+             * loop from spinning on one native_res_evict would refuse to free. */
+            if (!e->owned || e->persistent || !blyt_rl_is_evictable(&e->rl))
                 continue;
             if (!victim || e->last_access < victim->last_access)
                 victim = e;
@@ -1225,8 +1234,8 @@ void blyt_mem_stats(blyt_mem_stats_t *out) {
 uint32_t blyt_mem_resources(blyt_mem_resource_t *resources, uint32_t cap) {
     uint32_t loaded = 0;
     for (uint32_t i = 0; i < s_res_count; i++) {
-        if (s_res[i].rl.load_count == 0)
-            continue;
+        if (s_res[i].rl.load_count == 0 && !s_res[i].persistent)
+            continue; /* persistent counts as resident from frame 0 (#160) */
         if (resources && loaded < cap) {
             resources[loaded].id = s_res[i].id;
             resources[loaded].size = s_res[i].len;
@@ -1242,9 +1251,62 @@ static void resources_force_release_pins(void) {
         blyt_rl_force_release_pins(&s_res[i].rl);
 }
 
+/* ── Persistent resources (ADR-0028, #160) ───────────────────────────────────
+ * Native mirror of resource.c's mark/preload: read the cart's `.cart.persistent`
+ * section (sorted u32-LE ids) from the retained mmap, mark the matching entries,
+ * and materialise them before init() runs. Same shape as the host (ADR-0007). */
+
+static uint32_t native_read_u32_le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Mark every entry whose id is listed in the `.cart.persistent` section. */
+static void native_mark_persistent(void) {
+    if (!s_cart_map)
+        return;
+    uint32_t off = 0, size = 0;
+    if (!blyt_elf32_find_section(s_cart_map, s_cart_size, ".cart.persistent", &off, &size))
+        return; /* no persistent set declared */
+    const uint8_t *ids = s_cart_map + off;
+    for (uint32_t b = 0; b + 4 <= size; b += 4) {
+        int i = res_find(native_read_u32_le(ids + b));
+        if (i >= 0)
+            s_res[i].persistent = 1; /* unknown ids ignored (packer validates) */
+    }
+}
+
+/* Pre-load the persistent set: materialise its bytes so they are resident before
+ * init(). Enforces the Layer-2 budget guard (#160) — returns -1 if the persistent
+ * footprint exceeds the 16 MB budget (an honestly-built cart never trips this; the
+ * packer's build guard caught it) or a persistent entry fails to decode. */
+static int native_preload_persistent(void) {
+    if (native_res_footprint() > BLYT_MEM_BUDGET_BYTES)
+        return -1;
+    for (uint32_t i = 0; i < s_res_count; i++) {
+        if (!s_res[i].persistent)
+            continue;
+        if (native_res_data(&s_res[i]) == NULL)
+            return -1;
+    }
+    return 0;
+}
+
 void blyt_runtime_startup(void) {
     load_cart_buf_counts(); /* must precede restricted filter (uses statx/mmap) */
     resources_init(); /* same: retains a cart mmap before the filter (#123) */
+    /* Persistent resources (#160): mark + pre-load before init() — runs here at
+     * guest_heap_used == 0 (no cart code yet) and pre-seccomp (decode mmaps are
+     * allowlisted anyway), so the reservation always fits the build-validated
+     * budget. An over-budget set (only via a hand-crafted cart) or a decode
+     * failure refuses to start, deterministically. */
+    native_mark_persistent();
+    if (native_preload_persistent() != 0) {
+        static const char msg[] =
+            "libblytcommon: FATAL: persistent resources exceed the 16 MB budget\n";
+        blyt_rs_write(2, msg, sizeof(msg) - 1);
+        blyt_rs_exit_group(127);
+    }
+    native_mem_publish_footprint(); /* reserve the persistent footprint before init */
     s_evict_every_frame = (getenv("BLYT_RESOURCE_EVICT_EVERY_FRAME") != 0); /* #137 */
     if (blyt_install_restricted_filter() != 0) {
         static const char msg[] = "libblytcommon: FATAL: seccomp install failed\n";

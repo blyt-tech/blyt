@@ -1,6 +1,7 @@
 #include "resource.h"
 
 #include "blyt_elf_section.h" /* runtime/shared: prefix enumerate + id parse (#141) */
+#include "blyt_mem_budget.h" /* runtime/shared: 16 MB budget cap (#160 preload guard) */
 #include "blyt_resource_codec.h" /* runtime/shared: per-resource compression (#157) */
 #include "cart_load.h" /* struct blyt_cart */
 
@@ -73,6 +74,7 @@ static blyt_resource_entry_t *table_push(blyt_resource_table_t *t) {
     e->src_path = NULL;
     e->rl = (blyt_rl_state_t){0};
     e->last_access = 0;
+    e->persistent = false;
     return e;
 }
 
@@ -117,8 +119,9 @@ size_t blyt_resource_entry_evict(blyt_resource_entry_t *e) {
     if (!e)
         return 0;
     /* The refcount predicate is the hard gate (single-sourced in runtime/shared);
-     * persistence (ADR-0028, #160) will AND in here once it lands. */
-    if (!blyt_rl_is_evictable(&e->rl))
+     * persistence (ADR-0028, #160) ANDs in: a persistent entry is never evicted,
+     * even with no outstanding load/pin. */
+    if (e->persistent || !blyt_rl_is_evictable(&e->rl))
         return 0;
     if (!e->owned)
         return 0; /* no owned bytes: map-aliased uncompressed, or already evicted */
@@ -141,10 +144,12 @@ size_t blyt_resource_table_evict_all_evictable(blyt_resource_table_t *t) {
 uint32_t blyt_resource_table_footprint(const blyt_resource_table_t *t) {
     uint32_t total = 0;
     for (size_t i = 0; i < t->count; i++) {
-        /* Non-evictable = referenced (loaded/pinned); persistence (#160) ANDs in
-         * here later. Count e->len up front, materialized or not (#157). */
-        if (!blyt_rl_is_evictable(&t->entries[i].rl))
-            total += (uint32_t)t->entries[i].len;
+        /* Non-evictable = referenced (loaded/pinned) OR persistent (#160). Count
+         * e->len up front, materialized or not (#157): a persistent resource
+         * reserves the budget from cart start (ADR-0028). */
+        const blyt_resource_entry_t *e = &t->entries[i];
+        if (e->persistent || !blyt_rl_is_evictable(&e->rl))
+            total += (uint32_t)e->len;
     }
     return total;
 }
@@ -153,7 +158,9 @@ uint32_t blyt_resource_table_resident_evictable(const blyt_resource_table_t *t) 
     uint32_t total = 0;
     for (size_t i = 0; i < t->count; i++) {
         const blyt_resource_entry_t *e = &t->entries[i];
-        if (e->owned && blyt_rl_is_evictable(&e->rl))
+        /* Reclaimable cache excludes persistent entries: they hold owned bytes
+         * but are non-evictable, so they are never "resident evictable" (#160). */
+        if (e->owned && !e->persistent && blyt_rl_is_evictable(&e->rl))
             total += (uint32_t)e->len;
     }
     return total;
@@ -185,7 +192,10 @@ size_t blyt_resource_table_evict_to_fit(blyt_resource_table_t *t, uint32_t max_r
         blyt_resource_entry_t *victim = NULL;
         for (size_t i = 0; i < t->count; i++) {
             blyt_resource_entry_t *e = &t->entries[i];
-            if (!e->owned || !blyt_rl_is_evictable(&e->rl))
+            /* Persistent entries are never victims (#160) — and excluding them
+             * here is also what keeps this loop from spinning on one that
+             * entry_evict would refuse to free. */
+            if (!e->owned || e->persistent || !blyt_rl_is_evictable(&e->rl))
                 continue;
             if (!victim || e->last_access < victim->last_access)
                 victim = e;
@@ -255,6 +265,56 @@ size_t blyt_resource_table_load_from_cart(blyt_resource_table_t *t, const blyt_c
     blyt_elf32_for_each_section_prefix((const uint8_t *)cart->map, cart->map_size,
                                        RESOURCE_SECTION_PREFIX, load_resource_section, &ctx);
     return t->count;
+}
+
+/* ── Persistent resources (ADR-0028, #160) ──────────────────────────────────── */
+
+#define PERSISTENT_SECTION ".cart.persistent"
+
+/* Parse a little-endian u32 at `p`. */
+static uint32_t read_u32_le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+void blyt_resource_table_mark_persistent(blyt_resource_table_t *t, const uint8_t *ids_le,
+                                         size_t n_bytes) {
+    if (!ids_le)
+        return;
+    for (size_t off = 0; off + 4 <= n_bytes; off += 4) {
+        uint32_t id = read_u32_le(ids_le + off);
+        blyt_resource_entry_t *e = blyt_resource_table_find_mut(t, id);
+        if (e)
+            e->persistent = true; /* unknown ids ignored (packer validates) */
+    }
+}
+
+void blyt_resource_table_load_persistent_from_cart(blyt_resource_table_t *t,
+                                                   const blyt_cart_t *cart) {
+    if (!cart || !cart->map)
+        return;
+    uint32_t off = 0, size = 0;
+    if (!blyt_elf32_find_section((const uint8_t *)cart->map, cart->map_size, PERSISTENT_SECTION,
+                                 &off, &size))
+        return; /* no persistent set declared */
+    blyt_resource_table_mark_persistent(t, (const uint8_t *)cart->map + off, size);
+}
+
+int blyt_resource_table_preload_persistent(blyt_resource_table_t *t) {
+    /* Layer-2 budget guard (#160): a persistent set whose decompressed total
+     * exceeds the budget is rejected before any byte is materialised — refuse to
+     * start rather than over-subscribe. footprint() already sums persistent len. */
+    if (blyt_resource_table_footprint(t) > BLYT_MEM_BUDGET_BYTES)
+        return -1;
+    for (size_t i = 0; i < t->count; i++) {
+        blyt_resource_entry_t *e = &t->entries[i];
+        if (!e->persistent)
+            continue;
+        /* Materialise so the bytes are resident before init() runs. A decode/OOM
+         * failure on a declared-essential resource fails cart start. */
+        if (blyt_resource_entry_data(e) == NULL)
+            return -1;
+    }
+    return 0;
 }
 
 /* Read an entire file into a freshly malloc'd buffer (NUL-terminated for
