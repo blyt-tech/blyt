@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "blyt_handle.h" /* runtime/shared: console-wide resource-constant encoding (ADR-0134) */
+#include "blyt_resource_codec.h" /* runtime/shared: BLYT_RES_ALGO_NONE (#157) */
 #include "blyt_runtime.h"
 #include "blyt_trace.h"
 #include "cart_load.h"
@@ -1336,6 +1338,19 @@ static void buf_op_trace(uint32_t op, uint32_t buf_id, int32_t slot, uint32_t fi
                     slot, field, vstr);
 }
 
+/* Resolve an incoming resource constant (the baked console-wide handle,
+ * ADR-0134) to its table entry: classify it as a cart-bundled RESOURCE and look
+ * up the decoded 24-bit id.  Returns NULL for a non-resource kind, a
+ * runtime-shipped provenance (no built-in registry yet — ADR-0134 defers it), or
+ * an absent id.  The table is keyed by the raw 24-bit id (the `.cart.resource.<id>`
+ * section id); only cart-facing values carry the kind/provenance tag. */
+static blyt_resource_entry_t *blyt_resolve_resource(blyt_resource_table_t *t, uint32_t handle) {
+    if (!blyt_handle_is_resource(handle) ||
+        blyt_resource_decode_provenance(handle) != BLYT_RESOURCE_PROV_CART)
+        return NULL;
+    return blyt_resource_table_find_mut(t, blyt_resource_decode_id(handle));
+}
+
 static void blyt_ecall_handler(riscv_t *rv) {
     uint32_t num = rv_get_reg(rv, rv_reg_a7);
 
@@ -1481,15 +1496,16 @@ static void blyt_ecall_handler(riscv_t *rv) {
         /* a0=id (in) -> result (out); a1=out_ptr vaddr, a2=out_size vaddr.
          * Copies the bytes into the per-frame guest scratch, returns the guest
          * pointer + length, and bumps the pin count. */
-        uint32_t id = rv_get_reg(rv, rv_reg_a0);
+        uint32_t handle = rv_get_reg(rv, rv_reg_a0); /* baked resource constant (ADR-0134) */
         uint32_t out_ptr_vaddr = rv_get_reg(rv, rv_reg_a1);
         uint32_t out_size_vaddr = rv_get_reg(rv, rv_reg_a2);
         vm_attr_t *attr = PRIV(rv);
         memory_t *mem = attr->mem;
 
         blyt_resource_entry_t *e =
-            g_run_ctx ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
-        blyt_tracef(BLYT_TRACE_API, "resource_pin(id=%u) -> %s len=%zu", id, e ? "ok" : "NOT_FOUND",
+            g_run_ctx ? blyt_resolve_resource(&g_run_ctx->resources, handle) : NULL;
+        blyt_tracef(BLYT_TRACE_API, "resource_pin(h=0x%08x id=%u) -> %s len=%zu", handle,
+                    blyt_resource_decode_id(handle), e ? "ok" : "NOT_FOUND",
                     e ? e->len : (size_t)0);
 
         uint32_t zero = 0;
@@ -1560,10 +1576,10 @@ static void blyt_ecall_handler(riscv_t *rv) {
     }
 
     case BLYT_ECALL_RESOURCE_UNPIN: {
-        /* a0=id -> result. */
-        uint32_t id = rv_get_reg(rv, rv_reg_a0);
+        /* a0=resource constant -> result. */
+        uint32_t handle = rv_get_reg(rv, rv_reg_a0);
         blyt_resource_entry_t *e =
-            g_run_ctx ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
+            g_run_ctx ? blyt_resolve_resource(&g_run_ctx->resources, handle) : NULL;
         uint32_t res;
         if (!e) {
             res = 4u; /* NOT_FOUND */
@@ -1576,65 +1592,18 @@ static void blyt_ecall_handler(riscv_t *rv) {
         } else {
             res = 1u; /* INVALID_ARG: nothing pinned */
         }
-        blyt_tracef(BLYT_TRACE_API, "resource_unpin(id=%u) -> %u", id, res);
+        blyt_tracef(BLYT_TRACE_API, "resource_unpin(id=%u) -> %u", blyt_resource_decode_id(handle),
+                    res);
         rv_set_reg(rv, rv_reg_a0, res);
         rv->PC += 4;
         return;
     }
 
-    case BLYT_ECALL_RESOURCE_LOAD: {
-        /* a0=id -> result; a1=out_handle vaddr. */
-        uint32_t id = rv_get_reg(rv, rv_reg_a0);
-        uint32_t out_handle_vaddr = rv_get_reg(rv, rv_reg_a1);
-        vm_attr_t *attr = PRIV(rv);
-        memory_t *mem = attr->mem;
-
-        blyt_resource_entry_t *e =
-            g_run_ctx ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
-        uint32_t handle = 0u;
-        uint32_t res;
-        if (!e) {
-            res = 4u; /* NOT_FOUND */
-        } else if (!mem_acct_reference_fits(g_run_ctx, mem, e, blyt_rl_is_evictable(&e->rl))) {
-            /* A fresh load reserves e->len of footprint up front (#157/#158).
-             * Refuse it if that would exceed the 16 MB budget; the guest stub
-             * maps a non-OK result to an invalid handle (nil). */
-            res = 2u; /* BLYT_ERR_BUFFER_FULL: over budget */
-        } else {
-            handle = blyt_rl_load(&e->rl, id);
-            blyt_resource_table_touch(&g_run_ctx->resources, e); /* recency for LRU (#158) */
-            mem_acct_publish_footprint(g_run_ctx, mem); /* footprint grew */
-            res = 0u; /* OK */
-        }
-        if (out_handle_vaddr)
-            memory_write(mem, out_handle_vaddr, (const uint8_t *)&handle, 4);
-        blyt_tracef(BLYT_TRACE_API, "resource_load(id=%u) -> handle=%u", id, handle);
-        rv_set_reg(rv, rv_reg_a0, res);
-        rv->PC += 4;
-        return;
-    }
-
-    case BLYT_ECALL_RESOURCE_RELEASE: {
-        /* a0=handle -> result.  The handle packs the id in its low 16 bits. */
-        uint32_t handle = rv_get_reg(rv, rv_reg_a0);
-        uint32_t id = handle & 0xFFFFu;
-        blyt_resource_entry_t *e =
-            (g_run_ctx && handle) ? blyt_resource_table_find_mut(&g_run_ctx->resources, id) : NULL;
-        uint32_t res;
-        if (e && blyt_rl_release(&e->rl, handle)) {
-            /* Residency dropped; if now unreferenced the bytes leave the footprint
-             * — republish so the guest sees the freed budget (#158). */
-            vm_attr_t *attr = PRIV(rv);
-            mem_acct_publish_footprint(g_run_ctx, attr->mem);
-            res = 0u; /* OK */
-        } else {
-            res = 1u; /* INVALID_ARG: stale/invalid handle */
-        }
-        blyt_tracef(BLYT_TRACE_API, "resource_release(handle=%u) -> %u", handle, res);
-        rv_set_reg(rv, rv_reg_a0, res);
-        rv->PC += 4;
-        return;
-    }
+        /* RESOURCE_LOAD (63) / RESOURCE_RELEASE (64) retired: the cart-held residency
+         * handle is gone (ADR-0134 / #196) — resources are referenced by their baked
+         * constant directly and the runtime owns residency (demand-load + LRU evict
+         * #137 + persistent #160). The ECALL numbers stay reserved (not renumbered),
+         * as RESOURCE_TEXT_GET (60) is. */
 
     case BLYT_ECALL_MEM_RESOURCES: {
         /* a0=out resources array vaddr (or 0); a1=cap pairs. Enumerates the
@@ -1653,11 +1622,18 @@ static void blyt_ecall_handler(riscv_t *rv) {
             const blyt_resource_table_t *t = &g_run_ctx->resources;
             for (size_t i = 0; i < t->count; i++) {
                 const blyt_resource_entry_t *e = &t->entries[i];
-                if (e->rl.load_count == 0 && !e->persistent)
-                    continue; /* persistent counts as resident from frame 0 (#160) */
+                /* Resident working set (ADR-0134, advisory): persistent (#160), a
+                 * decompressed entry currently in the cache (e->owned), or an
+                 * uncompressed zero-copy entry the cart has accessed
+                 * (last_access > 0). With the load handle gone, residency is the
+                 * advisory cache, not a cart-held count; the id is reported as the
+                 * baked constant so it matches the cart's R_<NAME>. */
+                if (!(e->persistent || e->owned != NULL ||
+                      (e->algo == BLYT_RES_ALGO_NONE && e->last_access > 0)))
+                    continue;
                 if (out_res_vaddr && loaded < cap) {
                     uint8_t pair[8];
-                    write_u32_le(pair + 0, e->id);
+                    write_u32_le(pair + 0, blyt_resource_encode(e->id, BLYT_RESOURCE_PROV_CART));
                     write_u32_le(pair + 4, (uint32_t)e->len);
                     memory_write(mem, out_res_vaddr + loaded * 8u, pair, sizeof(pair));
                 }

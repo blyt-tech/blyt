@@ -2,6 +2,7 @@ mod assets;
 mod c;
 mod cpp;
 mod external;
+mod handle;
 mod lua;
 mod persistent;
 mod resource_pack;

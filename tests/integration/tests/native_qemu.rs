@@ -1138,16 +1138,15 @@ void blyt_cart_draw(void) {}
         println!("  PASS: BLYS saves are portable across host and native");
     }
 
-    // ── Gate 12: resource lifecycle on metal (#123) ──────────────────
+    // ── Gate 12: resource pin on metal (#123, #196) ──────────────────
     //
     // The only coverage of the native libblytcommon resource path: a packed
-    // cart's embedded `.cart.resource.<id>` section reaches the cart through
-    // load/pin/unpin/release, served by a direct pointer into the retained cart
-    // mmap (no host).  One deterministic line encodes every result so the metal
-    // output can be matched against the emulated legs' (assets.rs): pin delivers
-    // the exact bytes+length, load returns OK with a non-zero handle, the first
-    // release succeeds, and the stale second release is rejected (INVALID_ARG=1).
-    println!("Gate 12: resource lifecycle on metal...");
+    // cart's embedded `.cart.resource.<id>` section reaches the cart by
+    // referencing the baked constant directly (ADR-0134), served via pin by a
+    // direct pointer into the retained cart mmap (no host).  One deterministic
+    // line encodes the result so the metal output can be matched against the
+    // emulated legs': pin delivers the exact bytes+length.
+    println!("Gate 12: resource pin on metal...");
     {
         let res_project = tmp.path().join("res_metal");
         CartProject::new()
@@ -1159,9 +1158,6 @@ void blyt_cart_draw(void) {}
 #include <string.h>
 
 void blyt_cart_init(void) {
-    blyt_resource_h h = BLYT_RESOURCE_INVALID;
-    blyt_result_t lr = blyt_resource_load(R_GREETING, &h);
-
     const void *ptr = NULL;
     size_t size = 0;
     blyt_result_t pr = blyt_resource_pin(R_GREETING, &ptr, &size);
@@ -1171,14 +1167,8 @@ void blyt_cart_init(void) {
     g[ptr ? n : 0] = '\0';
     blyt_resource_unpin(R_GREETING);
 
-    blyt_result_t r1 = blyt_resource_release(h);
-    blyt_result_t r2 = blyt_resource_release(h);
-
     char line[256];
-    snprintf(line, sizeof(line),
-             "R[%s] load=%d h=%d pin=%d bytes=%d rel1=%d rel2=%d",
-             g, (int)lr, (int)(h != BLYT_RESOURCE_INVALID), (int)pr,
-             (int)size, (int)r1, (int)r2);
+    snprintf(line, sizeof(line), "R[%s] pin=%d bytes=%d", g, (int)pr, (int)size);
     blyt_console_debug(line);
 }
 void blyt_cart_update(void) { blyt_quit(); }
@@ -1208,11 +1198,10 @@ void blyt_cart_draw(void) {}
             out.status.code()
         );
         assert!(
-            output.contains("R[Hello from metal!] load=0 h=1 pin=0 bytes=18 rel1=0 rel2=1"),
-            "expected the resource-lifecycle line on metal (pin delivers exact bytes; \
-             load ok with non-zero handle; valid then stale release; bytes=18 = the \
-             17-char greeting + the build-appended trailing NUL the byte-blind pin \
-             reports, #166)\noutput: {output}"
+            output.contains("R[Hello from metal!] pin=0 bytes=18"),
+            "expected the resource-pin line on metal (pin delivers exact bytes; \
+             bytes=18 = the 17-char greeting + the build-appended trailing NUL the \
+             byte-blind pin reports, #166)\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
     }
@@ -1238,17 +1227,14 @@ void blyt_cart_draw(void) {}
 #include <string.h>
 
 #define N 100
+#define R_ENCODE(id) (0x20000000u | (blyt_resource_id_t)(id)) /* kind RESOURCE, prov cart */
 
 void blyt_cart_init(void) {
-    int pin_ok = 0, load_ok = 0, match = 0, first_bad = -1;
+    int pin_ok = 0, match = 0, first_bad = -1;
     for (int k = 0; k < N; k++) {
-        blyt_resource_id_t id = (blyt_resource_id_t)(k + 1);
+        blyt_resource_id_t id = R_ENCODE(k + 1);
         char expect[32];
         int elen = snprintf(expect, sizeof(expect), "payload-%03d", k);
-
-        blyt_resource_h h = BLYT_RESOURCE_INVALID;
-        if (blyt_resource_load(id, &h) == BLYT_OK && h != BLYT_RESOURCE_INVALID)
-            load_ok++;
 
         const void *ptr = NULL;
         size_t size = 0;
@@ -1263,12 +1249,11 @@ void blyt_cart_init(void) {
             first_bad = k + 1;
         }
         blyt_resource_unpin(id);
-        blyt_resource_release(h);
     }
 
     char line[128];
-    snprintf(line, sizeof(line), "RES_MANY pin_ok=%d load_ok=%d match=%d first_bad=%d", pin_ok,
-             load_ok, match, first_bad);
+    snprintf(line, sizeof(line), "RES_MANY pin_ok=%d match=%d first_bad=%d", pin_ok, match,
+             first_bad);
     blyt_console_debug(line);
 }
 void blyt_cart_update(void) { blyt_quit(); }
@@ -1304,8 +1289,8 @@ void blyt_cart_draw(void) {}
             out.status.code()
         );
         assert!(
-            output.contains("RES_MANY pin_ok=100 load_ok=100 match=100 first_bad=-1"),
-            "expected all 100 distinct resources to pin/load with exact bytes on metal \
+            output.contains("RES_MANY pin_ok=100 match=100 first_bad=-1"),
+            "expected all 100 distinct resources to pin with exact bytes on metal \
              (no NATIVE_MAX_RES cap)\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
@@ -1518,11 +1503,14 @@ static int fill_heap(void) {
 
 void blyt_cart_init(void) {
     int a = fill_heap(); /* full 16 MB available to the heap */
-    blyt_resource_h h = BLYT_RESOURCE_INVALID;
-    blyt_result_t lr = blyt_resource_load(R_BIG, &h); /* reserve 4 MiB footprint */
+    /* Pin reserves 4 MiB of non-evictable footprint, held to the frame boundary
+     * (ADR-0134: pin is the residency reservation). */
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_result_t pr = blyt_resource_pin(R_BIG, &ptr, &size);
     int b = fill_heap(); /* only ~12 MB now available to the heap */
     char line[128];
-    snprintf(line, sizeof(line), "BUDGET a=%d b=%d lr=%d shrank=%d", a, b, (int)lr,
+    snprintf(line, sizeof(line), "BUDGET a=%d b=%d lr=%d shrank=%d", a, b, (int)pr,
              (int)(b > 0 && b < a));
     blyt_console_debug(line);
 }
@@ -1560,18 +1548,21 @@ void blyt_cart_draw(void) {}
         );
         println!("  PASS (16a): output = {:?}", output.trim());
 
-        // 16b: resource loads fail deterministically at the cap.
+        // 16b: resource pins fail deterministically at the cap.
         let cap_project = tmp.path().join("loadcap_metal");
         let mut p = CartProject::new().c(r#"
 #include "blyt.h"
 #include <stdio.h>
 
+#define R_ENCODE(id) (0x20000000u | (blyt_resource_id_t)(id)) /* kind RESOURCE, prov cart */
+
 void blyt_cart_init(void) {
     int ok = 0, first_fail = -1;
     for (int id = 1; id <= 5; id++) {
-        blyt_resource_h h = BLYT_RESOURCE_INVALID;
-        blyt_result_t r = blyt_resource_load((blyt_resource_id_t)id, &h);
-        if (r == BLYT_OK && h != BLYT_RESOURCE_INVALID)
+        const void *ptr = NULL;
+        size_t size = 0;
+        blyt_result_t r = blyt_resource_pin(R_ENCODE(id), &ptr, &size); /* held: reserves footprint */
+        if (r == BLYT_OK && ptr)
             ok++;
         else if (first_fail < 0)
             first_fail = id;
@@ -1717,9 +1708,6 @@ void blyt_cart_init(void) {
     if (blyt_resource_pin(pid, &p, &sz) == BLYT_OK && p)
         sum = sum_bytes(p, sz);
     blyt_resource_unpin(pid);
-    blyt_resource_h h = BLYT_RESOURCE_INVALID;
-    blyt_resource_load(pid, &h);
-    blyt_resource_release(h);
     int r1 = is_resident(pid);
     const void *p2 = NULL;
     size_t sz2 = 0;

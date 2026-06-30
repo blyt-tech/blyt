@@ -49,11 +49,10 @@ static S_FRAME: BlytCell<u32> = BlytCell::new(0);
 pub extern "C" fn blyt_cart_init() {
     S_FRAME.set(0);
 
-    // Load the text asset by handle and print its contents.  text_string()
-    // returns an owned, cross-frame copy (pin -> copy -> unpin).
-    let greeting = R_GREETING.load();
-    blyt::console_debug(&greeting.text_string());
-    // greeting drops here -> release.
+    // Print the text asset's contents.  text_string() returns an owned,
+    // cross-frame copy (pin -> copy -> unpin).  The resource is referenced by its
+    // constant directly — no load/release handle (ADR-0134, #196).
+    blyt::console_debug(&R_GREETING.text_string());
 }
 
 #[no_mangle]

@@ -31,6 +31,7 @@
 #include "blyt_elf_section.h" /* runtime/shared: blyt_elf32_find_section */
 #include "blyt_fp_canon.h" /* runtime/shared: blyt_canon_f32/f64 (ADR-0010) */
 #include "blyt_gen.h" /* runtime/shared: blyt_gen_next (ADR-0096) */
+#include "blyt_handle.h" /* runtime/shared: console-wide resource-constant encoding (ADR-0134) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "blyt_native_trace.h"
 #include "blyt_resource_codec.h" /* runtime/shared: per-resource compression (#157) */
@@ -988,12 +989,25 @@ static void resources_init(void) {
     s_res_count = fc.n;
 }
 
-/* Look up a resource entry by id in the eagerly-populated table; -1 if absent. */
+/* Look up a resource entry by raw 24-bit id in the eagerly-populated table; -1 if
+ * absent.  The table is keyed by the `.cart.resource.<id>` section id; only
+ * cart-facing values carry the kind/provenance tag. */
 static int res_find(uint32_t id) {
     for (uint32_t i = 0; i < s_res_count; i++)
         if (s_res[i].id == id)
             return (int)i;
     return -1;
+}
+
+/* Resolve an incoming resource constant (the baked console-wide handle,
+ * ADR-0134) to a table index: classify as a cart-bundled RESOURCE and look up
+ * the decoded id.  -1 for a non-resource kind, runtime-shipped provenance (no
+ * built-in registry yet), or an absent id. */
+static int res_resolve(uint32_t handle) {
+    if (!blyt_handle_is_resource(handle) ||
+        blyt_resource_decode_provenance(handle) != BLYT_RESOURCE_PROV_CART)
+        return -1;
+    return res_find(blyt_resource_decode_id(handle));
 }
 
 /* Decompressed bytes for a resource: a NONE entry returns its zero-copy map
@@ -1138,7 +1152,7 @@ static int native_mem_reference_fits(const native_res_t *e, int was_evictable) {
 }
 
 blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size) {
-    int i = res_find(id);
+    int i = res_resolve(id);
     if (i < 0) {
         if (out_ptr)
             *out_ptr = 0;
@@ -1171,7 +1185,7 @@ blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, siz
 }
 
 blyt_result_t blyt_resource_unpin(blyt_resource_id_t id) {
-    int i = res_find(id);
+    int i = res_resolve(id);
     if (i < 0)
         return BLYT_ERR_NOT_FOUND;
     if (!blyt_rl_unpin(&s_res[i].rl))
@@ -1181,40 +1195,9 @@ blyt_result_t blyt_resource_unpin(blyt_resource_id_t id) {
     return BLYT_OK;
 }
 
-blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_handle) {
-    int i = res_find(id);
-    if (i < 0) {
-        if (out_handle)
-            *out_handle = BLYT_RESOURCE_INVALID;
-        return BLYT_ERR_NOT_FOUND;
-    }
-    /* A fresh load reserves e->len of footprint up front (#157/#158). Refuse it
-     * if that would exceed the 16 MB budget — the caller maps !OK to nil. */
-    if (!native_mem_reference_fits(&s_res[i], blyt_rl_is_evictable(&s_res[i].rl))) {
-        if (out_handle)
-            *out_handle = BLYT_RESOURCE_INVALID;
-        return BLYT_ERR_BUFFER_FULL;
-    }
-    blyt_resource_h h = blyt_rl_load(&s_res[i].rl, id);
-    native_res_touch(&s_res[i]); /* recency for LRU (#158) */
-    native_mem_publish_footprint(); /* footprint grew */
-    if (out_handle)
-        *out_handle = h;
-    return BLYT_OK;
-}
-
-blyt_result_t blyt_resource_release(blyt_resource_h handle) {
-    if (!handle)
-        return BLYT_ERR_INVALID_ARG;
-    int i = res_find(handle & 0xFFFFu);
-    if (i < 0)
-        return BLYT_ERR_INVALID_ARG;
-    if (!blyt_rl_release(&s_res[i].rl, handle))
-        return BLYT_ERR_INVALID_ARG;
-    /* Residency dropped; if now unreferenced its bytes leave the footprint. */
-    native_mem_publish_footprint();
-    return BLYT_OK;
-}
+/* load/release retired (ADR-0134, #196): resources are referenced by their baked
+ * constant directly and residency is runtime-owned (demand-load + LRU evict
+ * #137 + persistent #160). */
 
 /* Memory introspection (ADR-0029, #159): the native counterparts of the guest
  * blyt_mem_stats / blyt_mem_resources. Scalars come from the same accounting
@@ -1234,10 +1217,16 @@ void blyt_mem_stats(blyt_mem_stats_t *out) {
 uint32_t blyt_mem_resources(blyt_mem_resource_t *resources, uint32_t cap) {
     uint32_t loaded = 0;
     for (uint32_t i = 0; i < s_res_count; i++) {
-        if (s_res[i].rl.load_count == 0 && !s_res[i].persistent)
-            continue; /* persistent counts as resident from frame 0 (#160) */
+        /* Resident working set (ADR-0134, advisory): persistent (#160), a
+         * decompressed entry in the cache (owned), or an uncompressed zero-copy
+         * entry the cart has accessed (last_access > 0).  Residency is the
+         * advisory cache, not a cart-held count; the id is reported as the baked
+         * constant so it matches the cart's R_<NAME>. */
+        if (!(s_res[i].persistent || s_res[i].owned != NULL ||
+              (s_res[i].algo == BLYT_RES_ALGO_NONE && s_res[i].last_access > 0)))
+            continue;
         if (resources && loaded < cap) {
-            resources[loaded].id = s_res[i].id;
+            resources[loaded].id = blyt_resource_encode(s_res[i].id, BLYT_RESOURCE_PROV_CART);
             resources[loaded].size = s_res[i].len;
         }
         loaded++;

@@ -2,8 +2,8 @@
  * hello-assets-c — the asset pipeline thin slice (issue #91).
  *
  * Identical player-movement behaviour to examples/hello-c (so it satisfies the
- * shared examples smoke-test), plus it loads the `greeting` text resource by
- * handle and prints its contents.  The R_GREETING constant comes from the
+ * shared examples smoke-test), plus it reads the `greeting` text resource by its
+ * constant and prints its contents.  The R_GREETING constant comes from the
  * generated cart_resources.h; the bytes come from assets/greeting.txt via the
  * content-addressed staging directory (dev) or a bundled ELF section (packed).
  */

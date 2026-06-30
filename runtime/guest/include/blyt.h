@@ -135,9 +135,11 @@ typedef uint32_t blyt_resource_id_t;
 typedef uint32_t blyt_text_resource_t;
 typedef uint32_t blyt_bytes_resource_t;
 
-/* Opaque load handle returned by blyt_resource_load (encodes id + load epoch). */
-typedef uint32_t blyt_resource_h;
-#define BLYT_RESOURCE_INVALID ((blyt_resource_h)0)
+/* Resources are referenced by their baked compile-time constant directly
+ * (ADR-0134, #196): there is no cart-held load handle to track or invalidate.
+ * The packer emits each R_<NAME> as a console-wide tagged u32 (kind RESOURCE,
+ * provenance + 24-bit id); the runtime decodes it, loads-or-cache-hits, and
+ * evicts transparently.  The cart just passes the constant to the accessors. */
 
 /* pin: copy the resource's bytes into the runtime scratch region; write the
  * frame-scoped pointer to *out_ptr and the byte length to *out_size, and
@@ -148,16 +150,6 @@ blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, siz
 /* unpin: drop a pin taken by blyt_resource_pin.  The pointer it returned is
  * invalid afterwards.  Returns BLYT_ERR_INVALID_ARG if nothing was pinned. */
 blyt_result_t blyt_resource_unpin(blyt_resource_id_t id);
-
-/* load: mark a resource resident and obtain a handle.  Idempotent (re-loading a
- * resident resource returns the same handle).  Returns BLYT_ERR_NOT_FOUND for an
- * unknown id (with *out_handle set to BLYT_RESOURCE_INVALID). */
-blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_handle);
-
-/* release: advisory — tell the runtime the cart no longer needs this handle.
- * Returns BLYT_ERR_INVALID_ARG if the handle is stale (already released, or from
- * a previous load epoch). */
-blyt_result_t blyt_resource_release(blyt_resource_h handle);
 
 /* text_get: convenience over pin -> copy -> unpin for *text* resources.  Returns
  * a freshly allocated, NUL-terminated copy of the resource's content bytes (the
