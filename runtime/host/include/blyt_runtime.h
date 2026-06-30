@@ -311,6 +311,12 @@ void blyt_session_notify_assets_reloaded(blyt_session_t *session, const uint32_t
 const uint8_t *blyt_session_get_pixels(const blyt_session_t *session);
 const uint32_t *blyt_session_get_palette(const blyt_session_t *session);
 
+/* True once the cart has issued any drawing call this run (the runtime stops
+ * compositing the test card after the first one).  The WASM host-Lua fast path
+ * reads this to decide test-card-vs-frame for a hybrid cart whose native half
+ * drew into the session framebuffer while its host-Lua half did not (#193). */
+bool blyt_session_cart_has_drawn(const blyt_session_t *session);
+
 /* Expand the current frame to XRGB8888 via palette lookup.
  * xrgb_out must hold at least BLYT_FRAME_W * BLYT_FRAME_H uint32_t. */
 void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out);

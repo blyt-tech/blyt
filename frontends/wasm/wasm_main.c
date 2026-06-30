@@ -710,25 +710,41 @@ static void render_testcard(void) {
     lua_present_paletted(s_pixels, s_palette);
 }
 
-/* blyt32.gfx.* host-Lua bindings (#188).  Each rasterizes into g_lua_pixels via
- * the shared integer core and flags g_lua_drawn; the frame loop then presents +
- * hashes it.  Mirror of the guest binding in blyt32lua.c and the host ECALL
- * handlers in cart_run.c — same primitives, same back-buffer geometry. */
+/* The paletted framebuffer the host-Lua gfx bindings rasterize into.  For a
+ * HYBRID cart a session is live (its native half runs in rv32emu per ADR-0130),
+ * and that half draws via the gfx ECALL handlers into the session's canonical
+ * framebuffer; the host-Lua half must draw into the SAME buffer or its output
+ * diverges from the native half and is dropped on wasm (#193).  Only a genuinely
+ * session-less pure-Lua cart uses the standalone g_lua_pixels.  (get_pixels is
+ * declared const for read-mostly frontends; the host-Lua path legitimately
+ * rasterizes into it, the same buffer the ECALL handlers mutate via the run
+ * context.) */
+static uint8_t *lua_gfx_fb(void) {
+    if (g_session)
+        return (uint8_t *)blyt_session_get_pixels(g_session);
+    return g_lua_pixels;
+}
+
+/* blyt32.gfx.* host-Lua bindings (#188).  Each rasterizes into the active
+ * framebuffer (see lua_gfx_fb) via the shared integer core and flags
+ * g_lua_drawn; the frame loop then presents + hashes it.  Mirror of the guest
+ * binding in blyt32lua.c and the host ECALL handlers in cart_run.c — same
+ * primitives, same back-buffer geometry. */
 static int lua_wasm_gfx_clear(lua_State *L) {
-    blyt_raster_clear(g_lua_pixels, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+    blyt_raster_clear(lua_gfx_fb(), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
                       (uint8_t)luaL_checkinteger(L, 1));
     g_lua_drawn = true;
     return 0;
 }
 static int lua_wasm_gfx_pixel(lua_State *L) {
-    blyt_raster_pixel(g_lua_pixels, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+    blyt_raster_pixel(lua_gfx_fb(), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
                       (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
                       (uint8_t)luaL_checkinteger(L, 3));
     g_lua_drawn = true;
     return 0;
 }
 static int lua_wasm_gfx_rect_fill(lua_State *L) {
-    blyt_raster_rect_fill(g_lua_pixels, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+    blyt_raster_rect_fill(lua_gfx_fb(), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
                           (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
                           (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
                           (uint8_t)luaL_checkinteger(L, 5));
@@ -736,7 +752,7 @@ static int lua_wasm_gfx_rect_fill(lua_State *L) {
     return 0;
 }
 static int lua_wasm_gfx_line(lua_State *L) {
-    blyt_raster_line(g_lua_pixels, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+    blyt_raster_line(lua_gfx_fb(), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
                      (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
                      (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
                      (uint8_t)luaL_checkinteger(L, 5));
@@ -2702,10 +2718,22 @@ static void wasm_lua_loop(void) {
         return;
     }
 
-    if (!g_lua_drawn)
+    if (g_session) {
+        /* Hybrid cart (#193): the native half (gfx ECALL handlers) and the
+         * host-Lua half (lua_gfx_fb) draw into the session's ONE canonical
+         * framebuffer — present + hash THAT so the native half's output is no
+         * longer dropped on wasm.  Either half having drawn displaces the test
+         * card (cart_has_drawn covers the native half; g_lua_drawn the Lua one). */
+        if (g_lua_drawn || blyt_session_cart_has_drawn(g_session))
+            lua_present_paletted(blyt_session_get_pixels(g_session),
+                                 blyt_session_get_palette(g_session));
+        else
+            render_testcard();
+    } else if (!g_lua_drawn) {
         render_testcard();
-    else
+    } else {
         lua_present_paletted(g_lua_pixels, g_lua_gfx_palette);
+    }
 
     if (trace_frame_open) {
         blyt_tracef(BLYT_TRACE_FRAME, "end");

@@ -399,6 +399,56 @@ function draw() end
     );
     let gfx_raw_cart = gfx_cart("gfx_raw", common::gfx::raw_present_c_draw());
 
+    // ── Build the Lua and hybrid gfx carts (gates 20 & 21, #193) ──────
+    // Fill the bare-metal cells of the gfx execution matrix the spike left
+    // untested: a pure-Lua gfx cart (native RV32 Lua VM → blyt32lua.c binding →
+    // native libblyt32 primitives → native framebuffer → weak-hook hash), and a
+    // hybrid cart whose torture frame is split across the Lua and native-C
+    // halves.  Both draw the SAME torture frame and must emit the SAME golden as
+    // every emulated leg — on metal the whole cart shares one framebuffer, so
+    // this is the low-risk single-buffer end of the #193 coherence proof.
+    let gfx_lua_cart = if have_lua_gate {
+        let project = tmp.path().join("gfx_lua");
+        CartProject::new()
+            .lua(&format!(
+                "function init() end\n\
+                 function update() blyt.quit() end\n\
+                 function draw()\n{}end\n",
+                common::gfx::lua_draw_body(&common::gfx::torture_frame())
+            ))
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+    let gfx_hybrid_cart = if have_lua_gate {
+        // Native half draws the clear + rects + first pixel; Lua draws the rest.
+        let ops = common::gfx::torture_frame();
+        let (native_ops, lua_ops) = ops.split_at(8);
+        let project = tmp.path().join("gfx_hybrid");
+        CartProject::new()
+            .lib_file(
+                "gfxlib",
+                "gfxlib.c",
+                &format!(
+                    "#include \"blyt.h\"\n\
+                     BLYT_LUA_MODULE_EXPORT_VOID(gfxlib, native_draw) {{\n{}}}\n",
+                    common::gfx::c_draw_body(native_ops)
+                ),
+            )
+            .lua(&format!(
+                "local g = require(\"gfxlib\")\n\
+                 function init() end\n\
+                 function update() blyt.quit() end\n\
+                 function draw()\n  g.native_draw()\n{}end\n",
+                common::gfx::lua_draw_body(lua_ops)
+            ))
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     // ── Start QEMU ────────────────────────────────────────────────────
     let ssh_port = free_port();
     println!("Starting QEMU (SSH port {ssh_port})...");
@@ -504,6 +554,18 @@ function draw() end
         qemu.scp_to(&gfx_raw_cart, "/tmp/blyt_gate/"),
         "scp gfx_raw.blyt failed"
     );
+    if let Some(ref cart) = gfx_lua_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp gfx_lua.blyt failed"
+        );
+    }
+    if let Some(ref cart) = gfx_hybrid_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp gfx_hybrid.blyt failed"
+        );
+    }
 
     // ── Diagnostics ───────────────────────────────────────────────────
     // Print environment info before the gate test to help diagnose failures.
@@ -1829,6 +1891,71 @@ void blyt_cart_draw(void) {}
              emulated legs (#160)\noutput: {output}"
         );
         println!("  PASS (19b): output = {:?}", output.trim());
+    }
+
+    // ── Gate 20: Lua gfx torture frame hashes to golden on metal (#193) ──
+    //
+    // The Lua × native bare-metal cell the spike left untested: a pure-Lua cart
+    // draws the torture frame via blyt32.gfx.*, running on the native RV32 Lua
+    // VM (blyt32lua.c binding → native libblyt32 primitives → native framebuffer
+    // → weak-hook hash).  Must emit the SAME golden as the C metal leg (gate 17)
+    // and every emulated Lua leg.
+    if gfx_lua_cart.is_some() {
+        println!("Gate 20: Lua gfx torture frame hashes to golden on metal...");
+        let expected =
+            common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/gfx_lua.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "gfx_lua.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&expected),
+            "native bare-metal Lua gfx must hash the torture frame identically to \
+             the C and emulated legs (expected {expected:?}; #193)\noutput: {output}"
+        );
+        println!("  PASS: {expected}");
+    } else {
+        println!("Gate 20: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 21: hybrid gfx torture frame hashes to golden on metal (#193) ──
+    //
+    // The hybrid × native bare-metal cell: the torture frame split across the Lua
+    // and native-C halves.  On metal the whole cart shares one framebuffer, so
+    // both halves' primitives compose into the same back buffer and must hash to
+    // the single-buffer golden — the low-risk end of the #193 coherence proof
+    // (its high-risk end is the wasm two-address-space cell in gfx.rs).
+    if gfx_hybrid_cart.is_some() {
+        println!("Gate 21: hybrid gfx torture frame hashes to golden on metal...");
+        let expected =
+            common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/gfx_hybrid.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "gfx_hybrid.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&expected),
+            "native bare-metal hybrid gfx (Lua + native-C halves) must hash the \
+             torture frame identically to the single-buffer golden (expected \
+             {expected:?}; #193)\noutput: {output}"
+        );
+        println!("  PASS: {expected}");
+    } else {
+        println!("Gate 21: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     println!("Gate tests passed.");
