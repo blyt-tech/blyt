@@ -40,9 +40,9 @@
 
 /* First-level classifier values (kind = h >> 29). */
 enum {
-    BLYT_HANDLE_KIND_NONE = 0,     /* universal null sentinel (the whole word is 0) */
+    BLYT_HANDLE_KIND_NONE = 0, /* universal null sentinel (the whole word is 0) */
     BLYT_HANDLE_KIND_RESOURCE = 1, /* baked resource constant (ADR-0134) */
-    BLYT_HANDLE_KIND_SURFACE = 2,  /* reserved for the surface model (#195) */
+    BLYT_HANDLE_KIND_SURFACE = 2, /* reserved for the surface model (#195) */
     BLYT_HANDLE_KIND_LOCKVIEW = 3, /* reserved for the surface model (#195) */
 };
 
@@ -52,18 +52,18 @@ enum {
 #define BLYT_HANDLE_KIND_SHIFT 29
 
 /* Resource-constant field layout. */
-#define BLYT_RESOURCE_ID_MASK 0x00FFFFFFu        /* bits 23–0 */
-#define BLYT_RESOURCE_PROVENANCE_SHIFT 24        /* bit 24 */
+#define BLYT_RESOURCE_ID_MASK 0x00FFFFFFu /* bits 23–0 */
+#define BLYT_RESOURCE_PROVENANCE_SHIFT 24 /* bit 24 */
 #define BLYT_RESOURCE_PROVENANCE_MASK 0x1u
-#define BLYT_RESOURCE_PROV_CART 0u    /* cart-bundled */
+#define BLYT_RESOURCE_PROV_CART 0u /* cart-bundled */
 #define BLYT_RESOURCE_PROV_RUNTIME 1u /* runtime-shipped / built-in (reserved) */
 
 /* Encode a resource constant from its packer-assigned id + provenance.  A macro
  * (not an inline fn) so it is usable in a constant expression — the packer emits
  * the literal value, and the `_Static_assert`s below pin the contract. */
-#define BLYT_RESOURCE_ENCODE(id, prov)                                                     \
-    (((uint32_t)BLYT_HANDLE_KIND_RESOURCE << BLYT_HANDLE_KIND_SHIFT) |                      \
-     (((uint32_t)(prov) & BLYT_RESOURCE_PROVENANCE_MASK) << BLYT_RESOURCE_PROVENANCE_SHIFT) | \
+#define BLYT_RESOURCE_ENCODE(id, prov)                                                             \
+    (((uint32_t)BLYT_HANDLE_KIND_RESOURCE << BLYT_HANDLE_KIND_SHIFT) |                             \
+     (((uint32_t)(prov) & BLYT_RESOURCE_PROVENANCE_MASK) << BLYT_RESOURCE_PROVENANCE_SHIFT) |      \
      ((uint32_t)(id) & BLYT_RESOURCE_ID_MASK))
 
 /* First-level classifier on any console handle. */
