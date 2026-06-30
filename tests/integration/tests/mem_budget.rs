@@ -52,12 +52,13 @@ end
 
 function init()
     local a = fill_heap() -- full 16 MB available to the heap
-    local h = R.BIG:load() -- reserve 4 MiB of non-evictable footprint
+    -- Pinning BIG reserves 4 MiB of non-evictable footprint, held to the frame
+    -- boundary (no unpin), so it survives the second measurement (ADR-0134: pin
+    -- is the residency reservation now that load/release are gone).
+    local ptr = blyt.resource.pin(R.BIG:id())
     local b = fill_heap() -- only ~12 MB now available to the heap
-    -- `h` stays referenced through the second fill so the load is not collected
-    -- (which would release the footprint) before the measurement.
     blyt.debug.print(string.format("BUDGET a=%d b=%d loaded=%d shrank=%d", a, b,
-        h and 1 or 0, (b > 0 and b < a) and 1 or 0))
+        ptr and 1 or 0, (b > 0 and b < a) and 1 or 0))
 end
 
 function update() blyt.quit() end
@@ -90,11 +91,11 @@ fn lua_heap_budget_shrinks_with_resident_resource_all_legs() {
 }
 
 /// A C cart that measures guest-heap headroom (64 KiB allocations until `malloc`
-/// returns NULL) twice: once with nothing resident, then again after `load`ing a
-/// 4 MiB resource (which reserves 4 MiB of non-evictable footprint up front).
-/// The second count must be strictly smaller — proving heap and resource cache
-/// share the SAME budget, not two separate pools — and both counts must be
-/// byte-identical across legs.
+/// returns NULL) twice: once with nothing resident, then again after `pin`ning a
+/// 4 MiB resource (which reserves 4 MiB of non-evictable footprint, held to the
+/// frame boundary — ADR-0134). The second count must be strictly smaller —
+/// proving heap and resource cache share the SAME budget, not two separate pools
+/// — and both counts must be byte-identical across legs.
 const BUDGET_C: &str = r#"
 #include "blyt.h"
 #include "cart_resources.h"
@@ -122,13 +123,16 @@ static int fill_heap(void) {
 void blyt_cart_init(void) {
     int a = fill_heap(); /* full 16 MB available to the heap */
 
-    blyt_resource_h h = BLYT_RESOURCE_INVALID;
-    blyt_result_t lr = blyt_resource_load(R_BIG, &h); /* reserve 4 MiB footprint */
+    /* Pinning R_BIG reserves 4 MiB of non-evictable footprint (held to the frame
+     * boundary — ADR-0134: pin is the residency reservation). */
+    const void *ptr = NULL;
+    size_t size = 0;
+    blyt_result_t pr = blyt_resource_pin(R_BIG, &ptr, &size);
 
     int b = fill_heap(); /* only ~12 MB now available to the heap */
 
     char line[128];
-    snprintf(line, sizeof(line), "BUDGET a=%d b=%d lr=%d shrank=%d", a, b, (int)lr,
+    snprintf(line, sizeof(line), "BUDGET a=%d b=%d lr=%d shrank=%d", a, b, (int)pr,
              (int)(b > 0 && b < a));
     blyt_console_debug(line);
 }
@@ -161,20 +165,26 @@ fn heap_budget_shrinks_with_resident_resource_all_legs() {
     run_cart_all_legs(&cart, "BUDGET a=255 b=191 lr=0 shrank=1");
 }
 
-/// A C cart that `load`s five distinct 4 MiB resources in turn. Each load reserves
-/// 4 MiB of non-evictable footprint up front, so the first four (16 MiB) fit the
-/// budget exactly and the fifth must fail — at the SAME load on every leg. This
-/// is the "deterministic nil at the cap across all legs" acceptance criterion.
+/// A C cart that `pin`s five distinct 4 MiB resources in turn, holding each pin.
+/// Each pin reserves 4 MiB of non-evictable footprint up front, so the first four
+/// (16 MiB) fit the budget exactly and the fifth must fail — at the SAME pin on
+/// every leg. This is the "deterministic refusal at the cap across all legs"
+/// acceptance criterion. The cart builds each resource constant from the loop
+/// index (kind RESOURCE = bit 29, cart provenance — ADR-0134); a real cart names
+/// R_<NAME>.
 const LOAD_CAP_C: &str = r#"
 #include "blyt.h"
 #include <stdio.h>
 
+#define R_ENCODE(id) (0x20000000u | (blyt_resource_id_t)(id)) /* kind RESOURCE, prov cart */
+
 void blyt_cart_init(void) {
     int ok = 0, first_fail = -1;
     for (int id = 1; id <= 5; id++) {
-        blyt_resource_h h = BLYT_RESOURCE_INVALID;
-        blyt_result_t r = blyt_resource_load((blyt_resource_id_t)id, &h);
-        if (r == BLYT_OK && h != BLYT_RESOURCE_INVALID)
+        const void *ptr = NULL;
+        size_t size = 0;
+        blyt_result_t r = blyt_resource_pin(R_ENCODE(id), &ptr, &size); /* held: reserves footprint */
+        if (r == BLYT_OK && ptr)
             ok++;
         else if (first_fail < 0)
             first_fail = id;

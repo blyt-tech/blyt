@@ -25,8 +25,7 @@
 #define ECALL_FRAME_DONE 2
 #define ECALL_RESOURCE_PIN 61
 #define ECALL_RESOURCE_UNPIN 62
-#define ECALL_RESOURCE_LOAD 63
-#define ECALL_RESOURCE_RELEASE 64
+/* 63 (RESOURCE_LOAD) / 64 (RESOURCE_RELEASE) retired — ADR-0134, #196. */
 #define ECALL_MEM_RESOURCES 70
 
 static unsigned int blytcommon_strlen(const char *s) {
@@ -75,13 +74,14 @@ __attribute__((noreturn)) void blyt_exit(int code) {
 void blyt_runtime_startup(void) {
 }
 
-/* ── Resource lifecycle ECALL stubs (ADR-0027, #123) ────────────────────────
+/* ── Resource pin ECALL stubs (ADR-0027, ADR-0134, #123/#196) ───────────────
  *
- * Emulated-path stubs: the host services pin/unpin/load/release over the ECALL
- * boundary (runtime/host/src/libblyt/cart_run.c) against its resource table.
- * The native libblytcommon variant overrides these with real implementations.
- * The blyt_resource_text_get convenience is portable (resources.c) and built on
- * top of pin/unpin, so it is not duplicated here. */
+ * Emulated-path stubs: the host services pin/unpin over the ECALL boundary
+ * (runtime/host/src/libblyt/cart_run.c) against its resource table, decoding the
+ * baked resource constant in a0.  The native libblytcommon variant overrides
+ * these with real implementations.  The blyt_resource_text_get / bytes_get
+ * conveniences are portable (resources.c) and built on top of pin/unpin, so they
+ * are not duplicated here. */
 
 blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, size_t *out_size) {
     register long a0 __asm__("a0") = (long)id;
@@ -95,21 +95,6 @@ blyt_result_t blyt_resource_pin(blyt_resource_id_t id, const void **out_ptr, siz
 blyt_result_t blyt_resource_unpin(blyt_resource_id_t id) {
     register long a0 __asm__("a0") = (long)id;
     register long a7 __asm__("a7") = ECALL_RESOURCE_UNPIN;
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
-    return (blyt_result_t)a0;
-}
-
-blyt_result_t blyt_resource_load(blyt_resource_id_t id, blyt_resource_h *out_handle) {
-    register long a0 __asm__("a0") = (long)id;
-    register long a1 __asm__("a1") = (long)out_handle;
-    register long a7 __asm__("a7") = ECALL_RESOURCE_LOAD;
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
-    return (blyt_result_t)a0;
-}
-
-blyt_result_t blyt_resource_release(blyt_resource_h handle) {
-    register long a0 __asm__("a0") = (long)handle;
-    register long a7 __asm__("a7") = ECALL_RESOURCE_RELEASE;
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
     return (blyt_result_t)a0;
 }

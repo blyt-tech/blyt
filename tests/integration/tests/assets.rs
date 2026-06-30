@@ -47,16 +47,15 @@ void blyt_cart_draw(void) {}
 "#;
 
 /// Pure-Lua counterpart of PER_FRAME_LOADER_C: re-reads and prints R.GREETING
-/// every frame through the resource handle API, so the WASM host-Lua fast path
-/// (g_session == NULL) can observe a hot-swap on the frame after update_assets.
-/// Never quits — the driver stops it.
+/// every frame through the constant-direct accessor (ADR-0134), so the WASM
+/// host-Lua fast path (g_session == NULL) can observe a hot-swap on the frame
+/// after update_assets. Never quits — the driver stops it.
 const PER_FRAME_LOADER_LUA: &str = r#"
 local R = require("cart_resources")
 local function print_greeting()
-    local res = R.GREETING:load()
-    if res then
-        blyt.debug.print(res:text())
-        res:release()
+    local t = R.GREETING:text()
+    if t then
+        blyt.debug.print(t)
     end
 end
 function init() print_greeting() end
@@ -90,73 +89,33 @@ void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void) {}
 "#;
 
-/// C cart exercising the full resource lifecycle surface (#123): load->handle,
-/// pin->bytes->unpin, then a valid release followed by a stale release. It emits
-/// one deterministic line encoding every observable result so a single substring
-/// match pins identical behaviour across all three legs — proving pin delivers
-/// the exact bytes+length, load returns OK with a non-zero handle, the first
-/// release succeeds, and the stale second release is rejected (INVALID_ARG=1).
-const LIFECYCLE_C: &str = r#"
-#include "blyt.h"
-#include "cart_resources.h"
-#include <stdio.h>
-#include <string.h>
-
-void blyt_cart_init(void) {
-    blyt_resource_h h = BLYT_RESOURCE_INVALID;
-    blyt_result_t lr = blyt_resource_load(R_GREETING, &h);
-
-    const void *ptr = NULL;
-    size_t size = 0;
-    blyt_result_t pr = blyt_resource_pin(R_GREETING, &ptr, &size);
-    char g[64];
-    size_t n = size < sizeof(g) - 1 ? size : sizeof(g) - 1;
-    if (ptr) memcpy(g, ptr, n);
-    g[ptr ? n : 0] = '\0';
-    blyt_resource_unpin(R_GREETING);
-
-    blyt_result_t r1 = blyt_resource_release(h);       /* valid */
-    blyt_result_t r2 = blyt_resource_release(h);       /* stale -> rejected */
-
-    char line[256];
-    snprintf(line, sizeof(line),
-             "R[%s] load=%d h=%d pin=%d bytes=%d rel1=%d rel2=%d",
-             g, (int)lr, (int)(h != BLYT_RESOURCE_INVALID), (int)pr,
-             (int)size, (int)r1, (int)r2);
-    blyt_console_debug(line);
-}
-
-void blyt_cart_update(void) { blyt_quit(); }
-void blyt_cart_draw(void) {}
-"#;
-
-/// C cart that pins AND loads all 100 distinct resource ids and verifies each
-/// pin delivers the *exact* embedded bytes (not merely that the call returned
-/// OK — the #98 anti-pattern), emitting one deterministic summary line. The
-/// native bare-metal path historically capped its resource table at 64 entries
-/// (NATIVE_MAX_RES), so the 65th+ distinct id silently returned NOT_FOUND on
-/// metal while every emulated leg (host table grows via realloc) served it
-/// (#141). Resource ids are 1-based, assigned in sorted-name order, so the
-/// zero-padded `res_<k>.dat` assets map id (k+1) -> "payload-<k>". They are raw
-/// `.dat` (not text) so the pinned size is exactly the payload length — a text
-/// resource's build-appended trailing NUL (#166) would make size == elen+1.
+/// C cart that pins all 100 distinct resource ids and verifies each pin delivers
+/// the *exact* embedded bytes (not merely that the call returned OK — the #98
+/// anti-pattern), emitting one deterministic summary line. The native bare-metal
+/// path historically capped its resource table at 64 entries (NATIVE_MAX_RES), so
+/// the 65th+ distinct id silently returned NOT_FOUND on metal while every emulated
+/// leg (host table grows via realloc) served it (#141). Resource ids are 1-based,
+/// assigned in sorted-name order, so the zero-padded `res_<k>.dat` assets map id
+/// (k+1) -> "payload-<k>". They are raw `.dat` (not text) so the pinned size is
+/// exactly the payload length — a text resource's build-appended trailing NUL
+/// (#166) would make size == elen+1. The cart references resources by their baked
+/// console-wide constant (ADR-0134); a real cart names R_<NAME>, but this test
+/// builds the constant from the loop index, so it encodes the id inline
+/// (kind RESOURCE = bit 29, cart provenance) — equivalent to BLYT_RESOURCE_ENCODE.
 const MANY_RESOURCES_C: &str = r#"
 #include "blyt.h"
 #include <stdio.h>
 #include <string.h>
 
 #define N 100
+#define R_ENCODE(id) (0x20000000u | (blyt_resource_id_t)(id)) /* kind RESOURCE, prov cart */
 
 void blyt_cart_init(void) {
-    int pin_ok = 0, load_ok = 0, match = 0, first_bad = -1;
+    int pin_ok = 0, match = 0, first_bad = -1;
     for (int k = 0; k < N; k++) {
-        blyt_resource_id_t id = (blyt_resource_id_t)(k + 1);
+        blyt_resource_id_t id = R_ENCODE(k + 1);
         char expect[32];
         int elen = snprintf(expect, sizeof(expect), "payload-%03d", k);
-
-        blyt_resource_h h = BLYT_RESOURCE_INVALID;
-        if (blyt_resource_load(id, &h) == BLYT_OK && h != BLYT_RESOURCE_INVALID)
-            load_ok++;
 
         const void *ptr = NULL;
         size_t size = 0;
@@ -171,12 +130,11 @@ void blyt_cart_init(void) {
             first_bad = k + 1;
         }
         blyt_resource_unpin(id);
-        blyt_resource_release(h);
     }
 
     char line[128];
-    snprintf(line, sizeof(line), "RES_MANY pin_ok=%d load_ok=%d match=%d first_bad=%d", pin_ok,
-             load_ok, match, first_bad);
+    snprintf(line, sizeof(line), "RES_MANY pin_ok=%d match=%d first_bad=%d", pin_ok, match,
+             first_bad);
     blyt_console_debug(line);
 }
 
@@ -209,36 +167,7 @@ fn many_resources_round_trip_all_legs() {
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    run_cart_all_legs(
-        &cart,
-        "RES_MANY pin_ok=100 load_ok=100 match=100 first_bad=-1",
-    );
-}
-
-/// Packed cart: the full lifecycle surface (load/pin/unpin/release + stale
-/// rejection) produces identical observable output on native, WASM, libretro.
-#[test]
-fn resource_lifecycle_round_trips_all_legs() {
-    require_sdk();
-    require_wasm();
-    require_libretro_core();
-
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("resource_lifecycle");
-    CartProject::new()
-        .c(LIFECYCLE_C)
-        .asset("greeting.txt", "Hello from assets!")
-        .write(&project);
-
-    let cart = build_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    // bytes=19: the low-level pin is byte-blind and reports the *stored* length,
-    // which for a text resource includes the build-appended trailing NUL (#166).
-    run_cart_all_legs(
-        &cart,
-        "R[Hello from assets!] load=0 h=1 pin=0 bytes=19 rel1=0 rel2=1",
-    );
+    run_cart_all_legs(&cart, "RES_MANY pin_ok=100 match=100 first_bad=-1");
 }
 
 /// Packed cart: the greeting asset is embedded as an ELF section and reaches the
@@ -270,9 +199,7 @@ fn text_asset_round_trips_all_legs() {
 const LUA_RESOURCE_REQUIRE: &str = r#"
 local R = require("cart_resources")
 function init()
-    local res = R.GREETING:load()
-    blyt.debug.print(string.format("R[%d]=%s", R.GREETING:id(), res:text()))
-    res:release()
+    blyt.debug.print(string.format("R[%d]=%s", R.GREETING:id(), R.GREETING:text()))
 end
 function update() blyt.quit() end
 function draw() end
@@ -294,28 +221,31 @@ fn lua_resource_require_round_trips_all_legs() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    run_cart_all_legs(&cart, "R[1]=Hello from assets!");
+    // :id() returns the baked console-wide constant (ADR-0134): R_GREETING is the
+    // first resource, id 1 -> 0x20000001 = 536870913.
+    run_cart_all_legs(&cart, "R[536870913]=Hello from assets!");
 }
 
-/// Pure-Lua cart exercising the full handle surface: a typed text-resource
-/// constant, idempotent `:load()` (`==` holds), the kind-agnostic module-level
-/// `pin`/`unpin` returning a frame-scoped pointer + size, `:text()` owned copy,
-/// `__tostring`.  One deterministic line pins identical behaviour across native /
-/// WASM / libretro.  `tlen` (#txt) is the NUL-stripped content length (18) while
-/// `size` is the raw stored length the byte-blind pin reports (19, incl. the
+/// Pure-Lua cart exercising the constant-direct surface (ADR-0134): a typed
+/// text-resource constant, the kind-agnostic module-level `pin`/`unpin` returning
+/// a frame-scoped pointer + size, `:text()` owned copy, `:id()`, `__tostring`.
+/// One deterministic line pins identical behaviour across native / WASM /
+/// libretro.  `tlen` (#txt) is the NUL-stripped content length (18) while `size`
+/// is the raw stored length the byte-blind pin reports (19, incl. the
 /// build-appended trailing NUL, #166).
 const LUA_RESOURCE_LIFECYCLE: &str = r#"
+local R = require("cart_resources")
 function init()
-    local r = blyt.resource.text_resource(1)
-    local a = r:load()
-    local b = r:load()
-    local ptr, size = blyt.resource.pin(1)
-    blyt.resource.unpin(1)
-    local txt = a:text()
-    a:release()
+    -- Constant-direct surface (ADR-0134): the module-level pin/unpin raw escape
+    -- hatch takes the constant, and :text() reads the typed string.  tostring on
+    -- the constant prints its baked value (R_GREETING = 0x20000001 = 536870913).
+    local id = R.GREETING:id()
+    local ptr, size = blyt.resource.pin(id)
+    blyt.resource.unpin(id)
+    local txt = R.GREETING:text()
     blyt.debug.print(string.format(
-        "L[%s] tlen=%d size=%d eq=%s ptr=%s ts=%s",
-        txt, #txt, size, tostring(a == b), tostring(ptr ~= nil), tostring(a)))
+        "L[%s] tlen=%d size=%d id=%d ptr=%s ts=%s",
+        txt, #txt, size, id, tostring(ptr ~= nil), tostring(R.GREETING)))
 end
 function update() blyt.quit() end
 function draw() end
@@ -337,20 +267,19 @@ fn lua_resource_lifecycle_round_trips_all_legs() {
     let cart = build_lua_cart(&project);
     run_cart_all_legs(
         &cart,
-        "L[Hello from assets!] tlen=18 size=19 eq=true ptr=true ts=resource<1>",
+        "L[Hello from assets!] tlen=18 size=19 id=536870913 ptr=true ts=text_resource<536870913>",
     );
 }
 
-/// Rust cart exercising the full SDK resource surface (#94/#166): the
-/// packer-generated `R_GREETING: blyt::TextResource` constant (pulled in via
-/// `include!(env!("BLYT_CART_RESOURCES_RS"))`), `R_GREETING.load()` →
-/// `LoadedText::text_string` (owned copy), `R_GREETING.pin()` →
-/// `PinnedText::as_str` (frame-scoped borrow, NUL stripped), and `release`.  One
-/// deterministic line encodes every observable result — the greeting text, the
-/// owned-copy length, the borrow length, and that the owned copy equals the
-/// borrow — so a single substring match pins identical behaviour across all
-/// three legs (and proves the bytes are real, not a green-but-ignored stub).
-/// Both lengths are the NUL-stripped content length (18).
+/// Rust cart exercising the constant-direct SDK resource surface (#94/#166/#196):
+/// the packer-generated `R_GREETING: blyt::TextResource` constant (pulled in via
+/// `include!(env!("BLYT_CART_RESOURCES_RS"))`), `R_GREETING.text_string()` (owned
+/// copy) and `R_GREETING.pin()` → `PinnedText::as_str` (frame-scoped borrow, NUL
+/// stripped).  One deterministic line encodes every observable result — the
+/// greeting text, the owned-copy length, the borrow length, and that the owned
+/// copy equals the borrow — so a single substring match pins identical behaviour
+/// across all three legs (and proves the bytes are real, not a green-but-ignored
+/// stub).  Both lengths are the NUL-stripped content length (18).
 const LIFECYCLE_RUST: &str = r#"#![no_std]
 
 extern crate alloc;
@@ -360,8 +289,7 @@ include!(env!("BLYT_CART_RESOURCES_RS"));
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_init() {
-    let res = R_GREETING.load();
-    let owned = res.text_string();
+    let owned = R_GREETING.text_string();
 
     let pinned = R_GREETING.pin();
     let borrowed = pinned.as_str().unwrap();
@@ -375,7 +303,6 @@ pub extern "C" fn blyt_cart_init() {
     ));
 
     drop(pinned);
-    res.release();
 }
 
 #[no_mangle]
@@ -1102,11 +1029,11 @@ fn on_assets_reloaded_lua_libretro_ids_payload() {
 /// #93 lands the read API on the emulated legs (#122 follow-up).
 const CACHE_AT_INIT_LUA: &str = r#"
 local cached
+-- 0x20000001 = R_GREETING baked constant (kind RESOURCE, id 1; ADR-0134).
 local function cache_greeting()
-    local res = blyt.resource.text_resource(1):load()
-    if res then
-        cached = res:text()
-        res:release()
+    local t = blyt.resource.text_resource(0x20000001):text()
+    if t then
+        cached = t
     end
 end
 function init() cache_greeting() end
@@ -1468,7 +1395,7 @@ void blyt_cart_update(void) { blyt_quit(); }
 void blyt_cart_draw(void) {}
 "#;
 
-/// Rust cart: LoadedBytes::bytes_vec → owned Vec<u8>, hex-encode.
+/// Rust cart: BytesResource::bytes_vec → owned Vec<u8>, hex-encode.
 const BYTES_GET_RUST: &str = r#"#![no_std]
 
 extern crate alloc;
@@ -1479,14 +1406,12 @@ include!(env!("BLYT_CART_RESOURCES_RS"));
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_init() {
-    let res = R_BLOB.load();
-    let bytes = res.bytes_vec();
+    let bytes = R_BLOB.bytes_vec();
     let mut hex = String::new();
     for b in &bytes {
         hex.push_str(&format!("{:02x}", b));
     }
     blyt::console_debug(&format!("BYTES len={} hex={}", bytes.len(), hex));
-    res.release();
 }
 
 #[no_mangle]
@@ -1503,14 +1428,12 @@ pub extern "C" fn blyt_cart_draw() {}
 const BYTES_GET_LUA: &str = r#"
 local R = require("cart_resources")
 function init()
-    local res = R.BLOB:load()
-    local s = res:bytes()
+    local s = R.BLOB:bytes()
     local hex = {}
     for i = 1, #s do
         hex[i] = string.format("%02x", string.byte(s, i))
     end
     blyt.debug.print(string.format("BYTES len=%d hex=%s", #s, table.concat(hex)))
-    res:release()
 end
 function update() blyt.quit() end
 function draw() end
@@ -1535,7 +1458,7 @@ fn c_bytes_get_round_trips_all_legs() {
     run_cart_all_legs(&cart, BLOB_HEX);
 }
 
-/// Packed Rust cart: LoadedBytes::bytes_vec returns the exact opaque bytes,
+/// Packed Rust cart: BytesResource::bytes_vec returns the exact opaque bytes,
 /// identically across native / WASM / libretro.
 #[test]
 fn rust_bytes_vec_round_trips_all_legs() {
@@ -1715,16 +1638,16 @@ fn text_asset_embedded_nul_is_build_error() {
 }
 
 /// Rust compile barrier (#166): the text accessor exists only on the text types,
-/// so calling `text_string()` on a `LoadedBytes` (from a raw `BytesResource`
-/// constant) fails to compile — the Rust analogue of ADR-0068's typed handles.
+/// so calling `text_string()` on a `BytesResource` constant fails to compile —
+/// the Rust analogue of ADR-0068's typed handles.
 const RUST_TEXT_ON_BYTES: &str = r#"#![no_std]
 
 include!(env!("BLYT_CART_RESOURCES_RS"));
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_init() {
-    // R_BLOB is a BytesResource -> LoadedBytes, which has no text_string().
-    let _ = R_BLOB.load().text_string();
+    // R_BLOB is a BytesResource, which has no text_string().
+    let _ = R_BLOB.text_string();
 }
 
 #[no_mangle]

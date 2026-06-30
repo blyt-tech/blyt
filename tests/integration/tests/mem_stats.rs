@@ -51,15 +51,14 @@ static void emit(const char *tag) {
     blyt_console_debug(line);
 }
 
-static blyt_resource_h g_h;
-
 void blyt_cart_init(void) {
-    blyt_resource_load(R_BLOB, &g_h);
     size_t len = 0;
     void *p = blyt_resource_bytes_get(R_BLOB, &len); /* materialize the cache */
     free(p);
-    emit("AFTER_LOAD");
-    blyt_resource_release(g_h); /* now evictable; bytes resident until evicted */
+    /* No load handle (ADR-0134): the accessed blob is resident in cache and
+     * immediately evictable (pin_count 0), so the --evict-every-frame hook
+     * reclaims it at the next frame boundary. */
+    emit("ACCESSED");
 }
 
 void blyt_cart_update(void) {
@@ -104,8 +103,9 @@ fn mem_stats_consume_single_leg() {
         .stdout
         .clone();
     let s = String::from_utf8_lossy(&out);
+    // first id is the baked R_BLOB constant (id 1 -> 0x20000001 = 536870913).
     for expected in [
-        "AFTER_LOAD cap=16777216 cache=2048 loaded=1 first=1:2048 inv=1",
+        "ACCESSED cap=16777216 cache=2048 loaded=1 first=536870913:2048 inv=1",
         "AFTER_EVICT cap=16777216 cache=0 loaded=0 first=0:0 inv=1",
     ] {
         assert!(
@@ -122,17 +122,21 @@ fn mem_stats_consume_single_leg() {
 // leg), the total==cart+cache invariant, and the loaded-resource enumeration
 // (id + size — deterministic because loads are). The advisory cache numbers are
 // deliberately not in the asserted line. The three carts emit the SAME string,
-// so one expected value pins both cross-leg and cross-language parity.
-const PARITY_EXPECT: &str = "MEM cap=16777216 inv=1 loaded=1 first=1:5";
+// so one expected value pins both cross-leg and cross-language parity. The id is
+// the baked R_TAG constant (id 1 -> 0x20000001 = 536870913); the cart *accesses*
+// the resource (ADR-0134: no load handle) so it enters the resident working set.
+const PARITY_EXPECT: &str = "MEM cap=16777216 inv=1 loaded=1 first=536870913:5";
 
 const PARITY_C: &str = r#"
 #include "blyt.h"
 #include "cart_resources.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 void blyt_cart_init(void) {
-    blyt_resource_h h;
-    blyt_resource_load(R_TAG, &h);
+    size_t len = 0;
+    void *p = blyt_resource_bytes_get(R_TAG, &len); /* access -> resident */
+    free(p);
     blyt_mem_stats_t s = {0};
     blyt_mem_stats(&s);
     blyt_mem_resource_t res[8];
@@ -152,7 +156,7 @@ void blyt_cart_draw(void) {}
 const PARITY_LUA: &str = r#"
 local R = require("cart_resources")
 function init()
-    local h = R.TAG:load()
+    local _ = R.TAG:bytes() -- access -> resident
     local m = blyt32.mem.stats()
     local inv = (m.total_used == m.cart_allocations + m.resource_cache_used) and 1 or 0
     local first = m.resources_loaded[1]
@@ -160,7 +164,6 @@ function init()
     local fsz = first and first.size or 0
     blyt.debug.print(string.format("MEM cap=%d inv=%d loaded=%d first=%d:%d",
         m.budget_cap, inv, #m.resources_loaded, fid, fsz))
-    h:release()
 end
 function update() blyt.quit() end
 function draw() end
@@ -175,7 +178,7 @@ include!(env!("BLYT_CART_RESOURCES_RS"));
 
 #[no_mangle]
 pub extern "C" fn blyt_cart_init() {
-    let h = R_TAG.load();
+    let _ = R_TAG.bytes_vec(); // access -> resident
     let m = blyt::mem::stats();
     let inv = if m.total_used == m.cart_allocations + m.resource_cache_used { 1 } else { 0 };
     let (fid, fsz) = m
@@ -187,7 +190,6 @@ pub extern "C" fn blyt_cart_init() {
         "MEM cap={} inv={} loaded={} first={}:{}",
         m.budget_cap, inv, m.resources_loaded.len(), fid, fsz
     ));
-    h.release();
 }
 
 #[no_mangle]

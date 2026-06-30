@@ -39,7 +39,9 @@
 
 #ifdef BLYT_LUA
 #include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
+#include "blyt_handle.h" /* runtime/shared: console-wide resource-constant encoding (ADR-0134) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
+#include "blyt_resource_codec.h" /* runtime/shared: BLYT_RES_ALGO_NONE (#157) */
 #include "resource.h"
 #include "save.h"
 #include "state_buffer.h"
@@ -1239,20 +1241,16 @@ static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
  * semantics replicate the resource lifecycle ECALL handlers in cart_run.c.
  * ------------------------------------------------------------------------- */
 
-#define BLYT_RESOURCE_CONST_MT "blyt.resource.const"
-#define BLYT_RESOURCE_TEXT_HANDLE_MT "blyt.resource.text_handle"
-#define BLYT_RESOURCE_BYTES_HANDLE_MT "blyt.resource.bytes_handle"
+/* Kind-specific constant metatables (ADR-0068/#166): typed-ness is the metatable,
+ * so the wrong accessor raises "attempt to call a nil value".  ADR-0134/#196
+ * collapsed accessors onto the constant — no separate loaded handle. */
+#define BLYT_RESOURCE_TEXT_CONST_MT "blyt.resource.text_const"
+#define BLYT_RESOURCE_BYTES_CONST_MT "blyt.resource.bytes_const"
 
 typedef struct {
-    uint32_t id;
+    uint32_t id; /* the baked console-wide constant (ADR-0134) */
     int is_text;
 } wasm_resource_const_t;
-
-typedef struct {
-    uint32_t id;
-    uint32_t handle;
-    int released;
-} wasm_resource_handle_t;
 
 static blyt_resource_table_t *active_resource_table(void) {
     if (g_session)
@@ -1260,11 +1258,46 @@ static blyt_resource_table_t *active_resource_table(void) {
     return g_lua_resources_loaded ? &g_lua_resources : NULL;
 }
 
-static wasm_resource_handle_t *wasm_opt_handle(lua_State *L, int idx) {
-    void *p = luaL_testudata(L, idx, BLYT_RESOURCE_TEXT_HANDLE_MT);
+static wasm_resource_const_t *wasm_opt_const(lua_State *L, int idx) {
+    void *p = luaL_testudata(L, idx, BLYT_RESOURCE_TEXT_CONST_MT);
     if (!p)
-        p = luaL_testudata(L, idx, BLYT_RESOURCE_BYTES_HANDLE_MT);
-    return (wasm_resource_handle_t *)p;
+        p = luaL_testudata(L, idx, BLYT_RESOURCE_BYTES_CONST_MT);
+    return (wasm_resource_const_t *)p;
+}
+
+/* Resolve a baked resource constant to its host table entry: classify as a
+ * cart-bundled RESOURCE and look up the decoded id (ADR-0134).  NULL for a
+ * non-resource kind, runtime-shipped provenance, or an absent id. */
+static blyt_resource_entry_t *wasm_resolve(blyt_resource_table_t *t, uint32_t handle) {
+    if (!t || !blyt_handle_is_resource(handle) ||
+        blyt_resource_decode_provenance(handle) != BLYT_RESOURCE_PROV_CART)
+        return NULL;
+    return blyt_resource_table_find_mut(t, blyt_resource_decode_id(handle));
+}
+
+/* Pin an entry exactly as the rv32 RESOURCE_PIN ECALL handler does (cart_run.c):
+ * budget-gate, materialize (decode zstd), bump the pin, touch for LRU, republish
+ * the footprint — so the WASM host-Lua path stays behaviourally identical to the
+ * emulated path (#158).  Returns the resident bytes via *out (NULL/0-len is a
+ * valid success), or false if absent / over budget / decode failure. */
+static bool wasm_pin_entry(blyt_resource_table_t *t, blyt_resource_entry_t *e,
+                           const uint8_t **out) {
+    *out = NULL;
+    if (!e || !wasm_lua_reference_fits(t, e, blyt_rl_is_evictable(&e->rl)))
+        return false;
+    const uint8_t *bytes = blyt_resource_entry_data(e);
+    if (!bytes && e->len)
+        return false; /* decode failed */
+    blyt_rl_pin(&e->rl);
+    blyt_resource_table_touch(t, e); /* recency for LRU (#158) */
+    wasm_lua_publish_footprint(t); /* footprint grew; bound cache */
+    *out = bytes;
+    return true;
+}
+
+static void wasm_unpin_entry(blyt_resource_table_t *t, blyt_resource_entry_t *e) {
+    blyt_rl_unpin(&e->rl);
+    wasm_lua_publish_footprint(t); /* footprint may have shrunk (#158) */
 }
 
 static int wasm_text_resource(lua_State *L) {
@@ -1272,7 +1305,7 @@ static int wasm_text_resource(lua_State *L) {
     wasm_resource_const_t *c = (wasm_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
     c->id = id;
     c->is_text = 1;
-    luaL_setmetatable(L, BLYT_RESOURCE_CONST_MT);
+    luaL_setmetatable(L, BLYT_RESOURCE_TEXT_CONST_MT);
     return 1;
 }
 
@@ -1281,136 +1314,73 @@ static int wasm_bytes_resource(lua_State *L) {
     wasm_resource_const_t *c = (wasm_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
     c->id = id;
     c->is_text = 0;
-    luaL_setmetatable(L, BLYT_RESOURCE_CONST_MT);
-    return 1;
-}
-
-static int wasm_const_load(lua_State *L) {
-    wasm_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_CONST_MT);
-    blyt_resource_table_t *t = active_resource_table();
-    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, c->id) : NULL;
-    if (!e) {
-        lua_pushnil(L);
-        return 1;
-    }
-    /* A fresh load reserves e->len of footprint up front (#157/#158). Refuse it
-     * if that would cross the 16 MB budget — :load() returns nil, the same
-     * observable result as the rv32 path's BUFFER_FULL → invalid handle. */
-    if (!wasm_lua_reference_fits(t, e, blyt_rl_is_evictable(&e->rl))) {
-        lua_pushnil(L);
-        return 1;
-    }
-    wasm_resource_handle_t *uh = (wasm_resource_handle_t *)lua_newuserdatauv(L, sizeof(*uh), 0);
-    uh->id = c->id;
-    uh->handle = blyt_rl_load(&e->rl, c->id);
-    uh->released = 0;
-    blyt_resource_table_touch(t, e); /* recency for LRU (#158) */
-    wasm_lua_publish_footprint(t); /* footprint grew */
-    luaL_setmetatable(L, c->is_text ? BLYT_RESOURCE_TEXT_HANDLE_MT : BLYT_RESOURCE_BYTES_HANDLE_MT);
+    luaL_setmetatable(L, BLYT_RESOURCE_BYTES_CONST_MT);
     return 1;
 }
 
 static int wasm_const_id(lua_State *L) {
-    wasm_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_CONST_MT);
+    wasm_resource_const_t *c = wasm_opt_const(L, 1);
+    luaL_argcheck(L, c != NULL, 1, "resource constant expected");
     lua_pushinteger(L, (lua_Integer)c->id);
     return 1;
 }
 
 static int wasm_const_eq(lua_State *L) {
-    wasm_resource_const_t *a = luaL_checkudata(L, 1, BLYT_RESOURCE_CONST_MT);
-    wasm_resource_const_t *b = luaL_checkudata(L, 2, BLYT_RESOURCE_CONST_MT);
-    lua_pushboolean(L, a->id == b->id && a->is_text == b->is_text);
+    wasm_resource_const_t *a = wasm_opt_const(L, 1);
+    wasm_resource_const_t *b = wasm_opt_const(L, 2);
+    lua_pushboolean(L, a && b && a->id == b->id && a->is_text == b->is_text);
     return 1;
 }
 
 static int wasm_const_tostring(lua_State *L) {
-    wasm_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_CONST_MT);
+    wasm_resource_const_t *c = wasm_opt_const(L, 1);
+    luaL_argcheck(L, c != NULL, 1, "resource constant expected");
     lua_pushfstring(L, c->is_text ? "text_resource<%d>" : "bytes_resource<%d>", (int)c->id);
     return 1;
 }
 
-/* text handle :text() — owned copy, trailing storage NUL stripped (#166). */
-static int wasm_handle_text(lua_State *L) {
-    wasm_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_TEXT_HANDLE_MT);
+/* text constant :text() — owned copy, trailing storage NUL stripped (#166). */
+static int wasm_const_text(lua_State *L) {
+    wasm_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_TEXT_CONST_MT);
     blyt_resource_table_t *t = active_resource_table();
-    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, uh->id) : NULL;
-    if (!e) {
+    blyt_resource_entry_t *e = wasm_resolve(t, c->id);
+    const uint8_t *bytes = NULL;
+    if (!wasm_pin_entry(t, e, &bytes)) {
         lua_pushnil(L);
         return 1;
     }
-    blyt_rl_pin(&e->rl); /* pin -> copy -> unpin (frame-scoped pointer, ADR-0027) */
-    size_t content =
-        (e->len >= 1 && ((const char *)e->data)[e->len - 1] == '\0') ? e->len - 1 : e->len;
-    lua_pushlstring(L, (const char *)e->data, content);
-    blyt_rl_unpin(&e->rl);
+    size_t content = (e->len >= 1 && bytes[e->len - 1] == '\0') ? e->len - 1 : e->len;
+    lua_pushlstring(L, (const char *)bytes, content);
+    wasm_unpin_entry(t, e);
     return 1;
 }
 
-/* bytes handle :bytes() — owned copy of the exact bytes, verbatim (#162). */
-static int wasm_handle_bytes(lua_State *L) {
-    wasm_resource_handle_t *uh = luaL_checkudata(L, 1, BLYT_RESOURCE_BYTES_HANDLE_MT);
+/* bytes constant :bytes() — owned copy of the exact bytes, verbatim (#162). */
+static int wasm_const_bytes(lua_State *L) {
+    wasm_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_BYTES_CONST_MT);
     blyt_resource_table_t *t = active_resource_table();
-    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, uh->id) : NULL;
-    if (!e) {
+    blyt_resource_entry_t *e = wasm_resolve(t, c->id);
+    const uint8_t *bytes = NULL;
+    if (!wasm_pin_entry(t, e, &bytes)) {
         lua_pushnil(L);
         return 1;
     }
-    blyt_rl_pin(&e->rl);
-    lua_pushlstring(L, (const char *)e->data, e->len);
-    blyt_rl_unpin(&e->rl);
+    lua_pushlstring(L, (const char *)bytes, e->len);
+    wasm_unpin_entry(t, e);
     return 1;
 }
 
-static int wasm_handle_release(lua_State *L) {
-    wasm_resource_handle_t *uh = wasm_opt_handle(L, 1);
-    luaL_argcheck(L, uh != NULL, 1, "resource handle expected");
-    if (!uh->released) {
-        blyt_resource_table_t *t = active_resource_table();
-        blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, uh->id) : NULL;
-        if (e) {
-            blyt_rl_release(&e->rl, uh->handle);
-            /* Residency dropped; if now unreferenced its bytes leave the
-             * footprint — republish so the freed budget is visible (#158). */
-            wasm_lua_publish_footprint(t);
-        }
-        uh->released = 1;
-    }
-    return 0;
-}
-
-static int wasm_handle_eq(lua_State *L) {
-    wasm_resource_handle_t *a = wasm_opt_handle(L, 1);
-    wasm_resource_handle_t *b = wasm_opt_handle(L, 2);
-    lua_pushboolean(L, a && b && a->handle == b->handle && a->id == b->id);
-    return 1;
-}
-
-static int wasm_handle_tostring(lua_State *L) {
-    wasm_resource_handle_t *uh = wasm_opt_handle(L, 1);
-    luaL_argcheck(L, uh != NULL, 1, "resource handle expected");
-    lua_pushfstring(L, "resource<%d>", (int)uh->id);
-    return 1;
-}
-
-/* Module-level pin/unpin: kind-agnostic id-based escape hatch (#166). */
+/* Module-level pin/unpin: kind-agnostic raw escape hatch, takes the constant (#166). */
 static int wasm_resource_pin(lua_State *L) {
     uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
     blyt_resource_table_t *t = active_resource_table();
-    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, id) : NULL;
-    if (!e) {
+    blyt_resource_entry_t *e = wasm_resolve(t, id);
+    const uint8_t *bytes = NULL;
+    if (!wasm_pin_entry(t, e, &bytes)) {
         lua_pushnil(L);
         return 1;
     }
-    /* Pinning a so-far-evictable resource adds its bytes to the footprint; refuse
-     * if that crosses the 16 MB budget (nil), matching the rv32 pin (#158). */
-    if (!wasm_lua_reference_fits(t, e, blyt_rl_is_evictable(&e->rl))) {
-        lua_pushnil(L);
-        return 1;
-    }
-    blyt_rl_pin(&e->rl);
-    blyt_resource_table_touch(t, e); /* recency for LRU (#158) */
-    wasm_lua_publish_footprint(t); /* footprint grew */
-    lua_pushlightuserdata(L, (void *)(uintptr_t)e->data);
+    lua_pushlightuserdata(L, (void *)(uintptr_t)bytes);
     lua_pushinteger(L, (lua_Integer)e->len);
     return 2;
 }
@@ -1418,30 +1388,26 @@ static int wasm_resource_pin(lua_State *L) {
 static int wasm_resource_unpin(lua_State *L) {
     uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
     blyt_resource_table_t *t = active_resource_table();
-    blyt_resource_entry_t *e = t ? blyt_resource_table_find_mut(t, id) : NULL;
-    if (e) {
-        blyt_rl_unpin(&e->rl);
-        wasm_lua_publish_footprint(t); /* footprint may have shrunk (#158) */
-    }
+    blyt_resource_entry_t *e = wasm_resolve(t, id);
+    if (e)
+        wasm_unpin_entry(t, e);
     return 0;
 }
 
-/* Build a loaded-handle metatable carrying the kind-specific accessor plus the
- * shared release/__gc/__eq/__tostring.  Mirrors the guest register_handle_mt. */
-static void wasm_register_handle_mt(lua_State *L, const char *mt_name, lua_CFunction accessor,
-                                    const char *accessor_name) {
+/* Build a kind-specific constant metatable carrying its accessor plus the shared
+ * :id()/__eq/__tostring.  Mirrors the guest register_const_mt. */
+static void wasm_register_const_mt(lua_State *L, const char *mt_name, lua_CFunction accessor,
+                                   const char *accessor_name) {
     luaL_newmetatable(L, mt_name);
-    lua_pushcfunction(L, wasm_handle_release); /* __gc: idempotent release */
-    lua_setfield(L, -2, "__gc");
-    lua_pushcfunction(L, wasm_handle_eq);
+    lua_pushcfunction(L, wasm_const_eq);
     lua_setfield(L, -2, "__eq");
-    lua_pushcfunction(L, wasm_handle_tostring);
+    lua_pushcfunction(L, wasm_const_tostring);
     lua_setfield(L, -2, "__tostring");
     lua_newtable(L);
     lua_pushcfunction(L, accessor);
     lua_setfield(L, -2, accessor_name);
-    lua_pushcfunction(L, wasm_handle_release);
-    lua_setfield(L, -2, "release");
+    lua_pushcfunction(L, wasm_const_id);
+    lua_setfield(L, -2, "id");
     lua_setfield(L, -2, "__index");
     lua_pop(L, 1); /* pop mt */
 }
@@ -1449,22 +1415,8 @@ static void wasm_register_handle_mt(lua_State *L, const char *mt_name, lua_CFunc
 /* Register blyt.resource.* + blyt32.resource.* into g_lua, mirroring the guest
  * register_resource_module.  Call after the blyt/blyt32 globals exist. */
 static void wasm_register_resource_api(lua_State *L) {
-    /* Resource-constant metatable: :load(), :id(), __eq, __tostring. */
-    luaL_newmetatable(L, BLYT_RESOURCE_CONST_MT);
-    lua_pushcfunction(L, wasm_const_eq);
-    lua_setfield(L, -2, "__eq");
-    lua_pushcfunction(L, wasm_const_tostring);
-    lua_setfield(L, -2, "__tostring");
-    lua_newtable(L); /* __index */
-    lua_pushcfunction(L, wasm_const_load);
-    lua_setfield(L, -2, "load");
-    lua_pushcfunction(L, wasm_const_id);
-    lua_setfield(L, -2, "id");
-    lua_setfield(L, -2, "__index");
-    lua_pop(L, 1); /* pop const mt */
-
-    wasm_register_handle_mt(L, BLYT_RESOURCE_TEXT_HANDLE_MT, wasm_handle_text, "text");
-    wasm_register_handle_mt(L, BLYT_RESOURCE_BYTES_HANDLE_MT, wasm_handle_bytes, "bytes");
+    wasm_register_const_mt(L, BLYT_RESOURCE_TEXT_CONST_MT, wasm_const_text, "text");
+    wasm_register_const_mt(L, BLYT_RESOURCE_BYTES_CONST_MT, wasm_const_bytes, "bytes");
 
     lua_newtable(L); /* resource module */
     lua_pushcfunction(L, wasm_text_resource);
@@ -1516,10 +1468,15 @@ static int wasm_mem_stats(lua_State *L) {
     if (t) {
         for (size_t i = 0; i < t->count; i++) {
             const blyt_resource_entry_t *e = &t->entries[i];
-            if (e->rl.load_count == 0 && !e->persistent)
-                continue; /* persistent counts as resident from frame 0 (#160) */
+            /* Resident working set (ADR-0134, advisory): persistent (#160), a
+             * decompressed entry in the cache (owned), or an uncompressed
+             * zero-copy entry the cart has accessed (last_access > 0).  The id is
+             * reported as the baked constant so it matches R_<NAME>. */
+            if (!(e->persistent || e->owned != NULL ||
+                  (e->algo == BLYT_RES_ALGO_NONE && e->last_access > 0)))
+                continue;
             lua_createtable(L, 0, 2);
-            lua_pushinteger(L, (lua_Integer)e->id);
+            lua_pushinteger(L, (lua_Integer)blyt_resource_encode(e->id, BLYT_RESOURCE_PROV_CART));
             lua_setfield(L, -2, "id");
             lua_pushinteger(L, (lua_Integer)(uint32_t)e->len);
             lua_setfield(L, -2, "size");

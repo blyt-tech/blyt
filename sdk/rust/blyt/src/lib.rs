@@ -23,9 +23,7 @@ pub use buffer::{
 // Re-exported at the crate root so the packer-generated `cart_resources.rs` can
 // name the typed constants as `blyt::TextResource` / `blyt::BytesResource`
 // (issues #94, #166).
-pub use resource::{
-    BytesResource, LoadedBytes, LoadedText, PinnedBytes, PinnedText, TextResource,
-};
+pub use resource::{BytesResource, PinnedBytes, PinnedText, TextResource};
 
 // -------------------------------------------------------------------------
 // Raw C API

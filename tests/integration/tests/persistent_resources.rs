@@ -18,10 +18,10 @@ mod common;
 use common::*;
 use tempfile::TempDir;
 
-/// AC1 + AC3 + AC5 (C): a persistent resource is resident from frame 0 *without*
-/// any `load` (AC5), its bytes are readable in `init()` without a prior `load`
-/// (AC1), and `load`+`release` then `pin`+`unpin` leave it resident and its bytes
-/// valid (AC3) — all identical across every leg.
+/// AC1 + AC3 + AC5 (C): a persistent resource is resident from frame 0 (AC5), its
+/// bytes are readable in `init()` by referencing the constant directly — no load
+/// handle exists (AC1, ADR-0134) — and `pin`+`unpin` leave it resident and its
+/// bytes valid (AC3) — all identical across every leg.
 const USABLE_C: &str = r#"
 #include "blyt.h"
 #include "cart_resources.h"
@@ -29,7 +29,7 @@ const USABLE_C: &str = r#"
 #include <stdio.h>
 
 /* Is `id` reported resident by the introspection API? Persistent resources are
- * listed from frame 0 even with load_count == 0 (#160). */
+ * listed from frame 0 even when never pinned (#160). */
 static int is_resident(blyt_resource_id_t id) {
     blyt_mem_resource_t buf[8];
     uint32_t n = blyt_mem_resources(buf, 8);
@@ -52,8 +52,9 @@ void blyt_cart_init(void) {
     /* AC5: resident from frame 0 with no prior load. */
     int r0 = is_resident(pid);
 
-    /* AC1: read its bytes without ever calling load (the raw pin window needs no
-     * load; the bytes are already resident, so this is the preloaded path). */
+    /* AC1: read its bytes by referencing the constant directly (ADR-0134) — the
+     * raw pin window; the bytes are already resident, so this is the preloaded
+     * path. */
     const void *p = NULL;
     size_t sz = 0;
     unsigned sum = 0;
@@ -61,11 +62,8 @@ void blyt_cart_init(void) {
         sum = sum_bytes(p, sz);
     blyt_resource_unpin(pid);
 
-    /* AC3: load+release and the unpin above are no-ops on residency — still
-     * resident and its bytes still valid afterwards. */
-    blyt_resource_h h = BLYT_RESOURCE_INVALID;
-    blyt_resource_load(pid, &h);
-    blyt_resource_release(h);
+    /* AC3: pin/unpin is a no-op on residency — a persistent resource stays
+     * resident and its bytes stay valid afterwards. */
     int r1 = is_resident(pid);
     const void *p2 = NULL;
     size_t sz2 = 0;
@@ -138,7 +136,7 @@ static int fill_heap(void) {
 
 void blyt_cart_init(void) {
     /* Materialise the non-persistent sibling (pin+unpin) so it becomes resident
-     * but stays evictable (load_count == 0 && pin_count == 0). */
+     * but stays evictable (pin_count == 0, not persistent). */
     const void *p = NULL;
     size_t s = 0;
     blyt_resource_pin((blyt_resource_id_t)R_TRANS4, &p, &s);
@@ -193,8 +191,9 @@ local R = require("cart_resources")
 function init()
     local m = blyt32.mem.stats()
     local resident = 0
+    -- resources_loaded reports the baked constant id (ADR-0134); match R.PERS.
     for _, r in ipairs(m.resources_loaded) do
-        if r.id == 1 then resident = 1 end
+        if r.id == R.PERS:id() then resident = 1 end
     end
     blyt.debug.print(string.format("PERSLUA resident=%d loaded=%d", resident, #m.resources_loaded))
 end

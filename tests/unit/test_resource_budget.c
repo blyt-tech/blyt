@@ -50,20 +50,21 @@ static void test_footprint_counts_loaded_and_pinned(void) {
     for (uint32_t id = 1; id <= 4; id++)
         push_zstd(&t, id);
 
-    /* Nothing loaded/pinned: footprint is zero (even if some are resident). */
+    /* Nothing pinned: footprint is zero (even if some are resident). */
     assert(blyt_resource_entry_data(blyt_resource_table_find_mut(&t, 1)) != NULL);
     assert(blyt_resource_table_footprint(&t) == 0);
 
-    /* Footprint counts e->len up front — a load reserves it even before any
-     * decompress (e->len is authoritative pre-decode, #157). */
-    uint32_t h2 = blyt_rl_load(&blyt_resource_table_find_mut(&t, 2)->rl, 2);
-    assert(blyt_resource_table_footprint(&t) == L); /* #2 loaded, not yet decoded */
+    /* Footprint counts e->len up front — a pin reserves it even before any
+     * decompress (e->len is authoritative pre-decode, #157; ADR-0134: pin is the
+     * only reference). */
+    blyt_rl_pin(&blyt_resource_table_find_mut(&t, 2)->rl);
+    assert(blyt_resource_table_footprint(&t) == L); /* #2 pinned, not yet decoded */
 
     blyt_rl_pin(&blyt_resource_table_find_mut(&t, 3)->rl);
-    assert(blyt_resource_table_footprint(&t) == 2 * L); /* #2 load + #3 pin */
+    assert(blyt_resource_table_footprint(&t) == 2 * L); /* #2 + #3 pinned */
 
-    /* Releasing/unpinning shrinks the footprint back. */
-    assert(blyt_rl_release(&blyt_resource_table_find_mut(&t, 2)->rl, h2) == 1);
+    /* Unpinning shrinks the footprint back. */
+    assert(blyt_rl_unpin(&blyt_resource_table_find_mut(&t, 2)->rl) == 1);
     assert(blyt_resource_table_footprint(&t) == L);
     assert(blyt_rl_unpin(&blyt_resource_table_find_mut(&t, 3)->rl) == 1);
     assert(blyt_resource_table_footprint(&t) == 0);
@@ -79,9 +80,9 @@ static void test_resident_evictable_excludes_referenced(void) {
     }
     assert(blyt_resource_table_resident_evictable(&t) == 3 * L);
 
-    /* A load makes #2 non-evictable: it drops out of the evictable cache total
+    /* A pin makes #2 non-evictable: it drops out of the evictable cache total
      * (it is now part of the footprint instead). */
-    blyt_rl_load(&blyt_resource_table_find_mut(&t, 2)->rl, 2);
+    blyt_rl_pin(&blyt_resource_table_find_mut(&t, 2)->rl);
     assert(blyt_resource_table_resident_evictable(&t) == 2 * L);
     assert(blyt_resource_table_footprint(&t) == L);
     blyt_resource_table_clear(&t);

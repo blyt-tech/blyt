@@ -101,14 +101,13 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_save_write",
     "blyt_save_read",
 
-    /* blyt resource API (ADR-0027, ADR-0040, ADR-0088, issues #91/#123/#162).
-     * The four lifecycle primitives are ECALL stubs in libblytcommon; the
-     * blyt_resource_text_get / blyt_resource_bytes_get conveniences are
-     * guest-side helpers (also in libblytcommon) built from pin -> copy -> unpin. */
+    /* blyt resource API (ADR-0027, ADR-0040, ADR-0088, ADR-0134, #91/#123/#162/#196).
+     * pin/unpin are ECALL stubs in libblytcommon; the blyt_resource_text_get /
+     * blyt_resource_bytes_get conveniences are guest-side helpers (also in
+     * libblytcommon) built from pin -> copy -> unpin.  load/release are gone — a
+     * resource is referenced by its baked constant directly (ADR-0134). */
     "blyt_resource_pin",
     "blyt_resource_unpin",
-    "blyt_resource_load",
-    "blyt_resource_release",
     "blyt_resource_text_get",
     "blyt_resource_bytes_get",
 

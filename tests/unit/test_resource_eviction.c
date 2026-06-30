@@ -3,7 +3,7 @@
  * (runtime/host/src/libblyt/resource.c, ADR-0027 v2, #137).
  *
  * Eviction reclaims an entry's owned/decompressed bytes when nothing references
- * it (load_count==0 && pin_count==0, not persistent), re-pointing the entry to
+ * it (pin_count==0, not persistent — ADR-0134), re-pointing the entry to
  * its not-resident state; the next access re-materialises byte-identical bytes
  * from the cart section (zstd re-decode) or the dev-staging file. This pins the
  * mechanism directly: a zstd entry decodes, is evicted (owned freed), then
@@ -80,23 +80,6 @@ static void test_zstd_evict_then_rehydrate_identical(void) {
     blyt_resource_table_clear(&t);
 }
 
-static void test_loaded_entry_is_not_evicted(void) {
-    blyt_resource_table_t t;
-    make_zstd_table(&t, 1);
-    blyt_resource_entry_t *e = blyt_resource_table_find_mut(&t, 1);
-    assert(blyt_resource_entry_data(e) != NULL);
-    assert(e->owned != NULL);
-
-    uint32_t h = blyt_rl_load(&e->rl, 1); /* residency held */
-    assert(!blyt_rl_is_evictable(&e->rl));
-    assert(blyt_resource_entry_evict(e) == 0); /* skipped: loaded */
-    assert(e->owned != NULL); /* bytes intact */
-
-    assert(blyt_rl_release(&e->rl, h) == 1);
-    assert(blyt_resource_entry_evict(e) == strlen(PAYLOAD)); /* now evictable */
-    blyt_resource_table_clear(&t);
-}
-
 static void test_pinned_entry_is_not_evicted(void) {
     blyt_resource_table_t t;
     make_zstd_table(&t, 1);
@@ -116,8 +99,8 @@ static void test_pinned_entry_is_not_evicted(void) {
 static void test_evict_all_evictable_sweeps_only_eligible(void) {
     blyt_resource_table_t t;
     blyt_resource_table_init(&t);
-    /* Three zstd entries; materialise all, then hold a load on #2 and a pin on
-     * #3 so only #1 is evictable. */
+    /* Three zstd entries; materialise all, then hold a within-frame pin on #2 and
+     * #3 so only #1 is evictable (ADR-0134: pin is the only reference). */
     for (uint32_t id = 1; id <= 3; id++) {
         blyt_resource_entry_t *e = blyt_resource_table_test_push(&t);
         assert(e);
@@ -130,40 +113,19 @@ static void test_evict_all_evictable_sweeps_only_eligible(void) {
         e->owned = NULL;
         assert(blyt_resource_entry_data(e) != NULL);
     }
-    uint32_t h2 = blyt_rl_load(&blyt_resource_table_find_mut(&t, 2)->rl, 2);
+    blyt_rl_pin(&blyt_resource_table_find_mut(&t, 2)->rl);
     blyt_rl_pin(&blyt_resource_table_find_mut(&t, 3)->rl);
 
     size_t freed = blyt_resource_table_evict_all_evictable(&t);
     assert(freed == strlen(PAYLOAD)); /* only #1 */
     assert(blyt_resource_table_find_mut(&t, 1)->owned == NULL);
-    assert(blyt_resource_table_find_mut(&t, 2)->owned != NULL); /* loaded */
+    assert(blyt_resource_table_find_mut(&t, 2)->owned != NULL); /* pinned */
     assert(blyt_resource_table_find_mut(&t, 3)->owned != NULL); /* pinned */
 
-    /* Drop the refs; a second sweep reclaims the rest. */
-    (void)h2;
-    blyt_rl_release(&blyt_resource_table_find_mut(&t, 2)->rl, h2);
+    /* Drop the pins; a second sweep reclaims the rest. */
+    blyt_rl_unpin(&blyt_resource_table_find_mut(&t, 2)->rl);
     blyt_rl_unpin(&blyt_resource_table_find_mut(&t, 3)->rl);
     assert(blyt_resource_table_evict_all_evictable(&t) == 2 * strlen(PAYLOAD));
-    blyt_resource_table_clear(&t);
-}
-
-static void test_reload_after_evict_mints_fresh_generation(void) {
-    blyt_resource_table_t t;
-    make_zstd_table(&t, 1);
-    blyt_resource_entry_t *e = blyt_resource_table_find_mut(&t, 1);
-
-    uint32_t h1 = blyt_rl_load(&e->rl, 1);
-    assert(blyt_resource_entry_data(e) != NULL);
-    assert(blyt_rl_release(&e->rl, h1) == 1); /* released: now evictable */
-    assert(blyt_resource_entry_evict(e) == strlen(PAYLOAD));
-
-    /* A fresh load after eviction mints a new generation; the pre-eviction
-     * handle is stale and rejected (eviction never invalidates a *live* handle —
-     * only an already-released one). */
-    uint32_t h2 = blyt_rl_load(&e->rl, 1);
-    assert(h2 != h1);
-    assert(blyt_rl_release(&e->rl, h1) == 0); /* stale */
-    assert(blyt_rl_release(&e->rl, h2) == 1);
     blyt_resource_table_clear(&t);
 }
 
@@ -187,7 +149,7 @@ static void test_uncompressed_evict_is_noop(void) {
 /* ── Persistent resources (#160, ADR-0028) ─────────────────────────────────── */
 
 /* A persistent entry is excluded from eviction even when nothing references it
- * (load_count==0 && pin_count==0): the refcount predicate says evictable, but
+ * (pin_count==0): the refcount predicate says evictable, but
  * persistence overrides it — entry_evict and the all-evictable sweep both skip
  * it, so its bytes stay resident for the cart's whole lifetime. */
 static void test_persistent_entry_is_not_evicted(void) {
@@ -307,10 +269,8 @@ static void test_preload_over_budget_is_rejected(void) {
 
 int main(void) {
     test_zstd_evict_then_rehydrate_identical();
-    test_loaded_entry_is_not_evicted();
     test_pinned_entry_is_not_evicted();
     test_evict_all_evictable_sweeps_only_eligible();
-    test_reload_after_evict_mints_fresh_generation();
     test_uncompressed_evict_is_noop();
     test_persistent_entry_is_not_evicted();
     test_persistent_counts_in_footprint_not_cache();
