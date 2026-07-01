@@ -107,6 +107,18 @@ static native_surface_t *native_resolve_surface(blyt_surface_h h) {
     return s;
 }
 
+/* Reject handle-path access to a *locked* surface (#207): while a tier-2 lock is
+ * held the lock owns the surface, so every tier-1 op / blit / destroy reached via
+ * the surface handle is a no-op on bare metal — the release-build rejection that
+ * mirrors the host gate (cart_run.c) and kills the emulated-vs-native divergence.
+ * (There is no debug build on metal; the reject is always the silent no-op.)
+ * acquire uses the base resolver so it can still reject a *re*-acquire through its
+ * own locked check. */
+static native_surface_t *native_resolve_drawable(blyt_surface_h h) {
+    native_surface_t *s = native_resolve_surface(h);
+    return (s && s->locked) ? (native_surface_t *)0 : s;
+}
+
 blyt_surface_h blyt_surface_create(int32_t w, int32_t h) {
     native_surfaces_init();
     if (blyt_phase_current() != BLYT_PHASE_DRAW)
@@ -138,7 +150,7 @@ blyt_surface_h blyt_surface_create(int32_t w, int32_t h) {
 }
 
 void blyt_surface_destroy(blyt_surface_h surface) {
-    native_surface_t *s = native_resolve_surface(surface);
+    native_surface_t *s = native_resolve_drawable(surface); /* locked -> reject (#207) */
     if (s && !s->is_screen) {
         s->in_use = 0;
         s->gen++; /* invalidate outstanding handles */
@@ -146,34 +158,35 @@ void blyt_surface_destroy(blyt_surface_h surface) {
 }
 
 void blyt_surface_clear(blyt_surface_h dst, uint8_t color) {
-    native_surface_t *s = native_resolve_surface(dst);
+    native_surface_t *s = native_resolve_drawable(dst); /* locked -> reject (#207) */
     if (s)
         blyt_raster_clear(s->pixels, s->w, s->w, s->h, color);
 }
 
 void blyt_surface_pixel(blyt_surface_h dst, int32_t x, int32_t y, uint8_t color) {
-    native_surface_t *s = native_resolve_surface(dst);
+    native_surface_t *s = native_resolve_drawable(dst); /* locked -> reject (#207) */
     if (s)
         blyt_raster_pixel(s->pixels, s->w, s->w, s->h, x, y, color);
 }
 
 void blyt_surface_rect_fill(blyt_surface_h dst, int32_t x, int32_t y, int32_t w, int32_t h,
                             uint8_t color) {
-    native_surface_t *s = native_resolve_surface(dst);
+    native_surface_t *s = native_resolve_drawable(dst); /* locked -> reject (#207) */
     if (s)
         blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, x, y, w, h, color);
 }
 
 void blyt_surface_line(blyt_surface_h dst, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
                        uint8_t color) {
-    native_surface_t *s = native_resolve_surface(dst);
+    native_surface_t *s = native_resolve_drawable(dst); /* locked -> reject (#207) */
     if (s)
         blyt_raster_line(s->pixels, s->w, s->w, s->h, x0, y0, x1, y1, color);
 }
 
 void blyt_surface_blit(blyt_surface_h dst, blyt_surface_h src, int32_t x, int32_t y) {
-    native_surface_t *d = native_resolve_surface(dst);
-    native_surface_t *s = native_resolve_surface(src);
+    /* Reject if either endpoint is locked — a blit as dst OR src (#207). */
+    native_surface_t *d = native_resolve_drawable(dst);
+    native_surface_t *s = native_resolve_drawable(src);
     if (d && s)
         blyt_raster_blit(d->pixels, d->w, d->w, d->h, s->pixels, s->w, s->w, s->h, x, y);
 }

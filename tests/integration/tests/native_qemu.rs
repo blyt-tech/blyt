@@ -536,6 +536,46 @@ function draw() end
         common::gfx::expected_hash_line(&screen)
     };
 
+    // Exclusive-lock rejection carts (gates 26–27, #207).  On bare metal the
+    // tier-2 lock exposes the canonical buffer *directly* (no copy), so without
+    // the fix a handle-path op on a locked surface hits the same buffer the lock
+    // holds and its write is *kept* — whereas the emulated legs copy-in/out and
+    // the release flush *loses* it.  These carts pin that the native path rejects
+    // the op, matching the emulated golden bit-for-bit.
+    //
+    // Gate 26: a blit reading a locked surface as its SRC.  Create s, acquire it,
+    // fill the lock buffer with 7, blit s→screen while locked (must be rejected),
+    // release.  Golden = pure background: s never reaches the screen.
+    let surface_locked_blit_cart = {
+        let mut body = format!("  blyt_surface_clear(BLYT_SCREEN, {surf_bg});\n");
+        body += "  blyt_surface_h s = blyt_surface_create(64, 48);\n";
+        body += "  blyt_lock_t lk;\n  blyt_surface_acquire(s, &lk);\n";
+        body += "  blyt_raster_clear(lk.pixels, lk.stride, lk.w, lk.h, 7);\n";
+        body += "  blyt_surface_blit(BLYT_SCREEN, s, 100, 80); /* s locked -> rejected */\n";
+        body += "  blyt_surface_release(&lk);\n";
+        gfx_cart("surface_locked_blit", body)
+    };
+    let surface_locked_blit_golden = common::gfx::expected_hash_line(&vec![
+            surf_bg;
+            common::gfx::FRAME_W * common::gfx::FRAME_H
+        ]);
+
+    // Gate 27: a tier-1 op on the locked surface itself.  Acquire the screen, fill
+    // the lock buffer with 9, issue tier-1 clear(SCREEN, 4) while locked (must be
+    // rejected), release (flushes 9).  Golden = uniform 9: the stray 4 never lands.
+    // This is the native-discriminated case — the emulated flush masks the 4 either
+    // way, but a bare-metal cart without the fix keeps it.
+    let surface_locked_tier1_cart = {
+        let mut body =
+            String::from("  blyt_lock_t lk;\n  blyt_surface_acquire(BLYT_SCREEN, &lk);\n");
+        body += "  blyt_raster_clear(lk.pixels, lk.stride, lk.w, lk.h, 9);\n";
+        body += "  blyt_surface_clear(BLYT_SCREEN, 4); /* locked -> rejected */\n";
+        body += "  blyt_surface_release(&lk);\n";
+        gfx_cart("surface_locked_tier1", body)
+    };
+    let surface_locked_tier1_golden =
+        common::gfx::expected_hash_line(&vec![9u8; common::gfx::FRAME_W * common::gfx::FRAME_H]);
+
     // Lua off-screen surface cart (gate 25, #205): the native RV32 Lua VM →
     // blyt32.surface.* binding → native surface pool → framebuffer path.  Same
     // frame + golden as the C off-screen cart (surface_offscreen_golden).
@@ -692,6 +732,14 @@ function draw() end
             "scp surface_lua.blyt failed"
         );
     }
+    assert!(
+        qemu.scp_to(&surface_locked_blit_cart, "/tmp/blyt_gate/"),
+        "scp surface_locked_blit.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&surface_locked_tier1_cart, "/tmp/blyt_gate/"),
+        "scp surface_locked_tier1.blyt failed"
+    );
 
     // ── Diagnostics ───────────────────────────────────────────────────
     // Print environment info before the gate test to help diagnose failures.
@@ -2195,6 +2243,62 @@ void blyt_cart_draw(void) {}
         println!("  PASS: {surface_offscreen_golden}");
     } else {
         println!("Gate 25: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 26: blit reading a locked surface as src is rejected (#207) ──
+    //
+    // A blit whose SRC is a locked surface must no-op on metal, so the screen
+    // stays pure background — matching the emulated golden.  Without the fix the
+    // direct-pointer lock lets the blit read the lock's in-place colour-7 fill,
+    // compositing it onto the screen and diverging from the emulated legs.
+    {
+        println!("Gate 26: blit from a locked surface src is rejected on metal...");
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/surface_locked_blit.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "surface_locked_blit.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&surface_locked_blit_golden),
+            "native blit from a locked src must be rejected — screen must stay the \
+             background golden, identical to the emulated legs (expected \
+             {surface_locked_blit_golden:?}; #207)\noutput: {output}"
+        );
+        println!("  PASS: {surface_locked_blit_golden}");
+    }
+
+    // ── Gate 27: tier-1 op on the locked surface itself is rejected (#207) ──
+    //
+    // A tier-1 clear on the locked screen must no-op, so the released frame is the
+    // lock's uniform 9 — not the stray 4.  This is the native-discriminated case:
+    // the emulated flush masks the 4 either way, but a bare-metal cart without the
+    // fix keeps it (the lock exposes the canonical buffer directly), diverging.
+    {
+        println!("Gate 27: tier-1 op on a locked surface is rejected on metal...");
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/surface_locked_tier1.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "surface_locked_tier1.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&surface_locked_tier1_golden),
+            "native tier-1 op on a locked surface must be rejected — the frame must \
+             be the lock's uniform 9, not the stray 4 (expected \
+             {surface_locked_tier1_golden:?}; #207)\noutput: {output}"
+        );
+        println!("  PASS: {surface_locked_tier1_golden}");
     }
 
     println!("Gate tests passed.");

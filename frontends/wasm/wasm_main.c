@@ -800,6 +800,7 @@ typedef struct {
     uint16_t gen;
     bool in_use;
     bool is_screen;
+    bool locked; /* exclusive tier-2 lock held (#207) — set by Stage 2's acquire */
 } lua_surface_t;
 static lua_surface_t g_lua_surf[LUA_SURFACE_MAX];
 static bool g_lua_surf_init;
@@ -827,6 +828,18 @@ static lua_surface_t *lua_surf_resolve(uint32_t h) {
     if (s->is_screen)
         s->pixels = lua_gfx_fb(); /* dynamic: session buffer vs standalone */
     return s;
+}
+
+/* Reject handle-path access to a *locked* surface (#207): while a tier-2 lock is
+ * held the lock owns the surface, so every tier-1 op / blit / destroy is a no-op
+ * — the host-Lua mirror of the host (cart_run.c) and native (blyt32.c) lock
+ * gates, keeping the exclusive-lock invariant uniform across all three surface
+ * registries.  The host-Lua pool is tier-1 only today (no acquire — #205), so
+ * `locked` is always false here; wiring the reject now means #195 Stage 2's Lua
+ * lock inherits the invariant for free. */
+static lua_surface_t *lua_surf_resolve_drawable(uint32_t h) {
+    lua_surface_t *s = lua_surf_resolve(h);
+    return (s && s->locked) ? NULL : s;
 }
 
 /* Reap draw-scoped off-screen surfaces at the frame boundary (#205). */
@@ -872,7 +885,7 @@ static int lua_wasm_surface_create(lua_State *L) {
     return 1;
 }
 static int lua_wasm_surface_destroy(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
     if (s && !s->is_screen) {
         free(s->pixels);
         s->pixels = NULL;
@@ -882,7 +895,7 @@ static int lua_wasm_surface_destroy(lua_State *L) {
     return 0;
 }
 static int lua_wasm_surface_clear(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
     if (s) {
         blyt_raster_clear(s->pixels, s->w, s->w, s->h, (uint8_t)luaL_checkinteger(L, 2));
         if (s->is_screen)
@@ -891,7 +904,7 @@ static int lua_wasm_surface_clear(lua_State *L) {
     return 0;
 }
 static int lua_wasm_surface_pixel(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
     if (s) {
         blyt_raster_pixel(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
                           (int)luaL_checkinteger(L, 3), (uint8_t)luaL_checkinteger(L, 4));
@@ -901,7 +914,7 @@ static int lua_wasm_surface_pixel(lua_State *L) {
     return 0;
 }
 static int lua_wasm_surface_rect_fill(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
     if (s) {
         blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
                               (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
@@ -912,7 +925,7 @@ static int lua_wasm_surface_rect_fill(lua_State *L) {
     return 0;
 }
 static int lua_wasm_surface_line(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
     if (s) {
         blyt_raster_line(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
                          (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
@@ -923,8 +936,9 @@ static int lua_wasm_surface_line(lua_State *L) {
     return 0;
 }
 static int lua_wasm_surface_blit(lua_State *L) {
-    lua_surface_t *d = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
-    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 2));
+    /* Reject if either endpoint is locked — a blit as dst OR src (#207). */
+    lua_surface_t *d = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1));
+    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 2));
     if (d && s) {
         blyt_raster_blit(d->pixels, d->w, d->w, d->h, s->pixels, s->w, s->w, s->h,
                          (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4));

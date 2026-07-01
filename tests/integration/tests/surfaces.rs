@@ -351,6 +351,104 @@ fn surface_lock_stale_token_release_rejected_across_legs() {
     run_cart_libretro_with_env(&cart, &env, &expected);
 }
 
+/// Exclusive-lock invariant (#207): a **blit reading a locked surface as its
+/// source** is rejected, leg-identically.  While `s` is held by a tier-2 lock,
+/// the lock owns it — every handle-path access is a defined no-op until release.
+/// The cart clears the screen to a background, creates `s`, acquires it, fills
+/// the *materialized lock buffer* with colour 7, then blits `s` onto the screen
+/// while it is still locked.  With the invariant the blit no-ops, so the screen
+/// stays pure background.  This is the one shape the emulated flush cannot mask:
+/// without the fix the emulated leg blits the (still-blank) canonical `s` and the
+/// native leg blits the lock's in-place colour-7 — two different frames, neither
+/// the background.  Uniform rejection collapses them to the single golden.
+#[test]
+fn surface_blit_from_locked_src_rejected_across_legs() {
+    require_sdk();
+
+    let bg = 3u8;
+    let mut body = format!("  blyt_surface_clear(BLYT_SCREEN, {bg});\n");
+    body += "  blyt_surface_h s = blyt_surface_create(64, 48);\n";
+    body += "  blyt_lock_t lk;\n  blyt_surface_acquire(s, &lk);\n";
+    body += "  blyt_raster_clear(lk.pixels, lk.stride, lk.w, lk.h, 7);\n";
+    body += "  blyt_surface_blit(BLYT_SCREEN, s, 100, 80); /* s locked -> rejected */\n";
+    body += "  blyt_surface_release(&lk);\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_draw_cart(&tmp.path().join("surface-blit-locked-src"), &body);
+
+    // The blit was rejected, so the screen is background only — the locked
+    // surface never reaches it (with or without the flush that masks the write).
+    let screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Exclusive-lock invariant (#207): a **tier-1 op on the locked surface itself**
+/// is rejected, leg-identically.  The cart acquires the screen, fills the lock
+/// buffer with colour 9, then issues a tier-1 `clear(SCREEN, 4)` *while the screen
+/// is still locked*, and releases (flushing the 9).  With the invariant the tier-1
+/// clear no-ops on every leg, so the released frame is uniform 9.  This is the
+/// native-discriminated case: the emulated flush masks the stray tier-1 write
+/// either way (release overwrites the canonical buffer with the lock's 9), but a
+/// bare-metal cart without the fix keeps the 4 (the lock exposes the canonical
+/// buffer directly) — the QEMU gate is what catches that divergence.  Pinning the
+/// golden here fixes the cross-leg identity the gate must match.
+#[test]
+fn surface_tier1_on_locked_screen_rejected_across_legs() {
+    require_sdk();
+
+    let a = 9u8; // in-lock content, flushed on release
+    let b = 4u8; // stray tier-1 write on the locked screen — must be rejected
+    let mut body = String::from("  blyt_lock_t lk;\n  blyt_surface_acquire(BLYT_SCREEN, &lk);\n");
+    body += &format!("  blyt_raster_clear(lk.pixels, lk.stride, lk.w, lk.h, {a});\n");
+    body += &format!("  blyt_surface_clear(BLYT_SCREEN, {b}); /* locked -> rejected */\n");
+    body += "  blyt_surface_release(&lk);\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_draw_cart(&tmp.path().join("surface-tier1-locked"), &body);
+
+    // Screen is uniform A: the stray tier-1 B never lands, the lock's A flushes.
+    let screen = vec![a; gfx::FRAME_W * gfx::FRAME_H];
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// A tier-1 op on a *locked* surface in a **debug** cart is a hard error (dev
+/// trap), the debug-visible half of the #207 contract — the same relationship the
+/// out-of-phase debug test pins for the draw()-only rule.  The release build's
+/// no-op is a deliberate contract, not a silent swallow: built `--debug`, the
+/// stray tier-1 clear on the locked screen faults instead of no-op'ing, so the
+/// run aborts non-zero.
+#[test]
+fn surface_tier1_on_locked_surface_faults_in_debug_cart() {
+    require_sdk();
+
+    let src = r#"#include "blyt.h"
+void blyt_cart_init(void) {}
+void blyt_cart_update(void) { blyt_quit(); }
+void blyt_cart_draw(void) {
+  blyt_lock_t lk;
+  blyt_surface_acquire(BLYT_SCREEN, &lk);
+  blyt_surface_clear(BLYT_SCREEN, 4); /* locked -> debug hard error */
+  blyt_surface_release(&lk);
+}
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("surface-locked-debug-fault");
+    write_c_cart_project(&dir, src);
+    let cart = build_debug_cart(&dir);
+
+    run_cart_native_expect_fail(&cart);
+}
+
 /// A surface creation that would exceed the 16 MB memory budget (#158) returns
 /// BLYT_HANDLE_NONE; drawing into and blitting from NONE are defined no-ops.  The
 /// cart clears the screen to a background, tries an over-budget create, fills the
