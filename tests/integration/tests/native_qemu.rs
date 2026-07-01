@@ -536,6 +536,27 @@ function draw() end
         common::gfx::expected_hash_line(&screen)
     };
 
+    // Lua off-screen surface cart (gate 25, #205): the native RV32 Lua VM →
+    // blyt32.surface.* binding → native surface pool → framebuffer path.  Same
+    // frame + golden as the C off-screen cart (surface_offscreen_golden).
+    let surface_lua_cart = if have_lua_gate {
+        let mut draw = format!("  local s = blyt32.surface.create({SURF_SW}, {SURF_SH})\n");
+        draw += &common::gfx::lua_surface_draw_body(&surf_ops, "s");
+        draw += &format!("  blyt32.surface.clear(blyt32.surface.SCREEN, {surf_bg})\n");
+        draw += &format!("  blyt32.surface.blit(blyt32.surface.SCREEN, s, {SURF_BX}, {SURF_BY})\n");
+        let project = tmp.path().join("surface_lua");
+        CartProject::new()
+            .lua(&format!(
+                "function init() end\n\
+                 function update() blyt.quit() end\n\
+                 function draw()\n{draw}end\n"
+            ))
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     // ── Start QEMU ────────────────────────────────────────────────────
     let ssh_port = free_port();
     println!("Starting QEMU (SSH port {ssh_port})...");
@@ -665,6 +686,12 @@ function draw() end
         qemu.scp_to(&surface_raw_cart, "/tmp/blyt_gate/"),
         "scp surface_raw.blyt failed"
     );
+    if let Some(ref cart) = surface_lua_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp surface_lua.blyt failed"
+        );
+    }
 
     // ── Diagnostics ───────────────────────────────────────────────────
     // Print environment info before the gate test to help diagnose failures.
@@ -2138,6 +2165,36 @@ void blyt_cart_draw(void) {}
              emulated legs (expected {surface_raw_golden:?}; #205)\noutput: {output}"
         );
         println!("  PASS: {surface_raw_golden}");
+    }
+
+    // ── Gate 25: Lua off-screen surface draw + blit on metal (#205) ───
+    //
+    // The bare-metal Lua surface cell: the native RV32 Lua VM drives
+    // blyt32.surface.* → blyt32lua.c binding → the native surface pool →
+    // framebuffer.  Same frame + golden as the C off-screen cart (gate 22),
+    // proving the Lua surface binding is pixel-identical to C on metal too.
+    if surface_lua_cart.is_some() {
+        println!("Gate 25: Lua off-screen surface draw + blit on metal...");
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/surface_lua.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "surface_lua.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&surface_offscreen_golden),
+            "native bare-metal Lua surface draw + blit must hash identically to the \
+             C off-screen cart and the emulated legs (expected \
+             {surface_offscreen_golden:?}; #205)\noutput: {output}"
+        );
+        println!("  PASS: {surface_offscreen_golden}");
+    } else {
+        println!("Gate 25: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     println!("Gate tests passed.");
