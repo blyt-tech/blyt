@@ -317,6 +317,14 @@ const uint32_t *blyt_session_get_palette(const blyt_session_t *session);
  * drew into the session framebuffer while its host-Lua half did not (#193). */
 bool blyt_session_cart_has_drawn(const blyt_session_t *session);
 
+/* Set the cart lifecycle phase (blyt_phase.h: NONE/INIT/UPDATE/DRAW) on the
+ * session's run context.  On the emulated path the guest blyt_main sets this via
+ * BLYT_ECALL_PHASE; the WASM host-Lua fast path drives update/draw itself (no
+ * blyt_main), so it calls this to mirror the phase — keeping surface access
+ * draw()-only for a hybrid cart's native half, which still reaches the phase
+ * gate through the gfx ECALL handlers (#205). */
+void blyt_session_set_phase(blyt_session_t *session, int32_t phase);
+
 /* Expand the current frame to XRGB8888 via palette lookup.
  * xrgb_out must hold at least BLYT_FRAME_W * BLYT_FRAME_H uint32_t. */
 void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out);

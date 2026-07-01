@@ -49,6 +49,12 @@
 #define BLYT_ECALL_SAVE_WRITE 11
 #define BLYT_ECALL_SAVE_READ 12
 
+/* Lifecycle phase signal (issue #195 / #205; blyt_phase.h).  a0 = blyt_phase_t
+ * (NONE/INIT/UPDATE/DRAW).  Emitted by the guest blyt_main around each cart
+ * callback so the host can make all surface access draw()-only; the host stores
+ * it on run-ctx->phase.  Cheap (two per frame) and carries no return value. */
+#define BLYT_ECALL_PHASE 13
+
 /* State buffer op (ADR-0009, ADR-0057, ADR-0058, ADR-0096).
  * a0 = sub-opcode (BUF_OP_*), remaining args per sub-opcode below.
  * For GET ops: a1=buf_h, a2=slot, a3=field_h; returns value bits in a0

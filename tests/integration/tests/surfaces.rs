@@ -15,7 +15,8 @@ mod common;
 
 use common::gfx;
 use common::{
-    CartProject, build_cart, require_rust_riscv_target, require_sdk, write_c_cart_project,
+    CartProject, build_cart, build_debug_cart, require_rust_riscv_target, require_sdk,
+    run_cart_native_expect_fail, write_c_cart_project,
 };
 use common::{run_cart_libretro_with_env, run_cart_native_with_env, run_cart_wasm_with_env};
 
@@ -48,6 +49,124 @@ pub extern "C" fn blyt_cart_draw() {{
     );
     CartProject::new().rust(&src).write(dir);
     build_cart(dir)
+}
+
+/// Draw()-only enforcement (#205, slice 5): a surface access outside `draw()`
+/// is rejected.  In a release cart the rejection is a *defined, leg-identical*
+/// behaviour — writes are dropped, a tier-2 acquire reads as cleared — never
+/// UB; in a debug cart it is a hard error (a dev trap).  These tests pin both.
+
+/// Out-of-phase WRITE is a no-op (release, every leg).  `update()` clears the
+/// whole screen to colour 7 while the phase is UPDATE (not DRAW); if that write
+/// leaked the screen would be 7 everywhere, but `draw()` only sets one corner
+/// pixel, so the presented frame must be the blank (0) background with that
+/// single pixel — the out-of-phase clear left no trace.  Hashes identically on
+/// every emulated leg.
+#[test]
+fn surface_out_of_phase_write_is_noop_across_legs() {
+    require_sdk();
+
+    let src = r#"#include "blyt.h"
+void blyt_cart_init(void) {}
+void blyt_cart_update(void) {
+  blyt_surface_clear(BLYT_SCREEN, 7); /* outside draw() -> no-op in release */
+  blyt_quit();
+}
+void blyt_cart_draw(void) {
+  blyt_surface_pixel(BLYT_SCREEN, 319, 239, 1); /* flips cart_has_drawn */
+}
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("surface-phase-write");
+    write_c_cart_project(&dir, src);
+    let cart = build_cart(&dir);
+
+    // Screen is the blank background (the suppressed clear never ran), with the
+    // one draw()-phase pixel at the far corner.
+    let mut screen = vec![0u8; gfx::FRAME_W * gfx::FRAME_H];
+    screen[(gfx::FRAME_H - 1) * gfx::FRAME_W + (gfx::FRAME_W - 1)] = 1;
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Out-of-phase READ is cleared (release, every leg).  Frame 0's `draw()` fills
+/// the screen with colour 5 (real content).  Frame 1's `update()` — outside
+/// `draw()` — acquires the screen and samples pixel 0; the draw()-only rule
+/// means that acquire reads as *cleared*, so the sample is 0, not the real 5.
+/// Frame 1's `draw()` paints that sampled value at (0,0) over a colour-3 fill,
+/// so the presented frame is uniform 3 with a 0 at the origin.  If the read had
+/// leaked the real content, (0,0) would be 5.
+#[test]
+fn surface_out_of_phase_read_is_cleared_across_legs() {
+    require_sdk();
+
+    let src = r#"#include "blyt.h"
+static int g_n = 0;
+static unsigned char g_read = 200; /* sentinel: neither 0 (cleared) nor 5 (real) */
+void blyt_cart_init(void) {}
+void blyt_cart_update(void) {
+  if (g_n == 1) {
+    blyt_lock_t lk;
+    blyt_surface_acquire(BLYT_SCREEN, &lk); /* outside draw() -> reads cleared */
+    g_read = lk.pixels[0];
+    blyt_surface_release(&lk);
+    blyt_quit();
+  }
+  g_n++;
+}
+void blyt_cart_draw(void) {
+  if (g_n == 1) {
+    blyt_surface_clear(BLYT_SCREEN, 5); /* frame 0: establish real content */
+  } else {
+    blyt_surface_clear(BLYT_SCREEN, 3);
+    blyt_surface_pixel(BLYT_SCREEN, 0, 0, g_read);
+  }
+}
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("surface-phase-read");
+    write_c_cart_project(&dir, src);
+    let cart = build_cart(&dir);
+
+    // Frame 1: uniform colour 3, origin overwritten with the cleared (0) sample.
+    let mut screen = vec![3u8; gfx::FRAME_W * gfx::FRAME_H];
+    screen[0] = 0;
+    let expected = gfx::expected_hash_line(&screen);
+
+    // Two frames: the target hash is frame 1's, so run long enough to reach it.
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Out-of-phase surface access in a *debug* cart is a hard error (dev trap).
+/// The same shape as the write-no-op test, but built `--debug`: the `.cart.info`
+/// debug flag makes the runtime fault instead of silently no-op'ing, so the run
+/// aborts (non-zero exit) rather than completing.  This pins that the release
+/// no-op is a deliberate, debug-visible contract, not a silent swallow.
+#[test]
+fn surface_out_of_phase_access_faults_in_debug_cart() {
+    require_sdk();
+
+    let src = r#"#include "blyt.h"
+void blyt_cart_init(void) {}
+void blyt_cart_update(void) {
+  blyt_surface_clear(BLYT_SCREEN, 7); /* outside draw() -> debug hard error */
+  blyt_quit();
+}
+void blyt_cart_draw(void) {}
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("surface-phase-debug-fault");
+    write_c_cart_project(&dir, src);
+    let cart = build_debug_cart(&dir);
+
+    run_cart_native_expect_fail(&cart);
 }
 
 /// The tier-1 surface API drawn into `BLYT_SCREEN` is the gfx.* sugar's

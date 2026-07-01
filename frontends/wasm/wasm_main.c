@@ -33,6 +33,7 @@
 #include <string.h>
 
 #include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
+#include "blyt_phase.h" /* runtime/shared: lifecycle phase (draw()-only, #205) */
 #include "blyt_raster.h" /* runtime/shared: integer rasterizer core (#188) */
 #include "blyt_runtime.h"
 #include "blyt_trace.h"
@@ -266,9 +267,14 @@ static const char co_body_init[] = "init() "
 static const char co_body_reload_init[] = "init()";
 #endif
 
-/* Coroutine body: per-frame update/draw loop with frame-boundary yield. */
+/* Coroutine body: per-frame update/draw loop with frame-boundary yield.  The
+ * __blyt_phase_* brackets mirror the emulated blyt_main's BLYT_ECALL_PHASE
+ * signal so a hybrid cart's native half stays draw()-only (#205); they no-op for
+ * a session-less pure-Lua cart. */
 static const char co_body_running[] = "while not blyt.should_quit() do "
+                                      "  __blyt_phase_update() "
                                       "  update() "
+                                      "  __blyt_phase_draw() "
                                       "  if type(draw) == 'function' then draw() end "
                                       "  coroutine.yield() "
                                       "end "
@@ -409,6 +415,24 @@ static int lua_wasm_quit(lua_State *L) {
 static int lua_wasm_should_quit(lua_State *L) {
     lua_pushboolean(L, g_lua_quit);
     return 1;
+}
+
+/* Host-Lua lifecycle phase mirror (#205).  The emulated path's blyt_main signals
+ * the phase via BLYT_ECALL_PHASE; the host-Lua fast path drives update/draw
+ * itself, so the running coroutine brackets each callback with these to keep
+ * surface access draw()-only.  Only a hybrid cart's native half is affected — it
+ * reaches the phase gate through the gfx ECALL handlers — since the host-Lua gfx
+ * bindings rasterize directly and are not gated (that is slice-6 Lua-surface
+ * work).  A session-less pure-Lua cart no-ops (blyt_session_set_phase(NULL)). */
+static int lua_wasm_phase_update(lua_State *L) {
+    (void)L;
+    blyt_session_set_phase(g_session, BLYT_PHASE_UPDATE);
+    return 0;
+}
+static int lua_wasm_phase_draw(lua_State *L) {
+    (void)L;
+    blyt_session_set_phase(g_session, BLYT_PHASE_DRAW);
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -1701,6 +1725,10 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     lua_setglobal(g_lua, "blyt_quit");
     lua_pushcfunction(g_lua, wasm_lua_require);
     lua_setglobal(g_lua, "require");
+    lua_pushcfunction(g_lua, lua_wasm_phase_update);
+    lua_setglobal(g_lua, "__blyt_phase_update");
+    lua_pushcfunction(g_lua, lua_wasm_phase_draw);
+    lua_setglobal(g_lua, "__blyt_phase_draw");
 
     /* Step 8: re-register state + resource API */
     if (active_state_ctx())
@@ -2806,6 +2834,14 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     /* Register sandboxed require() */
     lua_pushcfunction(g_lua, wasm_lua_require);
     lua_setglobal(g_lua, "require");
+
+    /* Host-Lua lifecycle phase mirror (#205): the running coroutine brackets
+     * update()/draw() with these so a hybrid cart's native half stays
+     * draw()-only through the gfx ECALL gate. */
+    lua_pushcfunction(g_lua, lua_wasm_phase_update);
+    lua_setglobal(g_lua, "__blyt_phase_update");
+    lua_pushcfunction(g_lua, lua_wasm_phase_draw);
+    lua_setglobal(g_lua, "__blyt_phase_draw");
 
     /* Create rv32emu session when the cart has native code.
      * For pure Lua carts with only .cart.layouts, use a lightweight state ctx

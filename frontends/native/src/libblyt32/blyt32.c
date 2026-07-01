@@ -24,6 +24,7 @@
 #include "blyt.h"
 #include "blyt_frame_hash.h" /* runtime/shared: FNV-1a 64 over the paletted fb */
 #include "blyt_native_trace.h" /* getenv + raw-write helpers (no libc stdio) */
+#include "blyt_phase.h" /* runtime/shared: draw()-only phase (#205) */
 #include "blyt_raster.h" /* runtime/shared: integer rasterizer core */
 
 /* The paletted surface geometry.  Matches the host's BLYT_FRAME_W/H
@@ -48,6 +49,12 @@ static uint8_t s_framebuffer[NATIVE_FB_W * NATIVE_FB_H];
  * and any other handle is a defined no-op. */
 
 static uint8_t *native_resolve_screen(blyt_surface_h dst) {
+    /* Draw()-only enforcement (#205): surface access outside draw() is a defined
+     * no-op on the release path (this bare-metal build) — mirrors the host
+     * gate's release semantics so the QEMU gate matches the emulated legs.  A
+     * NULL buffer makes every screen op fall through to nothing. */
+    if (blyt_phase_current() != BLYT_PHASE_DRAW)
+        return (uint8_t *)0;
     return dst == BLYT_SCREEN ? s_framebuffer : (uint8_t *)0;
 }
 

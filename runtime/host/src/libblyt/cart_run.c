@@ -34,6 +34,7 @@
 #endif
 #endif
 #include "blyt_frame_hash.h"
+#include "blyt_phase.h" /* runtime/shared: lifecycle phase (draw()-only, #205) */
 #include "blyt_raster.h"
 #include "elf32.h"
 #include "testcard.h"
@@ -189,6 +190,8 @@ typedef struct {
     /* Tier-2 lock state (#205): while locked, the canonical buffer is
      * materialized into the guest VA region [lock_vaddr, lock_vaddr+lock_len). */
     bool locked;
+    bool lock_phantom; /* acquired outside draw() (release no-op): reads-as-cleared,
+                        * never flushes back to the canonical buffer (#205) */
     uint16_t lock_gen; /* bumped on release — a released token goes stale */
     uint32_t lock_vaddr; /* guest VA of the materialized region */
     uint32_t lock_len; /* == w*h */
@@ -264,6 +267,13 @@ typedef struct {
     /* Surface registry (#205): slot 0 = screen (aliases fb), slots 1.. are
      * off-screen surfaces.  Draw-scoped — reaped at each frame boundary. */
     blyt_surface_registry_t surfaces;
+    /* Lifecycle phase (#205, blyt_phase.h): set by BLYT_ECALL_PHASE from the
+     * guest blyt_main.  Surface access is permitted only while it is
+     * BLYT_PHASE_DRAW; outside draw() a debug cart faults (dev_fault) and a
+     * release cart gets a defined no-op. */
+    int32_t phase;
+    bool cart_is_debug; /* .cart.info debug flag — selects dev-trap vs no-op */
+    bool dev_fault; /* a draw()-only rule was violated in a debug cart */
     /* Guest vaddr of libblytc's exported blyt_mem_acct (blyt_mem_accounting_t),
      * resolved at cart load (#158). field 0 = guest_heap_used (guest-written,
      * host-read); field 4 = non_evictable_footprint (host-written, guest-read).
@@ -1456,9 +1466,12 @@ static void blyt_surface_flush_lock(blyt_surface_registry_t *reg, blyt_surface_s
                                     memory_t *mem) {
     if (!s->locked)
         return;
-    if (mem && s->pixels)
+    /* A phantom lock (acquired outside draw() in a release cart) never writes
+     * back to the canonical buffer — an out-of-phase op is a defined no-op. */
+    if (!s->lock_phantom && mem && s->pixels)
         memory_read(mem, s->pixels, s->lock_vaddr, s->lock_len);
     s->locked = false;
+    s->lock_phantom = false;
     s->lock_gen++;
     if (reg->active_locks > 0)
         reg->active_locks--;
@@ -1542,13 +1555,31 @@ static blyt_surface_slot_t *blyt_resolve_lockview(blyt_surface_registry_t *reg, 
     return s;
 }
 
+/* Zero `len` bytes of guest memory at `vaddr` (read-as-cleared materialization,
+ * #205).  Chunked from a small static zero buffer so an arbitrarily large region
+ * needs no host allocation. */
+static void guest_memzero(memory_t *mem, uint32_t vaddr, uint32_t len) {
+    static const uint8_t zeros[4096] = {0};
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t n = len - off;
+        if (n > sizeof(zeros))
+            n = sizeof(zeros);
+        memory_write(mem, vaddr + off, zeros, n);
+        off += n;
+    }
+}
+
 /* Acquire an exclusive tier-2 lock on the surface `handle`: carve a per-lock
- * region from the VA-gap arena, materialize (copy-in) the canonical buffer into
- * it, and write the guest blyt_lock_t (pixels/stride/w/h/token) to out_vaddr.
- * Returns 1 on success, 0 on failure (unresolvable surface, already locked, or
- * arena exhausted — the latter impossible given gap > budget). */
+ * region from the VA-gap arena, materialize the buffer into it, and write the
+ * guest blyt_lock_t (pixels/stride/w/h/token) to out_vaddr.  Normally the
+ * canonical buffer is copied in; when `clear_only` (an out-of-phase acquire in a
+ * release cart) the region is materialized as cleared instead and the lock is
+ * marked phantom so it never flushes back — the draw()-only read-as-cleared
+ * semantics.  Returns 1 on success, 0 on failure (unresolvable surface, already
+ * locked, or arena exhausted — the latter impossible given gap > budget). */
 static int blyt_surface_acquire_lock(blyt_run_ctx_t *ctx, memory_t *mem, uint32_t handle,
-                                     uint32_t out_vaddr) {
+                                     uint32_t out_vaddr, bool clear_only) {
     blyt_surface_registry_t *reg = &ctx->surfaces;
     blyt_surface_slot_t *s = blyt_resolve_surface(reg, handle);
     uint8_t lockbuf[20]; /* blyt_lock_t on ilp32: pixels,stride,w,h,token */
@@ -1569,10 +1600,15 @@ static int blyt_surface_acquire_lock(blyt_run_ctx_t *ctx, memory_t *mem, uint32_
     reg->active_locks++;
 
     /* Copy-in: the canonical buffer is the single source of truth, so every
-     * acquire reads it (coherence claim, #205). */
-    memory_write(mem, vaddr, s->pixels, len);
+     * acquire reads it (coherence claim, #205).  A phantom (out-of-phase) lock
+     * reads as cleared instead — it must not leak the real surface contents. */
+    if (clear_only)
+        guest_memzero(mem, vaddr, len);
+    else
+        memory_write(mem, vaddr, s->pixels, len);
 
     s->locked = true;
+    s->lock_phantom = clear_only;
     s->lock_vaddr = vaddr;
     s->lock_len = len;
     uint32_t token = blyt_lockview_encode(s->lock_gen, blyt_dyn_decode_index(handle));
@@ -1597,6 +1633,28 @@ static blyt_surface_slot_t *blyt_surface_release_lock(blyt_run_ctx_t *ctx, memor
         return NULL;
     blyt_surface_flush_lock(&ctx->surfaces, s, mem);
     return s;
+}
+
+/* Draw()-only phase gate for a surface access op (#205).  Returns true when the
+ * op may proceed (phase is DRAW).  Outside draw() it returns false and:
+ *   - in a debug cart, raises a dev fault and halts the emulator (*halted set);
+ *     the caller must return immediately without advancing PC.
+ *   - in a release cart, leaves *halted false; the caller performs its defined
+ *     no-op (writes drop, acquire reads as cleared) and advances PC normally.
+ * A NULL ctx behaves like the release no-op. */
+static bool blyt_surface_phase_gate(riscv_t *rv, bool *halted) {
+    *halted = false;
+    blyt_run_ctx_t *ctx = g_run_ctx;
+    if (!ctx || ctx->phase == BLYT_PHASE_DRAW)
+        return ctx != NULL;
+    if (ctx->cart_is_debug) {
+        if (ctx->log_fn)
+            ctx->log_fn("blyt: surface access outside draw() — debug build trap\n");
+        ctx->dev_fault = true;
+        rv_halt(rv);
+        *halted = true;
+    }
+    return false;
 }
 
 static void blyt_ecall_handler(riscv_t *rv) {
@@ -1655,6 +1713,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
         uint32_t dst = rv_get_reg(rv, rv_reg_a0);
         uint32_t color = rv_get_reg(rv, rv_reg_a1);
         blyt_tracef(BLYT_TRACE_API, "surface_clear(dst=0x%08x, color=%u)", dst, color);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
         if (s) {
             blyt_raster_clear(s->pixels, s->w, s->w, s->h, (uint8_t)color);
@@ -1672,6 +1735,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
         uint32_t color = rv_get_reg(rv, rv_reg_a3);
         blyt_tracef(BLYT_TRACE_API, "surface_pixel(dst=0x%08x, x=%d, y=%d, color=%u)", dst, x, y,
                     color);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
         if (s) {
             blyt_raster_pixel(s->pixels, s->w, s->w, s->h, x, y, (uint8_t)color);
@@ -1692,6 +1760,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
         blyt_tracef(BLYT_TRACE_API,
                     "surface_rect_fill(dst=0x%08x, x=%d, y=%d, w=%d, h=%d, color=%u)", dst, x, y, w,
                     h, color);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
         if (s) {
             blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, x, y, w, h, (uint8_t)color);
@@ -1712,6 +1785,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
         blyt_tracef(BLYT_TRACE_API,
                     "surface_line(dst=0x%08x, x0=%d, y0=%d, x1=%d, y1=%d, color=%u)", dst, x0, y0,
                     x1, y1, color);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
         if (s) {
             blyt_raster_line(s->pixels, s->w, s->w, s->h, x0, y0, x1, y1, (uint8_t)color);
@@ -1727,8 +1805,17 @@ static void blyt_ecall_handler(riscv_t *rv) {
         int32_t w = (int32_t)rv_get_reg(rv, rv_reg_a0);
         int32_t h = (int32_t)rv_get_reg(rv, rv_reg_a1);
         uint32_t handle = BLYT_HANDLE_NONE;
-        if (g_run_ctx)
-            handle = blyt_surface_create_slot(g_run_ctx, PRIV(rv)->mem, w, h);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            /* Out of phase: debug halts; release returns NONE (defined no-op). */
+            if (halted)
+                return;
+            blyt_tracef(BLYT_TRACE_API, "surface_create(w=%d, h=%d) -> NONE (outside draw)", w, h);
+            rv_set_reg(rv, rv_reg_a0, BLYT_HANDLE_NONE);
+            rv->PC += 4;
+            return;
+        }
+        handle = blyt_surface_create_slot(g_run_ctx, PRIV(rv)->mem, w, h);
         blyt_tracef(BLYT_TRACE_API, "surface_create(w=%d, h=%d) -> 0x%08x", w, h, handle);
         rv_set_reg(rv, rv_reg_a0, handle);
         rv->PC += 4;
@@ -1755,6 +1842,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
         int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a3);
         blyt_tracef(BLYT_TRACE_API, "surface_blit(dst=0x%08x, src=0x%08x, x=%d, y=%d)", dst, src, x,
                     y);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         blyt_surface_slot_t *ds =
             g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
         blyt_surface_slot_t *ss =
@@ -1773,10 +1865,18 @@ static void blyt_ecall_handler(riscv_t *rv) {
     case BLYT_ECALL_SURFACE_ACQUIRE: {
         uint32_t surface = rv_get_reg(rv, rv_reg_a0);
         uint32_t out_vaddr = rv_get_reg(rv, rv_reg_a1);
+        /* Out of phase: debug halts; release materializes a cleared (phantom)
+         * lock so a read sees zeros, not the real surface (read-as-cleared). */
+        bool halted;
+        bool clear_only = !blyt_surface_phase_gate(rv, &halted);
+        if (halted)
+            return;
         int ok = 0;
         if (g_run_ctx)
-            ok = blyt_surface_acquire_lock(g_run_ctx, PRIV(rv)->mem, surface, out_vaddr);
-        blyt_tracef(BLYT_TRACE_API, "surface_acquire(0x%08x) -> %s", surface, ok ? "ok" : "fail");
+            ok =
+                blyt_surface_acquire_lock(g_run_ctx, PRIV(rv)->mem, surface, out_vaddr, clear_only);
+        blyt_tracef(BLYT_TRACE_API, "surface_acquire(0x%08x)%s -> %s", surface,
+                    clear_only ? " [cleared]" : "", ok ? "ok" : "fail");
         rv_set_reg(rv, rv_reg_a0, (uint32_t)ok);
         rv->PC += 4;
         return;
@@ -1972,6 +2072,17 @@ static void blyt_ecall_handler(riscv_t *rv) {
 
         blyt_tracef(BLYT_TRACE_API, "mem_resources() -> loaded=%u", loaded);
         rv_set_reg(rv, rv_reg_a0, loaded);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_PHASE: {
+        /* Lifecycle phase signal (#205): the guest blyt_main tells the runtime
+         * which callback it is entering so surface access can be draw()-only. */
+        uint32_t phase = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "phase(%u)", phase);
+        if (g_run_ctx)
+            g_run_ctx->phase = (int32_t)phase;
         rv->PC += 4;
         return;
     }
@@ -3511,6 +3622,14 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
         .owned = false,
     };
 
+    /* Draw()-only surface enforcement (#205): phase starts NONE (no callback);
+     * the guest blyt_main advances it via BLYT_ECALL_PHASE.  A debug cart
+     * (.cart.info debug flag) hard-errors on out-of-phase surface access; a
+     * release cart gets the defined no-op. */
+    s->ctx.phase = BLYT_PHASE_NONE;
+    s->ctx.cart_is_debug = blyt_cart_is_debug(cart);
+    s->ctx.dev_fault = false;
+
     /* Resolve save directory: BLYT_SAVE_DIR env var or ~/.local/share/blyt */
     {
         const char *env_dir = getenv("BLYT_SAVE_DIR");
@@ -3954,7 +4073,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
 #endif
 
     bool trapped = session->ctx.ecall_trapped;
-    bool aborted = session->ctx.ecall_aborted;
+    bool aborted = session->ctx.ecall_aborted || session->ctx.dev_fault;
     g_run_ctx = NULL;
 
     if (trapped)
@@ -4070,6 +4189,11 @@ const uint32_t *blyt_session_get_palette(const blyt_session_t *session) {
 
 bool blyt_session_cart_has_drawn(const blyt_session_t *session) {
     return session->cart_has_drawn;
+}
+
+void blyt_session_set_phase(blyt_session_t *session, int32_t phase) {
+    if (session)
+        session->ctx.phase = phase;
 }
 
 void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out) {

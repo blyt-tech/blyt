@@ -34,6 +34,7 @@
 #include "blyt_handle.h" /* runtime/shared: console-wide resource-constant encoding (ADR-0134) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "blyt_native_trace.h"
+#include "blyt_phase.h" /* runtime/shared: lifecycle phase signal (#205) */
 #include "blyt_resource_codec.h" /* runtime/shared: per-resource compression (#157) */
 #include "blyt_resource_lifecycle.h" /* runtime/shared: load/pin refcount state (#123) */
 #include "seccomp_restricted.h"
@@ -1313,6 +1314,22 @@ void blyt_runtime_startup(void) {
  * sdk/lib/native/, not copied), so these definitions are the ones the cart
  * resolves over the DT_NEEDED chain.
  */
+
+/* blyt_phase_enter / blyt_phase_current — lifecycle phase signal (#205).
+ *
+ * On bare metal the guest library *is* the runtime, so there is no ECALL: the
+ * phase is a process global blyt_main writes and the native surface ops
+ * (libblyt32) read back through blyt_phase_current() to enforce draw()-only
+ * access.  Zero-initialised to BLYT_PHASE_NONE (no cart callback active). */
+static int32_t g_blyt_phase = BLYT_PHASE_NONE;
+
+void blyt_phase_enter(int32_t phase) {
+    g_blyt_phase = phase;
+}
+
+int32_t blyt_phase_current(void) {
+    return g_blyt_phase;
+}
 
 /* blyt_frame_done — frame-boundary housekeeping on the native path.
  *
