@@ -15,8 +15,9 @@ mod common;
 
 use common::gfx;
 use common::{
-    CartProject, build_cart, build_debug_cart, require_rust_riscv_target, require_sdk,
-    run_cart_native_expect_fail, write_c_cart_project,
+    CartProject, build_cart, build_debug_cart, build_lua_cart, require_lua_sdk,
+    require_rust_riscv_target, require_sdk, require_wasm, run_cart_native_expect_fail,
+    write_c_cart_project,
 };
 use common::{run_cart_libretro_with_env, run_cart_native_with_env, run_cart_wasm_with_env};
 
@@ -460,6 +461,96 @@ fn surface_lua_offscreen_draw_then_blit_hashes_identically_across_legs() {
     );
     let expected = gfx::expected_hash_line(&screen);
 
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Hybrid coherence with the tier-2 lock crossing the Lua/native boundary
+/// (#205). A hybrid cart draws the torture frame in two sequential halves into
+/// the ONE screen surface: the native half acquires the screen (tier-2), draws
+/// its slice with the in-lock primitives, and releases — flushing to the shared
+/// canonical buffer; then the host-Lua half draws the rest via the tier-1
+/// surface API. The combined frame must hash bit-identically to the same cart
+/// run fully-emulated and to the single-buffer golden, across the emulated trio.
+/// This is the coherence claim: a tier-2 lock composes with tier-1 across the
+/// bridge because release publishes to the one buffer both halves share.
+#[test]
+fn surface_hybrid_native_tier2_lua_tier1_coheres_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let ops = gfx::torture_frame();
+    let (native_ops, lua_ops) = ops.split_at(8);
+
+    let c_src = format!(
+        "#include \"blyt.h\"\n\
+         BLYT_LUA_EXPORT_VOID(native_draw) {{\n{}}}\n",
+        gfx::c_lock_draw_body(native_ops, "BLYT_SCREEN", "lk")
+    );
+    let lua_src = format!(
+        "function init() end\n\
+         function update() blyt.quit() end\n\
+         function draw()\n  native_draw()\n{}end\n",
+        gfx::lua_surface_draw_body(lua_ops, "blyt32.surface.SCREEN")
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("surface-hybrid-tier2");
+    CartProject::new().c(&c_src).lua(&lua_src).write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// A lock-view token is inert once it crosses the Lua/native boundary (#205).
+/// The native half acquires the screen, draws colour X under the lock, releases,
+/// and returns the (now spent) lock-view token to Lua. Lua passes that token to
+/// a tier-1 surface op (`blyt32.surface.clear(tok, Y)`) — but a lock-view is a
+/// distinct handle kind, so the runtime's classify-at-entry rejects it and the
+/// op no-ops. The screen must stay X (never Y) on every leg: the live lock never
+/// marshals (its buffer pointer is meaningless across the bridge) and the token
+/// that does cross fails the next op's kind check.
+#[test]
+fn surface_lockview_token_across_bridge_rejected_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let x = 6u8;
+    let y = 11u8;
+
+    let c_src = format!(
+        "#include \"blyt.h\"\n\
+         BLYT_LUA_EXPORT_I32(native_lock_and_leak_token, int32_t unused) {{\n\
+         \x20 (void)unused;\n\
+         \x20 blyt_lock_t lk;\n\
+         \x20 blyt_surface_acquire(BLYT_SCREEN, &lk);\n\
+         \x20 blyt_raster_clear(lk.pixels, lk.stride, lk.w, lk.h, {x});\n\
+         \x20 blyt_surface_release(&lk);\n\
+         \x20 return (int32_t)lk.token;\n\
+         }}\n"
+    );
+    let lua_src = format!(
+        "function init() end\n\
+         function update() blyt.quit() end\n\
+         function draw()\n\
+         \x20 local tok = native_lock_and_leak_token(0)\n\
+         \x20 blyt32.surface.clear(tok, {y})\n\
+         end\n"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("surface-lockview-bridge");
+    CartProject::new().c(&c_src).lua(&lua_src).write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    // The token is a LOCKVIEW handle; a tier-1 op on it fails the kind check and
+    // no-ops, so the screen stays uniformly X — Y never lands.
+    let screen = vec![x; gfx::FRAME_W * gfx::FRAME_H];
+    let expected = gfx::expected_hash_line(&screen);
     let env = [("BLYT_FRAME_HASH", "1")];
     run_cart_native_with_env(&cart, &env, &expected);
     run_cart_wasm_with_env(&cart, &env, &expected);
