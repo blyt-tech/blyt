@@ -929,6 +929,14 @@ add_executable(test_blys tests/unit/test_blys.c runtime/shared/blyt_blys.c)
 target_include_directories(test_blys PRIVATE runtime/shared)
 add_test(NAME test_blys COMMAND test_blys)
 
+# test_handle: pins the console-wide tagged-u32 handle encoding
+# (runtime/shared/blyt_handle.h, ADR-0134/ADR-0096, #195/#196) — the SURFACE /
+# LOCKVIEW kinds and the reserved BLYT_SCREEN constant. Header-only and
+# freestanding, so the test just needs the include dir.
+add_executable(test_handle tests/unit/test_handle.c)
+target_include_directories(test_handle PRIVATE runtime/shared)
+add_test(NAME test_handle COMMAND test_handle)
+
 # test_resource_lifecycle: pins the shared resource load/pin refcount state
 # machine (runtime/shared/blyt_resource_lifecycle.h, #123). Header-only and
 # freestanding, so the test just needs the include dir.
@@ -1270,6 +1278,7 @@ add_dependencies(
   test_cart_load
   test_cart_run
   test_blys
+  test_handle
   test_resource_lifecycle
   test_mem_budget
   test_arena
