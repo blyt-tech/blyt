@@ -17,8 +17,9 @@ mod common;
 
 use common::gfx;
 use common::{
-    CartProject, build_cart, require_sdk, run_cart_libretro_with_env, run_cart_native_with_env,
-    run_cart_wasm_with_env, write_c_cart_project,
+    CartProject, build_cart, build_lua_cart, require_lua_sdk, require_sdk, require_wasm,
+    run_cart_libretro_with_env, run_cart_native_with_env, run_cart_wasm_with_env,
+    write_c_cart_project,
 };
 
 /// Build a C cart whose `blyt_cart_draw` runs `draw_body` once, then quits.
@@ -163,6 +164,98 @@ fn gfx_torture_frame_lua_hashes_identically_across_legs() {
     let cart = build_cart(&project);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Build a Lua + native-C **hybrid** cart whose torture frame is split across
+/// both halves: the native C lib draws `ops[..split]` via `blyt_gfx_*`, then the
+/// Lua `draw()` calls that export and draws `ops[split..]` via `blyt32.gfx.*`.
+/// Both halves must land in ONE framebuffer, so the combined frame hashes to
+/// `render(ops)` — the #193 coherence proof.
+fn build_gfx_hybrid_cart(
+    dir: &std::path::Path,
+    ops: &[gfx::Op],
+    split: usize,
+) -> std::path::PathBuf {
+    let (native_ops, lua_ops) = ops.split_at(split);
+    let c_src = format!(
+        "#include \"blyt.h\"\n\
+         BLYT_LUA_EXPORT_VOID(native_draw) {{\n{}}}\n",
+        gfx::c_draw_body(native_ops)
+    );
+    let lua_src = format!(
+        "function init() end\n\
+         function update() blyt.quit() end\n\
+         function draw()\n  native_draw()\n{}end\n",
+        gfx::lua_draw_body(lua_ops)
+    );
+    CartProject::new().c(&c_src).lua(&lua_src).write(dir);
+    build_lua_cart(dir)
+}
+
+/// The #193 bug cell + hybrid parity.  A hybrid cart draws the torture frame from
+/// **both** halves — native (`blyt_gfx_*`) and host-Lua (`blyt32.gfx.*`).  On wasm
+/// the two halves live in two address spaces (Lua host-side, native in rv32emu per
+/// ADR-0130); before the fix the host-Lua half drew into a separate `g_lua_pixels`
+/// and the native half's output was silently dropped.  After unifying onto the
+/// session's canonical framebuffer the combined frame must hash **bit-identically**
+/// to the same cart run fully-emulated — and to the single-buffer golden — across
+/// the emulated trio (blytplay / wasm / libretro).
+#[test]
+fn gfx_hybrid_both_halves_hash_identically_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    let ops = gfx::torture_frame();
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Split so each half draws a non-trivial slice (native: clear + rects + a
+    // pixel; Lua: the remaining pixels + every line primitive).
+    let cart = build_gfx_hybrid_cart(&tmp.path().join("gfx-hybrid"), &ops, 8);
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Build a hybrid cart whose native half uses the raw `acquire`/`present` path
+/// (writing [`gfx::raw_pattern_frame`] straight into the runtime-reserved
+/// region); the Lua half only drives the frame.  On wasm the native half is
+/// emulated, so its `present` lands in `session->pixels[]` — exactly the buffer
+/// the host-Lua present path dropped before #193.
+fn build_gfx_hybrid_raw_cart(dir: &std::path::Path) -> std::path::PathBuf {
+    let c_src = format!(
+        "#include \"blyt.h\"\n\
+         BLYT_LUA_EXPORT_VOID(native_present) {{\n{}}}\n",
+        gfx::raw_present_c_draw()
+    );
+    let lua_src = "function init() end\n\
+                   function update() blyt.quit() end\n\
+                   function draw() native_present() end\n";
+    CartProject::new().c(&c_src).lua(lua_src).write(dir);
+    build_lua_cart(dir)
+}
+
+/// Hybrid `acquire`/`present` from the native half.  A hybrid cart whose native
+/// code acquires the raw framebuffer and presents a deterministic pattern must
+/// hash identically across the emulated trio — proving the native half's
+/// `acquire`/`present` (the path most clearly dropped on wasm before #193) now
+/// reaches the unified framebuffer the wasm present path emits.
+#[test]
+fn gfx_hybrid_native_acquire_present_hashes_identically_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_gfx_hybrid_raw_cart(&tmp.path().join("gfx-hybrid-raw"));
+
+    let expected = gfx::expected_hash_line(&gfx::raw_pattern_frame());
     let env = [("BLYT_FRAME_HASH", "1")];
     run_cart_native_with_env(&cart, &env, &expected);
     run_cart_wasm_with_env(&cart, &env, &expected);

@@ -3720,6 +3720,10 @@ const uint32_t *blyt_session_get_palette(const blyt_session_t *session) {
     return session->palette;
 }
 
+bool blyt_session_cart_has_drawn(const blyt_session_t *session) {
+    return session->cart_has_drawn;
+}
+
 void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out) {
     const uint8_t *px = session->pixels;
     const uint32_t *pal = session->palette;
