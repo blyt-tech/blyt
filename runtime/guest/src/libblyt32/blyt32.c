@@ -30,6 +30,8 @@
 #define ECALL_SURFACE_CREATE 106
 #define ECALL_SURFACE_DESTROY 107
 #define ECALL_SURFACE_BLIT 108
+#define ECALL_SURFACE_ACQUIRE 109
+#define ECALL_SURFACE_RELEASE 110
 
 /* BUF_OP sub-opcodes */
 #define BUF_OP_GET_F32 1
@@ -187,6 +189,24 @@ uint8_t *blyt_gfx_acquire(void) {
 void blyt_gfx_present(void) {
     register long a7 __asm__("a7") = ECALL_GFX_PRESENT;
     __asm__ volatile("ecall" : : "r"(a7) : "memory");
+}
+
+/* Tier-2 lock (#205).  Acquire passes the surface and the guest address of the
+ * caller's blyt_lock_t; the host materializes the buffer and writes the struct
+ * fields (pixels/stride/w/h/token) into it, returning 1/0 in a0.  Release passes
+ * the lock's token; the host flushes the buffer and invalidates the token. */
+int32_t blyt_surface_acquire(blyt_surface_h surface, blyt_lock_t *out) {
+    register long a0 __asm__("a0") = (long)surface;
+    register long a1 __asm__("a1") = (long)out;
+    register long a7 __asm__("a7") = ECALL_SURFACE_ACQUIRE;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    return (int32_t)a0;
+}
+
+void blyt_surface_release(blyt_lock_t *lock) {
+    register long a0 __asm__("a0") = (long)(lock ? lock->token : 0u);
+    register long a7 __asm__("a7") = ECALL_SURFACE_RELEASE;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
 }
 
 /* -------------------------------------------------------------------------

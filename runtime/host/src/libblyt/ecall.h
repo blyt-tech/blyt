@@ -154,6 +154,21 @@
 #define BLYT_ECALL_SURFACE_CREATE 106
 #define BLYT_ECALL_SURFACE_DESTROY 107
 #define BLYT_ECALL_SURFACE_BLIT 108
+
+/* Tier-2 per-pixel lock (acquire/release, #205).  A cart that needs raw per-pixel
+ * access acquires a surface: the runtime materializes its canonical buffer into a
+ * guest-addressable region and hands back a blyt_lock_t {pixels, stride, w, h,
+ * token}.  The cart reads/writes pixels directly and/or draws with the
+ * freestanding blyt_raster_* primitives (guest-side, no ECALL), then releases —
+ * flushing the region back to the canonical buffer and invalidating the token.
+ * Exclusive per surface; distinct surfaces may be locked at once.
+ *   SURFACE_ACQUIRE: a0=surface, a1=out_lock vaddr (blyt_lock_t to fill).  On
+ *     failure (unresolvable surface, already locked, no region) the lock's token
+ *     is BLYT_HANDLE_NONE and pixels is 0.
+ *   SURFACE_RELEASE: a0=lock-view token; flushes + invalidates.  A no-op on a
+ *     stale/foreign token (kind or generation mismatch). */
+#define BLYT_ECALL_SURFACE_ACQUIRE 109
+#define BLYT_ECALL_SURFACE_RELEASE 110
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1

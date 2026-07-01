@@ -121,6 +121,31 @@ pub mod gfx {
         s
     }
 
+    /// Emit a C draw body that issues `ops` under a tier-2 lock on `surface`:
+    /// acquire, draw with the freestanding `blyt_raster_*` primitives on the
+    /// locked buffer (guest-side, no ECALL), then release.  Drawing the same
+    /// frame this way must hash identically to the tier-1 path — the tier-1 ≡
+    /// tier-2 guarantee (#205), since both call the same rasterizer source.
+    /// `lk` is the emitted `blyt_lock_t` variable name.
+    pub fn c_lock_draw_body(ops: &[Op], surface: &str, lk: &str) -> String {
+        let mut s = format!("  blyt_lock_t {lk};\n  blyt_surface_acquire({surface}, &{lk});\n");
+        let b = format!("{lk}.pixels, {lk}.stride, {lk}.w, {lk}.h");
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  blyt_raster_clear({b}, {c});\n"),
+                Op::Pixel(x, y, c) => s += &format!("  blyt_raster_pixel({b}, {x}, {y}, {c});\n"),
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  blyt_raster_rect_fill({b}, {x}, {y}, {w}, {h}, {c});\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  blyt_raster_line({b}, {x0}, {y0}, {x1}, {y1}, {c});\n")
+                }
+            }
+        }
+        s += &format!("  blyt_surface_release(&{lk});\n");
+        s
+    }
+
     /// Emit the C `blyt_cart_draw` body that issues `ops` via the gfx primitives.
     pub fn c_draw_body(ops: &[Op]) -> String {
         let mut s = String::new();

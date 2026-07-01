@@ -105,6 +105,113 @@ fn surface_offscreen_draw_then_blit_to_screen_hashes_identically_across_legs() {
     run_cart_libretro_with_env(&cart, &env, &expected);
 }
 
+/// Tier-1 ≡ tier-2 (#205 acceptance oracle): the torture frame drawn into the
+/// screen *under a lock* — acquire, draw with the freestanding blyt_raster_*
+/// primitives on the materialized buffer, release — must hash to the identical
+/// golden the tier-1 serviced ops produce, on every leg.  This pins both the
+/// per-pixel round-trip (copy-in/copy-out is byte-exact) and that in-lock drawing
+/// shares the tier-1 rasterizer source.
+#[test]
+fn surface_lock_tier2_screen_equals_tier1_torture_across_legs() {
+    require_sdk();
+    let ops = gfx::torture_frame();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_draw_cart(
+        &tmp.path().join("surface-lock-tier2"),
+        &gfx::c_lock_draw_body(&ops, "BLYT_SCREEN", "lk"),
+    );
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// Per-pixel round-trip through the copy-in/copy-out path: create an off-screen
+/// surface, acquire it, write a deterministic pattern straight into lock.pixels
+/// (raw, no rasterizer), release (flush), then blit to the screen.  The presented
+/// screen must equal the reference (same pattern blitted over the background) on
+/// every leg — proving raw per-pixel writes survive materialization byte-exactly.
+#[test]
+fn surface_lock_raw_per_pixel_roundtrips_across_legs() {
+    require_sdk();
+
+    const SW: i32 = 40;
+    const SH: i32 = 30;
+    let bg = 2u8;
+
+    // Pattern p(x,y) = (x*7 + y*13) & 0xff, written per-pixel through the lock.
+    let mut body = format!("  blyt_surface_clear(BLYT_SCREEN, {bg});\n");
+    body += &format!("  blyt_surface_h s = blyt_surface_create({SW}, {SH});\n");
+    body += "  blyt_lock_t lk;\n  blyt_surface_acquire(s, &lk);\n";
+    body += "  for (int yy = 0; yy < lk.h; yy++)\n";
+    body += "    for (int xx = 0; xx < lk.w; xx++)\n";
+    body += "      lk.pixels[(long)yy * lk.stride + xx] = (unsigned char)((xx * 7 + yy * 13) & 0xff);\n";
+    body += "  blyt_surface_release(&lk);\n";
+    body += "  blyt_surface_blit(BLYT_SCREEN, s, 20, 15);\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_draw_cart(&tmp.path().join("surface-lock-raw"), &body);
+
+    // Reference: build the src pattern, blit over the bg-cleared screen.
+    let mut src = vec![0u8; (SW * SH) as usize];
+    for yy in 0..SH {
+        for xx in 0..SW {
+            src[(yy * SW + xx) as usize] = ((xx * 7 + yy * 13) & 0xff) as u8;
+        }
+    }
+    let mut screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
+    gfx::blit(
+        &mut screen,
+        gfx::FRAME_W,
+        gfx::FRAME_H,
+        &src,
+        SW as usize,
+        SH as usize,
+        20,
+        15,
+    );
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// A lock-view token is rejected once released (generation/lock-state check,
+/// #205).  The cart draws colour X into the screen under a lock and releases it;
+/// then it tampers — writes colour Y into the now-stale buffer and calls release
+/// again with the same token.  The stale release must be a no-op, so the screen
+/// stays X.  If the token were honoured the screen would become Y.
+#[test]
+fn surface_lock_stale_token_release_rejected_across_legs() {
+    require_sdk();
+
+    let x = 9u8;
+    let y = 4u8;
+    let mut body = String::from("  blyt_lock_t lk;\n  blyt_surface_acquire(BLYT_SCREEN, &lk);\n");
+    body += &format!("  blyt_raster_clear(lk.pixels, lk.stride, lk.w, lk.h, {x});\n");
+    body += "  blyt_surface_release(&lk);\n"; // screen = X, token now stale
+    // Tamper: write Y into the stale region and try to flush it via the stale token.
+    body += &format!("  blyt_raster_clear(lk.pixels, lk.stride, lk.w, lk.h, {y});\n");
+    body += "  blyt_surface_release(&lk);\n"; // stale token -> no-op
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_draw_cart(&tmp.path().join("surface-lock-stale"), &body);
+
+    // Screen must be uniformly X — the stale release did not flush Y.
+    let screen = vec![x; gfx::FRAME_W * gfx::FRAME_H];
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
 /// A surface creation that would exceed the 16 MB memory budget (#158) returns
 /// BLYT_HANDLE_NONE; drawing into and blitting from NONE are defined no-ops.  The
 /// cart clears the screen to a background, tries an over-budget create, fills the

@@ -186,7 +186,21 @@ typedef struct {
     bool in_use;
     bool is_screen; /* slot 0: draws flip cart_has_drawn; never freed/reaped */
     bool owned; /* pixels was malloc'd by the runtime (off-screen surfaces) */
+    /* Tier-2 lock state (#205): while locked, the canonical buffer is
+     * materialized into the guest VA region [lock_vaddr, lock_vaddr+lock_len). */
+    bool locked;
+    uint16_t lock_gen; /* bumped on release — a released token goes stale */
+    uint32_t lock_vaddr; /* guest VA of the materialized region */
+    uint32_t lock_len; /* == w*h */
 } blyt_surface_slot_t;
+
+/* The tier-2 lock materialization arena: the free 32 MiB VA gap Spike X verified
+ * (BLYT_GFX_FB_BASE .. arena at 64 MiB).  A bump allocator carves per-lock
+ * regions from it and resets when the last lock releases; since concurrent locks
+ * sum to at most the 16 MB surface budget and the gap is 32 MiB, it can never
+ * exhaust (#205). */
+#define BLYT_SURFACE_LOCK_ARENA_BASE BLYT_GFX_FB_BASE
+#define BLYT_SURFACE_LOCK_ARENA_SIZE 0x02000000u /* 32 MiB */
 
 typedef struct {
     blyt_surface_slot_t slots[BLYT_SURFACE_MAX];
@@ -194,6 +208,8 @@ typedef struct {
      * the non-evictable footprint so surface creation shares the unified 16 MB
      * budget with the guest heap and resource cache (#158/#205). */
     uint32_t surface_bytes;
+    uint32_t lock_bump; /* bump offset into the lock arena */
+    int active_locks; /* live locks; the bump resets to 0 when this hits 0 */
 } blyt_surface_registry_t;
 
 /* -------------------------------------------------------------------------
@@ -1433,14 +1449,36 @@ static void blyt_surface_free_slot(blyt_surface_registry_t *reg, blyt_surface_sl
     s->gen++; /* invalidate handles referencing this slot */
 }
 
+/* Flush a locked surface's materialized guest region back into its canonical
+ * buffer and clear the lock, bumping the lock generation so the outstanding
+ * token goes stale.  A no-op if the slot is not locked. */
+static void blyt_surface_flush_lock(blyt_surface_registry_t *reg, blyt_surface_slot_t *s,
+                                    memory_t *mem) {
+    if (!s->locked)
+        return;
+    if (mem && s->pixels)
+        memory_read(mem, s->pixels, s->lock_vaddr, s->lock_len);
+    s->locked = false;
+    s->lock_gen++;
+    if (reg->active_locks > 0)
+        reg->active_locks--;
+    if (reg->active_locks == 0)
+        reg->lock_bump = 0; /* arena empty — reclaim it */
+}
+
 /* Reap every off-screen surface at the frame boundary (draw-scoped lifetime,
  * #205): surfaces are derived per-frame artifacts, so none survive into the next
- * frame.  Screen (slot 0) is untouched. */
+ * frame.  Any lock the cart forgot to release is force-flushed first (frame
+ * boundary force-release).  Screen (slot 0) is force-released but not freed. */
 static void blyt_surface_reap_all(blyt_run_ctx_t *ctx, memory_t *mem) {
     blyt_surface_registry_t *reg = &ctx->surfaces;
+    for (uint32_t i = 0; i < BLYT_SURFACE_MAX; i++)
+        blyt_surface_flush_lock(reg, &reg->slots[i], mem);
     for (uint32_t i = 1; i < BLYT_SURFACE_MAX; i++)
         blyt_surface_free_slot(reg, &reg->slots[i]);
     /* surface_bytes has been decremented per slot; it is now 0. */
+    reg->lock_bump = 0;
+    reg->active_locks = 0;
     if (mem)
         mem_acct_publish_footprint(ctx, mem);
 }
@@ -1486,6 +1524,79 @@ static uint32_t blyt_surface_create_slot(blyt_run_ctx_t *ctx, memory_t *mem, int
     reg->surface_bytes += bytes;
     mem_acct_publish_footprint(ctx, mem);
     return blyt_surface_encode(s->gen, idx);
+}
+
+/* Resolve a lock-view token to the surface slot it locks: classify kind
+ * LOCKVIEW, validate the slot index, that it is actually locked, and that the
+ * token's generation matches (a released token has a bumped lock_gen → stale).
+ * Returns NULL otherwise. */
+static blyt_surface_slot_t *blyt_resolve_lockview(blyt_surface_registry_t *reg, uint32_t token) {
+    if (!blyt_handle_is_lockview(token))
+        return NULL;
+    uint32_t idx = blyt_dyn_decode_index(token);
+    if (idx >= BLYT_SURFACE_MAX)
+        return NULL;
+    blyt_surface_slot_t *s = &reg->slots[idx];
+    if (!s->locked || (uint16_t)blyt_dyn_decode_gen(token) != s->lock_gen)
+        return NULL;
+    return s;
+}
+
+/* Acquire an exclusive tier-2 lock on the surface `handle`: carve a per-lock
+ * region from the VA-gap arena, materialize (copy-in) the canonical buffer into
+ * it, and write the guest blyt_lock_t (pixels/stride/w/h/token) to out_vaddr.
+ * Returns 1 on success, 0 on failure (unresolvable surface, already locked, or
+ * arena exhausted — the latter impossible given gap > budget). */
+static int blyt_surface_acquire_lock(blyt_run_ctx_t *ctx, memory_t *mem, uint32_t handle,
+                                     uint32_t out_vaddr) {
+    blyt_surface_registry_t *reg = &ctx->surfaces;
+    blyt_surface_slot_t *s = blyt_resolve_surface(reg, handle);
+    uint8_t lockbuf[20]; /* blyt_lock_t on ilp32: pixels,stride,w,h,token */
+    if (!s || s->locked) {
+        memset(lockbuf, 0, sizeof(lockbuf)); /* token = NONE, pixels = 0 */
+        memory_write(mem, out_vaddr, lockbuf, sizeof(lockbuf));
+        return 0;
+    }
+    uint32_t len = (uint32_t)((uint32_t)s->w * (uint32_t)s->h);
+    uint32_t aligned = (len + 3u) & ~3u;
+    if ((uint64_t)reg->lock_bump + aligned > BLYT_SURFACE_LOCK_ARENA_SIZE) {
+        memset(lockbuf, 0, sizeof(lockbuf));
+        memory_write(mem, out_vaddr, lockbuf, sizeof(lockbuf));
+        return 0;
+    }
+    uint32_t vaddr = BLYT_SURFACE_LOCK_ARENA_BASE + reg->lock_bump;
+    reg->lock_bump += aligned;
+    reg->active_locks++;
+
+    /* Copy-in: the canonical buffer is the single source of truth, so every
+     * acquire reads it (coherence claim, #205). */
+    memory_write(mem, vaddr, s->pixels, len);
+
+    s->locked = true;
+    s->lock_vaddr = vaddr;
+    s->lock_len = len;
+    uint32_t token = blyt_lockview_encode(s->lock_gen, blyt_dyn_decode_index(handle));
+
+    write_u32_le(lockbuf + 0, vaddr); /* pixels */
+    write_u32_le(lockbuf + 4, (uint32_t)s->w); /* stride */
+    write_u32_le(lockbuf + 8, (uint32_t)s->w); /* w */
+    write_u32_le(lockbuf + 12, (uint32_t)s->h); /* h */
+    write_u32_le(lockbuf + 16, token); /* token */
+    memory_write(mem, out_vaddr, lockbuf, sizeof(lockbuf));
+    return 1;
+}
+
+/* Release a tier-2 lock by its token: flush (copy-out) the materialized region
+ * back into the canonical buffer and invalidate the token.  A no-op on a stale
+ * or foreign token.  Returns the released slot (for cart_has_drawn on screen),
+ * or NULL. */
+static blyt_surface_slot_t *blyt_surface_release_lock(blyt_run_ctx_t *ctx, memory_t *mem,
+                                                      uint32_t token) {
+    blyt_surface_slot_t *s = blyt_resolve_lockview(&ctx->surfaces, token);
+    if (!s)
+        return NULL;
+    blyt_surface_flush_lock(&ctx->surfaces, s, mem);
+    return s;
 }
 
 static void blyt_ecall_handler(riscv_t *rv) {
@@ -1652,6 +1763,31 @@ static void blyt_ecall_handler(riscv_t *rv) {
             blyt_raster_blit(ds->pixels, ds->w, ds->w, ds->h, ss->pixels, ss->w, ss->w, ss->h, x,
                              y);
             if (ds->is_screen && g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    /* Tier-2 per-pixel lock (#205). */
+    case BLYT_ECALL_SURFACE_ACQUIRE: {
+        uint32_t surface = rv_get_reg(rv, rv_reg_a0);
+        uint32_t out_vaddr = rv_get_reg(rv, rv_reg_a1);
+        int ok = 0;
+        if (g_run_ctx)
+            ok = blyt_surface_acquire_lock(g_run_ctx, PRIV(rv)->mem, surface, out_vaddr);
+        blyt_tracef(BLYT_TRACE_API, "surface_acquire(0x%08x) -> %s", surface, ok ? "ok" : "fail");
+        rv_set_reg(rv, rv_reg_a0, (uint32_t)ok);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SURFACE_RELEASE: {
+        uint32_t token = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "surface_release(0x%08x)", token);
+        if (g_run_ctx) {
+            blyt_surface_slot_t *s = blyt_surface_release_lock(g_run_ctx, PRIV(rv)->mem, token);
+            if (s && s->is_screen && g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
         rv->PC += 4;

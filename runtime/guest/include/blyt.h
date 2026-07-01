@@ -351,6 +351,46 @@ void blyt_surface_line(blyt_surface_h dst, int32_t x0, int32_t y0, int32_t x1, i
  * the palette is global).  src may be BLYT_SCREEN or a created surface. */
 void blyt_surface_blit(blyt_surface_h dst, blyt_surface_h src, int32_t x, int32_t y);
 
+/* -------------------------------------------------------------------------
+ * Tier-2 per-pixel surface lock (#205)
+ *
+ * For raw per-pixel work, acquire a surface: the runtime materializes its
+ * buffer where the cart can read/write it and hands back a blyt_lock_t.  Write
+ * pixels directly through lock.pixels (row-major, lock.stride bytes per row) or
+ * draw with the freestanding blyt_raster_* primitives below (guest-side, no
+ * ECALL) — the SAME rasterizer the tier-1 ops use, so lock drawing is
+ * pixel-identical.  Release when done: the buffer is flushed back and the lock
+ * token goes stale.  The lock is exclusive per surface and valid only until
+ * release or the end of draw(); the pointer must not be used after release.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    uint8_t *pixels; /* materialized buffer (row-major palette indices) */
+    int32_t stride; /* bytes per row (== w) */
+    int32_t w, h; /* surface dimensions */
+    blyt_lockview_h token; /* pass to blyt_surface_release; BLYT_HANDLE_NONE on failure */
+} blyt_lock_t;
+
+/* Acquire an exclusive per-pixel lock on `surface`.  Fills *out and returns 1 on
+ * success; on failure (unresolvable surface, already locked) zeroes *out (token
+ * BLYT_HANDLE_NONE) and returns 0. */
+int32_t blyt_surface_acquire(blyt_surface_h surface, blyt_lock_t *out);
+
+/* Release a lock: flush the materialized buffer back to the surface and
+ * invalidate the token.  A no-op on a stale/foreign token. */
+void blyt_surface_release(blyt_lock_t *lock);
+
+/* In-lock drawing primitives — the freestanding integer rasterizer
+ * (runtime/shared/blyt_raster.h), called on a locked surface's buffer.  Bounds
+ * are the lock's (stride, w, h).  Identical source to the tier-1 host handlers. */
+void blyt_raster_clear(uint8_t *fb, int stride, int width, int height, uint8_t color);
+void blyt_raster_pixel(uint8_t *fb, int stride, int width, int height, int x, int y, uint8_t color);
+void blyt_raster_rect_fill(uint8_t *fb, int stride, int width, int height, int x, int y, int w,
+                           int h, uint8_t color);
+void blyt_raster_line(uint8_t *fb, int stride, int width, int height, int x0, int y0, int x1,
+                      int y1, uint8_t color);
+void blyt_raster_blit(uint8_t *dst, int dstride, int dwidth, int dheight, const uint8_t *src,
+                      int sstride, int swidth, int sheight, int x, int y);
+
 /* gfx.* — literal sugar over BLYT_SCREEN (ADR-0046 canvas-is-receiver, #205).
  * The screen-targeting shorthand; not a parallel path — the same host-side
  * rasterizer, so they cannot drift from the surface API. */

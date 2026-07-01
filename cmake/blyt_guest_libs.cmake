@@ -613,6 +613,11 @@ foreach(_var release debug)
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blyt_common.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/blytcommon_emu.c"
     "${CMAKE_SOURCE_DIR}/runtime/guest/src/libblytcommon/resources.c"
+    # Tier-2 in-lock primitives (#205): the shared integer rasterizer, so a cart
+    # holding a surface lock draws into the materialized buffer guest-side (zero
+    # ECALL) via the SAME source the host tier-1 handlers use — the tier-1 ≡
+    # tier-2 determinism guarantee holds by construction.
+    "${CMAKE_SOURCE_DIR}/runtime/shared/blyt_raster.c"
     ${LIBBLYTC_SRCS}
     ${SF_ALL}
     ${SF_RISCV}
