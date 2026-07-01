@@ -54,3 +54,85 @@ fn surface_screen_torture_frame_hashes_identically_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &expected);
     run_cart_libretro_with_env(&cart, &env, &expected);
 }
+
+/// End-to-end off-screen surface: create a blank surface, draw into it, then blit
+/// it onto the screen.  The presented screen must hash bit-identically across all
+/// legs and equal the reference (background cleared, then the rendered surface
+/// composited at the blit offset) — proving create + tier-1 draw into an
+/// off-screen buffer + blit-to-screen all compose deterministically.
+#[test]
+fn surface_offscreen_draw_then_blit_to_screen_hashes_identically_across_legs() {
+    require_sdk();
+
+    // The off-screen surface content and where it lands on the screen.
+    const SW: i32 = 64;
+    const SH: i32 = 48;
+    const BX: i32 = 100;
+    const BY: i32 = 80;
+    let surf_ops = [
+        gfx::Op::Clear(5),
+        gfx::Op::Rect(10, 10, 20, 15, 9),
+        gfx::Op::Line(0, 0, 63, 47, 12),
+    ];
+    let bg = 3u8;
+
+    let mut body = format!("  blyt_surface_h s = blyt_surface_create({SW}, {SH});\n");
+    body += &gfx::c_surface_draw_body(&surf_ops, "s");
+    body += &format!("  blyt_surface_clear(BLYT_SCREEN, {bg});\n");
+    body += &format!("  blyt_surface_blit(BLYT_SCREEN, s, {BX}, {BY});\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_draw_cart(&tmp.path().join("surface-offscreen-blit"), &body);
+
+    // Reference: screen cleared to bg, then the rendered surface blitted at (BX,BY).
+    let src = gfx::render_dims(&surf_ops, SW as usize, SH as usize);
+    let mut screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
+    gfx::blit(
+        &mut screen,
+        gfx::FRAME_W,
+        gfx::FRAME_H,
+        &src,
+        SW as usize,
+        SH as usize,
+        BX,
+        BY,
+    );
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// A surface creation that would exceed the 16 MB memory budget (#158) returns
+/// BLYT_HANDLE_NONE; drawing into and blitting from NONE are defined no-ops.  The
+/// cart clears the screen to a background, tries an over-budget create, fills the
+/// (would-be) surface, and blits it — so the presented screen is background-only.
+/// The companion in-budget test above shows the same shape *does* composite, so
+/// the contrast pins that the budget rejection is real, not an unrelated no-op.
+#[test]
+fn surface_over_budget_create_returns_none_across_legs() {
+    require_sdk();
+
+    // 8192x8192 = 64 MiB, four times the 16 MB budget, so create must return NONE
+    // (the byte count is well within the dimension/overflow guard — it is the
+    // budget that rejects it, not the size clamp).
+    let bg = 3u8;
+    let mut body = format!("  blyt_surface_clear(BLYT_SCREEN, {bg});\n");
+    body += "  blyt_surface_h s = blyt_surface_create(8192, 8192);\n";
+    body += "  blyt_surface_clear(s, 7);\n"; // no-op on NONE
+    body += "  blyt_surface_blit(BLYT_SCREEN, s, 0, 0);\n"; // no-op on NONE
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_draw_cart(&tmp.path().join("surface-over-budget"), &body);
+
+    // Screen is background-only: the over-budget surface never materialized.
+    let screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}

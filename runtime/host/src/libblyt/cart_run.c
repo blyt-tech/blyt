@@ -190,6 +190,10 @@ typedef struct {
 
 typedef struct {
     blyt_surface_slot_t slots[BLYT_SURFACE_MAX];
+    /* Total bytes of off-screen surface buffers (screen excluded).  Folded into
+     * the non-evictable footprint so surface creation shares the unified 16 MB
+     * budget with the guest heap and resource cache (#158/#205). */
+    uint32_t surface_bytes;
 } blyt_surface_registry_t;
 
 /* -------------------------------------------------------------------------
@@ -582,10 +586,18 @@ static uint32_t mem_acct_guest_heap_used(const blyt_run_ctx_t *ctx, memory_t *me
  * the guest-visible accounting block, and bound the resident evictable cache to
  * the room the new footprint leaves (the housekeeping eviction site, #158). Call
  * after any load/pin/unpin/release and at the frame boundary. */
+/* The non-evictable footprint the budget predicate charges against: resident
+ * loaded/pinned/persistent resource bytes plus live off-screen surface buffers
+ * (#205).  Both are irreclaimable within a frame, so both sit in the predicate's
+ * footprint term alongside the guest heap. */
+static uint32_t ctx_non_evictable_footprint(const blyt_run_ctx_t *ctx) {
+    return blyt_resource_table_footprint(&ctx->resources) + ctx->surfaces.surface_bytes;
+}
+
 static void mem_acct_publish_footprint(blyt_run_ctx_t *ctx, memory_t *mem) {
     if (!ctx->mem_acct_vaddr)
         return;
-    uint32_t footprint = blyt_resource_table_footprint(&ctx->resources);
+    uint32_t footprint = ctx_non_evictable_footprint(ctx);
     uint8_t b[4];
     write_u32_le(b, footprint);
     memory_write(mem, ctx->mem_acct_vaddr + 4u, b, 4);
@@ -609,7 +621,7 @@ static int mem_acct_reference_fits(blyt_run_ctx_t *ctx, memory_t *mem,
         return 1; /* no accounting block: budget unenforced host-side */
     uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
     uint32_t heap_used = mem_acct_guest_heap_used(ctx, mem);
-    uint32_t footprint = blyt_resource_table_footprint(&ctx->resources);
+    uint32_t footprint = ctx_non_evictable_footprint(ctx);
     return blyt_mem_alloc_fits(heap_used, footprint, incoming);
 }
 
@@ -1398,6 +1410,84 @@ static blyt_surface_slot_t *blyt_resolve_surface(blyt_surface_registry_t *reg, u
     return s;
 }
 
+/* Largest off-screen surface edge — an overflow guard, not the size limit: it
+ * bounds w*h so the uint32 byte count and the i64-clipped rasterizer
+ * intermediates never overflow (8192*8192 = 64 MiB fits both).  The 16 MB budget
+ * (#158) is the real size limit and rejects anything that does not fit. */
+#define BLYT_SURFACE_MAX_DIM 8192
+
+/* Free one off-screen surface slot: release its buffer, drop its bytes from the
+ * budget footprint, and bump the generation so any outstanding handle goes
+ * stale.  A no-op on the screen slot (never owned).  Caller republishes the
+ * footprint. */
+static void blyt_surface_free_slot(blyt_surface_registry_t *reg, blyt_surface_slot_t *s) {
+    if (!s->in_use || s->is_screen)
+        return;
+    if (s->owned && s->pixels) {
+        reg->surface_bytes -= (uint32_t)((uint32_t)s->w * (uint32_t)s->h);
+        free(s->pixels);
+    }
+    s->pixels = NULL;
+    s->in_use = false;
+    s->owned = false;
+    s->gen++; /* invalidate handles referencing this slot */
+}
+
+/* Reap every off-screen surface at the frame boundary (draw-scoped lifetime,
+ * #205): surfaces are derived per-frame artifacts, so none survive into the next
+ * frame.  Screen (slot 0) is untouched. */
+static void blyt_surface_reap_all(blyt_run_ctx_t *ctx, memory_t *mem) {
+    blyt_surface_registry_t *reg = &ctx->surfaces;
+    for (uint32_t i = 1; i < BLYT_SURFACE_MAX; i++)
+        blyt_surface_free_slot(reg, &reg->slots[i]);
+    /* surface_bytes has been decremented per slot; it is now 0. */
+    if (mem)
+        mem_acct_publish_footprint(ctx, mem);
+}
+
+/* Create a blank off-screen surface of w x h, charging w*h against the unified
+ * budget.  Returns a fresh SURFACE handle, or BLYT_HANDLE_NONE on invalid size,
+ * an exhausted registry, an allocation failure, or an over-budget request. */
+static uint32_t blyt_surface_create_slot(blyt_run_ctx_t *ctx, memory_t *mem, int32_t w, int32_t h) {
+    blyt_surface_registry_t *reg = &ctx->surfaces;
+    if (w <= 0 || h <= 0 || w > BLYT_SURFACE_MAX_DIM || h > BLYT_SURFACE_MAX_DIM)
+        return BLYT_HANDLE_NONE;
+    uint32_t bytes = (uint32_t)w * (uint32_t)h;
+
+    /* Budget: a surface is non-evictable for the frame, so it charges against the
+     * same predicate as the heap + non-evictable resources (#158). */
+    uint32_t heap_used = mem_acct_guest_heap_used(ctx, mem);
+    if (!blyt_mem_alloc_fits(heap_used, ctx_non_evictable_footprint(ctx), bytes))
+        return BLYT_HANDLE_NONE;
+
+    uint32_t idx = 0;
+    for (uint32_t i = 1; i < BLYT_SURFACE_MAX; i++) {
+        if (!reg->slots[i].in_use) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == 0) /* registry full (slot 0 is the screen) */
+        return BLYT_HANDLE_NONE;
+
+    uint8_t *pixels = (uint8_t *)calloc(bytes, 1); /* blank = palette index 0 */
+    if (!pixels)
+        return BLYT_HANDLE_NONE;
+
+    blyt_surface_slot_t *s = &reg->slots[idx];
+    s->pixels = pixels;
+    s->w = w;
+    s->h = h;
+    s->in_use = true;
+    s->is_screen = false;
+    s->owned = true;
+    /* s->gen carries over from the previous occupant so a stale handle to that
+     * occupant does not alias this new surface. */
+    reg->surface_bytes += bytes;
+    mem_acct_publish_footprint(ctx, mem);
+    return blyt_surface_encode(s->gen, idx);
+}
+
 static void blyt_ecall_handler(riscv_t *rv) {
     uint32_t num = rv_get_reg(rv, rv_reg_a7);
 
@@ -1515,6 +1605,53 @@ static void blyt_ecall_handler(riscv_t *rv) {
         if (s) {
             blyt_raster_line(s->pixels, s->w, s->w, s->h, x0, y0, x1, y1, (uint8_t)color);
             if (s->is_screen && g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    /* Surface lifecycle + blit (tier-1, #205). */
+    case BLYT_ECALL_SURFACE_CREATE: {
+        int32_t w = (int32_t)rv_get_reg(rv, rv_reg_a0);
+        int32_t h = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        uint32_t handle = BLYT_HANDLE_NONE;
+        if (g_run_ctx)
+            handle = blyt_surface_create_slot(g_run_ctx, PRIV(rv)->mem, w, h);
+        blyt_tracef(BLYT_TRACE_API, "surface_create(w=%d, h=%d) -> 0x%08x", w, h, handle);
+        rv_set_reg(rv, rv_reg_a0, handle);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SURFACE_DESTROY: {
+        uint32_t handle = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "surface_destroy(0x%08x)", handle);
+        blyt_surface_slot_t *s =
+            g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, handle) : NULL;
+        if (s && !s->is_screen) {
+            blyt_surface_free_slot(&g_run_ctx->surfaces, s);
+            mem_acct_publish_footprint(g_run_ctx, PRIV(rv)->mem);
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SURFACE_BLIT: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        uint32_t src = rv_get_reg(rv, rv_reg_a1);
+        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a3);
+        blyt_tracef(BLYT_TRACE_API, "surface_blit(dst=0x%08x, src=0x%08x, x=%d, y=%d)", dst, src, x,
+                    y);
+        blyt_surface_slot_t *ds =
+            g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        blyt_surface_slot_t *ss =
+            g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, src) : NULL;
+        if (ds && ss) {
+            blyt_raster_blit(ds->pixels, ds->w, ds->w, ds->h, ss->pixels, ss->w, ss->w, ss->h, x,
+                             y);
+            if (ds->is_screen && g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
         rv->PC += 4;
@@ -3385,6 +3522,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
      * the frame it was taken in (ADR-0027 frame-scope amendment, #123). */
     session->ctx.resource_scratch_off = 0;
     blyt_resource_table_force_release_pins(&session->ctx.resources);
+    /* Reap the previous frame's off-screen surfaces: they are draw-scoped derived
+     * artifacts (#205), so none survive the frame boundary.  Frees their buffers
+     * and drops their bytes from the budget footprint (republished below). */
+    blyt_surface_reap_all(&session->ctx, session->attr.mem);
     /* Frame-boundary housekeeping (#158): pins just dropped, so the footprint may
      * have shrunk — republish it and bound the resident evictable cache to the
      * room the current heap+footprint leaves. Covers the "heap grew mid-frame

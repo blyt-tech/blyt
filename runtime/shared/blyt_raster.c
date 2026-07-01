@@ -47,6 +47,37 @@ void blyt_raster_rect_fill(uint8_t *fb, int stride, int width, int height, int x
         memset(fb + (size_t)row * (size_t)stride + (size_t)x0, color, (size_t)(x1 - x0));
 }
 
+void blyt_raster_blit(uint8_t *dst, int dstride, int dwidth, int dheight, const uint8_t *src,
+                      int sstride, int swidth, int sheight, int x, int y) {
+    if (!dst || !src || dstride <= 0 || sstride <= 0 || swidth <= 0 || sheight <= 0)
+        return;
+    /* Destination window, clipped to dst; 64-bit so x+swidth can't overflow. */
+    int64_t dx0 = x, dy0 = y;
+    int64_t dx1 = (int64_t)x + (int64_t)swidth, dy1 = (int64_t)y + (int64_t)sheight;
+    /* Source offset for the pixels the left/top clip skipped. */
+    int64_t sox = 0, soy = 0;
+    if (dx0 < 0) {
+        sox = -dx0;
+        dx0 = 0;
+    }
+    if (dy0 < 0) {
+        soy = -dy0;
+        dy0 = 0;
+    }
+    if (dx1 > dwidth)
+        dx1 = dwidth;
+    if (dy1 > dheight)
+        dy1 = dheight;
+    if (dx1 <= dx0 || dy1 <= dy0)
+        return;
+    size_t run = (size_t)(dx1 - dx0);
+    for (int64_t row = dy0; row < dy1; row++) {
+        int64_t srow = soy + (row - dy0);
+        memcpy(dst + (size_t)row * (size_t)dstride + (size_t)dx0,
+               src + (size_t)srow * (size_t)sstride + (size_t)sox, run);
+    }
+}
+
 void blyt_raster_line(uint8_t *fb, int stride, int width, int height, int x0, int y0, int x1,
                       int y1, uint8_t color) {
     if (!fb || stride <= 0)

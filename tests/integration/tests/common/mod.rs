@@ -192,6 +192,84 @@ pub mod gfx {
         fb
     }
 
+    /// Render `ops` into a paletted buffer of arbitrary `w` x `h` — the
+    /// off-screen-surface counterpart of [`render`] (which is the 320x240
+    /// screen).  Mirrors blyt_raster.c with the surface's own bounds/stride.
+    pub fn render_dims(ops: &[Op], w: usize, h: usize) -> Vec<u8> {
+        let mut fb = vec![0u8; w * h];
+        let put = |fb: &mut [u8], x: i32, y: i32, c: u8| {
+            if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
+                fb[y as usize * w + x as usize] = c;
+            }
+        };
+        for op in ops {
+            match *op {
+                Op::Clear(c) => fb.iter_mut().for_each(|p| *p = c),
+                Op::Pixel(x, y, c) => put(&mut fb, x, y, c),
+                Op::Rect(x, y, rw, rh, c) => {
+                    if rw > 0 && rh > 0 {
+                        let x0 = x.max(0) as i64;
+                        let y0 = y.max(0) as i64;
+                        let x1 = (x as i64 + rw as i64).min(w as i64);
+                        let y1 = (y as i64 + rh as i64).min(h as i64);
+                        for yy in y0..y1 {
+                            for xx in x0..x1 {
+                                put(&mut fb, xx as i32, yy as i32, c);
+                            }
+                        }
+                    }
+                }
+                Op::Line(mut x0, mut y0, x1, y1, c) => {
+                    let dx = (x1 - x0).abs();
+                    let dy = (y1 - y0).abs();
+                    let sx = if x0 < x1 { 1 } else { -1 };
+                    let sy = if y0 < y1 { 1 } else { -1 };
+                    let mut err = dx - dy;
+                    loop {
+                        put(&mut fb, x0, y0, c);
+                        if x0 == x1 && y0 == y1 {
+                            break;
+                        }
+                        let e2 = 2 * err;
+                        if e2 > -dy {
+                            err -= dy;
+                            x0 += sx;
+                        }
+                        if e2 < dx {
+                            err += dx;
+                            y0 += sy;
+                        }
+                    }
+                }
+            }
+        }
+        fb
+    }
+
+    /// Copy `src` (sw x sh) into `dst` (dw x dh) with top-left at (x,y), clipped
+    /// to dst — the reference for blyt_raster_blit / blyt_surface_blit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit(
+        dst: &mut [u8],
+        dw: usize,
+        dh: usize,
+        src: &[u8],
+        sw: usize,
+        sh: usize,
+        x: i32,
+        y: i32,
+    ) {
+        for sy in 0..sh as i32 {
+            for sx in 0..sw as i32 {
+                let dx = x + sx;
+                let dy = y + sy;
+                if dx >= 0 && (dx as usize) < dw && dy >= 0 && (dy as usize) < dh {
+                    dst[dy as usize * dw + dx as usize] = src[sy as usize * sw + sx as usize];
+                }
+            }
+        }
+    }
+
     /// FNV-1a 64, matching runtime/shared/blyt_frame_hash.c.
     pub fn fnv1a(bytes: &[u8]) -> u64 {
         let mut h = 0xcbf29ce484222325u64;
