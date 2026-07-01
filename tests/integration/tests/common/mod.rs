@@ -146,6 +146,27 @@ pub mod gfx {
         s
     }
 
+    /// Emit a Rust `blyt_cart_draw` body issuing `ops` via the tier-1 surface API
+    /// (`blyt::gfx`) on `dst` (e.g. `"blyt::gfx::SCREEN"`). The Rust-cart
+    /// counterpart of [`c_surface_draw_body`]; drawing the torture frame into the
+    /// screen this way must hash to the same golden as every other leg (#205).
+    pub fn rust_surface_draw_body(ops: &[Op], dst: &str) -> String {
+        let mut s = String::new();
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("    {dst}.clear({c});\n"),
+                Op::Pixel(x, y, c) => s += &format!("    {dst}.pixel({x}, {y}, {c});\n"),
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("    {dst}.rect_fill({x}, {y}, {w}, {h}, {c});\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("    {dst}.line({x0}, {y0}, {x1}, {y1}, {c});\n")
+                }
+            }
+        }
+        s
+    }
+
     /// Emit the C `blyt_cart_draw` body that issues `ops` via the gfx primitives.
     pub fn c_draw_body(ops: &[Op]) -> String {
         let mut s = String::new();

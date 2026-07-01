@@ -14,7 +14,9 @@
 mod common;
 
 use common::gfx;
-use common::{build_cart, require_sdk, write_c_cart_project};
+use common::{
+    CartProject, build_cart, require_rust_riscv_target, require_sdk, write_c_cart_project,
+};
 use common::{run_cart_libretro_with_env, run_cart_native_with_env, run_cart_wasm_with_env};
 
 /// Build a C cart whose `blyt_cart_draw` runs `draw_body` once, then quits.
@@ -28,6 +30,23 @@ void blyt_cart_draw(void) {{
 "#
     );
     write_c_cart_project(dir, &src);
+    build_cart(dir)
+}
+
+/// Build a Rust cart whose `blyt_cart_draw` runs `draw_body` once, then quits.
+fn build_rust_draw_cart(dir: &std::path::Path, draw_body: &str) -> std::path::PathBuf {
+    let src = format!(
+        r#"#![no_std]
+#[no_mangle]
+pub extern "C" fn blyt_cart_init() {{}}
+#[no_mangle]
+pub extern "C" fn blyt_cart_update() {{ blyt::quit(); }}
+#[no_mangle]
+pub extern "C" fn blyt_cart_draw() {{
+{draw_body}}}
+"#
+    );
+    CartProject::new().rust(&src).write(dir);
     build_cart(dir)
 }
 
@@ -236,6 +255,82 @@ fn surface_over_budget_create_returns_none_across_legs() {
 
     // Screen is background-only: the over-budget surface never materialized.
     let screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// The Rust SDK surface API (`blyt::gfx`) draws the torture frame into the
+/// screen via the tier-1 methods and must hash to the identical `common::gfx`
+/// golden every other leg produces — proving the Rust bindings are pixel-exact
+/// with the C path (#205, the "C + Rust" scope).
+#[test]
+fn surface_rust_screen_torture_hashes_identically_across_legs() {
+    require_sdk();
+    require_rust_riscv_target();
+    let ops = gfx::torture_frame();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_rust_draw_cart(
+        &tmp.path().join("surface-rust-torture"),
+        &gfx::rust_surface_draw_body(&ops, "blyt::gfx::SCREEN"),
+    );
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// The Rust `SurfaceLock` guard (tier-2): create an off-screen surface, draw into
+/// it under a lock (in-lock primitives on the materialized buffer), let the guard
+/// drop (which flushes), then blit to the screen. The presented screen must equal
+/// the reference on every leg — exercising acquire, the in-lock rasterizer
+/// helpers, and Drop-as-release from Rust.
+#[test]
+fn surface_rust_lock_offscreen_blit_hashes_identically_across_legs() {
+    require_sdk();
+    require_rust_riscv_target();
+
+    const SW: i32 = 64;
+    const SH: i32 = 48;
+    const BX: i32 = 100;
+    const BY: i32 = 80;
+    let surf_ops = [
+        gfx::Op::Clear(5),
+        gfx::Op::Rect(10, 10, 20, 15, 9),
+        gfx::Op::Line(0, 0, 63, 47, 12),
+    ];
+    let bg = 3u8;
+
+    let mut body = format!("    let s = blyt::gfx::Surface::create({SW}, {SH}).unwrap();\n");
+    body += "    {\n        let mut lk = s.acquire().unwrap();\n";
+    body += "        lk.clear(5);\n";
+    body += "        lk.rect_fill(10, 10, 20, 15, 9);\n";
+    body += "        lk.line(0, 0, 63, 47, 12);\n";
+    body += "    }\n"; // drop flushes
+    body += &format!("    blyt::gfx::SCREEN.clear({bg});\n");
+    body += &format!("    blyt::gfx::SCREEN.blit(s, {BX}, {BY});\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_rust_draw_cart(&tmp.path().join("surface-rust-lock"), &body);
+
+    let src = gfx::render_dims(&surf_ops, SW as usize, SH as usize);
+    let mut screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
+    gfx::blit(
+        &mut screen,
+        gfx::FRAME_W,
+        gfx::FRAME_H,
+        &src,
+        SW as usize,
+        SH as usize,
+        BX,
+        BY,
+    );
     let expected = gfx::expected_hash_line(&screen);
 
     let env = [("BLYT_FRAME_HASH", "1")];
