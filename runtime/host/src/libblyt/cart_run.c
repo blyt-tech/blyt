@@ -1657,6 +1657,33 @@ static bool blyt_surface_phase_gate(riscv_t *rv, bool *halted) {
     return false;
 }
 
+/* Exclusive-lock gate (#207).  While a surface is held by a tier-2 lock the lock
+ * owns it: any access via the surface *handle* — a tier-1 op, a blit (as dst or
+ * src), a re-acquire, or destroy — is a defined rejection until release.  This
+ * completes the exclusivity `acquire` already half-enforces and, crucially,
+ * makes the reject leg-identical: without it a tier-1 write to a locked surface
+ * is silently lost on the emulated copy-in/out path but kept on the native
+ * direct-pointer path (blyt32.c), diverging the frame.  Returns true when access
+ * may proceed (the slot is absent or unlocked); on a locked slot returns false
+ * and, in a debug cart, raises a dev fault + halts (*halted) so the misuse
+ * surfaces loudly, while a release cart leaves the caller to perform its no-op.
+ * Same debug/release split as blyt_surface_phase_gate. */
+static bool blyt_surface_lock_gate(riscv_t *rv, const blyt_surface_slot_t *s, bool *halted) {
+    *halted = false;
+    if (!s || !s->locked)
+        return true;
+    blyt_run_ctx_t *ctx = g_run_ctx;
+    if (ctx && ctx->cart_is_debug) {
+        if (ctx->log_fn)
+            ctx->log_fn(
+                "blyt: access to a locked surface outside its lock view — debug build trap\n");
+        ctx->dev_fault = true;
+        rv_halt(rv);
+        *halted = true;
+    }
+    return false;
+}
+
 static void blyt_ecall_handler(riscv_t *rv) {
     uint32_t num = rv_get_reg(rv, rv_reg_a7);
 
@@ -1719,6 +1746,10 @@ static void blyt_ecall_handler(riscv_t *rv) {
             return;
         }
         blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (!blyt_surface_lock_gate(rv, s, &halted)) { /* locked -> reject (#207) */
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         if (s) {
             blyt_raster_clear(s->pixels, s->w, s->w, s->h, (uint8_t)color);
             if (s->is_screen && g_run_ctx->cart_has_drawn)
@@ -1741,6 +1772,10 @@ static void blyt_ecall_handler(riscv_t *rv) {
             return;
         }
         blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (!blyt_surface_lock_gate(rv, s, &halted)) { /* locked -> reject (#207) */
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         if (s) {
             blyt_raster_pixel(s->pixels, s->w, s->w, s->h, x, y, (uint8_t)color);
             if (s->is_screen && g_run_ctx->cart_has_drawn)
@@ -1766,6 +1801,10 @@ static void blyt_ecall_handler(riscv_t *rv) {
             return;
         }
         blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (!blyt_surface_lock_gate(rv, s, &halted)) { /* locked -> reject (#207) */
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         if (s) {
             blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, x, y, w, h, (uint8_t)color);
             if (s->is_screen && g_run_ctx->cart_has_drawn)
@@ -1791,6 +1830,10 @@ static void blyt_ecall_handler(riscv_t *rv) {
             return;
         }
         blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (!blyt_surface_lock_gate(rv, s, &halted)) { /* locked -> reject (#207) */
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         if (s) {
             blyt_raster_line(s->pixels, s->w, s->w, s->h, x0, y0, x1, y1, (uint8_t)color);
             if (s->is_screen && g_run_ctx->cart_has_drawn)
@@ -1827,6 +1870,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
         blyt_tracef(BLYT_TRACE_API, "surface_destroy(0x%08x)", handle);
         blyt_surface_slot_t *s =
             g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, handle) : NULL;
+        bool halted;
+        if (!blyt_surface_lock_gate(rv, s, &halted)) { /* locked -> reject (#207) */
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         if (s && !s->is_screen) {
             blyt_surface_free_slot(&g_run_ctx->surfaces, s);
             mem_acct_publish_footprint(g_run_ctx, PRIV(rv)->mem);
@@ -1851,6 +1899,11 @@ static void blyt_ecall_handler(riscv_t *rv) {
             g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
         blyt_surface_slot_t *ss =
             g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, src) : NULL;
+        /* Reject if either endpoint is locked — a blit as dst OR src (#207). */
+        if (!blyt_surface_lock_gate(rv, ds, &halted) || !blyt_surface_lock_gate(rv, ss, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
         if (ds && ss) {
             blyt_raster_blit(ds->pixels, ds->w, ds->w, ds->h, ss->pixels, ss->w, ss->w, ss->h, x,
                              y);
