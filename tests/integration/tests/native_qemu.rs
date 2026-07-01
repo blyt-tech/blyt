@@ -449,6 +449,93 @@ function draw() end
         None
     };
 
+    // ── Build the surface carts (gates 22–24, #205) ───────────────────
+    // Exercise the generalized surface API on bare metal: off-screen create +
+    // tier-1 draw + blit-to-screen, tier-2 acquire/release on the screen, and a
+    // raw per-pixel round-trip through an off-screen lock.  The native pool
+    // hands a tier-2 lock the canonical buffer pointer directly (one address
+    // space, no copy), so these prove the direct-pointer path hashes identically
+    // to the copy-in/out emulated legs and the golden reference rasterizer.
+    const SURF_SW: i32 = 64;
+    const SURF_SH: i32 = 48;
+    const SURF_BX: i32 = 100;
+    const SURF_BY: i32 = 80;
+    let surf_ops = [
+        common::gfx::Op::Clear(5),
+        common::gfx::Op::Rect(10, 10, 20, 15, 9),
+        common::gfx::Op::Line(0, 0, 63, 47, 12),
+    ];
+    let surf_bg = 3u8;
+
+    let surface_offscreen_cart = {
+        let mut body = format!("  blyt_surface_h s = blyt_surface_create({SURF_SW}, {SURF_SH});\n");
+        body += &common::gfx::c_surface_draw_body(&surf_ops, "s");
+        body += &format!("  blyt_surface_clear(BLYT_SCREEN, {surf_bg});\n");
+        body += &format!("  blyt_surface_blit(BLYT_SCREEN, s, {SURF_BX}, {SURF_BY});\n");
+        gfx_cart("surface_offscreen", body)
+    };
+    let surface_offscreen_golden = {
+        let src = common::gfx::render_dims(&surf_ops, SURF_SW as usize, SURF_SH as usize);
+        let mut screen = vec![surf_bg; common::gfx::FRAME_W * common::gfx::FRAME_H];
+        common::gfx::blit(
+            &mut screen,
+            common::gfx::FRAME_W,
+            common::gfx::FRAME_H,
+            &src,
+            SURF_SW as usize,
+            SURF_SH as usize,
+            SURF_BX,
+            SURF_BY,
+        );
+        common::gfx::expected_hash_line(&screen)
+    };
+
+    // Tier-2 lock on the screen drawing the torture frame — must equal the
+    // tier-1 golden (tier-1 ≡ tier-2 by construction, direct-pointer path).
+    let surface_lock_cart = gfx_cart(
+        "surface_lock",
+        common::gfx::c_lock_draw_body(&common::gfx::torture_frame(), "BLYT_SCREEN", "lk"),
+    );
+    let surface_lock_golden =
+        common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
+
+    // Raw per-pixel round-trip through an off-screen lock, then blit to screen.
+    let surface_raw_cart = {
+        const RW: i32 = 40;
+        const RH: i32 = 30;
+        let mut body = format!("  blyt_surface_clear(BLYT_SCREEN, {surf_bg});\n");
+        body += &format!("  blyt_surface_h s = blyt_surface_create({RW}, {RH});\n");
+        body += "  blyt_lock_t lk;\n  blyt_surface_acquire(s, &lk);\n";
+        body += "  for (int yy = 0; yy < lk.h; yy++)\n";
+        body += "    for (int xx = 0; xx < lk.w; xx++)\n";
+        body += "      lk.pixels[(long)yy * lk.stride + xx] = (unsigned char)((xx * 7 + yy * 13) & 0xff);\n";
+        body += "  blyt_surface_release(&lk);\n";
+        body += "  blyt_surface_blit(BLYT_SCREEN, s, 20, 15);\n";
+        gfx_cart("surface_raw", body)
+    };
+    let surface_raw_golden = {
+        const RW: i32 = 40;
+        const RH: i32 = 30;
+        let mut src = vec![0u8; (RW * RH) as usize];
+        for yy in 0..RH {
+            for xx in 0..RW {
+                src[(yy * RW + xx) as usize] = ((xx * 7 + yy * 13) & 0xff) as u8;
+            }
+        }
+        let mut screen = vec![surf_bg; common::gfx::FRAME_W * common::gfx::FRAME_H];
+        common::gfx::blit(
+            &mut screen,
+            common::gfx::FRAME_W,
+            common::gfx::FRAME_H,
+            &src,
+            RW as usize,
+            RH as usize,
+            20,
+            15,
+        );
+        common::gfx::expected_hash_line(&screen)
+    };
+
     // ── Start QEMU ────────────────────────────────────────────────────
     let ssh_port = free_port();
     println!("Starting QEMU (SSH port {ssh_port})...");
@@ -566,6 +653,18 @@ function draw() end
             "scp gfx_hybrid.blyt failed"
         );
     }
+    assert!(
+        qemu.scp_to(&surface_offscreen_cart, "/tmp/blyt_gate/"),
+        "scp surface_offscreen.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&surface_lock_cart, "/tmp/blyt_gate/"),
+        "scp surface_lock.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&surface_raw_cart, "/tmp/blyt_gate/"),
+        "scp surface_raw.blyt failed"
+    );
 
     // ── Diagnostics ───────────────────────────────────────────────────
     // Print environment info before the gate test to help diagnose failures.
@@ -1956,6 +2055,89 @@ void blyt_cart_draw(void) {}
         println!("  PASS: {expected}");
     } else {
         println!("Gate 21: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 22: off-screen surface draw + blit on metal (#205) ───────
+    //
+    // Create a blank off-screen surface from the native pool, draw into it with
+    // the tier-1 primitives, clear the screen to a background, and blit the
+    // surface onto it.  The presented screen must equal the reference golden —
+    // proving native off-screen create + tier-1 draw + blit compose identically
+    // to the copy-based emulated legs.
+    {
+        println!("Gate 22: off-screen surface draw + blit on metal...");
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/surface_offscreen.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "surface_offscreen.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&surface_offscreen_golden),
+            "native off-screen surface draw + blit must hash identically to the \
+             emulated legs (expected {surface_offscreen_golden:?}; #205)\noutput: {output}"
+        );
+        println!("  PASS: {surface_offscreen_golden}");
+    }
+
+    // ── Gate 23: tier-2 lock on the screen == tier-1 golden (#205) ────
+    //
+    // Acquire the screen, draw the torture frame with the freestanding
+    // blyt_raster_* primitives on the materialized buffer, release.  On metal the
+    // lock exposes the canonical framebuffer pointer directly (no copy), so the
+    // result must equal the tier-1 golden — pinning tier-1 ≡ tier-2 on bare metal.
+    {
+        println!("Gate 23: tier-2 lock on screen == tier-1 golden on metal...");
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/surface_lock.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "surface_lock.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&surface_lock_golden),
+            "native tier-2 screen lock must hash identically to the tier-1 golden \
+             (expected {surface_lock_golden:?}; #205)\noutput: {output}"
+        );
+        println!("  PASS: {surface_lock_golden}");
+    }
+
+    // ── Gate 24: raw per-pixel round-trip through an off-screen lock (#205) ──
+    //
+    // Acquire an off-screen surface, write a deterministic pattern straight into
+    // lock.pixels (raw, no rasterizer), release, then blit to the screen.  The
+    // presented screen must equal the reference — proving raw per-pixel writes
+    // through the native direct-pointer lock survive byte-exactly and blit onto
+    // the screen identically to the emulated copy-in/out path.
+    {
+        println!("Gate 24: raw per-pixel off-screen lock round-trip on metal...");
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/surface_raw.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "surface_raw.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&surface_raw_golden),
+            "native off-screen tier-2 raw round-trip must hash identically to the \
+             emulated legs (expected {surface_raw_golden:?}; #205)\noutput: {output}"
+        );
+        println!("  PASS: {surface_raw_golden}");
     }
 
     println!("Gate tests passed.");

@@ -50,6 +50,11 @@
  * libblytcommon knowing anything about the graphics surface. */
 extern void blyt_gfx_on_frame_boundary(void) __attribute__((weak));
 
+/* Off-screen surface reap hook (#205): draw-scoped surfaces are freed at each
+ * frame boundary.  Strongly defined by the libblyt32 graphics variant, weak here
+ * (same cross-lib pattern as blyt_gfx_on_frame_boundary). */
+extern void blyt_gfx_reap_surfaces(void) __attribute__((weak));
+
 /* ── Linux ABI constants (inline — no linux/fcntl.h dependency) ─────────── */
 
 #define NATIVE_AT_FDCWD (-100)
@@ -1391,6 +1396,10 @@ void blyt_frame_done(void) {
      * is loaded. */
     if (blyt_gfx_on_frame_boundary)
         blyt_gfx_on_frame_boundary();
+    /* Reap draw-scoped off-screen surfaces (#205): none survive the frame
+     * boundary.  Weak ref → NULL when no graphics variant is loaded. */
+    if (blyt_gfx_reap_surfaces)
+        blyt_gfx_reap_surfaces();
 }
 
 /* blyt_exit — clean process exit after the cart main loop.
