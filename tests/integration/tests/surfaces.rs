@@ -382,6 +382,90 @@ fn surface_over_budget_create_returns_none_across_legs() {
     run_cart_libretro_with_env(&cart, &env, &expected);
 }
 
+/// The Lua tier-1 surface API (`blyt32.surface.*`) drawing the torture frame
+/// into the screen must hash to the identical golden — proving the Lua binding
+/// is pixel-exact with C/Rust across emulated-Lua (blytplay/libretro via
+/// blyt32lua.c) and host-Lua (the wasm fast path).  Lua is tier-1 only (#205).
+#[test]
+fn surface_lua_screen_torture_hashes_identically_across_legs() {
+    require_sdk();
+    let ops = gfx::torture_frame();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("surface-lua-torture");
+    CartProject::new()
+        .lua(&format!(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n{}end\n",
+            gfx::lua_surface_draw_body(&ops, "blyt32.surface.SCREEN")
+        ))
+        .write(&project);
+    let cart = build_cart(&project);
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// The Lua tier-1 surface API end-to-end: create a blank off-screen surface,
+/// draw into it, clear the screen, and blit the surface onto it.  The presented
+/// screen must hash identically across every leg and equal the reference —
+/// proving Lua `blyt32.surface.create`/draw/`blit` compose deterministically on
+/// the emulated-Lua registry (ECALL) and the host-Lua pool (wasm) alike (#205).
+#[test]
+fn surface_lua_offscreen_draw_then_blit_hashes_identically_across_legs() {
+    require_sdk();
+
+    const SW: i32 = 64;
+    const SH: i32 = 48;
+    const BX: i32 = 100;
+    const BY: i32 = 80;
+    let surf_ops = [
+        gfx::Op::Clear(5),
+        gfx::Op::Rect(10, 10, 20, 15, 9),
+        gfx::Op::Line(0, 0, 63, 47, 12),
+    ];
+    let bg = 3u8;
+
+    let mut draw = format!("  local s = blyt32.surface.create({SW}, {SH})\n");
+    draw += &gfx::lua_surface_draw_body(&surf_ops, "s");
+    draw += &format!("  blyt32.surface.clear(blyt32.surface.SCREEN, {bg})\n");
+    draw += &format!("  blyt32.surface.blit(blyt32.surface.SCREEN, s, {BX}, {BY})\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("surface-lua-offscreen");
+    CartProject::new()
+        .lua(&format!(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n{draw}end\n"
+        ))
+        .write(&project);
+    let cart = build_cart(&project);
+
+    let src = gfx::render_dims(&surf_ops, SW as usize, SH as usize);
+    let mut screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
+    gfx::blit(
+        &mut screen,
+        gfx::FRAME_W,
+        gfx::FRAME_H,
+        &src,
+        SW as usize,
+        SH as usize,
+        BX,
+        BY,
+    );
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
 /// The Rust SDK surface API (`blyt::gfx`) draws the torture frame into the
 /// screen via the tier-1 methods and must hash to the identical `common::gfx`
 /// golden every other leg produces — proving the Rust bindings are pixel-exact

@@ -97,6 +97,30 @@ pub mod gfx {
         s
     }
 
+    /// Emit a Lua draw body issuing `ops` via the tier-1 surface API
+    /// (`blyt32.surface.*(dst, …)`) targeting `dst` (e.g.
+    /// `"blyt32.surface.SCREEN"` or a handle from `blyt32.surface.create`). The
+    /// Lua counterpart of [`c_surface_draw_body`]; Lua is tier-1 only (#205), and
+    /// this must hash identically to the C/Rust legs.
+    pub fn lua_surface_draw_body(ops: &[Op], dst: &str) -> String {
+        let mut s = String::new();
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  blyt32.surface.clear({dst}, {c})\n"),
+                Op::Pixel(x, y, c) => {
+                    s += &format!("  blyt32.surface.pixel({dst}, {x}, {y}, {c})\n")
+                }
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  blyt32.surface.rect_fill({dst}, {x}, {y}, {w}, {h}, {c})\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  blyt32.surface.line({dst}, {x0}, {y0}, {x1}, {y1}, {c})\n")
+                }
+            }
+        }
+        s
+    }
+
     /// Emit a C `blyt_cart_draw` body that issues `ops` via the tier-1 surface
     /// API (`blyt_surface_*(dst, …)`) targeting `dst` (e.g. `"BLYT_SCREEN"` or a
     /// created surface handle variable). Drawing the torture frame into
