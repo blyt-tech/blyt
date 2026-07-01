@@ -38,25 +38,43 @@
  * every probe writes all pixels it cares about before reading the hash. */
 static uint8_t s_framebuffer[NATIVE_FB_W * NATIVE_FB_H];
 
-/* ── Drawing primitives (ADR-0052/0086) ─────────────────────────────────────
+/* ── Tier-1 surface ops (ADR-0052/0086/0008, #188 / #195 / #205) ─────────────
  *
  * Native entry points the cart resolves directly (no ECALL); each forwards to
- * the shared integer rasterizer over the in-process back buffer. */
+ * the shared integer rasterizer over the destination surface's buffer.  The
+ * gfx.* screen shorthand is inline sugar over these (blyt.h).  Off-screen
+ * surfaces (blyt_surface_create/destroy/blit) land here alongside the QEMU gate
+ * coverage; for now the screen (BLYT_SCREEN, slot 0) is the only destination
+ * and any other handle is a defined no-op. */
 
-void blyt_gfx_clear(uint8_t color) {
-    blyt_raster_clear(s_framebuffer, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, color);
+static uint8_t *native_resolve_screen(blyt_surface_h dst) {
+    return dst == BLYT_SCREEN ? s_framebuffer : (uint8_t *)0;
 }
 
-void blyt_gfx_pixel(int32_t x, int32_t y, uint8_t color) {
-    blyt_raster_pixel(s_framebuffer, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x, y, color);
+void blyt_surface_clear(blyt_surface_h dst, uint8_t color) {
+    uint8_t *fb = native_resolve_screen(dst);
+    if (fb)
+        blyt_raster_clear(fb, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, color);
 }
 
-void blyt_gfx_rect_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t color) {
-    blyt_raster_rect_fill(s_framebuffer, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x, y, w, h, color);
+void blyt_surface_pixel(blyt_surface_h dst, int32_t x, int32_t y, uint8_t color) {
+    uint8_t *fb = native_resolve_screen(dst);
+    if (fb)
+        blyt_raster_pixel(fb, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x, y, color);
 }
 
-void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color) {
-    blyt_raster_line(s_framebuffer, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x0, y0, x1, y1, color);
+void blyt_surface_rect_fill(blyt_surface_h dst, int32_t x, int32_t y, int32_t w, int32_t h,
+                            uint8_t color) {
+    uint8_t *fb = native_resolve_screen(dst);
+    if (fb)
+        blyt_raster_rect_fill(fb, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x, y, w, h, color);
+}
+
+void blyt_surface_line(blyt_surface_h dst, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                       uint8_t color) {
+    uint8_t *fb = native_resolve_screen(dst);
+    if (fb)
+        blyt_raster_line(fb, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x0, y0, x1, y1, color);
 }
 
 /* ── Direct framebuffer access (issue #188 / Spike X, Q1) ────────────────────

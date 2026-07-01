@@ -97,6 +97,30 @@ pub mod gfx {
         s
     }
 
+    /// Emit a C `blyt_cart_draw` body that issues `ops` via the tier-1 surface
+    /// API (`blyt_surface_*(dst, …)`) targeting `dst` (e.g. `"BLYT_SCREEN"` or a
+    /// created surface handle variable). Drawing the torture frame into
+    /// `BLYT_SCREEN` this way must hash identically to [`c_draw_body`] — the
+    /// gfx.* sugar and the surface API share one host-side rasterizer (#205).
+    pub fn c_surface_draw_body(ops: &[Op], dst: &str) -> String {
+        let mut s = String::new();
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  blyt_surface_clear({dst}, {c});\n"),
+                Op::Pixel(x, y, c) => {
+                    s += &format!("  blyt_surface_pixel({dst}, {x}, {y}, {c});\n")
+                }
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  blyt_surface_rect_fill({dst}, {x}, {y}, {w}, {h}, {c});\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  blyt_surface_line({dst}, {x0}, {y0}, {x1}, {y1}, {c});\n")
+                }
+            }
+        }
+        s
+    }
+
     /// Emit the C `blyt_cart_draw` body that issues `ops` via the gfx primitives.
     pub fn c_draw_body(ops: &[Op]) -> String {
         let mut s = String::new();

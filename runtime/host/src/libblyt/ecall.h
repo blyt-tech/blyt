@@ -106,34 +106,54 @@
  * are advisory (LRU/history-dependent) — a tuning signal, never game state. */
 #define BLYT_ECALL_MEM_RESOURCES 70
 
-/* Graphics ECALLs (100–199, ADR-0052/0086; issue #188 / Spike X).
+/* Graphics / surface ECALLs (100–199, ADR-0052/0086/0008; issue #188 / Spike X,
+ * generalized to runtime-managed surfaces in #195/#205).
  *
- * The paletted 2D drawing surface is Blyt32-specific; its primitives are
- * host-side (reached by ECALL on the emulated path) and back the runtime's
- * session->pixels[] via the shared integer rasterizer (runtime/shared/
- * blyt_raster.c).  The first handler to run sets cart_has_drawn, displacing the
- * PM5544 test card.
+ * The paletted 2D drawing surface is Blyt32-specific; its tier-1 serviced ops
+ * are host-side (reached by ECALL on the emulated path) and rasterize into a
+ * *destination surface* via the shared integer rasterizer (runtime/shared/
+ * blyt_raster.c).  Every op carries the destination surface handle in a0 (a
+ * console-wide tagged u32, blyt_handle.h); BLYT_SCREEN (0x40000000) is the
+ * built-in screen surface backed by session->pixels[].  A draw into the screen
+ * sets cart_has_drawn, displacing the PM5544 test card; draws into off-screen
+ * surfaces do not (they only reach the screen via a blit).  `gfx.*` is literal
+ * sugar over BLYT_SCREEN.
  *
  * Coordinates are signed i32 passed in the argument registers; primitives clip
- * to the 320x240 surface.
- *   GFX_CLEAR:     a0=color (palette index); fills the whole framebuffer.
- *   GFX_PIXEL:     a0=x, a1=y, a2=color.
- *   GFX_RECT_FILL: a0=x, a1=y, a2=w, a3=h, a4=color.
- *   GFX_LINE:      a0=x0, a1=y0, a2=x1, a3=y1, a4=color. */
-#define BLYT_ECALL_GFX_CLEAR 100
-#define BLYT_ECALL_GFX_PIXEL 101
-#define BLYT_ECALL_GFX_RECT_FILL 102
-#define BLYT_ECALL_GFX_LINE 103
+ * to the destination surface's bounds.  A handle that does not resolve to a live
+ * surface (wrong kind, stale generation, out of phase) is a dev error / no-op.
+ *   SURFACE_CLEAR:     a0=dst, a1=color (palette index); fills the whole surface.
+ *   SURFACE_PIXEL:     a0=dst, a1=x, a2=y, a3=color.
+ *   SURFACE_RECT_FILL: a0=dst, a1=x, a2=y, a3=w, a4=h, a5=color.
+ *   SURFACE_LINE:      a0=dst, a1=x0, a2=y0, a3=x1, a4=y1, a5=color. */
+#define BLYT_ECALL_SURFACE_CLEAR 100
+#define BLYT_ECALL_SURFACE_PIXEL 101
+#define BLYT_ECALL_SURFACE_RECT_FILL 102
+#define BLYT_ECALL_SURFACE_LINE 103
 
-/* Raw-framebuffer acquire/present (issue #188 / Spike X, Q1).  The mechanism
- * under test for direct pixel access: the runtime reserves a fixed guest region
- * the size of the paletted framebuffer (BLYT_GFX_FB_BASE in cart_run.c).
+/* Raw-framebuffer acquire/present (issue #188 / Spike X, Q1).  The fixed-region
+ * mechanism from the spike; superseded by the tier-2 surface acquire/release
+ * lock (SURFACE_ACQUIRE / SURFACE_RELEASE below) in #205 but kept here until
+ * that lands.
  *   GFX_ACQUIRE: no args; returns the guest VA of that region in a0.  The cart
  *     writes palette indices directly into it (no per-pixel ECALL).
  *   GFX_PRESENT: no args; copies the whole region into session->pixels[] and
  *     sets cart_has_drawn (displacing the test card). */
 #define BLYT_ECALL_GFX_ACQUIRE 104
 #define BLYT_ECALL_GFX_PRESENT 105
+
+/* Surface lifecycle + blit (tier-1, #205).
+ *   SURFACE_CREATE:  a0=w, a1=h; returns a surface handle in a0 (BLYT_HANDLE_NONE
+ *     on failure — invalid size or over the 16 MB budget).  Blank (index 0)
+ *     content; draw-scoped (auto-reaped at end of draw()); counts against the
+ *     unified memory budget (#158).
+ *   SURFACE_DESTROY: a0=surface; optional early free (a no-op on BLYT_SCREEN or a
+ *     stale/invalid handle).
+ *   SURFACE_BLIT:    a0=dst, a1=src, a2=x, a3=y; copies the whole src surface into
+ *     dst at (x,y), clipped to dst; index-copy (palette is global). */
+#define BLYT_ECALL_SURFACE_CREATE 106
+#define BLYT_ECALL_SURFACE_DESTROY 107
+#define BLYT_ECALL_SURFACE_BLIT 108
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1

@@ -292,35 +292,86 @@ void blyt_frame_done(void);
 void blyt_console_debug(const char *s);
 
 /* -------------------------------------------------------------------------
- * Graphics (Blyt32 variant, ADR-0052/0086; issue #188 / Spike X)
+ * Graphics — surfaces (Blyt32 variant, ADR-0052/0086/0008; #188 / #195 / #205)
  *
- * The 320x240 256-colour paletted drawing surface.  Primitives are host-side
- * (reached by ECALL on the emulated path; implemented natively in the native
- * libblyt32 variant) and write the runtime-owned back buffer.  Colours are
- * palette indices.  The first draw call of a frame displaces the boot test
- * card.
+ * A surface is a runtime-managed 256-colour paletted buffer.  BLYT_SCREEN is
+ * the built-in 320x240 screen; off-screen surfaces are created with
+ * blyt_surface_create.  The tier-1 serviced ops rasterize into a destination
+ * surface host-side (reached by ECALL on the emulated path; implemented
+ * natively in the native libblyt32 variant).  Colours are palette indices.  A
+ * draw into BLYT_SCREEN displaces the boot test card on the first call of a
+ * frame; draws into off-screen surfaces reach the screen only via a blit.
+ *
+ * Surfaces are draw-scoped: created blank inside blyt_cart_draw and auto-reaped
+ * at end of draw() (their handles then go stale); they are not saved and count
+ * against the 16 MB memory budget.  Handles are the console-wide tagged u32
+ * (blyt_handle.h); passing a handle that no longer resolves (wrong kind, stale
+ * generation) is a dev error and a defined no-op in release.
  * ------------------------------------------------------------------------- */
 
-/* Fill the entire framebuffer with one palette index. */
-void blyt_gfx_clear(uint8_t color);
+/* Console-wide tagged handles (blyt_handle.h).  Aliased to uint32_t so resource
+ * constants and surface handles pass to the surface API with no cast. */
+typedef uint32_t blyt_surface_h;
+typedef uint32_t blyt_lockview_h;
 
-/* Set one pixel at (x,y) to a palette index.  Off-screen coordinates are
- * silently clipped (ADR-0048: no clip rect / camera). */
-void blyt_gfx_pixel(int32_t x, int32_t y, uint8_t color);
+/* The built-in screen surface (SURFACE kind, slot 0, gen 0).  A reserved
+ * constant — must equal runtime/shared/blyt_handle.h's BLYT_SCREEN (pinned there
+ * by _Static_assert).  Guarded so a guest lib that also includes the canonical
+ * blyt_handle.h (native path) gets a single, non-clashing definition. */
+#ifndef BLYT_SCREEN
+#define BLYT_SCREEN ((blyt_surface_h)0x40000000u)
+#endif
+
+/* Create a blank (index 0) off-screen surface of w x h.  Draw-scoped: valid
+ * only for the rest of the current draw().  Returns BLYT_HANDLE_NONE (0) on
+ * invalid size or when it would exceed the memory budget. */
+blyt_surface_h blyt_surface_create(int32_t w, int32_t h);
+
+/* Optionally free a surface early (a no-op on BLYT_SCREEN or a stale handle);
+ * otherwise surfaces are reaped automatically at the end of draw(). */
+void blyt_surface_destroy(blyt_surface_h surface);
+
+/* Fill the entire destination surface with one palette index. */
+void blyt_surface_clear(blyt_surface_h dst, uint8_t color);
+
+/* Set one pixel at (x,y).  Off-surface coordinates are silently clipped
+ * (ADR-0048: no clip rect / camera). */
+void blyt_surface_pixel(blyt_surface_h dst, int32_t x, int32_t y, uint8_t color);
 
 /* Fill a w x h rectangle with top-left at (x,y); top/left inclusive,
- * bottom/right exclusive.  Clipped to the framebuffer. */
-void blyt_gfx_rect_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t color);
+ * bottom/right exclusive.  Clipped to the surface. */
+void blyt_surface_rect_fill(blyt_surface_h dst, int32_t x, int32_t y, int32_t w, int32_t h,
+                            uint8_t color);
 
 /* Draw a line between (x0,y0) and (x1,y1) inclusive (integer Bresenham). */
-void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color);
+void blyt_surface_line(blyt_surface_h dst, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                       uint8_t color);
 
-/* Direct framebuffer access (issue #188 / Spike X, Q1).  blyt_gfx_acquire()
- * returns a pointer to the 320x240 paletted back buffer (one byte per pixel,
- * row-major); the cart may write palette indices straight into it without a
- * per-pixel ECALL.  blyt_gfx_present() flushes those writes to the runtime
- * framebuffer and displaces the boot test card.  The pointer is valid for the
- * lifetime of the cart; present after each batch of direct writes. */
+/* Copy the whole src surface into dst at (x,y), clipped to dst (index copy —
+ * the palette is global).  src may be BLYT_SCREEN or a created surface. */
+void blyt_surface_blit(blyt_surface_h dst, blyt_surface_h src, int32_t x, int32_t y);
+
+/* gfx.* — literal sugar over BLYT_SCREEN (ADR-0046 canvas-is-receiver, #205).
+ * The screen-targeting shorthand; not a parallel path — the same host-side
+ * rasterizer, so they cannot drift from the surface API. */
+static inline void blyt_gfx_clear(uint8_t color) {
+    blyt_surface_clear(BLYT_SCREEN, color);
+}
+static inline void blyt_gfx_pixel(int32_t x, int32_t y, uint8_t color) {
+    blyt_surface_pixel(BLYT_SCREEN, x, y, color);
+}
+static inline void blyt_gfx_rect_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t color) {
+    blyt_surface_rect_fill(BLYT_SCREEN, x, y, w, h, color);
+}
+static inline void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color) {
+    blyt_surface_line(BLYT_SCREEN, x0, y0, x1, y1, color);
+}
+
+/* Direct framebuffer access (issue #188 / Spike X, Q1) — the fixed-region raw
+ * path; superseded by the tier-2 surface lock (blyt_surface_acquire, #205) but
+ * kept until that lands.  blyt_gfx_acquire() returns a pointer to the 320x240
+ * paletted back buffer; blyt_gfx_present() flushes those writes and displaces
+ * the boot test card. */
 uint8_t *blyt_gfx_acquire(void);
 void blyt_gfx_present(void);
 

@@ -167,6 +167,32 @@ typedef struct {
 #endif
 
 /* -------------------------------------------------------------------------
+ * Surface registry (#195/#205) — runtime-managed paletted buffers.
+ *
+ * Slot 0 is always BLYT_SCREEN (session->pixels[], never reaped or
+ * budget-counted); slots 1.. are off-screen surfaces created within draw() and
+ * auto-reaped at the frame boundary.  A surface handle (blyt_handle.h) is
+ * kind SURFACE | gen | index; a resolver rejects a wrong kind or a stale
+ * generation.  The canonical buffer is the single source of truth for coherence
+ * across the emulated / host-Lua / native execution models (decision 1).
+ * ------------------------------------------------------------------------- */
+
+#define BLYT_SURFACE_MAX 64 /* registry slots incl. slot 0 = screen */
+
+typedef struct {
+    uint8_t *pixels; /* canonical buffer; slot 0 aliases session->pixels */
+    int32_t w, h; /* dimensions; stride == w (tightly packed) */
+    uint16_t gen; /* surface generation — bumped on reap/destroy */
+    bool in_use;
+    bool is_screen; /* slot 0: draws flip cart_has_drawn; never freed/reaped */
+    bool owned; /* pixels was malloc'd by the runtime (off-screen surfaces) */
+} blyt_surface_slot_t;
+
+typedef struct {
+    blyt_surface_slot_t slots[BLYT_SURFACE_MAX];
+} blyt_surface_registry_t;
+
+/* -------------------------------------------------------------------------
  * ECALL handler context
  * ------------------------------------------------------------------------- */
 
@@ -215,6 +241,9 @@ typedef struct {
      * handle.  Mirrors the state_ctx "pointer into the owning session" idiom. */
     uint8_t *fb; /* = session->pixels */
     bool *cart_has_drawn; /* = &session->cart_has_drawn */
+    /* Surface registry (#205): slot 0 = screen (aliases fb), slots 1.. are
+     * off-screen surfaces.  Draw-scoped — reaped at each frame boundary. */
+    blyt_surface_registry_t surfaces;
     /* Guest vaddr of libblytc's exported blyt_mem_acct (blyt_mem_accounting_t),
      * resolved at cart load (#158). field 0 = guest_heap_used (guest-written,
      * host-read); field 4 = non_evictable_footprint (host-written, guest-read).
@@ -1351,6 +1380,24 @@ static blyt_resource_entry_t *blyt_resolve_resource(blyt_resource_table_t *t, ui
     return blyt_resource_table_find_mut(t, blyt_resource_decode_id(handle));
 }
 
+/* Resolve a surface handle to its live registry slot, mirroring the
+ * resolve-at-entry pattern (#196): classify the tagged u32, then validate the
+ * slot index and generation.  Returns NULL for a non-surface kind, an
+ * out-of-range or free slot, or a stale generation (use-after-reap/destroy) —
+ * every gfx entry point classifies its handle this way, so a lock-view token or
+ * a resource constant can never reach a surface buffer (#205). */
+static blyt_surface_slot_t *blyt_resolve_surface(blyt_surface_registry_t *reg, uint32_t handle) {
+    if (!blyt_handle_is_surface(handle))
+        return NULL;
+    uint32_t idx = blyt_dyn_decode_index(handle);
+    if (idx >= BLYT_SURFACE_MAX)
+        return NULL;
+    blyt_surface_slot_t *s = &reg->slots[idx];
+    if (!s->in_use || (uint16_t)blyt_dyn_decode_gen(handle) != s->gen)
+        return NULL;
+    return s;
+}
+
 static void blyt_ecall_handler(riscv_t *rv) {
     uint32_t num = rv_get_reg(rv, rv_reg_a7);
 
@@ -1397,68 +1444,77 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 
-    /* Graphics primitives (ADR-0052/0086, issue #188 / Spike X).  Host-side
-     * rasterization into session->pixels[] via the shared integer core; the
-     * first such call flips cart_has_drawn so the runtime stops compositing the
-     * PM5544 test card. */
-    case BLYT_ECALL_GFX_CLEAR: {
-        uint32_t color = rv_get_reg(rv, rv_reg_a0);
-        blyt_tracef(BLYT_TRACE_API, "gfx_clear(color=%u)", color);
-        if (g_run_ctx && g_run_ctx->fb) {
-            blyt_raster_clear(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
-                              (uint8_t)color);
-            if (g_run_ctx->cart_has_drawn)
+    /* Tier-1 surface ops (ADR-0052/0086/0008, #188 / #195 / #205).  Host-side
+     * rasterization into the destination surface's canonical buffer via the
+     * shared integer core; a0 carries the destination surface handle.  A draw
+     * into BLYT_SCREEN flips cart_has_drawn (displacing the PM5544 test card);
+     * off-screen surface draws do not.  An unresolvable handle (wrong kind /
+     * stale generation) is a defined no-op. */
+    case BLYT_ECALL_SURFACE_CLEAR: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        uint32_t color = rv_get_reg(rv, rv_reg_a1);
+        blyt_tracef(BLYT_TRACE_API, "surface_clear(dst=0x%08x, color=%u)", dst, color);
+        blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (s) {
+            blyt_raster_clear(s->pixels, s->w, s->w, s->h, (uint8_t)color);
+            if (s->is_screen && g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
         rv->PC += 4;
         return;
     }
 
-    case BLYT_ECALL_GFX_PIXEL: {
-        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a0);
-        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a1);
-        uint32_t color = rv_get_reg(rv, rv_reg_a2);
-        blyt_tracef(BLYT_TRACE_API, "gfx_pixel(x=%d, y=%d, color=%u)", x, y, color);
-        if (g_run_ctx && g_run_ctx->fb) {
-            blyt_raster_pixel(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x, y,
-                              (uint8_t)color);
-            if (g_run_ctx->cart_has_drawn)
-                *g_run_ctx->cart_has_drawn = true;
-        }
-        rv->PC += 4;
-        return;
-    }
-
-    case BLYT_ECALL_GFX_RECT_FILL: {
-        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a0);
-        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a1);
-        int32_t w = (int32_t)rv_get_reg(rv, rv_reg_a2);
-        int32_t h = (int32_t)rv_get_reg(rv, rv_reg_a3);
-        uint32_t color = rv_get_reg(rv, rv_reg_a4);
-        blyt_tracef(BLYT_TRACE_API, "gfx_rect_fill(x=%d, y=%d, w=%d, h=%d, color=%u)", x, y, w, h,
+    case BLYT_ECALL_SURFACE_PIXEL: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        uint32_t color = rv_get_reg(rv, rv_reg_a3);
+        blyt_tracef(BLYT_TRACE_API, "surface_pixel(dst=0x%08x, x=%d, y=%d, color=%u)", dst, x, y,
                     color);
-        if (g_run_ctx && g_run_ctx->fb) {
-            blyt_raster_rect_fill(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x, y, w,
-                                  h, (uint8_t)color);
-            if (g_run_ctx->cart_has_drawn)
+        blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (s) {
+            blyt_raster_pixel(s->pixels, s->w, s->w, s->h, x, y, (uint8_t)color);
+            if (s->is_screen && g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
         rv->PC += 4;
         return;
     }
 
-    case BLYT_ECALL_GFX_LINE: {
-        int32_t x0 = (int32_t)rv_get_reg(rv, rv_reg_a0);
-        int32_t y0 = (int32_t)rv_get_reg(rv, rv_reg_a1);
-        int32_t x1 = (int32_t)rv_get_reg(rv, rv_reg_a2);
-        int32_t y1 = (int32_t)rv_get_reg(rv, rv_reg_a3);
-        uint32_t color = rv_get_reg(rv, rv_reg_a4);
-        blyt_tracef(BLYT_TRACE_API, "gfx_line(x0=%d, y0=%d, x1=%d, y1=%d, color=%u)", x0, y0, x1,
-                    y1, color);
-        if (g_run_ctx && g_run_ctx->fb) {
-            blyt_raster_line(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x0, y0, x1,
-                             y1, (uint8_t)color);
-            if (g_run_ctx->cart_has_drawn)
+    case BLYT_ECALL_SURFACE_RECT_FILL: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        int32_t w = (int32_t)rv_get_reg(rv, rv_reg_a3);
+        int32_t h = (int32_t)rv_get_reg(rv, rv_reg_a4);
+        uint32_t color = rv_get_reg(rv, rv_reg_a5);
+        blyt_tracef(BLYT_TRACE_API,
+                    "surface_rect_fill(dst=0x%08x, x=%d, y=%d, w=%d, h=%d, color=%u)", dst, x, y, w,
+                    h, color);
+        blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (s) {
+            blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, x, y, w, h, (uint8_t)color);
+            if (s->is_screen && g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SURFACE_LINE: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        int32_t x0 = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        int32_t y0 = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        int32_t x1 = (int32_t)rv_get_reg(rv, rv_reg_a3);
+        int32_t y1 = (int32_t)rv_get_reg(rv, rv_reg_a4);
+        uint32_t color = rv_get_reg(rv, rv_reg_a5);
+        blyt_tracef(BLYT_TRACE_API,
+                    "surface_line(dst=0x%08x, x0=%d, y0=%d, x1=%d, y1=%d, color=%u)", dst, x0, y0,
+                    x1, y1, color);
+        blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (s) {
+            blyt_raster_line(s->pixels, s->w, s->w, s->h, x0, y0, x1, y1, (uint8_t)color);
+            if (s->is_screen && g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
         rv->PC += 4;
@@ -3166,6 +3222,21 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
      * The session address is stable across hot swaps, so this is set once. */
     s->ctx.fb = s->pixels;
     s->ctx.cart_has_drawn = &s->cart_has_drawn;
+
+    /* Surface registry (#205): slot 0 is BLYT_SCREEN, aliasing the session's
+     * paletted framebuffer — never reaped, destroyed, or budget-counted.  Its
+     * generation stays 0 so the reserved BLYT_SCREEN handle (0x40000000) always
+     * resolves.  Off-screen surfaces occupy slots 1.. and are reaped each frame. */
+    memset(&s->ctx.surfaces, 0, sizeof(s->ctx.surfaces));
+    s->ctx.surfaces.slots[0] = (blyt_surface_slot_t){
+        .pixels = s->pixels,
+        .w = BLYT_FRAME_W,
+        .h = BLYT_FRAME_H,
+        .gen = 0,
+        .in_use = true,
+        .is_screen = true,
+        .owned = false,
+    };
 
     /* Resolve save directory: BLYT_SAVE_DIR env var or ~/.local/share/blyt */
     {
