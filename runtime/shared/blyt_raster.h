@@ -43,3 +43,11 @@ void blyt_raster_rect_fill(uint8_t *fb, int stride, int width, int height, int x
  * Bresenham, clipped per-pixel to the framebuffer. */
 void blyt_raster_line(uint8_t *fb, int stride, int width, int height, int x0, int y0, int x1,
                       int y1, uint8_t color);
+
+/* Copy the swidth x sheight src buffer into dst with its top-left at (x,y),
+ * clipped to dst's [0,dwidth) x [0,dheight) bounds.  Plain palette-index copy
+ * (the palette is global); no transparency.  No-op on NULL buffers or when the
+ * clipped destination window is empty.  Coordinates may be negative / off-screen
+ * (clipped with 64-bit intermediates). */
+void blyt_raster_blit(uint8_t *dst, int dstride, int dwidth, int dheight, const uint8_t *src,
+                      int sstride, int swidth, int sheight, int x, int y);

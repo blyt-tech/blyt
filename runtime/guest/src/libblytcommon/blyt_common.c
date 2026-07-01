@@ -17,6 +17,8 @@
 
 #include "blyt.h"
 
+#include "blyt_phase.h" /* runtime/shared: lifecycle phase signal (#205) */
+
 /* -------------------------------------------------------------------------
  * blyt_quit — set the quit flag; blyt_main exits its loop next tick
  * ------------------------------------------------------------------------- */
@@ -97,13 +99,21 @@ __attribute__((weak)) void blyt_cart_on_assets_reloaded(const uint32_t *ids, siz
 void blyt_main(void) {
     g_quit_requested = 0;
 
+    /* Phase signal (#205): tell the runtime which lifecycle callback is running
+     * so it can make all surface access draw()-only.  Two per frame — the phase
+     * stays put until the next enter, so update() runs at UPDATE and everything
+     * up to the next update (draw, frame_done) at DRAW.  init/on_new_state run
+     * at INIT.  Only DRAW permits surface ops. */
+    blyt_phase_enter(BLYT_PHASE_INIT);
     blyt_cart_init();
     blyt_cart_on_new_state();
 
     while (!g_quit_requested) {
         /* blyt_frame_done() fires ECALL 2 after draw; the host handles it
          * (SDL events, frame-rate cap, etc.) then resumes the emulator. */
+        blyt_phase_enter(BLYT_PHASE_UPDATE);
         blyt_cart_update();
+        blyt_phase_enter(BLYT_PHASE_DRAW);
         blyt_cart_draw();
         blyt_frame_done();
     }

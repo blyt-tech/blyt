@@ -97,6 +97,100 @@ pub mod gfx {
         s
     }
 
+    /// Emit a Lua draw body issuing `ops` via the tier-1 surface API
+    /// (`blyt32.surface.*(dst, …)`) targeting `dst` (e.g.
+    /// `"blyt32.surface.SCREEN"` or a handle from `blyt32.surface.create`). The
+    /// Lua counterpart of [`c_surface_draw_body`]; Lua is tier-1 only (#205), and
+    /// this must hash identically to the C/Rust legs.
+    pub fn lua_surface_draw_body(ops: &[Op], dst: &str) -> String {
+        let mut s = String::new();
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  blyt32.surface.clear({dst}, {c})\n"),
+                Op::Pixel(x, y, c) => {
+                    s += &format!("  blyt32.surface.pixel({dst}, {x}, {y}, {c})\n")
+                }
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  blyt32.surface.rect_fill({dst}, {x}, {y}, {w}, {h}, {c})\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  blyt32.surface.line({dst}, {x0}, {y0}, {x1}, {y1}, {c})\n")
+                }
+            }
+        }
+        s
+    }
+
+    /// Emit a C `blyt_cart_draw` body that issues `ops` via the tier-1 surface
+    /// API (`blyt_surface_*(dst, …)`) targeting `dst` (e.g. `"BLYT_SCREEN"` or a
+    /// created surface handle variable). Drawing the torture frame into
+    /// `BLYT_SCREEN` this way must hash identically to [`c_draw_body`] — the
+    /// gfx.* sugar and the surface API share one host-side rasterizer (#205).
+    pub fn c_surface_draw_body(ops: &[Op], dst: &str) -> String {
+        let mut s = String::new();
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  blyt_surface_clear({dst}, {c});\n"),
+                Op::Pixel(x, y, c) => {
+                    s += &format!("  blyt_surface_pixel({dst}, {x}, {y}, {c});\n")
+                }
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  blyt_surface_rect_fill({dst}, {x}, {y}, {w}, {h}, {c});\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  blyt_surface_line({dst}, {x0}, {y0}, {x1}, {y1}, {c});\n")
+                }
+            }
+        }
+        s
+    }
+
+    /// Emit a C draw body that issues `ops` under a tier-2 lock on `surface`:
+    /// acquire, draw with the freestanding `blyt_raster_*` primitives on the
+    /// locked buffer (guest-side, no ECALL), then release.  Drawing the same
+    /// frame this way must hash identically to the tier-1 path — the tier-1 ≡
+    /// tier-2 guarantee (#205), since both call the same rasterizer source.
+    /// `lk` is the emitted `blyt_lock_t` variable name.
+    pub fn c_lock_draw_body(ops: &[Op], surface: &str, lk: &str) -> String {
+        let mut s = format!("  blyt_lock_t {lk};\n  blyt_surface_acquire({surface}, &{lk});\n");
+        let b = format!("{lk}.pixels, {lk}.stride, {lk}.w, {lk}.h");
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  blyt_raster_clear({b}, {c});\n"),
+                Op::Pixel(x, y, c) => s += &format!("  blyt_raster_pixel({b}, {x}, {y}, {c});\n"),
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  blyt_raster_rect_fill({b}, {x}, {y}, {w}, {h}, {c});\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  blyt_raster_line({b}, {x0}, {y0}, {x1}, {y1}, {c});\n")
+                }
+            }
+        }
+        s += &format!("  blyt_surface_release(&{lk});\n");
+        s
+    }
+
+    /// Emit a Rust `blyt_cart_draw` body issuing `ops` via the tier-1 surface API
+    /// (`blyt::gfx`) on `dst` (e.g. `"blyt::gfx::SCREEN"`). The Rust-cart
+    /// counterpart of [`c_surface_draw_body`]; drawing the torture frame into the
+    /// screen this way must hash to the same golden as every other leg (#205).
+    pub fn rust_surface_draw_body(ops: &[Op], dst: &str) -> String {
+        let mut s = String::new();
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("    {dst}.clear({c});\n"),
+                Op::Pixel(x, y, c) => s += &format!("    {dst}.pixel({x}, {y}, {c});\n"),
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("    {dst}.rect_fill({x}, {y}, {w}, {h}, {c});\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("    {dst}.line({x0}, {y0}, {x1}, {y1}, {c});\n")
+                }
+            }
+        }
+        s
+    }
+
     /// Emit the C `blyt_cart_draw` body that issues `ops` via the gfx primitives.
     pub fn c_draw_body(ops: &[Op]) -> String {
         let mut s = String::new();
@@ -166,6 +260,84 @@ pub mod gfx {
             }
         }
         fb
+    }
+
+    /// Render `ops` into a paletted buffer of arbitrary `w` x `h` — the
+    /// off-screen-surface counterpart of [`render`] (which is the 320x240
+    /// screen).  Mirrors blyt_raster.c with the surface's own bounds/stride.
+    pub fn render_dims(ops: &[Op], w: usize, h: usize) -> Vec<u8> {
+        let mut fb = vec![0u8; w * h];
+        let put = |fb: &mut [u8], x: i32, y: i32, c: u8| {
+            if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
+                fb[y as usize * w + x as usize] = c;
+            }
+        };
+        for op in ops {
+            match *op {
+                Op::Clear(c) => fb.iter_mut().for_each(|p| *p = c),
+                Op::Pixel(x, y, c) => put(&mut fb, x, y, c),
+                Op::Rect(x, y, rw, rh, c) => {
+                    if rw > 0 && rh > 0 {
+                        let x0 = x.max(0) as i64;
+                        let y0 = y.max(0) as i64;
+                        let x1 = (x as i64 + rw as i64).min(w as i64);
+                        let y1 = (y as i64 + rh as i64).min(h as i64);
+                        for yy in y0..y1 {
+                            for xx in x0..x1 {
+                                put(&mut fb, xx as i32, yy as i32, c);
+                            }
+                        }
+                    }
+                }
+                Op::Line(mut x0, mut y0, x1, y1, c) => {
+                    let dx = (x1 - x0).abs();
+                    let dy = (y1 - y0).abs();
+                    let sx = if x0 < x1 { 1 } else { -1 };
+                    let sy = if y0 < y1 { 1 } else { -1 };
+                    let mut err = dx - dy;
+                    loop {
+                        put(&mut fb, x0, y0, c);
+                        if x0 == x1 && y0 == y1 {
+                            break;
+                        }
+                        let e2 = 2 * err;
+                        if e2 > -dy {
+                            err -= dy;
+                            x0 += sx;
+                        }
+                        if e2 < dx {
+                            err += dx;
+                            y0 += sy;
+                        }
+                    }
+                }
+            }
+        }
+        fb
+    }
+
+    /// Copy `src` (sw x sh) into `dst` (dw x dh) with top-left at (x,y), clipped
+    /// to dst — the reference for blyt_raster_blit / blyt_surface_blit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit(
+        dst: &mut [u8],
+        dw: usize,
+        dh: usize,
+        src: &[u8],
+        sw: usize,
+        sh: usize,
+        x: i32,
+        y: i32,
+    ) {
+        for sy in 0..sh as i32 {
+            for sx in 0..sw as i32 {
+                let dx = x + sx;
+                let dy = y + sy;
+                if dx >= 0 && (dx as usize) < dw && dy >= 0 && (dy as usize) < dh {
+                    dst[dy as usize * dw + dx as usize] = src[sy as usize * sw + sx as usize];
+                }
+            }
+        }
     }
 
     /// FNV-1a 64, matching runtime/shared/blyt_frame_hash.c.

@@ -23,7 +23,10 @@
 
 #include "blyt.h"
 #include "blyt_frame_hash.h" /* runtime/shared: FNV-1a 64 over the paletted fb */
+#include "blyt_handle.h" /* runtime/shared: SURFACE/LOCKVIEW encode/classify (#196/#205) */
+#include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (#158) */
 #include "blyt_native_trace.h" /* getenv + raw-write helpers (no libc stdio) */
+#include "blyt_phase.h" /* runtime/shared: draw()-only phase (#205) */
 #include "blyt_raster.h" /* runtime/shared: integer rasterizer core */
 
 /* The paletted surface geometry.  Matches the host's BLYT_FRAME_W/H
@@ -38,25 +41,205 @@
  * every probe writes all pixels it cares about before reading the hash. */
 static uint8_t s_framebuffer[NATIVE_FB_W * NATIVE_FB_H];
 
-/* ── Drawing primitives (ADR-0052/0086) ─────────────────────────────────────
+/* ── Surface registry (ADR-0052/0086/0008, #188 / #195 / #205) ───────────────
  *
- * Native entry points the cart resolves directly (no ECALL); each forwards to
- * the shared integer rasterizer over the in-process back buffer. */
+ * On bare metal the guest library *is* the runtime, so surfaces are a
+ * process-local pool (no ECALL, no host registry).  Slot 0 is BLYT_SCREEN,
+ * aliasing s_framebuffer; slots 1.. are off-screen surfaces carved from a
+ * static bump arena.  The pool mirrors the host registry in cart_run.c but is
+ * simpler: a tier-2 lock hands back the canonical buffer pointer *directly*
+ * (same address space — no copy-in/out), so in-lock drawing writes the surface
+ * in place.  Surfaces are draw-scoped: reaped at each frame boundary
+ * (blyt_gfx_reap_surfaces, called from the native blyt_frame_done).
+ *
+ * The arena is sized to the unified 16 MB budget so a create that would overflow
+ * it returns BLYT_HANDLE_NONE — the bare-metal analogue of the host's budget
+ * rejection (the emulated legs assert the exact number; here parity is the
+ * NONE-on-overflow behaviour, not shared heap accounting).  BSS zero-fill gives
+ * an empty pool with no constructor (none run on this path, #43); the pool is
+ * lazily initialised on first use. */
 
-void blyt_gfx_clear(uint8_t color) {
-    blyt_raster_clear(s_framebuffer, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, color);
+#define NATIVE_SURFACE_MAX 64 /* slots incl. slot 0 = screen */
+#define NATIVE_SURFACE_MAX_DIM 8192 /* overflow guard; the budget is the real cap */
+
+typedef struct {
+    uint8_t *pixels; /* slot 0 -> s_framebuffer; off-screen -> into the arena */
+    int32_t w, h;
+    uint16_t gen; /* bumped on reap/destroy — a stale surface handle goes stale */
+    uint8_t in_use;
+    uint8_t is_screen;
+    uint8_t locked;
+    uint16_t lock_gen; /* bumped on release — a released lock token goes stale */
+} native_surface_t;
+
+static native_surface_t s_surfaces[NATIVE_SURFACE_MAX];
+static uint8_t s_surface_arena[BLYT_MEM_BUDGET_BYTES]; /* off-screen bump arena */
+static uint32_t s_surface_bump;
+static uint8_t s_surfaces_init;
+
+static void native_surfaces_init(void) {
+    if (s_surfaces_init)
+        return;
+    s_surfaces[0].pixels = s_framebuffer;
+    s_surfaces[0].w = NATIVE_FB_W;
+    s_surfaces[0].h = NATIVE_FB_H;
+    s_surfaces[0].in_use = 1;
+    s_surfaces[0].is_screen = 1;
+    s_surfaces_init = 1;
 }
 
-void blyt_gfx_pixel(int32_t x, int32_t y, uint8_t color) {
-    blyt_raster_pixel(s_framebuffer, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x, y, color);
+/* Resolve a surface handle to its slot, enforcing draw()-only access (#205):
+ * outside draw() this returns NULL, so every access op no-ops on the release
+ * bare-metal build — matching the host gate's release semantics.  A wrong kind
+ * or stale generation also returns NULL. */
+static native_surface_t *native_resolve_surface(blyt_surface_h h) {
+    native_surfaces_init();
+    if (blyt_phase_current() != BLYT_PHASE_DRAW)
+        return (native_surface_t *)0;
+    if (!blyt_handle_is_surface(h))
+        return (native_surface_t *)0;
+    uint32_t idx = blyt_dyn_decode_index(h);
+    if (idx >= NATIVE_SURFACE_MAX)
+        return (native_surface_t *)0;
+    native_surface_t *s = &s_surfaces[idx];
+    if (!s->in_use || (uint16_t)blyt_dyn_decode_gen(h) != s->gen)
+        return (native_surface_t *)0;
+    return s;
 }
 
-void blyt_gfx_rect_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t color) {
-    blyt_raster_rect_fill(s_framebuffer, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x, y, w, h, color);
+blyt_surface_h blyt_surface_create(int32_t w, int32_t h) {
+    native_surfaces_init();
+    if (blyt_phase_current() != BLYT_PHASE_DRAW)
+        return BLYT_HANDLE_NONE;
+    if (w <= 0 || h <= 0 || w > NATIVE_SURFACE_MAX_DIM || h > NATIVE_SURFACE_MAX_DIM)
+        return BLYT_HANDLE_NONE;
+    uint32_t bytes = (uint32_t)w * (uint32_t)h;
+    if ((uint64_t)s_surface_bump + bytes > sizeof(s_surface_arena))
+        return BLYT_HANDLE_NONE; /* over budget */
+    uint32_t idx = 0;
+    for (uint32_t i = 1; i < NATIVE_SURFACE_MAX; i++) {
+        if (!s_surfaces[i].in_use) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == 0) /* registry full */
+        return BLYT_HANDLE_NONE;
+    uint8_t *buf = &s_surface_arena[s_surface_bump];
+    s_surface_bump += bytes;
+    blyt_raster_clear(buf, w, w, h, 0); /* blank = palette index 0 */
+    native_surface_t *s = &s_surfaces[idx];
+    s->pixels = buf;
+    s->w = w;
+    s->h = h;
+    s->in_use = 1;
+    s->is_screen = 0;
+    return blyt_surface_encode(s->gen, idx);
 }
 
-void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color) {
-    blyt_raster_line(s_framebuffer, NATIVE_FB_W, NATIVE_FB_W, NATIVE_FB_H, x0, y0, x1, y1, color);
+void blyt_surface_destroy(blyt_surface_h surface) {
+    native_surface_t *s = native_resolve_surface(surface);
+    if (s && !s->is_screen) {
+        s->in_use = 0;
+        s->gen++; /* invalidate outstanding handles */
+    }
+}
+
+void blyt_surface_clear(blyt_surface_h dst, uint8_t color) {
+    native_surface_t *s = native_resolve_surface(dst);
+    if (s)
+        blyt_raster_clear(s->pixels, s->w, s->w, s->h, color);
+}
+
+void blyt_surface_pixel(blyt_surface_h dst, int32_t x, int32_t y, uint8_t color) {
+    native_surface_t *s = native_resolve_surface(dst);
+    if (s)
+        blyt_raster_pixel(s->pixels, s->w, s->w, s->h, x, y, color);
+}
+
+void blyt_surface_rect_fill(blyt_surface_h dst, int32_t x, int32_t y, int32_t w, int32_t h,
+                            uint8_t color) {
+    native_surface_t *s = native_resolve_surface(dst);
+    if (s)
+        blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, x, y, w, h, color);
+}
+
+void blyt_surface_line(blyt_surface_h dst, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                       uint8_t color) {
+    native_surface_t *s = native_resolve_surface(dst);
+    if (s)
+        blyt_raster_line(s->pixels, s->w, s->w, s->h, x0, y0, x1, y1, color);
+}
+
+void blyt_surface_blit(blyt_surface_h dst, blyt_surface_h src, int32_t x, int32_t y) {
+    native_surface_t *d = native_resolve_surface(dst);
+    native_surface_t *s = native_resolve_surface(src);
+    if (d && s)
+        blyt_raster_blit(d->pixels, d->w, d->w, d->h, s->pixels, s->w, s->w, s->h, x, y);
+}
+
+int32_t blyt_surface_acquire(blyt_surface_h surface, blyt_lock_t *out) {
+    native_surface_t *s = native_resolve_surface(surface);
+    if (!s || s->locked) {
+        if (out) {
+            out->pixels = (uint8_t *)0;
+            out->stride = 0;
+            out->w = 0;
+            out->h = 0;
+            out->token = BLYT_HANDLE_NONE;
+        }
+        return 0;
+    }
+    s->locked = 1;
+    /* Direct canonical pointer: bare metal shares one address space, so in-lock
+     * drawing writes the surface buffer in place (no materialization copy). */
+    out->pixels = s->pixels;
+    out->stride = s->w;
+    out->w = s->w;
+    out->h = s->h;
+    out->token = blyt_lockview_encode(s->lock_gen, blyt_dyn_decode_index(surface));
+    return 1;
+}
+
+void blyt_surface_release(blyt_lock_t *lock) {
+    if (!lock)
+        return;
+    uint32_t token = lock->token;
+    if (!blyt_handle_is_lockview(token))
+        return;
+    uint32_t idx = blyt_dyn_decode_index(token);
+    if (idx >= NATIVE_SURFACE_MAX)
+        return;
+    native_surface_t *s = &s_surfaces[idx];
+    if (!s->locked || (uint16_t)blyt_dyn_decode_gen(token) != s->lock_gen)
+        return; /* stale or foreign token */
+    s->locked = 0;
+    s->lock_gen++; /* the token is now stale */
+    /* Nothing to flush: the lock exposed the canonical buffer directly. */
+}
+
+/* Reap off-screen surfaces at the frame boundary (draw-scoped, #205): free the
+ * arena, drop every off-screen slot, and force-release any lock the cart left
+ * held.  Called from the native blyt_frame_done via a weak reference (like
+ * blyt_gfx_on_frame_boundary), so libblytcommon stays graphics-agnostic. */
+void blyt_gfx_reap_surfaces(void) {
+    native_surfaces_init();
+    for (uint32_t i = 1; i < NATIVE_SURFACE_MAX; i++) {
+        native_surface_t *s = &s_surfaces[i];
+        if (s->locked) {
+            s->locked = 0;
+            s->lock_gen++;
+        }
+        if (s->in_use) {
+            s->in_use = 0;
+            s->gen++;
+        }
+    }
+    if (s_surfaces[0].locked) { /* screen: force-release, never freed */
+        s_surfaces[0].locked = 0;
+        s_surfaces[0].lock_gen++;
+    }
+    s_surface_bump = 0;
 }
 
 /* ── Direct framebuffer access (issue #188 / Spike X, Q1) ────────────────────

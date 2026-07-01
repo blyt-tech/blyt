@@ -21,12 +21,17 @@
 #define ECALL_SAVE_WRITE 11
 #define ECALL_SAVE_READ 12
 #define ECALL_BUF_OP 50
-#define ECALL_GFX_CLEAR 100
-#define ECALL_GFX_PIXEL 101
-#define ECALL_GFX_RECT_FILL 102
-#define ECALL_GFX_LINE 103
+#define ECALL_SURFACE_CLEAR 100
+#define ECALL_SURFACE_PIXEL 101
+#define ECALL_SURFACE_RECT_FILL 102
+#define ECALL_SURFACE_LINE 103
 #define ECALL_GFX_ACQUIRE 104
 #define ECALL_GFX_PRESENT 105
+#define ECALL_SURFACE_CREATE 106
+#define ECALL_SURFACE_DESTROY 107
+#define ECALL_SURFACE_BLIT 108
+#define ECALL_SURFACE_ACQUIRE 109
+#define ECALL_SURFACE_RELEASE 110
 
 /* BUF_OP sub-opcodes */
 #define BUF_OP_GET_F32 1
@@ -94,46 +99,84 @@
  * variant-agnostic, not part of the libblyt32 transport surface. */
 
 /* -------------------------------------------------------------------------
- * Graphics primitives (ADR-0052/0086, issue #188 / Spike X)
+ * Graphics — surface tier-1 primitives (ADR-0052/0086/0008, #188 / #195 / #205)
  *
- * The paletted 2D surface is Blyt32-specific, so its ECALL stubs live here.
- * On the emulated path the host services the ecall and rasterizes into
- * session->pixels[]; the native variant (frontends/native/src/libblyt32)
- * implements the same entry points against the shared rasterizer directly.
+ * The paletted 2D surface model is Blyt32-specific, so its ECALL stubs live
+ * here.  Every op carries the destination surface handle in a0.  On the emulated
+ * path the host services the ecall and rasterizes into the resolved surface's
+ * buffer (BLYT_SCREEN -> session->pixels[]); the native variant
+ * (frontends/native/src/libblyt32) implements the same entry points against the
+ * shared rasterizer directly.  The gfx.* screen shorthand is inline sugar over
+ * these (blyt.h), so there is no second code path to drift.
  * ------------------------------------------------------------------------- */
 
-void blyt_gfx_clear(uint8_t color) {
-    register long a0 __asm__("a0") = (long)color;
-    register long a7 __asm__("a7") = ECALL_GFX_CLEAR;
+blyt_surface_h blyt_surface_create(int32_t w, int32_t h) {
+    register long a0 __asm__("a0") = (long)w;
+    register long a1 __asm__("a1") = (long)h;
+    register long a7 __asm__("a7") = ECALL_SURFACE_CREATE;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    return (blyt_surface_h)a0;
+}
+
+void blyt_surface_destroy(blyt_surface_h surface) {
+    register long a0 __asm__("a0") = (long)surface;
+    register long a7 __asm__("a7") = ECALL_SURFACE_DESTROY;
     __asm__ volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
 }
 
-void blyt_gfx_pixel(int32_t x, int32_t y, uint8_t color) {
-    register long a0 __asm__("a0") = (long)x;
-    register long a1 __asm__("a1") = (long)y;
-    register long a2 __asm__("a2") = (long)color;
-    register long a7 __asm__("a7") = ECALL_GFX_PIXEL;
-    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a7) : "memory");
+void blyt_surface_clear(blyt_surface_h dst, uint8_t color) {
+    register long a0 __asm__("a0") = (long)dst;
+    register long a1 __asm__("a1") = (long)color;
+    register long a7 __asm__("a7") = ECALL_SURFACE_CLEAR;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a7) : "memory");
 }
 
-void blyt_gfx_rect_fill(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t color) {
-    register long a0 __asm__("a0") = (long)x;
-    register long a1 __asm__("a1") = (long)y;
-    register long a2 __asm__("a2") = (long)w;
-    register long a3 __asm__("a3") = (long)h;
-    register long a4 __asm__("a4") = (long)color;
-    register long a7 __asm__("a7") = ECALL_GFX_RECT_FILL;
-    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7) : "memory");
+void blyt_surface_pixel(blyt_surface_h dst, int32_t x, int32_t y, uint8_t color) {
+    register long a0 __asm__("a0") = (long)dst;
+    register long a1 __asm__("a1") = (long)x;
+    register long a2 __asm__("a2") = (long)y;
+    register long a3 __asm__("a3") = (long)color;
+    register long a7 __asm__("a7") = ECALL_SURFACE_PIXEL;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory");
 }
 
-void blyt_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t color) {
-    register long a0 __asm__("a0") = (long)x0;
-    register long a1 __asm__("a1") = (long)y0;
-    register long a2 __asm__("a2") = (long)x1;
-    register long a3 __asm__("a3") = (long)y1;
-    register long a4 __asm__("a4") = (long)color;
-    register long a7 __asm__("a7") = ECALL_GFX_LINE;
-    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7) : "memory");
+void blyt_surface_rect_fill(blyt_surface_h dst, int32_t x, int32_t y, int32_t w, int32_t h,
+                            uint8_t color) {
+    register long a0 __asm__("a0") = (long)dst;
+    register long a1 __asm__("a1") = (long)x;
+    register long a2 __asm__("a2") = (long)y;
+    register long a3 __asm__("a3") = (long)w;
+    register long a4 __asm__("a4") = (long)h;
+    register long a5 __asm__("a5") = (long)color;
+    register long a7 __asm__("a7") = ECALL_SURFACE_RECT_FILL;
+    __asm__ volatile("ecall"
+                     :
+                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
+                     : "memory");
+}
+
+void blyt_surface_line(blyt_surface_h dst, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                       uint8_t color) {
+    register long a0 __asm__("a0") = (long)dst;
+    register long a1 __asm__("a1") = (long)x0;
+    register long a2 __asm__("a2") = (long)y0;
+    register long a3 __asm__("a3") = (long)x1;
+    register long a4 __asm__("a4") = (long)y1;
+    register long a5 __asm__("a5") = (long)color;
+    register long a7 __asm__("a7") = ECALL_SURFACE_LINE;
+    __asm__ volatile("ecall"
+                     :
+                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
+                     : "memory");
+}
+
+void blyt_surface_blit(blyt_surface_h dst, blyt_surface_h src, int32_t x, int32_t y) {
+    register long a0 __asm__("a0") = (long)dst;
+    register long a1 __asm__("a1") = (long)src;
+    register long a2 __asm__("a2") = (long)x;
+    register long a3 __asm__("a3") = (long)y;
+    register long a7 __asm__("a7") = ECALL_SURFACE_BLIT;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory");
 }
 
 uint8_t *blyt_gfx_acquire(void) {
@@ -146,6 +189,24 @@ uint8_t *blyt_gfx_acquire(void) {
 void blyt_gfx_present(void) {
     register long a7 __asm__("a7") = ECALL_GFX_PRESENT;
     __asm__ volatile("ecall" : : "r"(a7) : "memory");
+}
+
+/* Tier-2 lock (#205).  Acquire passes the surface and the guest address of the
+ * caller's blyt_lock_t; the host materializes the buffer and writes the struct
+ * fields (pixels/stride/w/h/token) into it, returning 1/0 in a0.  Release passes
+ * the lock's token; the host flushes the buffer and invalidates the token. */
+int32_t blyt_surface_acquire(blyt_surface_h surface, blyt_lock_t *out) {
+    register long a0 __asm__("a0") = (long)surface;
+    register long a1 __asm__("a1") = (long)out;
+    register long a7 __asm__("a7") = ECALL_SURFACE_ACQUIRE;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    return (int32_t)a0;
+}
+
+void blyt_surface_release(blyt_lock_t *lock) {
+    register long a0 __asm__("a0") = (long)(lock ? lock->token : 0u);
+    register long a7 __asm__("a7") = ECALL_SURFACE_RELEASE;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
 }
 
 /* -------------------------------------------------------------------------

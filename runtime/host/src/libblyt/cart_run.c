@@ -34,6 +34,7 @@
 #endif
 #endif
 #include "blyt_frame_hash.h"
+#include "blyt_phase.h" /* runtime/shared: lifecycle phase (draw()-only, #205) */
 #include "blyt_raster.h"
 #include "elf32.h"
 #include "testcard.h"
@@ -167,6 +168,54 @@ typedef struct {
 #endif
 
 /* -------------------------------------------------------------------------
+ * Surface registry (#195/#205) — runtime-managed paletted buffers.
+ *
+ * Slot 0 is always BLYT_SCREEN (session->pixels[], never reaped or
+ * budget-counted); slots 1.. are off-screen surfaces created within draw() and
+ * auto-reaped at the frame boundary.  A surface handle (blyt_handle.h) is
+ * kind SURFACE | gen | index; a resolver rejects a wrong kind or a stale
+ * generation.  The canonical buffer is the single source of truth for coherence
+ * across the emulated / host-Lua / native execution models (decision 1).
+ * ------------------------------------------------------------------------- */
+
+#define BLYT_SURFACE_MAX 64 /* registry slots incl. slot 0 = screen */
+
+typedef struct {
+    uint8_t *pixels; /* canonical buffer; slot 0 aliases session->pixels */
+    int32_t w, h; /* dimensions; stride == w (tightly packed) */
+    uint16_t gen; /* surface generation — bumped on reap/destroy */
+    bool in_use;
+    bool is_screen; /* slot 0: draws flip cart_has_drawn; never freed/reaped */
+    bool owned; /* pixels was malloc'd by the runtime (off-screen surfaces) */
+    /* Tier-2 lock state (#205): while locked, the canonical buffer is
+     * materialized into the guest VA region [lock_vaddr, lock_vaddr+lock_len). */
+    bool locked;
+    bool lock_phantom; /* acquired outside draw() (release no-op): reads-as-cleared,
+                        * never flushes back to the canonical buffer (#205) */
+    uint16_t lock_gen; /* bumped on release — a released token goes stale */
+    uint32_t lock_vaddr; /* guest VA of the materialized region */
+    uint32_t lock_len; /* == w*h */
+} blyt_surface_slot_t;
+
+/* The tier-2 lock materialization arena: the free 32 MiB VA gap Spike X verified
+ * (BLYT_GFX_FB_BASE .. arena at 64 MiB).  A bump allocator carves per-lock
+ * regions from it and resets when the last lock releases; since concurrent locks
+ * sum to at most the 16 MB surface budget and the gap is 32 MiB, it can never
+ * exhaust (#205). */
+#define BLYT_SURFACE_LOCK_ARENA_BASE BLYT_GFX_FB_BASE
+#define BLYT_SURFACE_LOCK_ARENA_SIZE 0x02000000u /* 32 MiB */
+
+typedef struct {
+    blyt_surface_slot_t slots[BLYT_SURFACE_MAX];
+    /* Total bytes of off-screen surface buffers (screen excluded).  Folded into
+     * the non-evictable footprint so surface creation shares the unified 16 MB
+     * budget with the guest heap and resource cache (#158/#205). */
+    uint32_t surface_bytes;
+    uint32_t lock_bump; /* bump offset into the lock arena */
+    int active_locks; /* live locks; the bump resets to 0 when this hits 0 */
+} blyt_surface_registry_t;
+
+/* -------------------------------------------------------------------------
  * ECALL handler context
  * ------------------------------------------------------------------------- */
 
@@ -215,6 +264,16 @@ typedef struct {
      * handle.  Mirrors the state_ctx "pointer into the owning session" idiom. */
     uint8_t *fb; /* = session->pixels */
     bool *cart_has_drawn; /* = &session->cart_has_drawn */
+    /* Surface registry (#205): slot 0 = screen (aliases fb), slots 1.. are
+     * off-screen surfaces.  Draw-scoped — reaped at each frame boundary. */
+    blyt_surface_registry_t surfaces;
+    /* Lifecycle phase (#205, blyt_phase.h): set by BLYT_ECALL_PHASE from the
+     * guest blyt_main.  Surface access is permitted only while it is
+     * BLYT_PHASE_DRAW; outside draw() a debug cart faults (dev_fault) and a
+     * release cart gets a defined no-op. */
+    int32_t phase;
+    bool cart_is_debug; /* .cart.info debug flag — selects dev-trap vs no-op */
+    bool dev_fault; /* a draw()-only rule was violated in a debug cart */
     /* Guest vaddr of libblytc's exported blyt_mem_acct (blyt_mem_accounting_t),
      * resolved at cart load (#158). field 0 = guest_heap_used (guest-written,
      * host-read); field 4 = non_evictable_footprint (host-written, guest-read).
@@ -553,10 +612,18 @@ static uint32_t mem_acct_guest_heap_used(const blyt_run_ctx_t *ctx, memory_t *me
  * the guest-visible accounting block, and bound the resident evictable cache to
  * the room the new footprint leaves (the housekeeping eviction site, #158). Call
  * after any load/pin/unpin/release and at the frame boundary. */
+/* The non-evictable footprint the budget predicate charges against: resident
+ * loaded/pinned/persistent resource bytes plus live off-screen surface buffers
+ * (#205).  Both are irreclaimable within a frame, so both sit in the predicate's
+ * footprint term alongside the guest heap. */
+static uint32_t ctx_non_evictable_footprint(const blyt_run_ctx_t *ctx) {
+    return blyt_resource_table_footprint(&ctx->resources) + ctx->surfaces.surface_bytes;
+}
+
 static void mem_acct_publish_footprint(blyt_run_ctx_t *ctx, memory_t *mem) {
     if (!ctx->mem_acct_vaddr)
         return;
-    uint32_t footprint = blyt_resource_table_footprint(&ctx->resources);
+    uint32_t footprint = ctx_non_evictable_footprint(ctx);
     uint8_t b[4];
     write_u32_le(b, footprint);
     memory_write(mem, ctx->mem_acct_vaddr + 4u, b, 4);
@@ -580,7 +647,7 @@ static int mem_acct_reference_fits(blyt_run_ctx_t *ctx, memory_t *mem,
         return 1; /* no accounting block: budget unenforced host-side */
     uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
     uint32_t heap_used = mem_acct_guest_heap_used(ctx, mem);
-    uint32_t footprint = blyt_resource_table_footprint(&ctx->resources);
+    uint32_t footprint = ctx_non_evictable_footprint(ctx);
     return blyt_mem_alloc_fits(heap_used, footprint, incoming);
 }
 
@@ -1351,6 +1418,245 @@ static blyt_resource_entry_t *blyt_resolve_resource(blyt_resource_table_t *t, ui
     return blyt_resource_table_find_mut(t, blyt_resource_decode_id(handle));
 }
 
+/* Resolve a surface handle to its live registry slot, mirroring the
+ * resolve-at-entry pattern (#196): classify the tagged u32, then validate the
+ * slot index and generation.  Returns NULL for a non-surface kind, an
+ * out-of-range or free slot, or a stale generation (use-after-reap/destroy) —
+ * every gfx entry point classifies its handle this way, so a lock-view token or
+ * a resource constant can never reach a surface buffer (#205). */
+static blyt_surface_slot_t *blyt_resolve_surface(blyt_surface_registry_t *reg, uint32_t handle) {
+    if (!blyt_handle_is_surface(handle))
+        return NULL;
+    uint32_t idx = blyt_dyn_decode_index(handle);
+    if (idx >= BLYT_SURFACE_MAX)
+        return NULL;
+    blyt_surface_slot_t *s = &reg->slots[idx];
+    if (!s->in_use || (uint16_t)blyt_dyn_decode_gen(handle) != s->gen)
+        return NULL;
+    return s;
+}
+
+/* Largest off-screen surface edge — an overflow guard, not the size limit: it
+ * bounds w*h so the uint32 byte count and the i64-clipped rasterizer
+ * intermediates never overflow (8192*8192 = 64 MiB fits both).  The 16 MB budget
+ * (#158) is the real size limit and rejects anything that does not fit. */
+#define BLYT_SURFACE_MAX_DIM 8192
+
+/* Free one off-screen surface slot: release its buffer, drop its bytes from the
+ * budget footprint, and bump the generation so any outstanding handle goes
+ * stale.  A no-op on the screen slot (never owned).  Caller republishes the
+ * footprint. */
+static void blyt_surface_free_slot(blyt_surface_registry_t *reg, blyt_surface_slot_t *s) {
+    if (!s->in_use || s->is_screen)
+        return;
+    if (s->owned && s->pixels) {
+        reg->surface_bytes -= (uint32_t)((uint32_t)s->w * (uint32_t)s->h);
+        free(s->pixels);
+    }
+    s->pixels = NULL;
+    s->in_use = false;
+    s->owned = false;
+    s->gen++; /* invalidate handles referencing this slot */
+}
+
+/* Flush a locked surface's materialized guest region back into its canonical
+ * buffer and clear the lock, bumping the lock generation so the outstanding
+ * token goes stale.  A no-op if the slot is not locked. */
+static void blyt_surface_flush_lock(blyt_surface_registry_t *reg, blyt_surface_slot_t *s,
+                                    memory_t *mem) {
+    if (!s->locked)
+        return;
+    /* A phantom lock (acquired outside draw() in a release cart) never writes
+     * back to the canonical buffer — an out-of-phase op is a defined no-op. */
+    if (!s->lock_phantom && mem && s->pixels)
+        memory_read(mem, s->pixels, s->lock_vaddr, s->lock_len);
+    s->locked = false;
+    s->lock_phantom = false;
+    s->lock_gen++;
+    if (reg->active_locks > 0)
+        reg->active_locks--;
+    if (reg->active_locks == 0)
+        reg->lock_bump = 0; /* arena empty — reclaim it */
+}
+
+/* Reap every off-screen surface at the frame boundary (draw-scoped lifetime,
+ * #205): surfaces are derived per-frame artifacts, so none survive into the next
+ * frame.  Any lock the cart forgot to release is force-flushed first (frame
+ * boundary force-release).  Screen (slot 0) is force-released but not freed. */
+static void blyt_surface_reap_all(blyt_run_ctx_t *ctx, memory_t *mem) {
+    blyt_surface_registry_t *reg = &ctx->surfaces;
+    for (uint32_t i = 0; i < BLYT_SURFACE_MAX; i++)
+        blyt_surface_flush_lock(reg, &reg->slots[i], mem);
+    for (uint32_t i = 1; i < BLYT_SURFACE_MAX; i++)
+        blyt_surface_free_slot(reg, &reg->slots[i]);
+    /* surface_bytes has been decremented per slot; it is now 0. */
+    reg->lock_bump = 0;
+    reg->active_locks = 0;
+    if (mem)
+        mem_acct_publish_footprint(ctx, mem);
+}
+
+/* Create a blank off-screen surface of w x h, charging w*h against the unified
+ * budget.  Returns a fresh SURFACE handle, or BLYT_HANDLE_NONE on invalid size,
+ * an exhausted registry, an allocation failure, or an over-budget request. */
+static uint32_t blyt_surface_create_slot(blyt_run_ctx_t *ctx, memory_t *mem, int32_t w, int32_t h) {
+    blyt_surface_registry_t *reg = &ctx->surfaces;
+    if (w <= 0 || h <= 0 || w > BLYT_SURFACE_MAX_DIM || h > BLYT_SURFACE_MAX_DIM)
+        return BLYT_HANDLE_NONE;
+    uint32_t bytes = (uint32_t)w * (uint32_t)h;
+
+    /* Budget: a surface is non-evictable for the frame, so it charges against the
+     * same predicate as the heap + non-evictable resources (#158). */
+    uint32_t heap_used = mem_acct_guest_heap_used(ctx, mem);
+    if (!blyt_mem_alloc_fits(heap_used, ctx_non_evictable_footprint(ctx), bytes))
+        return BLYT_HANDLE_NONE;
+
+    uint32_t idx = 0;
+    for (uint32_t i = 1; i < BLYT_SURFACE_MAX; i++) {
+        if (!reg->slots[i].in_use) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == 0) /* registry full (slot 0 is the screen) */
+        return BLYT_HANDLE_NONE;
+
+    uint8_t *pixels = (uint8_t *)calloc(bytes, 1); /* blank = palette index 0 */
+    if (!pixels)
+        return BLYT_HANDLE_NONE;
+
+    blyt_surface_slot_t *s = &reg->slots[idx];
+    s->pixels = pixels;
+    s->w = w;
+    s->h = h;
+    s->in_use = true;
+    s->is_screen = false;
+    s->owned = true;
+    /* s->gen carries over from the previous occupant so a stale handle to that
+     * occupant does not alias this new surface. */
+    reg->surface_bytes += bytes;
+    mem_acct_publish_footprint(ctx, mem);
+    return blyt_surface_encode(s->gen, idx);
+}
+
+/* Resolve a lock-view token to the surface slot it locks: classify kind
+ * LOCKVIEW, validate the slot index, that it is actually locked, and that the
+ * token's generation matches (a released token has a bumped lock_gen → stale).
+ * Returns NULL otherwise. */
+static blyt_surface_slot_t *blyt_resolve_lockview(blyt_surface_registry_t *reg, uint32_t token) {
+    if (!blyt_handle_is_lockview(token))
+        return NULL;
+    uint32_t idx = blyt_dyn_decode_index(token);
+    if (idx >= BLYT_SURFACE_MAX)
+        return NULL;
+    blyt_surface_slot_t *s = &reg->slots[idx];
+    if (!s->locked || (uint16_t)blyt_dyn_decode_gen(token) != s->lock_gen)
+        return NULL;
+    return s;
+}
+
+/* Zero `len` bytes of guest memory at `vaddr` (read-as-cleared materialization,
+ * #205).  Chunked from a small static zero buffer so an arbitrarily large region
+ * needs no host allocation. */
+static void guest_memzero(memory_t *mem, uint32_t vaddr, uint32_t len) {
+    static const uint8_t zeros[4096] = {0};
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t n = len - off;
+        if (n > sizeof(zeros))
+            n = sizeof(zeros);
+        memory_write(mem, vaddr + off, zeros, n);
+        off += n;
+    }
+}
+
+/* Acquire an exclusive tier-2 lock on the surface `handle`: carve a per-lock
+ * region from the VA-gap arena, materialize the buffer into it, and write the
+ * guest blyt_lock_t (pixels/stride/w/h/token) to out_vaddr.  Normally the
+ * canonical buffer is copied in; when `clear_only` (an out-of-phase acquire in a
+ * release cart) the region is materialized as cleared instead and the lock is
+ * marked phantom so it never flushes back — the draw()-only read-as-cleared
+ * semantics.  Returns 1 on success, 0 on failure (unresolvable surface, already
+ * locked, or arena exhausted — the latter impossible given gap > budget). */
+static int blyt_surface_acquire_lock(blyt_run_ctx_t *ctx, memory_t *mem, uint32_t handle,
+                                     uint32_t out_vaddr, bool clear_only) {
+    blyt_surface_registry_t *reg = &ctx->surfaces;
+    blyt_surface_slot_t *s = blyt_resolve_surface(reg, handle);
+    uint8_t lockbuf[20]; /* blyt_lock_t on ilp32: pixels,stride,w,h,token */
+    if (!s || s->locked) {
+        memset(lockbuf, 0, sizeof(lockbuf)); /* token = NONE, pixels = 0 */
+        memory_write(mem, out_vaddr, lockbuf, sizeof(lockbuf));
+        return 0;
+    }
+    uint32_t len = (uint32_t)((uint32_t)s->w * (uint32_t)s->h);
+    uint32_t aligned = (len + 3u) & ~3u;
+    if ((uint64_t)reg->lock_bump + aligned > BLYT_SURFACE_LOCK_ARENA_SIZE) {
+        memset(lockbuf, 0, sizeof(lockbuf));
+        memory_write(mem, out_vaddr, lockbuf, sizeof(lockbuf));
+        return 0;
+    }
+    uint32_t vaddr = BLYT_SURFACE_LOCK_ARENA_BASE + reg->lock_bump;
+    reg->lock_bump += aligned;
+    reg->active_locks++;
+
+    /* Copy-in: the canonical buffer is the single source of truth, so every
+     * acquire reads it (coherence claim, #205).  A phantom (out-of-phase) lock
+     * reads as cleared instead — it must not leak the real surface contents. */
+    if (clear_only)
+        guest_memzero(mem, vaddr, len);
+    else
+        memory_write(mem, vaddr, s->pixels, len);
+
+    s->locked = true;
+    s->lock_phantom = clear_only;
+    s->lock_vaddr = vaddr;
+    s->lock_len = len;
+    uint32_t token = blyt_lockview_encode(s->lock_gen, blyt_dyn_decode_index(handle));
+
+    write_u32_le(lockbuf + 0, vaddr); /* pixels */
+    write_u32_le(lockbuf + 4, (uint32_t)s->w); /* stride */
+    write_u32_le(lockbuf + 8, (uint32_t)s->w); /* w */
+    write_u32_le(lockbuf + 12, (uint32_t)s->h); /* h */
+    write_u32_le(lockbuf + 16, token); /* token */
+    memory_write(mem, out_vaddr, lockbuf, sizeof(lockbuf));
+    return 1;
+}
+
+/* Release a tier-2 lock by its token: flush (copy-out) the materialized region
+ * back into the canonical buffer and invalidate the token.  A no-op on a stale
+ * or foreign token.  Returns the released slot (for cart_has_drawn on screen),
+ * or NULL. */
+static blyt_surface_slot_t *blyt_surface_release_lock(blyt_run_ctx_t *ctx, memory_t *mem,
+                                                      uint32_t token) {
+    blyt_surface_slot_t *s = blyt_resolve_lockview(&ctx->surfaces, token);
+    if (!s)
+        return NULL;
+    blyt_surface_flush_lock(&ctx->surfaces, s, mem);
+    return s;
+}
+
+/* Draw()-only phase gate for a surface access op (#205).  Returns true when the
+ * op may proceed (phase is DRAW).  Outside draw() it returns false and:
+ *   - in a debug cart, raises a dev fault and halts the emulator (*halted set);
+ *     the caller must return immediately without advancing PC.
+ *   - in a release cart, leaves *halted false; the caller performs its defined
+ *     no-op (writes drop, acquire reads as cleared) and advances PC normally.
+ * A NULL ctx behaves like the release no-op. */
+static bool blyt_surface_phase_gate(riscv_t *rv, bool *halted) {
+    *halted = false;
+    blyt_run_ctx_t *ctx = g_run_ctx;
+    if (!ctx || ctx->phase == BLYT_PHASE_DRAW)
+        return ctx != NULL;
+    if (ctx->cart_is_debug) {
+        if (ctx->log_fn)
+            ctx->log_fn("blyt: surface access outside draw() — debug build trap\n");
+        ctx->dev_fault = true;
+        rv_halt(rv);
+        *halted = true;
+    }
+    return false;
+}
+
 static void blyt_ecall_handler(riscv_t *rv) {
     uint32_t num = rv_get_reg(rv, rv_reg_a7);
 
@@ -1397,68 +1703,191 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 
-    /* Graphics primitives (ADR-0052/0086, issue #188 / Spike X).  Host-side
-     * rasterization into session->pixels[] via the shared integer core; the
-     * first such call flips cart_has_drawn so the runtime stops compositing the
-     * PM5544 test card. */
-    case BLYT_ECALL_GFX_CLEAR: {
-        uint32_t color = rv_get_reg(rv, rv_reg_a0);
-        blyt_tracef(BLYT_TRACE_API, "gfx_clear(color=%u)", color);
-        if (g_run_ctx && g_run_ctx->fb) {
-            blyt_raster_clear(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
-                              (uint8_t)color);
-            if (g_run_ctx->cart_has_drawn)
+    /* Tier-1 surface ops (ADR-0052/0086/0008, #188 / #195 / #205).  Host-side
+     * rasterization into the destination surface's canonical buffer via the
+     * shared integer core; a0 carries the destination surface handle.  A draw
+     * into BLYT_SCREEN flips cart_has_drawn (displacing the PM5544 test card);
+     * off-screen surface draws do not.  An unresolvable handle (wrong kind /
+     * stale generation) is a defined no-op. */
+    case BLYT_ECALL_SURFACE_CLEAR: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        uint32_t color = rv_get_reg(rv, rv_reg_a1);
+        blyt_tracef(BLYT_TRACE_API, "surface_clear(dst=0x%08x, color=%u)", dst, color);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
+        blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (s) {
+            blyt_raster_clear(s->pixels, s->w, s->w, s->h, (uint8_t)color);
+            if (s->is_screen && g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
         rv->PC += 4;
         return;
     }
 
-    case BLYT_ECALL_GFX_PIXEL: {
-        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a0);
-        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a1);
-        uint32_t color = rv_get_reg(rv, rv_reg_a2);
-        blyt_tracef(BLYT_TRACE_API, "gfx_pixel(x=%d, y=%d, color=%u)", x, y, color);
-        if (g_run_ctx && g_run_ctx->fb) {
-            blyt_raster_pixel(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x, y,
-                              (uint8_t)color);
-            if (g_run_ctx->cart_has_drawn)
-                *g_run_ctx->cart_has_drawn = true;
-        }
-        rv->PC += 4;
-        return;
-    }
-
-    case BLYT_ECALL_GFX_RECT_FILL: {
-        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a0);
-        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a1);
-        int32_t w = (int32_t)rv_get_reg(rv, rv_reg_a2);
-        int32_t h = (int32_t)rv_get_reg(rv, rv_reg_a3);
-        uint32_t color = rv_get_reg(rv, rv_reg_a4);
-        blyt_tracef(BLYT_TRACE_API, "gfx_rect_fill(x=%d, y=%d, w=%d, h=%d, color=%u)", x, y, w, h,
+    case BLYT_ECALL_SURFACE_PIXEL: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        uint32_t color = rv_get_reg(rv, rv_reg_a3);
+        blyt_tracef(BLYT_TRACE_API, "surface_pixel(dst=0x%08x, x=%d, y=%d, color=%u)", dst, x, y,
                     color);
-        if (g_run_ctx && g_run_ctx->fb) {
-            blyt_raster_rect_fill(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x, y, w,
-                                  h, (uint8_t)color);
-            if (g_run_ctx->cart_has_drawn)
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
+        blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (s) {
+            blyt_raster_pixel(s->pixels, s->w, s->w, s->h, x, y, (uint8_t)color);
+            if (s->is_screen && g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
         rv->PC += 4;
         return;
     }
 
-    case BLYT_ECALL_GFX_LINE: {
-        int32_t x0 = (int32_t)rv_get_reg(rv, rv_reg_a0);
-        int32_t y0 = (int32_t)rv_get_reg(rv, rv_reg_a1);
-        int32_t x1 = (int32_t)rv_get_reg(rv, rv_reg_a2);
-        int32_t y1 = (int32_t)rv_get_reg(rv, rv_reg_a3);
-        uint32_t color = rv_get_reg(rv, rv_reg_a4);
-        blyt_tracef(BLYT_TRACE_API, "gfx_line(x0=%d, y0=%d, x1=%d, y1=%d, color=%u)", x0, y0, x1,
-                    y1, color);
-        if (g_run_ctx && g_run_ctx->fb) {
-            blyt_raster_line(g_run_ctx->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, x0, y0, x1,
-                             y1, (uint8_t)color);
-            if (g_run_ctx->cart_has_drawn)
+    case BLYT_ECALL_SURFACE_RECT_FILL: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        int32_t w = (int32_t)rv_get_reg(rv, rv_reg_a3);
+        int32_t h = (int32_t)rv_get_reg(rv, rv_reg_a4);
+        uint32_t color = rv_get_reg(rv, rv_reg_a5);
+        blyt_tracef(BLYT_TRACE_API,
+                    "surface_rect_fill(dst=0x%08x, x=%d, y=%d, w=%d, h=%d, color=%u)", dst, x, y, w,
+                    h, color);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
+        blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (s) {
+            blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, x, y, w, h, (uint8_t)color);
+            if (s->is_screen && g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SURFACE_LINE: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        int32_t x0 = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        int32_t y0 = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        int32_t x1 = (int32_t)rv_get_reg(rv, rv_reg_a3);
+        int32_t y1 = (int32_t)rv_get_reg(rv, rv_reg_a4);
+        uint32_t color = rv_get_reg(rv, rv_reg_a5);
+        blyt_tracef(BLYT_TRACE_API,
+                    "surface_line(dst=0x%08x, x0=%d, y0=%d, x1=%d, y1=%d, color=%u)", dst, x0, y0,
+                    x1, y1, color);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
+        blyt_surface_slot_t *s = g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        if (s) {
+            blyt_raster_line(s->pixels, s->w, s->w, s->h, x0, y0, x1, y1, (uint8_t)color);
+            if (s->is_screen && g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    /* Surface lifecycle + blit (tier-1, #205). */
+    case BLYT_ECALL_SURFACE_CREATE: {
+        int32_t w = (int32_t)rv_get_reg(rv, rv_reg_a0);
+        int32_t h = (int32_t)rv_get_reg(rv, rv_reg_a1);
+        uint32_t handle = BLYT_HANDLE_NONE;
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            /* Out of phase: debug halts; release returns NONE (defined no-op). */
+            if (halted)
+                return;
+            blyt_tracef(BLYT_TRACE_API, "surface_create(w=%d, h=%d) -> NONE (outside draw)", w, h);
+            rv_set_reg(rv, rv_reg_a0, BLYT_HANDLE_NONE);
+            rv->PC += 4;
+            return;
+        }
+        handle = blyt_surface_create_slot(g_run_ctx, PRIV(rv)->mem, w, h);
+        blyt_tracef(BLYT_TRACE_API, "surface_create(w=%d, h=%d) -> 0x%08x", w, h, handle);
+        rv_set_reg(rv, rv_reg_a0, handle);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SURFACE_DESTROY: {
+        uint32_t handle = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "surface_destroy(0x%08x)", handle);
+        blyt_surface_slot_t *s =
+            g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, handle) : NULL;
+        if (s && !s->is_screen) {
+            blyt_surface_free_slot(&g_run_ctx->surfaces, s);
+            mem_acct_publish_footprint(g_run_ctx, PRIV(rv)->mem);
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SURFACE_BLIT: {
+        uint32_t dst = rv_get_reg(rv, rv_reg_a0);
+        uint32_t src = rv_get_reg(rv, rv_reg_a1);
+        int32_t x = (int32_t)rv_get_reg(rv, rv_reg_a2);
+        int32_t y = (int32_t)rv_get_reg(rv, rv_reg_a3);
+        blyt_tracef(BLYT_TRACE_API, "surface_blit(dst=0x%08x, src=0x%08x, x=%d, y=%d)", dst, src, x,
+                    y);
+        bool halted;
+        if (!blyt_surface_phase_gate(rv, &halted)) {
+            rv->PC += halted ? 0 : 4;
+            return;
+        }
+        blyt_surface_slot_t *ds =
+            g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, dst) : NULL;
+        blyt_surface_slot_t *ss =
+            g_run_ctx ? blyt_resolve_surface(&g_run_ctx->surfaces, src) : NULL;
+        if (ds && ss) {
+            blyt_raster_blit(ds->pixels, ds->w, ds->w, ds->h, ss->pixels, ss->w, ss->w, ss->h, x,
+                             y);
+            if (ds->is_screen && g_run_ctx->cart_has_drawn)
+                *g_run_ctx->cart_has_drawn = true;
+        }
+        rv->PC += 4;
+        return;
+    }
+
+    /* Tier-2 per-pixel lock (#205). */
+    case BLYT_ECALL_SURFACE_ACQUIRE: {
+        uint32_t surface = rv_get_reg(rv, rv_reg_a0);
+        uint32_t out_vaddr = rv_get_reg(rv, rv_reg_a1);
+        /* Out of phase: debug halts; release materializes a cleared (phantom)
+         * lock so a read sees zeros, not the real surface (read-as-cleared). */
+        bool halted;
+        bool clear_only = !blyt_surface_phase_gate(rv, &halted);
+        if (halted)
+            return;
+        int ok = 0;
+        if (g_run_ctx)
+            ok =
+                blyt_surface_acquire_lock(g_run_ctx, PRIV(rv)->mem, surface, out_vaddr, clear_only);
+        blyt_tracef(BLYT_TRACE_API, "surface_acquire(0x%08x)%s -> %s", surface,
+                    clear_only ? " [cleared]" : "", ok ? "ok" : "fail");
+        rv_set_reg(rv, rv_reg_a0, (uint32_t)ok);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_SURFACE_RELEASE: {
+        uint32_t token = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "surface_release(0x%08x)", token);
+        if (g_run_ctx) {
+            blyt_surface_slot_t *s = blyt_surface_release_lock(g_run_ctx, PRIV(rv)->mem, token);
+            if (s && s->is_screen && g_run_ctx->cart_has_drawn)
                 *g_run_ctx->cart_has_drawn = true;
         }
         rv->PC += 4;
@@ -1643,6 +2072,17 @@ static void blyt_ecall_handler(riscv_t *rv) {
 
         blyt_tracef(BLYT_TRACE_API, "mem_resources() -> loaded=%u", loaded);
         rv_set_reg(rv, rv_reg_a0, loaded);
+        rv->PC += 4;
+        return;
+    }
+
+    case BLYT_ECALL_PHASE: {
+        /* Lifecycle phase signal (#205): the guest blyt_main tells the runtime
+         * which callback it is entering so surface access can be draw()-only. */
+        uint32_t phase = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "phase(%u)", phase);
+        if (g_run_ctx)
+            g_run_ctx->phase = (int32_t)phase;
         rv->PC += 4;
         return;
     }
@@ -3167,6 +3607,29 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     s->ctx.fb = s->pixels;
     s->ctx.cart_has_drawn = &s->cart_has_drawn;
 
+    /* Surface registry (#205): slot 0 is BLYT_SCREEN, aliasing the session's
+     * paletted framebuffer — never reaped, destroyed, or budget-counted.  Its
+     * generation stays 0 so the reserved BLYT_SCREEN handle (0x40000000) always
+     * resolves.  Off-screen surfaces occupy slots 1.. and are reaped each frame. */
+    memset(&s->ctx.surfaces, 0, sizeof(s->ctx.surfaces));
+    s->ctx.surfaces.slots[0] = (blyt_surface_slot_t){
+        .pixels = s->pixels,
+        .w = BLYT_FRAME_W,
+        .h = BLYT_FRAME_H,
+        .gen = 0,
+        .in_use = true,
+        .is_screen = true,
+        .owned = false,
+    };
+
+    /* Draw()-only surface enforcement (#205): phase starts NONE (no callback);
+     * the guest blyt_main advances it via BLYT_ECALL_PHASE.  A debug cart
+     * (.cart.info debug flag) hard-errors on out-of-phase surface access; a
+     * release cart gets the defined no-op. */
+    s->ctx.phase = BLYT_PHASE_NONE;
+    s->ctx.cart_is_debug = blyt_cart_is_debug(cart);
+    s->ctx.dev_fault = false;
+
     /* Resolve save directory: BLYT_SAVE_DIR env var or ~/.local/share/blyt */
     {
         const char *env_dir = getenv("BLYT_SAVE_DIR");
@@ -3314,6 +3777,10 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
      * the frame it was taken in (ADR-0027 frame-scope amendment, #123). */
     session->ctx.resource_scratch_off = 0;
     blyt_resource_table_force_release_pins(&session->ctx.resources);
+    /* Reap the previous frame's off-screen surfaces: they are draw-scoped derived
+     * artifacts (#205), so none survive the frame boundary.  Frees their buffers
+     * and drops their bytes from the budget footprint (republished below). */
+    blyt_surface_reap_all(&session->ctx, session->attr.mem);
     /* Frame-boundary housekeeping (#158): pins just dropped, so the footprint may
      * have shrunk — republish it and bound the resident evictable cache to the
      * room the current heap+footprint leaves. Covers the "heap grew mid-frame
@@ -3606,7 +4073,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
 #endif
 
     bool trapped = session->ctx.ecall_trapped;
-    bool aborted = session->ctx.ecall_aborted;
+    bool aborted = session->ctx.ecall_aborted || session->ctx.dev_fault;
     g_run_ctx = NULL;
 
     if (trapped)
@@ -3722,6 +4189,11 @@ const uint32_t *blyt_session_get_palette(const blyt_session_t *session) {
 
 bool blyt_session_cart_has_drawn(const blyt_session_t *session) {
     return session->cart_has_drawn;
+}
+
+void blyt_session_set_phase(blyt_session_t *session, int32_t phase) {
+    if (session)
+        session->ctx.phase = phase;
 }
 
 void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out) {

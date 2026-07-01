@@ -111,14 +111,28 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_resource_text_get",
     "blyt_resource_bytes_get",
 
-    /* blyt graphics API (ADR-0052/0086, issue #188 / Spike X).  Paletted 2D
-     * primitives exported by libblyt32.so; host-side on the emulated path. */
-    "blyt_gfx_clear",
-    "blyt_gfx_pixel",
-    "blyt_gfx_rect_fill",
-    "blyt_gfx_line",
+    /* blyt graphics / surface API (ADR-0052/0086/0008, #188 / #195 / #205).
+     * Tier-1 serviced ops + surface lifecycle exported by libblyt32.so;
+     * host-side on the emulated path.  gfx.* is inline sugar over these
+     * (blyt.h), so blyt_gfx_{clear,pixel,rect_fill,line} are not imported. */
+    "blyt_surface_create",
+    "blyt_surface_destroy",
+    "blyt_surface_clear",
+    "blyt_surface_pixel",
+    "blyt_surface_rect_fill",
+    "blyt_surface_line",
+    "blyt_surface_blit",
+    "blyt_surface_acquire",
+    "blyt_surface_release",
     "blyt_gfx_acquire",
     "blyt_gfx_present",
+    /* Tier-2 in-lock primitives (#205): the freestanding rasterizer, exported by
+     * libblyt32.so so a cart holding a lock draws guest-side with no ECALL. */
+    "blyt_raster_clear",
+    "blyt_raster_pixel",
+    "blyt_raster_rect_fill",
+    "blyt_raster_line",
+    "blyt_raster_blit",
 
     /* blyt memory introspection (ADR-0029, #159): blyt_mem_stats reads the
      * guest-visible accounting block (no ECALL); blyt_mem_resources is the

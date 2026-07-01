@@ -33,6 +33,7 @@
 #include <string.h>
 
 #include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
+#include "blyt_phase.h" /* runtime/shared: lifecycle phase (draw()-only, #205) */
 #include "blyt_raster.h" /* runtime/shared: integer rasterizer core (#188) */
 #include "blyt_runtime.h"
 #include "blyt_trace.h"
@@ -266,9 +267,14 @@ static const char co_body_init[] = "init() "
 static const char co_body_reload_init[] = "init()";
 #endif
 
-/* Coroutine body: per-frame update/draw loop with frame-boundary yield. */
+/* Coroutine body: per-frame update/draw loop with frame-boundary yield.  The
+ * __blyt_phase_* brackets mirror the emulated blyt_main's BLYT_ECALL_PHASE
+ * signal so a hybrid cart's native half stays draw()-only (#205); they no-op for
+ * a session-less pure-Lua cart. */
 static const char co_body_running[] = "while not blyt.should_quit() do "
+                                      "  __blyt_phase_update() "
                                       "  update() "
+                                      "  __blyt_phase_draw() "
                                       "  if type(draw) == 'function' then draw() end "
                                       "  coroutine.yield() "
                                       "end "
@@ -409,6 +415,24 @@ static int lua_wasm_quit(lua_State *L) {
 static int lua_wasm_should_quit(lua_State *L) {
     lua_pushboolean(L, g_lua_quit);
     return 1;
+}
+
+/* Host-Lua lifecycle phase mirror (#205).  The emulated path's blyt_main signals
+ * the phase via BLYT_ECALL_PHASE; the host-Lua fast path drives update/draw
+ * itself, so the running coroutine brackets each callback with these to keep
+ * surface access draw()-only.  Only a hybrid cart's native half is affected — it
+ * reaches the phase gate through the gfx ECALL handlers — since the host-Lua gfx
+ * bindings rasterize directly and are not gated (that is slice-6 Lua-surface
+ * work).  A session-less pure-Lua cart no-ops (blyt_session_set_phase(NULL)). */
+static int lua_wasm_phase_update(lua_State *L) {
+    (void)L;
+    blyt_session_set_phase(g_session, BLYT_PHASE_UPDATE);
+    return 0;
+}
+static int lua_wasm_phase_draw(lua_State *L) {
+    (void)L;
+    blyt_session_set_phase(g_session, BLYT_PHASE_DRAW);
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -760,6 +784,156 @@ static int lua_wasm_gfx_line(lua_State *L) {
     return 0;
 }
 
+/* Host-Lua surface pool (blyt32.surface.*, #205).  A pure-Lua cart on the wasm
+ * fast path has no rv32 session, so its surfaces live here — the host-Lua mirror
+ * of the native pool (blyt32.c) and the host registry (cart_run.c).  Slot 0 is
+ * the screen: its pixels resolve to lua_gfx_fb() on each access (the session
+ * buffer for a hybrid, g_lua_pixels standalone).  Off-screen slots hold malloc'd
+ * buffers, freed at the frame boundary (draw-scoped).  Lua is tier-1 only — no
+ * acquire/release.  Drawing is ungated here (the emulated Lua legs enforce
+ * draw()-only through the ECALL gate; the host-Lua per-callback enforcement is
+ * slice-6+ work). */
+#define LUA_SURFACE_MAX 64
+typedef struct {
+    uint8_t *pixels;
+    int32_t w, h;
+    uint16_t gen;
+    bool in_use;
+    bool is_screen;
+} lua_surface_t;
+static lua_surface_t g_lua_surf[LUA_SURFACE_MAX];
+static bool g_lua_surf_init;
+
+static void lua_surf_ensure_init(void) {
+    if (g_lua_surf_init)
+        return;
+    g_lua_surf[0].in_use = true;
+    g_lua_surf[0].is_screen = true;
+    g_lua_surf[0].w = BLYT_FRAME_W;
+    g_lua_surf[0].h = BLYT_FRAME_H;
+    g_lua_surf_init = true;
+}
+
+static lua_surface_t *lua_surf_resolve(uint32_t h) {
+    lua_surf_ensure_init();
+    if (!blyt_handle_is_surface(h))
+        return NULL;
+    uint32_t idx = blyt_dyn_decode_index(h);
+    if (idx >= LUA_SURFACE_MAX)
+        return NULL;
+    lua_surface_t *s = &g_lua_surf[idx];
+    if (!s->in_use || (uint16_t)blyt_dyn_decode_gen(h) != s->gen)
+        return NULL;
+    if (s->is_screen)
+        s->pixels = lua_gfx_fb(); /* dynamic: session buffer vs standalone */
+    return s;
+}
+
+/* Reap draw-scoped off-screen surfaces at the frame boundary (#205). */
+static void lua_surf_reap(void) {
+    lua_surf_ensure_init();
+    for (uint32_t i = 1; i < LUA_SURFACE_MAX; i++) {
+        if (g_lua_surf[i].in_use) {
+            free(g_lua_surf[i].pixels);
+            g_lua_surf[i].pixels = NULL;
+            g_lua_surf[i].in_use = false;
+            g_lua_surf[i].gen++;
+        }
+    }
+}
+
+static int lua_wasm_surface_create(lua_State *L) {
+    lua_surf_ensure_init();
+    int32_t w = (int32_t)luaL_checkinteger(L, 1);
+    int32_t h = (int32_t)luaL_checkinteger(L, 2);
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) {
+        lua_pushinteger(L, (lua_Integer)BLYT_HANDLE_NONE);
+        return 1;
+    }
+    uint32_t idx = 0;
+    for (uint32_t i = 1; i < LUA_SURFACE_MAX; i++) {
+        if (!g_lua_surf[i].in_use) {
+            idx = i;
+            break;
+        }
+    }
+    uint8_t *buf = idx ? (uint8_t *)malloc((size_t)w * (size_t)h) : NULL;
+    if (!buf) {
+        lua_pushinteger(L, (lua_Integer)BLYT_HANDLE_NONE);
+        return 1;
+    }
+    blyt_raster_clear(buf, w, w, h, 0); /* blank = palette index 0 */
+    g_lua_surf[idx].pixels = buf;
+    g_lua_surf[idx].w = w;
+    g_lua_surf[idx].h = h;
+    g_lua_surf[idx].in_use = true;
+    g_lua_surf[idx].is_screen = false;
+    lua_pushinteger(L, (lua_Integer)blyt_surface_encode(g_lua_surf[idx].gen, idx));
+    return 1;
+}
+static int lua_wasm_surface_destroy(lua_State *L) {
+    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    if (s && !s->is_screen) {
+        free(s->pixels);
+        s->pixels = NULL;
+        s->in_use = false;
+        s->gen++;
+    }
+    return 0;
+}
+static int lua_wasm_surface_clear(lua_State *L) {
+    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    if (s) {
+        blyt_raster_clear(s->pixels, s->w, s->w, s->h, (uint8_t)luaL_checkinteger(L, 2));
+        if (s->is_screen)
+            g_lua_drawn = true;
+    }
+    return 0;
+}
+static int lua_wasm_surface_pixel(lua_State *L) {
+    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    if (s) {
+        blyt_raster_pixel(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
+                          (int)luaL_checkinteger(L, 3), (uint8_t)luaL_checkinteger(L, 4));
+        if (s->is_screen)
+            g_lua_drawn = true;
+    }
+    return 0;
+}
+static int lua_wasm_surface_rect_fill(lua_State *L) {
+    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    if (s) {
+        blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
+                              (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                              (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (s->is_screen)
+            g_lua_drawn = true;
+    }
+    return 0;
+}
+static int lua_wasm_surface_line(lua_State *L) {
+    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    if (s) {
+        blyt_raster_line(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                         (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (s->is_screen)
+            g_lua_drawn = true;
+    }
+    return 0;
+}
+static int lua_wasm_surface_blit(lua_State *L) {
+    lua_surface_t *d = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 1));
+    lua_surface_t *s = lua_surf_resolve((uint32_t)luaL_checkinteger(L, 2));
+    if (d && s) {
+        blyt_raster_blit(d->pixels, d->w, d->w, d->h, s->pixels, s->w, s->w, s->h,
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4));
+        if (d->is_screen)
+            g_lua_drawn = true;
+    }
+    return 0;
+}
+
 /* Register blyt32.gfx.* onto the existing blyt32 global.  Called from both the
  * initial run_lua_cart setup and the reset/reload re-register, like the state
  * and resource API helpers. */
@@ -789,6 +963,26 @@ static void wasm_register_gfx_api(lua_State *L) {
         lua_setfield(L, -2, gfx_fns[i].name);
     }
     lua_setfield(L, -2, "gfx"); /* blyt32.gfx = gfx */
+
+    /* blyt32.surface.* — tier-1 surface API on the host-Lua fast path (#205). */
+    lua_newtable(L); /* blyt32.surface */
+    static const struct {
+        const char *name;
+        lua_CFunction fn;
+    } surface_fns[] = {
+        {"create", lua_wasm_surface_create},       {"destroy", lua_wasm_surface_destroy},
+        {"clear", lua_wasm_surface_clear},         {"pixel", lua_wasm_surface_pixel},
+        {"rect_fill", lua_wasm_surface_rect_fill}, {"line", lua_wasm_surface_line},
+        {"blit", lua_wasm_surface_blit},           {NULL, NULL},
+    };
+    for (int i = 0; surface_fns[i].name; i++) {
+        lua_pushcfunction(L, surface_fns[i].fn);
+        lua_setfield(L, -2, surface_fns[i].name);
+    }
+    lua_pushinteger(L, (lua_Integer)BLYT_SCREEN); /* blyt32.surface.SCREEN */
+    lua_setfield(L, -2, "SCREEN");
+    lua_setfield(L, -2, "surface"); /* blyt32.surface = surface */
+
     lua_pop(L, 1); /* pop blyt32 */
 }
 
@@ -1701,6 +1895,10 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     lua_setglobal(g_lua, "blyt_quit");
     lua_pushcfunction(g_lua, wasm_lua_require);
     lua_setglobal(g_lua, "require");
+    lua_pushcfunction(g_lua, lua_wasm_phase_update);
+    lua_setglobal(g_lua, "__blyt_phase_update");
+    lua_pushcfunction(g_lua, lua_wasm_phase_draw);
+    lua_setglobal(g_lua, "__blyt_phase_draw");
 
     /* Step 8: re-register state + resource API */
     if (active_state_ctx())
@@ -2681,6 +2879,10 @@ static void wasm_lua_loop(void) {
         trace_frame_open = true;
     }
     g_lua_drawn = false;
+    /* Reap the previous frame's off-screen surfaces (draw-scoped, #205) before
+     * the new frame's draw creates fresh ones — mirrors the host reap at
+     * blyt_session_run_frame start. */
+    lua_surf_reap();
     int nres = 0;
     int status = lua_resume(g_lua_co, g_lua, 0, &nres);
 
@@ -2806,6 +3008,14 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     /* Register sandboxed require() */
     lua_pushcfunction(g_lua, wasm_lua_require);
     lua_setglobal(g_lua, "require");
+
+    /* Host-Lua lifecycle phase mirror (#205): the running coroutine brackets
+     * update()/draw() with these so a hybrid cart's native half stays
+     * draw()-only through the gfx ECALL gate. */
+    lua_pushcfunction(g_lua, lua_wasm_phase_update);
+    lua_setglobal(g_lua, "__blyt_phase_update");
+    lua_pushcfunction(g_lua, lua_wasm_phase_draw);
+    lua_setglobal(g_lua, "__blyt_phase_draw");
 
     /* Create rv32emu session when the cart has native code.
      * For pure Lua carts with only .cart.layouts, use a lightweight state ctx

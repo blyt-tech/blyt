@@ -115,6 +115,51 @@ static int lua_blyt_gfx_line(lua_State *L) {
     return 0;
 }
 
+/* Surface tier-1 bindings (blyt32.surface.*, #205).  Lua is tier-1 only: the
+ * canvas is the explicit first argument (blyt32.surface.SCREEN or a handle from
+ * create), source images/surfaces are arguments.  Each forwards to the
+ * libblyt32.so surface primitive (an ECALL into the host on the emulated path).
+ * There is no acquire/release binding — the per-pixel tier-2 lock is C/Rust and
+ * native-only (the Lua per-pixel fast path is deferred).  Handles are u32 but
+ * fit a positive lua_Integer (i32): SURFACE/LOCKVIEW kinds keep bit 31 clear. */
+static int lua_blyt_surface_create(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)blyt_surface_create((int32_t)luaL_checkinteger(L, 1),
+                                                        (int32_t)luaL_checkinteger(L, 2)));
+    return 1;
+}
+static int lua_blyt_surface_destroy(lua_State *L) {
+    blyt_surface_destroy((blyt_surface_h)luaL_checkinteger(L, 1));
+    return 0;
+}
+static int lua_blyt_surface_clear(lua_State *L) {
+    blyt_surface_clear((blyt_surface_h)luaL_checkinteger(L, 1), (uint8_t)luaL_checkinteger(L, 2));
+    return 0;
+}
+static int lua_blyt_surface_pixel(lua_State *L) {
+    blyt_surface_pixel((blyt_surface_h)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                       (int32_t)luaL_checkinteger(L, 3), (uint8_t)luaL_checkinteger(L, 4));
+    return 0;
+}
+static int lua_blyt_surface_rect_fill(lua_State *L) {
+    blyt_surface_rect_fill((blyt_surface_h)luaL_checkinteger(L, 1),
+                           (int32_t)luaL_checkinteger(L, 2), (int32_t)luaL_checkinteger(L, 3),
+                           (int32_t)luaL_checkinteger(L, 4), (int32_t)luaL_checkinteger(L, 5),
+                           (uint8_t)luaL_checkinteger(L, 6));
+    return 0;
+}
+static int lua_blyt_surface_line(lua_State *L) {
+    blyt_surface_line((blyt_surface_h)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                      (int32_t)luaL_checkinteger(L, 3), (int32_t)luaL_checkinteger(L, 4),
+                      (int32_t)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+    return 0;
+}
+static int lua_blyt_surface_blit(lua_State *L) {
+    blyt_surface_blit((blyt_surface_h)luaL_checkinteger(L, 1),
+                      (blyt_surface_h)luaL_checkinteger(L, 2), (int32_t)luaL_checkinteger(L, 3),
+                      (int32_t)luaL_checkinteger(L, 4));
+    return 0;
+}
+
 static int lua_blyt_save_write(lua_State *L) {
     lua_pushinteger(L, blyt_save_write((uint32_t)luaL_checkinteger(L, 1)));
     return 1;
@@ -597,6 +642,25 @@ static void register_blyt32(lua_State *L) {
         lua_setfield(L, -2, gfx_fns[i].name);
     }
     lua_setfield(L, -2, "gfx"); /* blyt32.gfx = gfx; pops gfx */
+
+    /* --- blyt32.surface subtable (tier-1 surface API, #205) --- */
+    lua_newtable(L); /* blyt32.surface */
+    static const struct {
+        const char *name;
+        lua_CFunction fn;
+    } surface_fns[] = {
+        {"create", lua_blyt_surface_create},       {"destroy", lua_blyt_surface_destroy},
+        {"clear", lua_blyt_surface_clear},         {"pixel", lua_blyt_surface_pixel},
+        {"rect_fill", lua_blyt_surface_rect_fill}, {"line", lua_blyt_surface_line},
+        {"blit", lua_blyt_surface_blit},           {NULL, NULL},
+    };
+    for (int i = 0; surface_fns[i].name; i++) {
+        lua_pushcfunction(L, surface_fns[i].fn);
+        lua_setfield(L, -2, surface_fns[i].name);
+    }
+    lua_pushinteger(L, (lua_Integer)BLYT_SCREEN); /* blyt32.surface.SCREEN */
+    lua_setfield(L, -2, "SCREEN");
+    lua_setfield(L, -2, "surface"); /* blyt32.surface = surface; pops surface */
 
     lua_setglobal(L, "blyt32"); /* pops blyt32 */
 

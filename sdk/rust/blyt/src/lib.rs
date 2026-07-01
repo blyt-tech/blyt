@@ -13,6 +13,7 @@
 use core::ffi::c_char;
 
 pub mod buffer;
+pub mod gfx;
 pub mod mem;
 pub mod resource;
 pub mod save;

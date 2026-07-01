@@ -23,6 +23,7 @@
 /* ECALL numbers (must match runtime/host/src/libblyt/ecall.h). */
 #define ECALL_CONSOLE_DEBUG 1
 #define ECALL_FRAME_DONE 2
+#define ECALL_PHASE 13
 #define ECALL_RESOURCE_PIN 61
 #define ECALL_RESOURCE_UNPIN 62
 /* 63 (RESOURCE_LOAD) / 64 (RESOURCE_RELEASE) retired — ADR-0134, #196. */
@@ -43,6 +44,18 @@ static unsigned int blytcommon_strlen(const char *s) {
 void blyt_frame_done(void) {
     register long a7 __asm__("a7") = ECALL_FRAME_DONE;
     __asm__ volatile("ecall" : : "r"(a7) : "memory");
+}
+
+/* blyt_phase_enter — lifecycle phase signal (ECALL 13, #205).
+ *
+ * Emitted by blyt_main around each cart callback; the host stores it on
+ * run-ctx->phase and permits surface access only while it is BLYT_PHASE_DRAW.
+ * On the emulated path the guest never reads the phase back, so
+ * blyt_phase_current is native-only (see native blytcommon.c). */
+void blyt_phase_enter(int32_t phase) {
+    register long a0 __asm__("a0") = (long)phase;
+    register long a7 __asm__("a7") = ECALL_PHASE;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
 }
 
 /* blyt_console_debug — ADR-0085 ECALL stub (a0=ptr, a1=len). */
