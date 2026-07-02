@@ -18,6 +18,16 @@
 #include "blyt.h"
 
 #include "blyt_phase.h" /* runtime/shared: lifecycle phase signal (#205) */
+#include "blyt_runtime_flags.h" /* runtime/shared: host→guest runtime flags (#208) */
+
+/* Host→guest runtime flags block (#208).  Lives in libblytcommon — the portable
+ * runtime lib every cart loads — so the tier-2 Lua lock's guest binding (which
+ * already depends on libblytcommon for blyt_mem_stats) resolves it on the native
+ * dynamic-link path too, and the host resolves its guest address (symtab_lookup)
+ * to write cart_is_debug once at session setup.  Exported (no version script on
+ * libblytcommon); read with no ECALL to pick hard-error vs no-op on a bad
+ * per-pixel access.  A per-build constant, so it does not affect determinism. */
+blyt_runtime_flags_t blyt_runtime_flags = {0};
 
 /* -------------------------------------------------------------------------
  * blyt_quit — set the quit flag; blyt_main exits its loop next tick

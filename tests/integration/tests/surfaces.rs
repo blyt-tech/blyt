@@ -509,6 +509,135 @@ fn surface_lua_screen_torture_hashes_identically_across_legs() {
     run_cart_libretro_with_env(&cart, &env, &expected);
 }
 
+/// #208 Stage 2: the Lua tier-2 per-pixel lock (`blyt32.surface.acquire` →
+/// `lk:set`/`clear`/`rect_fill`/`line` → `lk:release`) drawing the torture frame
+/// into the screen must hash to the identical golden on every leg — extending
+/// the tier-1 ≡ tier-2 ≡ C guarantee (#205) to the Lua per-pixel path across
+/// emulated-Lua (blyt32.c) and host-Lua (the wasm fast path). Red until acquire
+/// and the lock userdata are bound in both Lua bindings.
+#[test]
+fn surface_lua_lock_tier2_screen_torture_hashes_identically_across_legs() {
+    require_sdk();
+    let ops = gfx::torture_frame();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("surface-lua-lock-torture");
+    CartProject::new()
+        .lua(&format!(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n{}end\n",
+            gfx::lua_lock_draw_body(&ops, "blyt32.surface.SCREEN", "lk")
+        ))
+        .write(&project);
+    let cart = build_cart(&project);
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// #208: `lk:get` reads back what `lk:set` wrote (per-pixel round-trip), and an
+/// out-of-bounds read returns the defined cleared `0` in a release cart. The
+/// frame is hashed on every leg so the guest (blyt32.c copy-in/out) and host-Lua
+/// (direct pointer) read paths are proven pixel-identical.
+#[test]
+fn surface_lua_lock_get_roundtrip_across_legs() {
+    require_sdk();
+    // clear 3; write 42 at (10,10); copy it to (20,20) via get; OOB read → 0 at (30,30).
+    let ops = [
+        gfx::Op::Clear(3),
+        gfx::Op::Pixel(10, 10, 42),
+        gfx::Op::Pixel(20, 20, 42), // == lk:get(10,10)
+        gfx::Op::Pixel(30, 30, 0),  // == lk:get(-1,-1), OOB → 0
+    ];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("surface-lua-lock-get");
+    CartProject::new()
+        .lua(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n\
+             \x20 local lk = blyt32.surface.acquire(blyt32.surface.SCREEN)\n\
+             \x20 lk:clear(3)\n\
+             \x20 lk:set(10, 10, 42)\n\
+             \x20 lk:set(20, 20, lk:get(10, 10))\n\
+             \x20 lk:set(30, 30, lk:get(-1, -1))\n\
+             \x20 lk:release()\n\
+             end\n",
+        )
+        .write(&project);
+    let cart = build_cart(&project);
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// #208: using a lock after `lk:release()` is a defined no-op in a release cart
+/// (never a crash). The post-release `set` must not land — the golden includes
+/// only the pre-release pixel. Guards the released-flag check on every leg.
+#[test]
+fn surface_lua_lock_use_after_release_is_noop_across_legs() {
+    require_sdk();
+    let ops = [gfx::Op::Clear(3), gfx::Op::Pixel(5, 5, 7)];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("surface-lua-lock-uar");
+    CartProject::new()
+        .lua(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n\
+             \x20 local lk = blyt32.surface.acquire(blyt32.surface.SCREEN)\n\
+             \x20 lk:clear(3)\n\
+             \x20 lk:set(5, 5, 7)\n\
+             \x20 lk:release()\n\
+             \x20 lk:set(6, 6, 8)\n\
+             end\n",
+        )
+        .write(&project);
+    let cart = build_cart(&project);
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// #208: in a DEBUG cart, an out-of-bounds `lk:set` is a hard Lua error — not the
+/// release no-op — surfaced through Lua's normal error path (and, in a debug
+/// session, pausing the DAP debugger). Headless, the raised error is logged to
+/// the console, so we assert its message appears. This pins that the release
+/// no-op is a deliberate, debug-visible contract, and that the guest read
+/// cart_is_debug == 1 from the host-published runtime-flags block. (Unlike the
+/// host-side phase gate, a guest Lua error follows Lua's log-and-continue path
+/// rather than aborting the process — see call_global in blyt32lua.c.)
+#[test]
+fn surface_lua_lock_oob_errors_in_debug_cart() {
+    require_sdk();
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("surface-lua-lock-oob-debug");
+    CartProject::new()
+        .lua(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n\
+             \x20 local lk = blyt32.surface.acquire(blyt32.surface.SCREEN)\n\
+             \x20 lk:set(1000, 1000, 7)\n\
+             end\n",
+        )
+        .write(&project);
+    let cart = build_debug_cart(&project);
+    run_cart_native_with_env(&cart, &[], "out of bounds");
+}
+
 /// The Lua tier-1 surface API end-to-end: create a blank off-screen surface,
 /// draw into it, clear the screen, and blit the surface onto it.  The presented
 /// screen must hash identically across every leg and equal the reference —
@@ -559,6 +688,47 @@ fn surface_lua_offscreen_draw_then_blit_hashes_identically_across_legs() {
     );
     let expected = gfx::expected_hash_line(&screen);
 
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
+/// #208 cross-half screen-lock coherence: while the host-Lua half holds a tier-2
+/// lock on the SCREEN, a tier-1 op the native half issues on the screen must be
+/// REJECTED on every leg — the #207 exclusive-lock invariant, now spanning both
+/// halves of a WASM hybrid through the one session registry (#210). The frame
+/// hashes identically across legs and equals the golden WITHOUT the rejected op:
+/// on the fast path the Lua acquire marks the session slot locked, so
+/// cart_run.c's lock gate rejects the native op exactly as on the single-registry
+/// (emulated/native) legs. This is the case #210 was landed to make coherent.
+#[test]
+fn surface_hybrid_lua_screen_lock_rejects_native_tier1_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let c_src = "#include \"blyt.h\"\n\
+                 BLYT_LUA_EXPORT_VOID(native_rect) {\n\
+                 \x20 blyt_surface_rect_fill(BLYT_SCREEN, 50, 50, 20, 20, 9);\n\
+                 }\n";
+    let lua_src = "function init() end\n\
+                   function update() blyt.quit() end\n\
+                   function draw()\n\
+                   \x20 local lk = blyt32.surface.acquire(blyt32.surface.SCREEN)\n\
+                   \x20 lk:clear(3)\n\
+                   \x20 lk:set(10, 10, 7)\n\
+                   \x20 native_rect()\n\
+                   \x20 lk:release()\n\
+                   end\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("surface-hybrid-lock-reject");
+    CartProject::new().c(c_src).lua(lua_src).write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    // Golden = only the Lua lock's draws; the native rect is rejected on every leg.
+    let ops = [gfx::Op::Clear(3), gfx::Op::Pixel(10, 10, 7)];
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
     let env = [("BLYT_FRAME_HASH", "1")];
     run_cart_native_with_env(&cart, &env, &expected);
     run_cart_wasm_with_env(&cart, &env, &expected);

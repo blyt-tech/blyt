@@ -193,6 +193,9 @@ typedef struct {
     bool locked;
     bool lock_phantom; /* acquired outside draw() (release no-op): reads-as-cleared,
                         * never flushes back to the canonical buffer (#205) */
+    bool lock_direct; /* host-Lua tier-2 lock (#208): the caller drew straight into
+                       * the canonical buffer (no guest-VA copy), so release/reap
+                       * skip the copy-out — the writes already landed. */
     uint16_t lock_gen; /* bumped on release — a released token goes stale */
     uint32_t lock_vaddr; /* guest VA of the materialized region */
     uint32_t lock_len; /* == w*h */
@@ -1486,11 +1489,14 @@ static void blyt_surface_flush_lock(blyt_surface_registry_t *reg, blyt_surface_s
     if (!s->locked)
         return;
     /* A phantom lock (acquired outside draw() in a release cart) never writes
-     * back to the canonical buffer — an out-of-phase op is a defined no-op. */
-    if (!s->lock_phantom && mem && s->pixels)
+     * back to the canonical buffer — an out-of-phase op is a defined no-op.  A
+     * direct lock (host-Lua tier-2, #208) drew straight into the canonical
+     * buffer, so there is nothing to copy back either. */
+    if (!s->lock_phantom && !s->lock_direct && mem && s->pixels)
         memory_read(mem, s->pixels, s->lock_vaddr, s->lock_len);
     s->locked = false;
     s->lock_phantom = false;
+    s->lock_direct = false;
     s->lock_gen++;
     if (reg->active_locks > 0)
         reg->active_locks--;
@@ -3300,6 +3306,17 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
          * .data is zero-initialised in the freshly mapped lib (footprint 0,
          * matching "nothing loaded yet"), so no stamp is needed at fresh load. */
         s->ctx.mem_acct_vaddr = symtab_lookup(all_syms, "blyt_mem_acct");
+        /* Publish the host→guest runtime-flags block (#208): the tier-2 Lua lock
+         * reads cart_is_debug from it to choose hard-error vs no-op on a bad
+         * per-pixel access, with no ECALL.  Resolved + written once here (a
+         * per-build constant); absent for carts that don't link it (only the Lua
+         * runtime exports it today), in which case the guest reads 0 = release. */
+        uint32_t rt_flags_vaddr = symtab_lookup(all_syms, "blyt_runtime_flags");
+        if (rt_flags_vaddr != 0) {
+            uint8_t v[4];
+            write_u32_le(v, blyt_cart_is_debug(cart) ? 1u : 0u);
+            memory_write(mem, rt_flags_vaddr, v, 4); /* offset 0 = cart_is_debug */
+        }
     }
 
     /* Retain the lib images on the session (issue #119) so a hot swap can
@@ -4358,6 +4375,43 @@ uint8_t *blyt_session_surface_drawable(blyt_session_t *session, uint32_t handle,
     if (out_is_screen)
         *out_is_screen = s->is_screen;
     return s->pixels;
+}
+
+uint8_t *blyt_session_surface_acquire(blyt_session_t *session, uint32_t handle, int32_t *out_w,
+                                      int32_t *out_h, uint32_t *out_token) {
+    if (out_token)
+        *out_token = BLYT_HANDLE_NONE;
+    if (!session)
+        return NULL;
+    blyt_surface_registry_t *reg = &session->ctx.surfaces;
+    blyt_surface_slot_t *s = blyt_resolve_surface(reg, handle);
+    if (!s || s->locked) /* unresolvable, or already locked (exclusive, #205/#207) */
+        return NULL;
+    /* Direct-pointer tier-2 lock for a host-Lua caller (#208): mark the slot
+     * locked so tier-1 ops on it are rejected (#207 within-registry, #210
+     * cross-half for a hybrid's screen), and hand back the canonical buffer —
+     * no guest-VA arena, no copy.  Release/reap skip the copy-out (lock_direct). */
+    s->locked = true;
+    s->lock_phantom = false;
+    s->lock_direct = true;
+    s->lock_vaddr = 0;
+    s->lock_len = 0;
+    reg->active_locks++;
+    if (out_w)
+        *out_w = s->w;
+    if (out_h)
+        *out_h = s->h;
+    if (out_token)
+        *out_token = blyt_lockview_encode(s->lock_gen, blyt_dyn_decode_index(handle));
+    return s->pixels;
+}
+
+void blyt_session_surface_release(blyt_session_t *session, uint32_t token) {
+    if (!session)
+        return;
+    blyt_surface_slot_t *s = blyt_resolve_lockview(&session->ctx.surfaces, token);
+    if (s) /* stale/foreign token → no-op */
+        blyt_surface_flush_lock(&session->ctx.surfaces, s, session->attr.mem);
 }
 
 void blyt_session_reap_surfaces(blyt_session_t *session) {

@@ -691,6 +691,30 @@ function draw() end
         None
     };
 
+    // Lua tier-2 lock cart (gate 29, #208): the native RV32 Lua VM →
+    // blyt32.surface.acquire → the guest lock userdata (set/clear/rect_fill/line)
+    // → the native surface pool's direct-pointer lock.  The torture frame drawn
+    // under a screen lock must equal the tier-1 / C-tier-2 torture golden on
+    // metal (surface_lock_golden), pinning the Lua per-pixel path bare-metal.
+    let surface_lua_lock_cart = if have_lua_gate {
+        let project = tmp.path().join("surface_lua_lock");
+        CartProject::new()
+            .lua(&format!(
+                "function init() end\n\
+                 function update() blyt.quit() end\n\
+                 function draw()\n{}end\n",
+                common::gfx::lua_lock_draw_body(
+                    &common::gfx::torture_frame(),
+                    "blyt32.surface.SCREEN",
+                    "lk"
+                )
+            ))
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     // ── Start QEMU ────────────────────────────────────────────────────
     let ssh_port = free_port();
     println!("Starting QEMU (SSH port {ssh_port})...");
@@ -842,6 +866,12 @@ function draw() end
         assert!(
             qemu.scp_to(cart, "/tmp/blyt_gate/"),
             "scp surface_hybrid_handle.blyt failed"
+        );
+    }
+    if let Some(ref cart) = surface_lua_lock_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp surface_lua_lock.blyt failed"
         );
     }
     assert!(
@@ -2568,6 +2598,37 @@ void blyt_cart_draw(void) {}
              (expected {expected_pal:?}; #221)\noutput: {output}"
         );
         println!("  PASS: {expected} + {expected_pal}");
+    }
+
+    // ── Gate 32: Lua tier-2 per-pixel lock on metal (#208) ─────────────
+    //
+    // The bare-metal Lua fast-pixel cell: the native RV32 Lua VM →
+    // blyt32.surface.acquire → the guest lock userdata → the native surface
+    // pool's direct-pointer lock.  The torture frame drawn under a screen lock
+    // must equal the tier-1 / C-tier-2 torture golden on metal, proving the Lua
+    // per-pixel path is pixel-identical to C on hardware too.
+    if surface_lua_lock_cart.is_some() {
+        println!("Gate 32: Lua tier-2 lock (acquire/set/release) on metal...");
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/surface_lua_lock.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "surface_lua_lock.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&surface_lock_golden),
+            "native bare-metal Lua tier-2 lock must hash identically to the tier-1 / \
+             C-tier-2 torture golden and the emulated legs (expected \
+             {surface_lock_golden:?}; #208)\noutput: {output}"
+        );
+        println!("  PASS: {surface_lock_golden}");
+    } else {
+        println!("Gate 32: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     println!("Gate tests passed.");

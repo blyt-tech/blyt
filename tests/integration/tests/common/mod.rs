@@ -170,6 +170,35 @@ pub mod gfx {
         s
     }
 
+    /// Emit a Lua draw body that issues `ops` under a tier-2 lock on `surface`
+    /// (#208 Stage 2): acquire, draw with the lock userdata's methods (per-pixel
+    /// `lk:set` plus the in-lock bulk `lk:clear`/`rect_fill`/`line`), then
+    /// release.  The Lua counterpart of [`c_lock_draw_body`]; drawing the same
+    /// frame this way must hash identically to the tier-1 / C-tier-2 goldens on
+    /// every leg.  `surface` is a Lua expression (e.g. `"blyt32.surface.SCREEN"`
+    /// or a handle variable); `lk` is the emitted lock variable name.
+    ///
+    /// `Pixel` ops emit `lk:set`, which is *checked* (out-of-bounds → no-op) —
+    /// equivalent to the raster clip for the in-bounds pixels in
+    /// [`torture_frame`], so the golden is unchanged.
+    pub fn lua_lock_draw_body(ops: &[Op], surface: &str, lk: &str) -> String {
+        let mut s = format!("  local {lk} = blyt32.surface.acquire({surface})\n");
+        for op in ops {
+            match *op {
+                Op::Clear(c) => s += &format!("  {lk}:clear({c})\n"),
+                Op::Pixel(x, y, c) => s += &format!("  {lk}:set({x}, {y}, {c})\n"),
+                Op::Rect(x, y, w, h, c) => {
+                    s += &format!("  {lk}:rect_fill({x}, {y}, {w}, {h}, {c})\n")
+                }
+                Op::Line(x0, y0, x1, y1, c) => {
+                    s += &format!("  {lk}:line({x0}, {y0}, {x1}, {y1}, {c})\n")
+                }
+            }
+        }
+        s += &format!("  {lk}:release()\n");
+        s
+    }
+
     /// Emit a Rust `blyt_cart_draw` body issuing `ops` via the tier-1 surface API
     /// (`blyt::gfx`) on `dst` (e.g. `"blyt::gfx::SCREEN"`). The Rust-cart
     /// counterpart of [`c_surface_draw_body`]; drawing the torture frame into the
