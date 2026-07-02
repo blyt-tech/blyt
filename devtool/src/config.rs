@@ -37,6 +37,13 @@ pub struct CartConfig {
     /// Built-in default-palette selection (issue #201, ADR-0042/0088).
     #[serde(default)]
     pub palettes: PalettesDecl,
+
+    /// Named color swatches → palette index, e.g. `colors: {sky: 47}` (issue
+    /// #203, ADR-0059). The packer emits a `C_<NAME>` compile-time constant per
+    /// entry (mirroring resource `R_*`), letting a cart name its custom
+    /// palette's indices. Names must be valid C/Lua identifiers.
+    #[serde(default)]
+    pub colors: BTreeMap<String, u8>,
 }
 
 /// The `palettes:` node in blyt.config.yaml (issue #201). Named (not
@@ -65,6 +72,17 @@ pub(crate) fn builtin_palette_id(name: &str) -> Option<u32> {
         "cga" => Some(4),
         _ => None,
     }
+}
+
+/// A non-empty `[A-Za-z_][A-Za-z0-9_]*` identifier — the shared rule for names
+/// that become C/Lua/Rust constant identifiers (issue #203 color swatches).
+pub(crate) fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn default_fps() -> u8 {
@@ -342,6 +360,19 @@ pub fn read_cart_config(project_dir: &Path) -> Result<CartConfig, String> {
         }
     }
 
+    // Validate color-swatch names are usable C/Lua identifiers (issue #203):
+    // non-empty, [A-Za-z_][A-Za-z0-9_]* — else the emitted C_<NAME> constant
+    // would not compile / the Lua `C.<NAME>` key would be invalid.
+    for name in cfg.colors.keys() {
+        if !is_ident(name) {
+            return Err(format!(
+                "blyt.config.yaml: color name {name:?} is not a valid identifier \
+                 (must be non-empty, start with a letter or underscore, and contain \
+                 only letters, digits, and underscores)"
+            ));
+        }
+    }
+
     // Validate all state_buffer record references
     for (buf_name, buf) in &cfg.state_buffers {
         if !cfg.records.contains_key(&buf.record) {
@@ -417,6 +448,48 @@ state_buffers:
     fn palettes_default_absent_is_none() {
         let cfg = parse("fps: 60\n").unwrap();
         assert!(cfg.palettes.default.is_none());
+    }
+
+    #[test]
+    fn colors_absent_is_empty() {
+        let cfg = parse("fps: 60\n").unwrap();
+        assert!(cfg.colors.is_empty());
+    }
+
+    #[test]
+    fn colors_parse_name_to_index() {
+        let cfg = parse("colors:\n  sky: 47\n  grass: 12\n").unwrap();
+        assert_eq!(cfg.colors.get("sky"), Some(&47));
+        assert_eq!(cfg.colors.get("grass"), Some(&12));
+    }
+
+    #[test]
+    fn colors_out_of_range_index_rejected() {
+        // serde rejects 300 for a u8 before our own validation runs.
+        let err = match parse("colors:\n  sky: 300\n") {
+            Err(e) => e,
+            Ok(_) => panic!("expected out-of-range color index to be rejected"),
+        };
+        assert!(err.contains("blyt.config.yaml"), "got: {err}");
+    }
+
+    #[test]
+    fn colors_invalid_identifier_rejected() {
+        let err = match parse("colors:\n  \"3d\": 5\n") {
+            Err(e) => e,
+            Ok(_) => panic!("expected invalid color identifier to be rejected"),
+        };
+        assert!(err.contains("not a valid identifier"), "got: {err}");
+    }
+
+    #[test]
+    fn is_ident_rules() {
+        assert!(is_ident("sky"));
+        assert!(is_ident("_x"));
+        assert!(is_ident("BR_RED"));
+        assert!(!is_ident(""));
+        assert!(!is_ident("3d"));
+        assert!(!is_ident("a-b"));
     }
 
     #[test]

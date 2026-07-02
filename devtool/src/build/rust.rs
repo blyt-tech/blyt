@@ -74,6 +74,7 @@ pub(super) struct CompileRustTask {
     pub is_lua: bool,
     pub cart_state_rs: Option<PathBuf>,
     pub cart_resources_rs: Option<PathBuf>,
+    pub cart_colors_rs: Option<PathBuf>,
     pub output: PathBuf,
     pub source_dir: PathBuf,
 }
@@ -102,6 +103,9 @@ impl Task for CompileRustTask {
         if let Some(ref rs) = self.cart_resources_rs {
             v.push(TaskInput::File(rs.clone()));
         }
+        if let Some(ref rs) = self.cart_colors_rs {
+            v.push(TaskInput::File(rs.clone()));
+        }
         v
     }
     fn outputs(&self) -> Vec<PathBuf> {
@@ -118,6 +122,7 @@ impl Task for CompileRustTask {
             self.is_lua,
             self.cart_state_rs.as_deref(),
             self.cart_resources_rs.as_deref(),
+            self.cart_colors_rs.as_deref(),
         )?;
         if archive != self.output {
             fs::copy(&archive, &self.output)
@@ -232,6 +237,7 @@ fn build_rust_archive(
     is_lua: bool,
     cart_state_rs: Option<&Path>,
     cart_resources_rs: Option<&Path>,
+    cart_colors_rs: Option<&Path>,
 ) -> Result<PathBuf, BuildError> {
     let mut cmd = cargo_cart_cmd(cargo, rust_manifest, build_dir);
     cmd.arg("--config").arg(format!(
@@ -258,6 +264,10 @@ fn build_rust_archive(
     if let Some(rs_path) = cart_resources_rs {
         let abs = std::fs::canonicalize(rs_path).unwrap_or_else(|_| rs_path.to_path_buf());
         cargo_cmd.env("BLYT_CART_RESOURCES_RS", abs);
+    }
+    if let Some(rs_path) = cart_colors_rs {
+        let abs = std::fs::canonicalize(rs_path).unwrap_or_else(|_| rs_path.to_path_buf());
+        cargo_cmd.env("BLYT_CART_COLORS_RS", abs);
     }
     let rust_flags = format!(
         "{extra_rustflags} --remap-path-prefix={}=/blyt/sdk/rust/blyt",
@@ -332,6 +342,7 @@ mod tests {
             is_lua: false,
             cart_state_rs: None,
             cart_resources_rs: None,
+            cart_colors_rs: None,
             output,
             source_dir,
         }

@@ -683,6 +683,52 @@ static void register_blyt32(lua_State *L) {
     lua_setfield(L, -2, "SCREEN");
     lua_setfield(L, -2, "surface"); /* blyt32.surface = surface; pops surface */
 
+    /* --- blyt32.color subtable: named color-index constants (#203) --- */
+    /* The EGA-16 naming vocabulary; each bundled palette its own index set.
+     * color.ega / .vga / .aurora carry the per-palette indices (names shared,
+     * values differ; vga's low 16 == ega); the color root mirrors aurora as the
+     * zero-config default (blyt.h's BLYT_<NAME> aliases).  Values come straight
+     * from blyt.h -- this is guest code, so no duplication. */
+    static const char *const color_names[16] = {
+        "BLACK",  "BLUE",    "GREEN",    "CYAN",    "RED",    "MAGENTA",    "BROWN",     "LTGRAY",
+        "DKGRAY", "BR_BLUE", "BR_GREEN", "BR_CYAN", "BR_RED", "BR_MAGENTA", "BR_YELLOW", "WHITE",
+    };
+    static const uint8_t ega_idx[16] = {
+        BLYT_EGA_BLACK,  BLYT_EGA_BLUE,       BLYT_EGA_GREEN,     BLYT_EGA_CYAN,
+        BLYT_EGA_RED,    BLYT_EGA_MAGENTA,    BLYT_EGA_BROWN,     BLYT_EGA_LTGRAY,
+        BLYT_EGA_DKGRAY, BLYT_EGA_BR_BLUE,    BLYT_EGA_BR_GREEN,  BLYT_EGA_BR_CYAN,
+        BLYT_EGA_BR_RED, BLYT_EGA_BR_MAGENTA, BLYT_EGA_BR_YELLOW, BLYT_EGA_WHITE,
+    };
+    static const uint8_t aurora_idx[16] = {
+        BLYT_AURORA_BLACK,  BLYT_AURORA_BLUE,       BLYT_AURORA_GREEN,     BLYT_AURORA_CYAN,
+        BLYT_AURORA_RED,    BLYT_AURORA_MAGENTA,    BLYT_AURORA_BROWN,     BLYT_AURORA_LTGRAY,
+        BLYT_AURORA_DKGRAY, BLYT_AURORA_BR_BLUE,    BLYT_AURORA_BR_GREEN,  BLYT_AURORA_BR_CYAN,
+        BLYT_AURORA_BR_RED, BLYT_AURORA_BR_MAGENTA, BLYT_AURORA_BR_YELLOW, BLYT_AURORA_WHITE,
+    };
+    lua_newtable(L); /* blyt32.color */
+    /* color.ega and color.vga (identical index set) */
+    for (int pass = 0; pass < 2; pass++) {
+        lua_newtable(L);
+        for (int i = 0; i < 16; i++) {
+            lua_pushinteger(L, (lua_Integer)ega_idx[i]);
+            lua_setfield(L, -2, color_names[i]);
+        }
+        lua_setfield(L, -2, pass == 0 ? "ega" : "vga");
+    }
+    /* color.aurora */
+    lua_newtable(L);
+    for (int i = 0; i < 16; i++) {
+        lua_pushinteger(L, (lua_Integer)aurora_idx[i]);
+        lua_setfield(L, -2, color_names[i]);
+    }
+    lua_setfield(L, -2, "aurora");
+    /* Default aliases on the color root -> aurora (the console default). */
+    for (int i = 0; i < 16; i++) {
+        lua_pushinteger(L, (lua_Integer)aurora_idx[i]);
+        lua_setfield(L, -2, color_names[i]);
+    }
+    lua_setfield(L, -2, "color"); /* blyt32.color = color; pops color */
+
     lua_setglobal(L, "blyt32"); /* pops blyt32 */
 
     lua_pop(L, 1); /* pop blyt.buf (idx B) */

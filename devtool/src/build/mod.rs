@@ -1,5 +1,6 @@
 mod assets;
 mod c;
+mod colors;
 mod cpp;
 mod external;
 mod handle;
@@ -1928,6 +1929,21 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     );
     tasks.extend(asset_tasks);
 
+    // Packer-generated color constants (#203, ADR-0059): emit cart_colors.{h,
+    // lua,rs} from the manifest's `colors:` swatch map. Independent of the asset
+    // pipeline (colors are a config map, not files); gated on its own presence.
+    let has_colors = !cart_config.colors.is_empty();
+    if has_colors {
+        tasks.push(Box::new(colors::GenerateColorHeadersTask {
+            c_output: build_dir.join("blyt/c/cart_colors.h"),
+            lua_output: build_dir.join("blyt/lua/cart_colors.lua"),
+            rust_output: build_dir.join("blyt/rust/cart_colors.rs"),
+            c_header: colors::generate_c_header(&cart_config.colors),
+            lua_module: colors::generate_lua_module(&cart_config.colors),
+            rust_module: colors::generate_rust_module(&cart_config.colors),
+        }));
+    }
+
     // Persistent resources (#160, ADR-0028): resolve the manifest's
     // `persistent_resources` names to ids against the scanned assets. This also
     // enforces the build-time budget guard (Layer 1) — an over-budget or
@@ -1992,6 +2008,12 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
         // an input, so the engine sequences the generating task ahead of it.
         if has_assets {
             lua_files.insert(0, build_dir.join("blyt/lua/cart_resources.lua"));
+        }
+        // Same for the packer-generated color module (#203): bundle it first so
+        // `require("cart_colors")` resolves before cart code runs at module
+        // scope.
+        if has_colors {
+            lua_files.insert(0, build_dir.join("blyt/lua/cart_colors.lua"));
         }
         let bytecode_path = build_dir.join("bytecode.luac");
         let data_c = build_dir.join("cart_lua_data.c");
@@ -2123,6 +2145,7 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
                 is_lua: true,
                 cart_state_rs: None,
                 cart_resources_rs: None,
+                cart_colors_rs: None,
                 output,
                 source_dir: lib_path,
             }));
@@ -2130,9 +2153,10 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     }
 
     let mut c_include_paths: Vec<PathBuf> = lib_include_paths;
-    // build/blyt/c holds both cart_state.h (state buffers) and cart_resources.h
-    // (assets); add it to the include path if either is generated.
-    if buffers_present || has_assets {
+    // build/blyt/c holds cart_state.h (state buffers), cart_resources.h
+    // (assets), and cart_colors.h (#203); add it to the include path if any is
+    // generated.
+    if buffers_present || has_assets || has_colors {
         c_include_paths.push(build_dir.join("blyt/c"));
     }
 
@@ -2224,6 +2248,14 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
         } else {
             None
         };
+        // Color constants (#203): generated only when the cart declares colors,
+        // matching the C/Lua gating.  Pulled in via
+        // `include!(env!("BLYT_CART_COLORS_RS"))`.
+        let cart_colors_rs = if has_colors {
+            Some(build_dir.join("blyt/rust/cart_colors.rs"))
+        } else {
+            None
+        };
         let output = rust_build_dir.join("cart.a");
         tasks.push(Box::new(rust::CompileRustTask {
             key_str: "cargo_game".to_string(),
@@ -2237,6 +2269,7 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
             is_lua,
             cart_state_rs,
             cart_resources_rs,
+            cart_colors_rs,
             output: output.clone(),
             source_dir: project_dir.join("src/game/rust"),
         }));
@@ -2463,6 +2496,7 @@ pub fn build_single_lib(
             is_lua: false,
             cart_state_rs: None,
             cart_resources_rs: None,
+            cart_colors_rs: None,
             output: output.clone(),
             source_dir: src_dir,
         })];
