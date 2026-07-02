@@ -7,11 +7,66 @@
 //! (ADR-0049: index 255 holds a real color, transparent only at blit time — a
 //! deferred image-tier concern). The output layout is XRGB8888 with the top
 //! byte 0, matching `session->palette` / `blyt_builtin_palette`.
-#![allow(dead_code)] // wired into the ResourceType::Palette transform in a later slice
 
 use crate::engine::{BuildError, build_err};
 
 pub(super) const PALETTE_ENTRIES: usize = 256;
+
+/// Staged size of a palette resource's `.data`: 256 entries × 4 bytes
+/// (XRGB8888, little-endian). The runtime `blyt_gfx_palette_set` requires
+/// exactly this many bytes (#214).
+pub(super) const PALETTE_DATA_LEN: usize = PALETTE_ENTRIES * 4;
+
+/// The three text palette-file formats, dispatched by file extension. Reserved
+/// as a *processed type* (`ResourceType::Palette`): these extensions are
+/// auto-scanned under `assets.dirs` regardless of `text_extensions` (ADR-0088
+/// amendment 2026-07-02, #214).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaletteFormat {
+    /// Lospec `.hex`.
+    Hex,
+    /// GIMP `.gpl`.
+    Gpl,
+    /// JASC-PAL text `.pal`.
+    Pal,
+}
+
+impl PaletteFormat {
+    /// Classify a file extension (case-insensitive) as a palette format, or
+    /// `None` for a non-palette extension.
+    pub(super) fn from_extension(ext: &str) -> Option<Self> {
+        if ext.eq_ignore_ascii_case("hex") {
+            Some(Self::Hex)
+        } else if ext.eq_ignore_ascii_case("gpl") {
+            Some(Self::Gpl)
+        } else if ext.eq_ignore_ascii_case("pal") {
+            Some(Self::Pal)
+        } else {
+            None
+        }
+    }
+
+    fn parse(self, text: &str) -> Result<[u32; PALETTE_ENTRIES], BuildError> {
+        match self {
+            Self::Hex => parse_hex(text),
+            Self::Gpl => parse_gpl(text),
+            Self::Pal => parse_pal(text),
+        }
+    }
+}
+
+/// Parse a palette file's text into its canonical staged bytes: the 256-entry
+/// XRGB8888 table serialized little-endian (matching the LE guest/host
+/// `session->palette` in-memory layout), exactly [`PALETTE_DATA_LEN`] bytes.
+pub(super) fn parse_to_bytes(fmt: PaletteFormat, text: &str) -> Result<Vec<u8>, BuildError> {
+    let table = fmt.parse(text)?;
+    let mut out = Vec::with_capacity(PALETTE_DATA_LEN);
+    for entry in table {
+        out.extend_from_slice(&entry.to_le_bytes());
+    }
+    debug_assert_eq!(out.len(), PALETTE_DATA_LEN);
+    Ok(out)
+}
 
 /// Pack 8-bit `r,g,b` into XRGB8888 (top/alpha byte 0).
 fn xrgb(r: u8, g: u8, b: u8) -> u32 {
@@ -65,7 +120,11 @@ fn parse_rgb_line(line: &str, ctx: &str) -> Result<u32, BuildError> {
         it.next()
             .ok_or_else(|| build_err(format!("{ctx}: missing {chan} component in {line:?}")))?
             .parse::<u8>()
-            .map_err(|_| build_err(format!("{ctx}: {chan} component not a 0-255 integer in {line:?}")))
+            .map_err(|_| {
+                build_err(format!(
+                    "{ctx}: {chan} component not a 0-255 integer in {line:?}"
+                ))
+            })
     };
     let (r, g, b) = (next("red")?, next("green")?, next("blue")?);
     Ok(xrgb(r, g, b))
@@ -98,7 +157,10 @@ pub(super) fn parse_gpl(text: &str) -> Result<[u32; PALETTE_ENTRIES], BuildError
         if !line.starts_with(|c: char| c.is_ascii_digit()) {
             continue;
         }
-        colors.push(parse_rgb_line(line, &format!("palette .gpl line {}", i + 1))?);
+        colors.push(parse_rgb_line(
+            line,
+            &format!("palette .gpl line {}", i + 1),
+        )?);
     }
     if !seen_magic {
         return Err(build_err(
@@ -219,6 +281,63 @@ mod tests {
     fn pal_rejects_count_exceeding_color_lines() {
         let src = "JASC-PAL\n0100\n3\n0 0 0\n255 0 0\n";
         let err = parse_pal(src).unwrap_err().to_string();
-        assert!(err.contains("3") || err.to_lowercase().contains("count"), "got: {err}");
+        assert!(
+            err.contains("3") || err.to_lowercase().contains("count"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn format_from_extension_is_case_insensitive() {
+        assert_eq!(
+            PaletteFormat::from_extension("hex"),
+            Some(PaletteFormat::Hex)
+        );
+        assert_eq!(
+            PaletteFormat::from_extension("GPL"),
+            Some(PaletteFormat::Gpl)
+        );
+        assert_eq!(
+            PaletteFormat::from_extension("Pal"),
+            Some(PaletteFormat::Pal)
+        );
+        assert_eq!(PaletteFormat::from_extension("txt"), None);
+        assert_eq!(PaletteFormat::from_extension("png"), None);
+    }
+
+    #[test]
+    fn parse_to_bytes_serializes_1024_le_bytes() {
+        let bytes = parse_to_bytes(PaletteFormat::Hex, "FF0000\n00FF00\n0000FF\n").unwrap();
+        assert_eq!(bytes.len(), PALETTE_DATA_LEN);
+        // XRGB8888 little-endian: 0x00FF0000 -> 00 00 FF 00.
+        assert_eq!(&bytes[0..4], &[0x00, 0x00, 0xFF, 0x00]);
+        assert_eq!(&bytes[4..8], &[0x00, 0xFF, 0x00, 0x00]);
+        assert_eq!(&bytes[8..12], &[0xFF, 0x00, 0x00, 0x00]);
+        // Unspecified indices pad black.
+        assert_eq!(&bytes[12..16], &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(&bytes[1020..1024], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn parse_to_bytes_dispatches_by_format() {
+        // The same three colors expressed in each format yield identical bytes.
+        let hex = parse_to_bytes(PaletteFormat::Hex, "000000\nFF0000\n0000FF\n").unwrap();
+        let gpl = parse_to_bytes(
+            PaletteFormat::Gpl,
+            "GIMP Palette\n0 0 0\n255 0 0\n0 0 255\n",
+        )
+        .unwrap();
+        let pal = parse_to_bytes(
+            PaletteFormat::Pal,
+            "JASC-PAL\n0100\n3\n0 0 0\n255 0 0\n0 0 255\n",
+        )
+        .unwrap();
+        assert_eq!(hex, gpl);
+        assert_eq!(gpl, pal);
+    }
+
+    #[test]
+    fn parse_to_bytes_propagates_parse_errors() {
+        assert!(parse_to_bytes(PaletteFormat::Hex, "nothex\n").is_err());
     }
 }
