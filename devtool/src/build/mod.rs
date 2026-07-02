@@ -5,6 +5,7 @@ mod cpp;
 mod external;
 mod handle;
 mod lua;
+mod palette;
 mod persistent;
 mod resource_pack;
 mod rust;
