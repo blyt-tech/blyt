@@ -973,6 +973,7 @@ if(BLYT_BUILD_NATIVE)
     "${LIBBLYT32_NATIVE_SRC}"
     "${SHARED_DIR}/blyt_raster.c"
     "${SHARED_DIR}/blyt_frame_hash.c"
+    "${SHARED_DIR}/blyt_palettes.c"
     CFLAGS
     -O2
     -I

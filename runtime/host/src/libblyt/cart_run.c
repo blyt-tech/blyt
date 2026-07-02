@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "blyt_handle.h" /* runtime/shared: console-wide resource-constant encoding (ADR-0134) */
+#include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
 #include "blyt_resource_codec.h" /* runtime/shared: BLYT_RES_ALGO_NONE (#157) */
 #include "blyt_runtime.h"
 #include "blyt_trace.h"
@@ -264,6 +265,7 @@ typedef struct {
      * handle.  Mirrors the state_ctx "pointer into the owning session" idiom. */
     uint8_t *fb; /* = session->pixels */
     bool *cart_has_drawn; /* = &session->cart_has_drawn */
+    uint32_t *palette; /* = session->palette (#201) */
     /* Surface registry (#205): slot 0 = screen (aliases fb), slots 1.. are
      * off-screen surfaces.  Draw-scoped — reaped at each frame boundary. */
     blyt_surface_registry_t surfaces;
@@ -1971,6 +1973,18 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 
+    /* Palette load (#201): a0=handle. A no-op on a handle that does not
+     * resolve to a built-in palette. */
+    case BLYT_ECALL_GFX_PALETTE_SET: {
+        uint32_t handle = rv_get_reg(rv, rv_reg_a0);
+        blyt_tracef(BLYT_TRACE_API, "gfx_palette_set(0x%08x)", handle);
+        const uint32_t *pal = blyt_builtin_palette(handle);
+        if (g_run_ctx && g_run_ctx->palette && pal)
+            memcpy(g_run_ctx->palette, pal, 256 * sizeof(uint32_t));
+        rv->PC += 4;
+        return;
+    }
+
     /* Resource lifecycle ECALLs (ADR-0027, #123).  Result codes are
      * blyt_result_t values (BLYT_OK=0, BLYT_ERR_INVALID_ARG=1, BLYT_ERR_IO=3,
      * BLYT_ERR_NOT_FOUND=4); the host does not include the guest blyt.h. */
@@ -3659,6 +3673,7 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
      * The session address is stable across hot swaps, so this is set once. */
     s->ctx.fb = s->pixels;
     s->ctx.cart_has_drawn = &s->cart_has_drawn;
+    s->ctx.palette = s->palette;
 
     /* Surface registry (#205): slot 0 is BLYT_SCREEN, aliasing the session's
      * paletted framebuffer — never reaped, destroyed, or budget-counted.  Its
@@ -3704,7 +3719,23 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
 #endif
     rv_set_reg(s->rv, rv_reg_ra, BLYT_TRAMPOLINE_EXIT_ADDR);
 
-    blyt_testcard_init_palette(s->palette);
+    /* Pre-init palette auto-load (#201, ADR-0088): the cart's declared
+     * `palettes: default:` handle, or the runtime default (aurora) when
+     * undeclared. The testcard (drawn only while !cart_has_drawn) renders
+     * through whatever this resolves to -- a palette-agnostic testcard remap
+     * is #204; until then a non-aurora default may render the testcard's
+     * bespoke indices as unintended colors, which is expected and does not
+     * affect its displace-on-first-draw behavior. */
+    {
+        uint32_t pal_handle = blyt_cart_default_palette(cart);
+        if (pal_handle == 0)
+            pal_handle = BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
+        const uint32_t *pal = blyt_builtin_palette(pal_handle);
+        if (!pal)
+            pal = blyt_builtin_palette(
+                BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+        memcpy(s->palette, pal, sizeof(s->palette));
+    }
 
 #ifdef BLYT_GDB
     /* Present the cart purely as a shared library, NOT as the main executable

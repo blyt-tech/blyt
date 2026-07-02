@@ -31,6 +31,12 @@ const RESOURCE_PROVENANCE_SHIFT: u32 = 24;
 /// `BLYT_RESOURCE_PROV_CART`.
 pub(super) const PROV_CART: u32 = 0;
 
+/// Provenance: a runtime-shipped/built-in resource. Mirrors
+/// `BLYT_RESOURCE_PROV_RUNTIME`. The only runtime-provenance constants the
+/// packer mints today are the four built-in palettes (issue #201); general
+/// built-in-resource population is still deferred (ADR-0134).
+pub(super) const PROV_RUNTIME: u32 = 1;
+
 /// Encode a packer-assigned resource id into the baked `u32` constant the cart
 /// ships and passes back into the resource API. Mirrors `BLYT_RESOURCE_ENCODE`.
 ///
@@ -49,6 +55,12 @@ pub(super) fn resource_encode(id: u32, provenance: u32) -> u32 {
 /// Encode a cart-bundled resource id — the common case for the packer.
 pub(super) fn resource_encode_cart(id: u32) -> u32 {
     resource_encode(id, PROV_CART)
+}
+
+/// Encode a built-in (runtime-shipped) resource id — used for the four
+/// built-in palette constants (issue #201).
+pub(super) fn resource_encode_runtime(id: u32) -> u32 {
+    resource_encode(id, PROV_RUNTIME)
 }
 
 #[cfg(test)]
@@ -75,5 +87,8 @@ mod tests {
         assert_eq!(resource_encode(1, 1), 0x2100_0001);
         // full-width id (16 M - 1) does not collide with the kind/provenance bits.
         assert_eq!(resource_encode_cart(RESOURCE_ID_MASK), 0x20FF_FFFF);
+        // resource_encode_runtime mirrors BLYT_PALETTE_AURORA (id 1, runtime
+        // provenance) — the canonical example from runtime/shared/blyt_palettes.h.
+        assert_eq!(resource_encode_runtime(1), 0x2100_0001);
     }
 }

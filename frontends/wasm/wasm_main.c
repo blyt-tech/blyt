@@ -42,6 +42,7 @@
 #include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
 #include "blyt_handle.h" /* runtime/shared: console-wide resource-constant encoding (ADR-0134) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
+#include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
 #include "blyt_resource_codec.h" /* runtime/shared: BLYT_RES_ALGO_NONE (#157) */
 #include "resource.h"
 #include "save.h"
@@ -749,6 +750,21 @@ static uint8_t *lua_gfx_fb(void) {
     return g_lua_pixels;
 }
 
+/* The active 256-entry palette the host-Lua gfx bindings write into (#201,
+ * fixing #199): the SAME "session when present, else standalone" routing as
+ * lua_gfx_fb, so a hybrid cart's Lua-half palette_set() call lands in the
+ * session's canonical palette (shared with the native half via cart_run.c's
+ * ECALL handler) instead of a parallel buffer that silently drops on wasm. */
+static uint32_t *lua_gfx_palette(void) {
+    if (g_session)
+        return (uint32_t *)blyt_session_get_palette(g_session);
+    if (!g_lua_gfx_palette_init) {
+        blyt_testcard_init_palette(g_lua_gfx_palette);
+        g_lua_gfx_palette_init = true;
+    }
+    return g_lua_gfx_palette;
+}
+
 /* blyt32.gfx.* host-Lua bindings (#188).  Each rasterizes into the active
  * framebuffer (see lua_gfx_fb) via the shared integer core and flags
  * g_lua_drawn; the frame loop then presents + hashes it.  Mirror of the guest
@@ -781,6 +797,20 @@ static int lua_wasm_gfx_line(lua_State *L) {
                      (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
                      (uint8_t)luaL_checkinteger(L, 5));
     g_lua_drawn = true;
+    return 0;
+}
+
+/* Palette load (#201).  Routes to the session palette for hybrid carts, the
+ * standalone buffer for session-less pure-Lua carts (lua_gfx_palette, #199).
+ * A no-op on a handle that does not resolve to a built-in palette. */
+static int lua_wasm_gfx_palette_set(lua_State *L) {
+    uint32_t handle = (uint32_t)luaL_checkinteger(L, 1);
+    const uint32_t *pal = blyt_builtin_palette(handle);
+    if (pal) {
+        uint32_t *dst = lua_gfx_palette();
+        for (int i = 0; i < 256; i++)
+            dst[i] = pal[i];
+    }
     return 0;
 }
 
@@ -1010,12 +1040,32 @@ static void wasm_register_gfx_api(lua_State *L) {
         {"pixel", lua_wasm_gfx_pixel},
         {"rect_fill", lua_wasm_gfx_rect_fill},
         {"line", lua_wasm_gfx_line},
+        {"palette_set", lua_wasm_gfx_palette_set},
         {NULL, NULL},
     };
     for (int i = 0; gfx_fns[i].name; i++) {
         lua_pushcfunction(L, gfx_fns[i].fn);
         lua_setfield(L, -2, gfx_fns[i].name);
     }
+    /* Built-in palette constants (#201), mirroring blyt32lua.c's pure-Lua
+     * binding and BLYT_SCREEN's plain-constant-field precedent.  wasm_main.c
+     * is host-side (not cart code), so it encodes directly from the canonical
+     * runtime/shared source rather than including the cart-facing blyt.h. */
+    lua_pushinteger(
+        L, (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_AURORA");
+    lua_pushinteger(L,
+                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_VGA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_VGA");
+    lua_pushinteger(L,
+                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_EGA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_EGA");
+    lua_pushinteger(L,
+                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_CGA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_CGA");
+    lua_pushinteger(
+        L, (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_DEFAULT");
     lua_setfield(L, -2, "gfx"); /* blyt32.gfx = gfx */
 
     /* blyt32.surface.* — tier-1 surface API on the host-Lua fast path (#205). */

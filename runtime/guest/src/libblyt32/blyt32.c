@@ -32,6 +32,7 @@
 #define ECALL_SURFACE_BLIT 108
 #define ECALL_SURFACE_ACQUIRE 109
 #define ECALL_SURFACE_RELEASE 110
+#define ECALL_GFX_PALETTE_SET 111
 
 /* BUF_OP sub-opcodes */
 #define BUF_OP_GET_F32 1
@@ -189,6 +190,12 @@ uint8_t *blyt_gfx_acquire(void) {
 void blyt_gfx_present(void) {
     register long a7 __asm__("a7") = ECALL_GFX_PRESENT;
     __asm__ volatile("ecall" : : "r"(a7) : "memory");
+}
+
+void blyt_gfx_palette_set(blyt_resource_id_t palette) {
+    register long a0 __asm__("a0") = (long)palette;
+    register long a7 __asm__("a7") = ECALL_GFX_PALETTE_SET;
+    __asm__ volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
 }
 
 /* Tier-2 lock (#205).  Acquire passes the surface and the guest address of the

@@ -34,6 +34,7 @@ struct blyt_cart {
     int is_debug; /* .cart.info `debug` flag (ADR-0129): declared debug build */
     int has_dwarf; /* a .debug_* section is present (DWARF, unstripped) */
     uint32_t save_version; /* .cart.config `save_version` (ADR-0125); 0 if absent */
+    uint32_t default_palette; /* .cart.config `default_palette` (#201); 0 if absent (aurora) */
 };
 
 /* ADR-0129: true for carts built with `blyt build --debug`.

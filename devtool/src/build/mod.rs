@@ -183,12 +183,26 @@ fn cart_info_bytes(debug: bool, info: &InfoFields) -> Vec<u8> {
  * ------------------------------------------------------------------------- */
 
 fn cart_config_bytes(cfg: &CartConfig) -> Vec<u8> {
+    // palettes.default (issue #201) -> the encoded runtime-provenance handle;
+    // 0 (unset) means the runtime default (aurora). read_cart_config already
+    // rejected an unknown name, so this only sees a validated one; the
+    // fallback to 0 covers CartConfig values built directly (e.g. in tests)
+    // without going through that validation.
+    let default_palette = cfg
+        .palettes
+        .default
+        .as_deref()
+        .and_then(crate::config::builtin_palette_id)
+        .map(handle::resource_encode_runtime)
+        .unwrap_or(0);
+
     let mut fbb = FlatBufferBuilder::new();
     let config = FbCartConfig::create(
         &mut fbb,
         &CartConfigArgs {
             fps: cfg.fps,
             save_version: cfg.save_version,
+            default_palette,
         },
     );
     fbb.finish(config, None);
@@ -2592,6 +2606,26 @@ mod tests {
         let b = cart_config_bytes(&CartConfig::default());
         let config = root_as_cart_config(&b[8..]).expect("valid CartConfig");
         assert_eq!(config.save_version(), 0);
+    }
+
+    #[test]
+    fn cart_config_default_palette_defaults_zero() {
+        let b = cart_config_bytes(&CartConfig::default());
+        let config = root_as_cart_config(&b[8..]).expect("valid CartConfig");
+        assert_eq!(config.default_palette(), 0);
+    }
+
+    #[test]
+    fn cart_config_default_palette_encodes_declared_name() {
+        let mut cfg = CartConfig {
+            fps: 60,
+            ..Default::default()
+        };
+        cfg.palettes.default = Some("vga".to_string());
+        let b = cart_config_bytes(&cfg);
+        let config = root_as_cart_config(&b[8..]).expect("valid CartConfig");
+        // vga = built-in id 2, runtime provenance -> 0x2100_0002.
+        assert_eq!(config.default_palette(), 0x2100_0002);
     }
 
     #[test]

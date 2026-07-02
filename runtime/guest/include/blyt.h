@@ -416,6 +416,42 @@ uint8_t *blyt_gfx_acquire(void);
 void blyt_gfx_present(void);
 
 /* -------------------------------------------------------------------------
+ * Graphics — palette (ADR-0042/0086, issue #201)
+ *
+ * The screen's 256-entry palette (XRGB8888) is global.  blyt_gfx_palette_set
+ * loads one of the four runtime-bundled built-in palettes wholesale.  A cart
+ * that declares no palette (`palettes:` in blyt.config.yaml) gets
+ * BLYT_PALETTE_DEFAULT (aurora) auto-loaded before init() (ADR-0088).  There
+ * is no cart-authored palette yet -- custom palettes are #203.
+ *
+ * Handles are console-wide tagged resource constants (blyt_handle.h) with
+ * runtime provenance -- must equal runtime/shared/blyt_palettes.h's builtin ids
+ * encoded via BLYT_RESOURCE_ENCODE(id, BLYT_RESOURCE_PROV_RUNTIME).  Guarded so
+ * a guest lib that also includes the canonical blyt_handle.h (native path)
+ * gets a single, non-clashing definition, matching the BLYT_SCREEN pattern
+ * above. */
+#ifndef BLYT_PALETTE_AURORA
+#define BLYT_PALETTE_AURORA ((blyt_resource_id_t)0x21000001u)
+#endif
+#ifndef BLYT_PALETTE_VGA
+#define BLYT_PALETTE_VGA ((blyt_resource_id_t)0x21000002u)
+#endif
+#ifndef BLYT_PALETTE_EGA
+#define BLYT_PALETTE_EGA ((blyt_resource_id_t)0x21000003u)
+#endif
+#ifndef BLYT_PALETTE_CGA
+#define BLYT_PALETTE_CGA ((blyt_resource_id_t)0x21000004u)
+#endif
+/* The console default -- what an undeclared-palette cart auto-loads. */
+#ifndef BLYT_PALETTE_DEFAULT
+#define BLYT_PALETTE_DEFAULT BLYT_PALETTE_AURORA
+#endif
+
+/* Load a built-in palette wholesale (all 256 entries).  A no-op on a handle
+ * that does not resolve to a built-in palette. */
+void blyt_gfx_palette_set(blyt_resource_id_t palette);
+
+/* -------------------------------------------------------------------------
  * Lua export macros (ADR-0111) — hybrid Lua+C carts
  *
  * Usage:

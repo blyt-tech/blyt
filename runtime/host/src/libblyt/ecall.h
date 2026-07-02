@@ -175,6 +175,14 @@
  *     stale/foreign token (kind or generation mismatch). */
 #define BLYT_ECALL_SURFACE_ACQUIRE 109
 #define BLYT_ECALL_SURFACE_RELEASE 110
+
+/* Palette load (issue #201, ADR-0042/0086).  Loads one of the four
+ * runtime-bundled built-in palettes wholesale into the global 256-entry
+ * screen palette.
+ *   GFX_PALETTE_SET: a0=palette handle (console-wide tagged u32, runtime
+ *     provenance).  A no-op on a handle that does not resolve to a built-in
+ *     palette (unknown id, wrong kind/provenance). */
+#define BLYT_ECALL_GFX_PALETTE_SET 111
 /* Sub-opcodes for BLYT_ECALL_BUF_OP (a0).
  * type_tag encoding: 0=i8 1=u8 2=i16 3=u16 4=i32 5=u32 6=f32 7=bool 8=f64 */
 #define BUF_OP_GET_F32 1

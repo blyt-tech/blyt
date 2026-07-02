@@ -11,6 +11,12 @@ table CartConfig {
     // (ADR-0087). 0 means undeclared. Appended field (FlatBuffers: never
     // reorder the fields above).
     save_version: uint32 = 0;
+    // The `palettes: { default: <name> }` declaration in blyt.config.yaml
+    // (issue #201): the console-wide tagged resource constant (runtime
+    // provenance) of the built-in palette to auto-load before init() when the
+    // cart declares none. 0 (unset) means the runtime default (aurora).
+    // Appended field (FlatBuffers: never reorder the fields above).
+    default_palette: uint32 = 0;
 }
 
 root_type CartConfig;
