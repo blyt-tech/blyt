@@ -350,15 +350,10 @@ pub fn read_cart_config(project_dir: &Path) -> Result<CartConfig, String> {
     let cfg: CartConfig =
         serde_yaml::from_str(&text).map_err(|e| format!("blyt.config.yaml: {e}"))?;
 
-    // Validate the palettes.default name against the built-in set (issue #201).
-    if let Some(name) = &cfg.palettes.default {
-        if builtin_palette_id(name).is_none() {
-            return Err(format!(
-                "blyt.config.yaml: unknown built-in palette {name:?} (expected one of: \
-                 aurora, vga, ega, cga)"
-            ));
-        }
-    }
+    // `palettes.default` is resolved at build time, not here (#214): it may name
+    // either a built-in (aurora/vga/ega/cga) or a palette-file *asset*, and the
+    // asset name→id map only exists after the asset scan. `cart_config_bytes`'s
+    // `resolve_default_palette` validates it against both namespaces there.
 
     // Validate color-swatch names are usable C/Lua identifiers (issue #203):
     // non-empty, [A-Za-z_][A-Za-z0-9_]* — else the emitted C_<NAME> constant
@@ -499,14 +494,13 @@ state_buffers:
     }
 
     #[test]
-    fn palettes_default_unknown_name_rejected() {
-        let err = parse("palettes:\n  default: not_a_palette\n")
-            .err()
-            .expect("config should be rejected");
-        assert!(
-            err.contains("unknown built-in palette"),
-            "unexpected error: {err}"
-        );
+    fn palettes_default_arbitrary_name_parses() {
+        // An unknown name is no longer rejected at parse time (#214): it may
+        // name a palette-file asset, resolved at build time
+        // (`resolve_default_palette`) against both the built-in and asset
+        // namespaces. Parsing just records the string.
+        let cfg = parse("palettes:\n  default: my_palette\n").unwrap();
+        assert_eq!(cfg.palettes.default.as_deref(), Some("my_palette"));
     }
 
     #[test]
