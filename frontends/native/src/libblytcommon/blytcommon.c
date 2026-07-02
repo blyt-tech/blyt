@@ -260,6 +260,19 @@ static uint64_t s_schema_hash;
  * reported as blyt_load_info_t.saved_cart_version on read.  0 if undeclared. */
 static uint32_t s_save_version;
 
+/* The running cart's .cart.config default_palette (#201), loaded at startup
+ * by load_cart_buf_counts().  The console-wide tagged handle of the built-in
+ * palette to auto-load before init(); 0 (undeclared) means the runtime
+ * default (aurora).  Read by libblyt32.so via blyt_native_default_palette(). */
+static uint32_t s_default_palette;
+
+/* Cross-.so accessor (#201): libblyt32.so's gfx surface has no ELF-parsing
+ * code of its own -- it reads the value this .so already parsed out of
+ * .cart.config, mirroring how save_version stays blytcommon-owned. */
+uint32_t blyt_native_default_palette(void) {
+    return s_default_palette;
+}
+
 /* Per-slot public generation (unbiased; see s_gen). */
 static uint16_t native_gen(uint32_t bi, int32_t s) {
     return s_gen[bi][s];
@@ -509,6 +522,21 @@ static void load_cart_buf_counts(void) {
                                 const uint8_t *sv_ptr = ctable + sv_foff;
                                 if (sv_ptr + 4u <= cfb + cfb_size)
                                     blyt32_native_memcpy(&s_save_version, sv_ptr, 4);
+                            }
+                            /* CartConfig.default_palette is field id 2
+                             * (vtable byte offset 8), the field appended
+                             * after save_version (#201).  An older cart's
+                             * vtable may be only 8 bytes (fps+save_version
+                             * only) -- the field is then absent, default 0,
+                             * same as any other missing FlatBuffers field. */
+                            if (cvtsize >= 10u) {
+                                uint16_t dp_foff;
+                                blyt32_native_memcpy(&dp_foff, cvtable + 8, 2);
+                                if (dp_foff != 0) {
+                                    const uint8_t *dp_ptr = ctable + dp_foff;
+                                    if (dp_ptr + 4u <= cfb + cfb_size)
+                                        blyt32_native_memcpy(&s_default_palette, dp_ptr, 4);
+                                }
                             }
                         }
                     }

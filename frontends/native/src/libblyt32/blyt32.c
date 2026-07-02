@@ -26,8 +26,14 @@
 #include "blyt_handle.h" /* runtime/shared: SURFACE/LOCKVIEW encode/classify (#196/#205) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (#158) */
 #include "blyt_native_trace.h" /* getenv + raw-write helpers (no libc stdio) */
+#include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
 #include "blyt_phase.h" /* runtime/shared: draw()-only phase (#205) */
 #include "blyt_raster.h" /* runtime/shared: integer rasterizer core */
+
+/* Implemented in the native libblytcommon variant, which already parses
+ * .cart.config to load save_version (#201): the console-wide tagged handle of
+ * the cart's `palettes: default:` declaration, or 0 (undeclared). */
+extern uint32_t blyt_native_default_palette(void);
 
 /* The paletted surface geometry.  Matches the host's BLYT_FRAME_W/H
  * (runtime/host/include/blyt_runtime.h); the proper graphics API will
@@ -77,9 +83,43 @@ static uint8_t s_surface_arena[BLYT_MEM_BUDGET_BYTES]; /* off-screen bump arena 
 static uint32_t s_surface_bump;
 static uint8_t s_surfaces_init;
 
+/* The screen's 256-entry palette (#201).  BSS zero-initialised; seeded to the
+ * cart's declared (or default aurora) built-in on first use, mirroring
+ * native_surfaces_init's lazy-init idiom -- there is no separate "session
+ * create" hook on bare metal. */
+static uint32_t s_palette[256];
+static uint8_t s_palette_init;
+
+static void native_palette_init(void) {
+    if (s_palette_init)
+        return;
+    uint32_t handle = blyt_native_default_palette();
+    if (handle == 0)
+        handle = BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
+    const uint32_t *pal = blyt_builtin_palette(handle);
+    if (!pal)
+        pal = blyt_builtin_palette(
+            BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    for (int i = 0; i < 256; i++)
+        s_palette[i] = pal[i];
+    s_palette_init = 1;
+}
+
+/* Load a built-in palette wholesale (#201).  A no-op on a handle that does
+ * not resolve to a built-in palette. */
+void blyt_gfx_palette_set(blyt_resource_id_t palette) {
+    native_palette_init();
+    const uint32_t *pal = blyt_builtin_palette(palette);
+    if (!pal)
+        return;
+    for (int i = 0; i < 256; i++)
+        s_palette[i] = pal[i];
+}
+
 static void native_surfaces_init(void) {
     if (s_surfaces_init)
         return;
+    native_palette_init();
     s_surfaces[0].pixels = s_framebuffer;
     s_surfaces[0].w = NATIVE_FB_W;
     s_surfaces[0].h = NATIVE_FB_H;

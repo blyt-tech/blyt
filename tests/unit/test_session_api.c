@@ -5,6 +5,7 @@
  *   test_session_api session  <cart.blyt> <lib_dir>
  *   test_session_api registry <cart.blyt> <lib_dir>
  *   test_session_api swap     <v1.blyt> <v2.blyt> <lib_dir>
+ *   test_session_api palette  <cart.blyt> <lib_dir>
  *
  * session  mode: drives the cart via blyt_session_create/run_frame/destroy
  *               with libs loaded from BLYT_LIB_DIR (set to lib_dir).
@@ -17,6 +18,13 @@
  *               the VM instance persisted (blyt_session_vm_id unchanged) and
  *               the v2 code booted and ran a clean frame.  Prints each cart's
  *               init marker so the caller can confirm v2's code went live.
+ * palette  mode: creates a session, runs one frame (so a cart's init() gets a
+ *               chance to call blyt_gfx_palette_set), and prints the resolved
+ *               256-entry session palette (#201) as a single line
+ *               "PALETTE:<256 x 8 hex XRGB8888 entries>" — proving both the
+ *               `palettes: default:` config's pre-init auto-load and an
+ *               explicit blyt_gfx_palette_set() call flow end-to-end through
+ *               the real build+load+run path.
  *
  * All modes print the blyt_console_debug output to stdout and exit 0 on
  * success.  Exit 1 on any failure.
@@ -267,6 +275,46 @@ static int mode_swap(const char *v1_path, const char *v2_path, const char *lib_d
 }
 
 /* -------------------------------------------------------------------------
+ * mode: palette — dump the resolved session palette (#201), no frames run.
+ * ------------------------------------------------------------------------- */
+
+static int mode_palette(const char *cart_path, const char *lib_dir) {
+    if (setenv("BLYT_LIB_DIR", lib_dir, 1) != 0) {
+        fprintf(stderr, "setenv BLYT_LIB_DIR failed\n");
+        return 1;
+    }
+
+    blyt_cart_t *cart = NULL;
+    blyt_cart_err_t cerr = blyt_cart_open(cart_path, &cart);
+    if (cerr != BLYT_CART_OK) {
+        fprintf(stderr, "blyt_cart_open: %s\n", blyt_cart_err_str(cerr));
+        return 1;
+    }
+
+    blyt_session_t *s = blyt_session_create(cart, log_fn);
+    if (!s) {
+        fprintf(stderr, "blyt_session_create returned NULL\n");
+        blyt_cart_close(cart);
+        return 1;
+    }
+
+    /* Run one frame so a cart that calls blyt_gfx_palette_set from init() has
+     * done so before the palette is read; a cart that never calls it (the
+     * auto-load-only case) leaves the pre-init default untouched either way. */
+    blyt_session_run_frame(s);
+
+    const uint32_t *pal = blyt_session_get_palette(s);
+    printf("PALETTE:");
+    for (int i = 0; i < 256; i++)
+        printf("%08x", pal[i]);
+    printf("\n");
+
+    blyt_session_destroy(s);
+    blyt_cart_close(cart);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------------- */
 
@@ -275,7 +323,7 @@ int main(int argc, char *argv[]) {
         return mode_swap(argv[2], argv[3], argv[4]);
 
     if (argc != 4) {
-        fprintf(stderr, "usage: test_session_api session|registry <cart.blyt> <lib_dir>\n"
+        fprintf(stderr, "usage: test_session_api session|registry|palette <cart.blyt> <lib_dir>\n"
                         "       test_session_api swap <v1.blyt> <v2.blyt> <lib_dir>\n");
         return 1;
     }
@@ -287,6 +335,8 @@ int main(int argc, char *argv[]) {
         return mode_session(cart_path, lib_dir);
     if (strcmp(mode, "registry") == 0)
         return mode_registry(cart_path, lib_dir);
+    if (strcmp(mode, "palette") == 0)
+        return mode_palette(cart_path, lib_dir);
 
     fprintf(stderr, "unknown mode: %s\n", mode);
     return 1;

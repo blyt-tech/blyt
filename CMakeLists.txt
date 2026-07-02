@@ -450,7 +450,8 @@ add_library(
   runtime/shared/blyt_resource_codec.c
   runtime/shared/blyt_blys.c
   runtime/shared/blyt_raster.c
-  runtime/shared/blyt_frame_hash.c)
+  runtime/shared/blyt_frame_hash.c
+  runtime/shared/blyt_palettes.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
 # same static library is usable in both executables and shared objects.
@@ -564,7 +565,8 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     runtime/shared/blyt_resource_codec.c
     runtime/shared/blyt_blys.c
     runtime/shared/blyt_raster.c
-    runtime/shared/blyt_frame_hash.c)
+    runtime/shared/blyt_frame_hash.c
+    runtime/shared/blyt_palettes.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
   target_include_directories(
@@ -958,6 +960,15 @@ add_executable(test_arena tests/unit/test_arena.c runtime/shared/blyt_arena.c)
 target_include_directories(test_arena PRIVATE runtime/shared)
 add_test(NAME test_arena COMMAND test_arena)
 
+# test_palettes: pins the built-in palette resolver (runtime/shared/
+# blyt_palettes.c, ADR-0042, issue #201) — handle classification (RESOURCE kind,
+# RUNTIME provenance), the four built-ins each resolving to a distinct table,
+# the sacrificial index 255 invariant, and aurora's pinned endpoints.
+add_executable(test_palettes tests/unit/test_palettes.c
+                             runtime/shared/blyt_palettes.c)
+target_include_directories(test_palettes PRIVATE runtime/shared)
+add_test(NAME test_palettes COMMAND test_palettes)
+
 # test_resource_eviction: the host resource eviction mechanism + rehydration
 # (runtime/host/src/libblyt/resource.c, ADR-0027 v2, #137). Links libblyt for
 # the table/entry API + the shared codec; constructs entries directly via the
@@ -1282,6 +1293,7 @@ add_dependencies(
   test_resource_lifecycle
   test_mem_budget
   test_arena
+  test_palettes
   test_resource_codec
   test_resource_eviction
   test_resource_budget)

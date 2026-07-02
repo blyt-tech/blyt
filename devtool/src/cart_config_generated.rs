@@ -38,6 +38,7 @@ pub mod blyt {
     impl<'a> CartConfig<'a> {
         pub const VT_FPS: ::flatbuffers::VOffsetT = 4;
         pub const VT_SAVE_VERSION: ::flatbuffers::VOffsetT = 6;
+        pub const VT_DEFAULT_PALETTE: ::flatbuffers::VOffsetT = 8;
 
         #[inline]
         pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -54,6 +55,7 @@ pub mod blyt {
             args: &'args CartConfigArgs,
         ) -> ::flatbuffers::WIPOffset<CartConfig<'bldr>> {
             let mut builder = CartConfigBuilder::new(_fbb);
+            builder.add_default_palette(args.default_palette);
             builder.add_save_version(args.save_version);
             builder.add_fps(args.fps);
             builder.finish()
@@ -77,6 +79,17 @@ pub mod blyt {
                     .unwrap()
             }
         }
+        #[inline]
+        pub fn default_palette(&self) -> u32 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u32>(CartConfig::VT_DEFAULT_PALETTE, Some(0))
+                    .unwrap()
+            }
+        }
     }
 
     impl ::flatbuffers::Verifiable for CartConfig<'_> {
@@ -88,6 +101,7 @@ pub mod blyt {
             v.visit_table(pos)?
                 .visit_field::<u8>("fps", Self::VT_FPS, false)?
                 .visit_field::<u32>("save_version", Self::VT_SAVE_VERSION, false)?
+                .visit_field::<u32>("default_palette", Self::VT_DEFAULT_PALETTE, false)?
                 .finish();
             Ok(())
         }
@@ -95,6 +109,7 @@ pub mod blyt {
     pub struct CartConfigArgs {
         pub fps: u8,
         pub save_version: u32,
+        pub default_palette: u32,
     }
     impl<'a> Default for CartConfigArgs {
         #[inline]
@@ -102,6 +117,7 @@ pub mod blyt {
             CartConfigArgs {
                 fps: 60,
                 save_version: 0,
+                default_palette: 0,
             }
         }
     }
@@ -119,6 +135,11 @@ pub mod blyt {
         pub fn add_save_version(&mut self, save_version: u32) {
             self.fbb_
                 .push_slot::<u32>(CartConfig::VT_SAVE_VERSION, save_version, 0);
+        }
+        #[inline]
+        pub fn add_default_palette(&mut self, default_palette: u32) {
+            self.fbb_
+                .push_slot::<u32>(CartConfig::VT_DEFAULT_PALETTE, default_palette, 0);
         }
         #[inline]
         pub fn new(
@@ -142,6 +163,7 @@ pub mod blyt {
             let mut ds = f.debug_struct("CartConfig");
             ds.field("fps", &self.fps());
             ds.field("save_version", &self.save_version());
+            ds.field("default_palette", &self.default_palette());
             ds.finish()
         }
     }

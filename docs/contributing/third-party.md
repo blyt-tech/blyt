@@ -156,3 +156,31 @@ keyed on the SHA256 of `CMakeLists.txt`.
 The `test-linux-docker` target mounts a `blyt-fetchcontent-cache-<arch>`
 Docker volume at `/root/.cache/blyt/fetchcontent` so the container build
 also caches downloads across runs.
+
+## Bundled assets (in runtime binary)
+
+Unlike the build-time dependencies above, these are runtime-shipped assets
+(ADR-0042) hand-authored directly into `runtime/shared/` — not fetched, not
+built from an external source tree.
+
+### Palettes (issue #201)
+
+- **aurora** (`palette_default` / `BLYT_PALETTE_AURORA` / `BLYT_PALETTE_DEFAULT`)
+  — DawnBringer "Aurora" (256 colors), sourced verbatim from its canonical
+  listing on [Lospec](https://lospec.com/palette-list/aurora). Aurora has no
+  explicit license anywhere authoritative (Lospec states none, Ettinger's hex
+  gist has none, DawnBringer has no written grant even for DB16/32). Included
+  **provisionally**: a bare list of RGB triples is not independently
+  copyrightable, and the palette is attributed here to its author (Ettinger,
+  "DawnBringer"). This is a risk-accepted decision, not a cleared license —
+  revisit before a 1.0 release (author blyt's own CC0 palette, or switch to an
+  explicitly CC0 source, if the risk calculus changes).
+- **vga** (`BLYT_PALETTE_VGA`) — the standard VGA 256-color default DAC
+  palette: 16 EGA colors + a 16-step grayscale ramp + a 216-color HSV cube.
+  Public-domain PC hardware standard; `runtime/shared/blyt_palettes.c`'s array
+  is a from-scratch reconstruction of the documented construction, not a copy
+  of any third-party source file.
+- **ega** (`BLYT_PALETTE_EGA`) — the standard 16-color EGA palette. Public
+  domain PC hardware standard.
+- **cga** (`BLYT_PALETTE_CGA`) — CGA palette 1, high intensity
+  (black/cyan/magenta/white). Public domain PC hardware standard.

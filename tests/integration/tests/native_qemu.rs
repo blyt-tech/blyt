@@ -399,6 +399,19 @@ function draw() end
     );
     let gfx_raw_cart = gfx_cart("gfx_raw", common::gfx::raw_present_c_draw());
 
+    // blyt_gfx_palette_set on bare metal (gate 26, #201): loads a built-in
+    // palette directly (no ECALL -- native_palette_init's lazy-seeded s_palette
+    // in frontends/native/src/libblyt32/blyt32.c) before drawing the SAME
+    // torture frame.  [blyt:fbhash] hashes indices, not RGB, so the op must
+    // round-trip without perturbing the golden gate 17 already proves.
+    let gfx_palette_set_cart = gfx_cart(
+        "gfx_palette_set",
+        format!(
+            "  blyt_gfx_palette_set(BLYT_PALETTE_VGA);\n{}",
+            common::gfx::c_draw_body(&common::gfx::torture_frame())
+        ),
+    );
+
     // ── Build the Lua and hybrid gfx carts (gates 20 & 21, #193) ──────
     // Fill the bare-metal cells of the gfx execution matrix the spike left
     // untested: a pure-Lua gfx cart (native RV32 Lua VM → blyt32lua.c binding →
@@ -738,6 +751,10 @@ function draw() end
     assert!(
         qemu.scp_to(&gfx_raw_cart, "/tmp/blyt_gate/"),
         "scp gfx_raw.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&gfx_palette_set_cart, "/tmp/blyt_gate/"),
+        "scp gfx_palette_set.blyt failed"
     );
     if let Some(ref cart) = gfx_lua_cart {
         assert!(
@@ -2374,6 +2391,38 @@ void blyt_cart_draw(void) {}
         println!("  PASS: {surface_offscreen_golden}");
     } else {
         println!("Gate 28: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 29: blyt_gfx_palette_set on metal (#201) ──────────────────
+    //
+    // Loads a built-in palette directly (no ECALL — native_palette_init's
+    // lazy-seeded s_palette in frontends/native/src/libblyt32/blyt32.c) and then
+    // draws the SAME torture frame as gate 17.  [blyt:fbhash] hashes palette
+    // *indices*, not RGB content, so the op must round-trip through the native
+    // dispatch path without perturbing gate 17's golden — proving the op is
+    // serviced on bare metal without trapping.  Cross-leg color parity is a
+    // palette-sensitive oracle deferred to #204.
+    {
+        println!("Gate 29: blyt_gfx_palette_set on metal...");
+        let expected =
+            common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/gfx_palette_set.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "gfx_palette_set.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&expected),
+            "native bare-metal blyt_gfx_palette_set must not perturb the index hash \
+             (expected {expected:?}; #201)\noutput: {output}"
+        );
+        println!("  PASS: {expected}");
     }
 
     println!("Gate tests passed.");

@@ -89,6 +89,11 @@ const char *blyt_cart_version(const blyt_cart_t *cart);
  * save header at write time. 0 when undeclared. */
 uint32_t blyt_cart_save_version(const blyt_cart_t *cart);
 
+/* .cart.config `default_palette` (issue #201): the built-in palette handle to
+ * auto-load before init() (`palettes: default:` in blyt.config.yaml). 0 when
+ * undeclared -- the session resolves that to the runtime default (aurora). */
+uint32_t blyt_cart_default_palette(const blyt_cart_t *cart);
+
 /* Runtime version string (from version.txt, baked in at build time). */
 const char *blyt_runtime_version(void);
 

@@ -356,6 +356,7 @@ add_executable(
   "${BLYT_ROOT}/runtime/shared/blyt_blys.c"
   "${BLYT_ROOT}/runtime/shared/blyt_raster.c"
   "${BLYT_ROOT}/runtime/shared/blyt_frame_hash.c"
+  "${BLYT_ROOT}/runtime/shared/blyt_palettes.c"
   # single-sourced cart-heap arena: backs the host-Lua fast path lua_Alloc so a
   # pure-Lua cart's guest_heap_used matches rv32 byte-for-byte (#158).
   "${BLYT_ROOT}/runtime/shared/blyt_arena.c"

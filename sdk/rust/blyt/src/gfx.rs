@@ -26,6 +26,7 @@ extern "C" {
     fn blyt_surface_blit(dst: u32, src: u32, x: i32, y: i32);
     fn blyt_surface_acquire(surface: u32, out: *mut RawLock) -> i32;
     fn blyt_surface_release(lock: *mut RawLock);
+    fn blyt_gfx_palette_set(palette: u32);
 
     // In-lock primitives (the freestanding rasterizer, exported by libblyt32.so).
     fn blyt_raster_clear(fb: *mut u8, stride: i32, width: i32, height: i32, color: u8);
@@ -61,6 +62,22 @@ pub struct Surface(pub u32);
 /// The built-in screen surface (SURFACE kind, slot 0) — never created or
 /// destroyed. Mirrors `BLYT_SCREEN` in `blyt.h` / `blyt_handle.h`.
 pub const SCREEN: Surface = Surface(0x4000_0000);
+
+/// Console-wide tagged handles of the four runtime-bundled built-in palettes
+/// (issue #201, ADR-0042). Mirrors `BLYT_PALETTE_*` in `blyt.h`.
+pub const PALETTE_AURORA: u32 = 0x2100_0001;
+pub const PALETTE_VGA: u32 = 0x2100_0002;
+pub const PALETTE_EGA: u32 = 0x2100_0003;
+pub const PALETTE_CGA: u32 = 0x2100_0004;
+/// The console default — what an undeclared-palette cart auto-loads.
+pub const PALETTE_DEFAULT: u32 = PALETTE_AURORA;
+
+/// Load a built-in palette wholesale (all 256 entries). A no-op on a handle
+/// that does not resolve to a built-in palette (issue #201).
+pub fn palette_set(palette: u32) {
+    // SAFETY: pure scalar ECALL.
+    unsafe { blyt_gfx_palette_set(palette) }
+}
 
 impl Surface {
     /// Create a blank `w`x`h` off-screen surface, draw-scoped to the current

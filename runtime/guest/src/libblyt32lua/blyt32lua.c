@@ -115,6 +115,13 @@ static int lua_blyt_gfx_line(lua_State *L) {
     return 0;
 }
 
+/* Palette load (issue #201). Handles are u32 but fit a positive lua_Integer
+ * (i32): RESOURCE-kind constants keep bit 31 clear. */
+static int lua_blyt_gfx_palette_set(lua_State *L) {
+    blyt_gfx_palette_set((blyt_resource_id_t)luaL_checkinteger(L, 1));
+    return 0;
+}
+
 /* Surface tier-1 bindings (blyt32.surface.*, #205).  Lua is tier-1 only: the
  * canvas is the explicit first argument (blyt32.surface.SCREEN or a handle from
  * create), source images/surfaces are arguments.  Each forwards to the
@@ -635,12 +642,26 @@ static void register_blyt32(lua_State *L) {
         {"pixel", lua_blyt_gfx_pixel},
         {"rect_fill", lua_blyt_gfx_rect_fill},
         {"line", lua_blyt_gfx_line},
+        {"palette_set", lua_blyt_gfx_palette_set},
         {NULL, NULL},
     };
     for (int i = 0; gfx_fns[i].name; i++) {
         lua_pushcfunction(L, gfx_fns[i].fn);
         lua_setfield(L, -2, gfx_fns[i].name);
     }
+    /* Built-in palette constants (#201), mirroring how BLYT_SCREEN is exposed
+     * (a plain constant field, not the packer-generated R module -- these are
+     * runtime built-ins, not cart-declared resources). */
+    lua_pushinteger(L, (lua_Integer)BLYT_PALETTE_AURORA);
+    lua_setfield(L, -2, "PALETTE_AURORA");
+    lua_pushinteger(L, (lua_Integer)BLYT_PALETTE_VGA);
+    lua_setfield(L, -2, "PALETTE_VGA");
+    lua_pushinteger(L, (lua_Integer)BLYT_PALETTE_EGA);
+    lua_setfield(L, -2, "PALETTE_EGA");
+    lua_pushinteger(L, (lua_Integer)BLYT_PALETTE_CGA);
+    lua_setfield(L, -2, "PALETTE_CGA");
+    lua_pushinteger(L, (lua_Integer)BLYT_PALETTE_DEFAULT);
+    lua_setfield(L, -2, "PALETTE_DEFAULT");
     lua_setfield(L, -2, "gfx"); /* blyt32.gfx = gfx; pops gfx */
 
     /* --- blyt32.surface subtable (tier-1 surface API, #205) --- */

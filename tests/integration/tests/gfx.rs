@@ -112,6 +112,31 @@ fn gfx_torture_frame_hashes_identically_across_legs() {
     run_cart_libretro_with_env(&cart, &env, &expected);
 }
 
+/// `blyt_gfx_palette_set` (issue #201): the new op must be serviced without
+/// trapping on every leg, and — since `[blyt:fbhash]` hashes palette *indices*,
+/// not the palette's RGB content — loading a different built-in palette before
+/// drawing the SAME torture frame must hash identically to the palette-less
+/// run. (Cross-leg *color* parity is a palette-sensitive oracle deferred to
+/// #204; this pins that the op round-trips through every leg's dispatch path
+/// without perturbing the index-only hash the emulated trio already proves.)
+#[test]
+fn gfx_palette_set_does_not_perturb_index_hash_across_legs() {
+    require_sdk();
+    let ops = gfx::torture_frame();
+
+    let mut draw_body = "  blyt_gfx_palette_set(BLYT_PALETTE_VGA);\n".to_string();
+    draw_body += &gfx::c_draw_body(&ops);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cart = build_draw_cart(&tmp.path().join("gfx-palette-set"), &draw_body);
+
+    let expected = gfx::expected_hash_line(&gfx::render(&ops));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}
+
 /// Q1 — the acquire/present raw-framebuffer contract.  `blyt_gfx_acquire()`
 /// returns a guest-VA pointer to a runtime-reserved framebuffer region; the cart
 /// writes a deterministic per-pixel pattern straight into it (no per-pixel ECALL)

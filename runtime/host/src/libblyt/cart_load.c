@@ -126,6 +126,7 @@ static const char *const SYMBOL_ALLOWLIST[] = {
     "blyt_surface_release",
     "blyt_gfx_acquire",
     "blyt_gfx_present",
+    "blyt_gfx_palette_set", /* #201 */
     /* Tier-2 in-lock primitives (#205): the freestanding rasterizer, exported by
      * libblyt32.so so a cart holding a lock draws guest-side with no ECALL. */
     "blyt_raster_clear",
@@ -772,6 +773,7 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
     int has_dwarf = 0; /* set when a .debug_* section is present (ADR-0129) */
     int cart_is_debug = 0; /* .cart.info `debug` flag (read below) */
     uint32_t cart_save_version = 0; /* .cart.config `save_version` (ADR-0125) */
+    uint32_t cart_default_palette = 0; /* .cart.config `default_palette` (#201) */
 
     for (uint16_t i = 0; i < eh->e_shnum; i++) {
         const Elf32_Shdr *sh = &shdrs[i];
@@ -1014,10 +1016,14 @@ blyt_cart_err_t blyt_cart_open(const char *path, blyt_cart_t **out) {
         }
 
         /* Read save_version (ADR-0125): stamped into the save header at write
-         * time, reported back as blyt_load_info_t.saved_cart_version on load. */
+         * time, reported back as blyt_load_info_t.saved_cart_version on load.
+         * Read default_palette (#201): the built-in palette to auto-load
+         * before init() when the cart declares one via `palettes: default:`. */
         blyt_CartConfig_table_t config = blyt_CartConfig_as_root(fb_aligned);
-        if (config)
+        if (config) {
             cart_save_version = blyt_CartConfig_save_version(config);
+            cart_default_palette = blyt_CartConfig_default_palette(config);
+        }
         free(fb_aligned);
     }
 
@@ -1107,6 +1113,7 @@ success: {
     cart->is_debug = cart_is_debug;
     cart->has_dwarf = has_dwarf;
     cart->save_version = cart_save_version;
+    cart->default_palette = cart_default_palette;
     cart->id = cart_id; /* ownership transferred; validated non-NULL above */
     cart->title = cart_title;
     cart->version = cart_version;
@@ -1339,6 +1346,10 @@ const char *blyt_cart_version(const blyt_cart_t *cart) {
 
 uint32_t blyt_cart_save_version(const blyt_cart_t *cart) {
     return cart ? cart->save_version : 0u;
+}
+
+uint32_t blyt_cart_default_palette(const blyt_cart_t *cart) {
+    return cart ? cart->default_palette : 0u;
 }
 
 const char *blyt_cart_err_str(blyt_cart_err_t err) {

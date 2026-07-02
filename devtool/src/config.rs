@@ -33,6 +33,38 @@ pub struct CartConfig {
     /// Named state buffer pool declarations.
     #[serde(default)]
     pub state_buffers: BTreeMap<String, BufferDecl>,
+
+    /// Built-in default-palette selection (issue #201, ADR-0042/0088).
+    #[serde(default)]
+    pub palettes: PalettesDecl,
+}
+
+/// The `palettes:` node in blyt.config.yaml (issue #201). Named (not
+/// `palette_`-prefixed) so it reads as `default: vga`, not `default:
+/// palette_vga`; forward-compatible with custom palettes (#203) declared as
+/// sibling keys under the same node.
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PalettesDecl {
+    /// The built-in palette (aurora/vga/ega/cga) to auto-load before init()
+    /// when the cart declares none. Absent means the runtime default
+    /// (aurora).
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// Resolve a `palettes.default` name to its packer id. Must mirror
+/// `runtime/shared/blyt_palettes.h`'s `BLYT_PAL_ID_*` enum exactly — both
+/// sides are pinned by `blyt::build::handle`'s round-trip test and this
+/// function's own name/order.
+pub(crate) fn builtin_palette_id(name: &str) -> Option<u32> {
+    match name {
+        "aurora" => Some(1),
+        "vga" => Some(2),
+        "ega" => Some(3),
+        "cga" => Some(4),
+        _ => None,
+    }
 }
 
 fn default_fps() -> u8 {
@@ -300,6 +332,16 @@ pub fn read_cart_config(project_dir: &Path) -> Result<CartConfig, String> {
     let cfg: CartConfig =
         serde_yaml::from_str(&text).map_err(|e| format!("blyt.config.yaml: {e}"))?;
 
+    // Validate the palettes.default name against the built-in set (issue #201).
+    if let Some(name) = &cfg.palettes.default {
+        if builtin_palette_id(name).is_none() {
+            return Err(format!(
+                "blyt.config.yaml: unknown built-in palette {name:?} (expected one of: \
+                 aurora, vga, ega, cga)"
+            ));
+        }
+    }
+
     // Validate all state_buffer record references
     for (buf_name, buf) in &cfg.state_buffers {
         if !cfg.records.contains_key(&buf.record) {
@@ -369,6 +411,38 @@ state_buffers:
     fn save_version_parses_when_declared() {
         let cfg = parse("save_version: 7\n").unwrap();
         assert_eq!(cfg.save_version, 7);
+    }
+
+    #[test]
+    fn palettes_default_absent_is_none() {
+        let cfg = parse("fps: 60\n").unwrap();
+        assert!(cfg.palettes.default.is_none());
+    }
+
+    #[test]
+    fn palettes_default_parses_builtin_name() {
+        let cfg = parse("palettes:\n  default: vga\n").unwrap();
+        assert_eq!(cfg.palettes.default.as_deref(), Some("vga"));
+    }
+
+    #[test]
+    fn palettes_default_unknown_name_rejected() {
+        let err = parse("palettes:\n  default: not_a_palette\n")
+            .err()
+            .expect("config should be rejected");
+        assert!(
+            err.contains("unknown built-in palette"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn builtin_palette_id_covers_all_four_names() {
+        assert_eq!(builtin_palette_id("aurora"), Some(1));
+        assert_eq!(builtin_palette_id("vga"), Some(2));
+        assert_eq!(builtin_palette_id("ega"), Some(3));
+        assert_eq!(builtin_palette_id("cga"), Some(4));
+        assert_eq!(builtin_palette_id("palette_vga"), None);
     }
 
     #[test]
