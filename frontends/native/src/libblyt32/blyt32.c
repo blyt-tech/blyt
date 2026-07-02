@@ -328,23 +328,29 @@ void blyt_gfx_on_frame_boundary(void) {
     if (!s_on)
         return;
 
-    uint64_t h = blyt_frame_hash(s_framebuffer, (size_t)NATIVE_FB_W * (size_t)NATIVE_FB_H);
+    native_palette_init();
 
-    /* Hand-format "[blyt:fbhash] %016llx\n" (no snprintf in these libs) and
-     * write to stdout (fd 1) — the channel run_cart_native asserts on, matching
-     * the host emit. */
-    char buf[32];
-    const char pfx[] = "[blyt:fbhash] ";
-    unsigned int i = 0;
-    for (unsigned int j = 0; j < sizeof(pfx) - 1; j++)
-        buf[i++] = pfx[j];
-    for (int shift = 60; shift >= 0; shift -= 4)
-        buf[i++] = "0123456789abcdef"[(h >> shift) & 0xFu];
-    buf[i++] = '\n';
+    /* Emit "[blyt:<tag>] %016llx\n" for a 64-bit hash.  No snprintf in these
+     * libs, so hand-format and write(2) to stdout (fd 1) — the channel
+     * run_cart_native asserts on, matching the host emit. */
+    for (int which = 0; which < 2; which++) {
+        uint64_t h =
+            which == 0 ? blyt_frame_hash(s_framebuffer, (size_t)NATIVE_FB_W * (size_t)NATIVE_FB_H)
+                       : blyt_frame_hash((const unsigned char *)s_palette, 256u * sizeof(uint32_t));
+        char buf[32];
+        /* which==0: "[blyt:fbhash] "  which==1: "[blyt:palhash] " (#199/#204) */
+        const char *pfx = which == 0 ? "[blyt:fbhash] " : "[blyt:palhash] ";
+        unsigned int i = 0;
+        for (unsigned int j = 0; pfx[j]; j++)
+            buf[i++] = pfx[j];
+        for (int shift = 60; shift >= 0; shift -= 4)
+            buf[i++] = "0123456789abcdef"[(h >> shift) & 0xFu];
+        buf[i++] = '\n';
 
-    register long a0 __asm__("a0") = 1; /* STDOUT_FILENO */
-    register const char *a1 __asm__("a1") = buf;
-    register long a2 __asm__("a2") = (long)i;
-    register long a7 __asm__("a7") = 64; /* SYS_write */
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+        register long a0 __asm__("a0") = 1; /* STDOUT_FILENO */
+        register const char *a1 __asm__("a1") = buf;
+        register long a2 __asm__("a2") = (long)i;
+        register long a7 __asm__("a7") = 64; /* SYS_write */
+        __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    }
 }

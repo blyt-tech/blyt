@@ -39,3 +39,11 @@ enum {
  * Returns NULL if the handle is not a RESOURCE-kind, RUNTIME-provenance
  * handle, or its id names no built-in palette. */
 const uint32_t *blyt_builtin_palette(uint32_t handle);
+
+/* Return the index of the palette entry closest to XRGB target `rgb`, measured
+ * by squared-Euclidean distance in 8-bit RGB (the top/alpha byte is ignored).
+ * Ties resolve to the lowest index, so the result is a pure, deterministic
+ * function of (palette, rgb) -- identical across every leg (host/wasm/native),
+ * which the testcard's palette-agnostic remap (#204) relies on.  `palette`
+ * points at 256 XRGB8888 entries. */
+uint8_t blyt_palette_nearest(const uint32_t *palette, uint32_t rgb);

@@ -2393,19 +2393,23 @@ void blyt_cart_draw(void) {}
         println!("Gate 28: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
-    // ── Gate 29: blyt_gfx_palette_set on metal (#201) ──────────────────
+    // ── Gate 29: blyt_gfx_palette_set on metal (#201/#199/#204) ────────
     //
     // Loads a built-in palette directly (no ECALL — native_palette_init's
     // lazy-seeded s_palette in frontends/native/src/libblyt32/blyt32.c) and then
     // draws the SAME torture frame as gate 17.  [blyt:fbhash] hashes palette
     // *indices*, not RGB content, so the op must round-trip through the native
-    // dispatch path without perturbing gate 17's golden — proving the op is
-    // serviced on bare metal without trapping.  Cross-leg color parity is a
-    // palette-sensitive oracle deferred to #204.
+    // dispatch path without perturbing gate 17's golden.  The palette-sensitive
+    // [blyt:palhash] oracle (#199/#204) additionally pins that the palette bytes
+    // actually became VGA on bare metal — the colour parity the index hash cannot
+    // see.  The expected palhash is FNV-1a over VGA's 1024 palette bytes, matching
+    // the emulated legs' palette_set tests in palettes.rs.
     {
         println!("Gate 29: blyt_gfx_palette_set on metal...");
         let expected =
             common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
+        // VGA built-in palette hash (see palette_set_changes_only_palhash_across_legs).
+        let expected_pal = "[blyt:palhash] 53fe4342eb448528";
         let out = qemu.ssh(
             "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
              --lib-dir /tmp/blyt_gate/native \
@@ -2422,7 +2426,12 @@ void blyt_cart_draw(void) {}
             "native bare-metal blyt_gfx_palette_set must not perturb the index hash \
              (expected {expected:?}; #201)\noutput: {output}"
         );
-        println!("  PASS: {expected}");
+        assert!(
+            output.contains(expected_pal),
+            "native bare-metal blyt_gfx_palette_set must load VGA's palette bytes \
+             (expected {expected_pal:?}; #199/#204)\noutput: {output}"
+        );
+        println!("  PASS: {expected} + {expected_pal}");
     }
 
     println!("Gate tests passed.");

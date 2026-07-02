@@ -190,3 +190,26 @@ const uint32_t *blyt_builtin_palette(uint32_t handle) {
         return 0;
     }
 }
+
+uint8_t blyt_palette_nearest(const uint32_t *palette, uint32_t rgb) {
+    int tr = (int)((rgb >> 16) & 0xFF);
+    int tg = (int)((rgb >> 8) & 0xFF);
+    int tb = (int)(rgb & 0xFF);
+    /* Max possible squared distance is 3*255^2 = 195075, so a 32-bit
+     * accumulator never overflows and the comparison is exact. */
+    uint32_t best_d = 0xFFFFFFFFu;
+    uint8_t best_i = 0;
+    for (int i = 0; i < 256; i++) {
+        int dr = (int)((palette[i] >> 16) & 0xFF) - tr;
+        int dg = (int)((palette[i] >> 8) & 0xFF) - tg;
+        int db = (int)(palette[i] & 0xFF) - tb;
+        uint32_t d = (uint32_t)(dr * dr + dg * dg + db * db);
+        if (d < best_d) {
+            best_d = d;
+            best_i = (uint8_t)i;
+            if (d == 0)
+                break;
+        }
+    }
+    return best_i;
+}
