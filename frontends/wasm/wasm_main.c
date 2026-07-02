@@ -1087,6 +1087,40 @@ static void wasm_register_gfx_api(lua_State *L) {
     lua_setfield(L, -2, "SCREEN");
     lua_setfield(L, -2, "surface"); /* blyt32.surface = surface */
 
+    /* --- blyt32.color subtable: named color-index constants (#203) --- */
+    /* Mirrors blyt32lua.c's pure-Lua binding.  wasm_main.c is host-side (not
+     * cart code) so it cannot include the cart-facing blyt.h -- these raw
+     * indices MUST match blyt.h's BLYT_EGA_* / BLYT_AURORA_*.  The cross-leg
+     * parity test (identical frame hash on native/wasm/libretro) is the guard
+     * against drift here. */
+    static const char *const color_names[16] = {
+        "BLACK",  "BLUE",    "GREEN",    "CYAN",    "RED",    "MAGENTA",    "BROWN",     "LTGRAY",
+        "DKGRAY", "BR_BLUE", "BR_GREEN", "BR_CYAN", "BR_RED", "BR_MAGENTA", "BR_YELLOW", "WHITE",
+    };
+    static const uint8_t ega_idx[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    static const uint8_t aurora_idx[16] = {0, 223, 185, 195, 155, 239, 165, 10,
+                                           5, 219, 189, 201, 160, 236, 175, 15};
+    lua_newtable(L); /* blyt32.color */
+    for (int pass = 0; pass < 2; pass++) { /* color.ega, color.vga (same set) */
+        lua_newtable(L);
+        for (int i = 0; i < 16; i++) {
+            lua_pushinteger(L, (lua_Integer)ega_idx[i]);
+            lua_setfield(L, -2, color_names[i]);
+        }
+        lua_setfield(L, -2, pass == 0 ? "ega" : "vga");
+    }
+    lua_newtable(L); /* color.aurora */
+    for (int i = 0; i < 16; i++) {
+        lua_pushinteger(L, (lua_Integer)aurora_idx[i]);
+        lua_setfield(L, -2, color_names[i]);
+    }
+    lua_setfield(L, -2, "aurora");
+    for (int i = 0; i < 16; i++) { /* default aliases on color root -> aurora */
+        lua_pushinteger(L, (lua_Integer)aurora_idx[i]);
+        lua_setfield(L, -2, color_names[i]);
+    }
+    lua_setfield(L, -2, "color"); /* blyt32.color = color */
+
     lua_pop(L, 1); /* pop blyt32 */
 }
 

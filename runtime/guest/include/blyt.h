@@ -452,6 +452,102 @@ void blyt_gfx_present(void);
 void blyt_gfx_palette_set(blyt_resource_id_t palette);
 
 /* -------------------------------------------------------------------------
+ * Graphics — named color-index constants (ADR-0059, issue #203)
+ *
+ * Plain compile-time palette *indices* (0-255), NOT the tagged resource
+ * handles that BLYT_PALETTE_* above are.  They let a cart draw text / basic
+ * graphics in known colors without defining indices first.  The EGA-16 is the
+ * shared naming vocabulary; each bundled palette ships its own set matching
+ * that palette's layout, so the same name is a different index per palette:
+ *
+ *   BLYT_EGA_*    canonical EGA indices 0-15.
+ *   BLYT_VGA_*    alias BLYT_EGA_* -- vga's low 16 ARE the EGA 16.
+ *   BLYT_AURORA_* the nearest-to-EGA index in the Aurora 256 (grays + black/
+ *                 white exact, chromatics hue-shifted; distance table in #203).
+ *
+ * A cart uses the set matching its active palette; there is no runtime
+ * resolution and nothing is deterministic-sensitive (these are literals).  The
+ * unprefixed BLYT_<NAME> aliases the console-default palette (aurora) for
+ * zero-config text -- but stops being semantically correct after a palette
+ * swap, so prefer the palette-specific set once the palette is known.  Custom
+ * (cart) palettes get packer-generated C_<NAME> constants instead (ADR-0059).
+ *
+ * EGA quirk: index 6 is BROWN (#AA5500), not a dark yellow, and there is no
+ * bright-brown -- the bright row is the BR_* names. */
+
+/* EGA-16 canonical indices 0-15. */
+#define BLYT_EGA_BLACK 0
+#define BLYT_EGA_BLUE 1
+#define BLYT_EGA_GREEN 2
+#define BLYT_EGA_CYAN 3
+#define BLYT_EGA_RED 4
+#define BLYT_EGA_MAGENTA 5
+#define BLYT_EGA_BROWN 6
+#define BLYT_EGA_LTGRAY 7
+#define BLYT_EGA_DKGRAY 8
+#define BLYT_EGA_BR_BLUE 9
+#define BLYT_EGA_BR_GREEN 10
+#define BLYT_EGA_BR_CYAN 11
+#define BLYT_EGA_BR_RED 12
+#define BLYT_EGA_BR_MAGENTA 13
+#define BLYT_EGA_BR_YELLOW 14
+#define BLYT_EGA_WHITE 15
+
+/* VGA's low 16 are the EGA 16 (identical RGB); alias them. */
+#define BLYT_VGA_BLACK BLYT_EGA_BLACK
+#define BLYT_VGA_BLUE BLYT_EGA_BLUE
+#define BLYT_VGA_GREEN BLYT_EGA_GREEN
+#define BLYT_VGA_CYAN BLYT_EGA_CYAN
+#define BLYT_VGA_RED BLYT_EGA_RED
+#define BLYT_VGA_MAGENTA BLYT_EGA_MAGENTA
+#define BLYT_VGA_BROWN BLYT_EGA_BROWN
+#define BLYT_VGA_LTGRAY BLYT_EGA_LTGRAY
+#define BLYT_VGA_DKGRAY BLYT_EGA_DKGRAY
+#define BLYT_VGA_BR_BLUE BLYT_EGA_BR_BLUE
+#define BLYT_VGA_BR_GREEN BLYT_EGA_BR_GREEN
+#define BLYT_VGA_BR_CYAN BLYT_EGA_BR_CYAN
+#define BLYT_VGA_BR_RED BLYT_EGA_BR_RED
+#define BLYT_VGA_BR_MAGENTA BLYT_EGA_BR_MAGENTA
+#define BLYT_VGA_BR_YELLOW BLYT_EGA_BR_YELLOW
+#define BLYT_VGA_WHITE BLYT_EGA_WHITE
+
+/* Aurora nearest-to-EGA indices (issue #203 distance table). */
+#define BLYT_AURORA_BLACK 0
+#define BLYT_AURORA_BLUE 223
+#define BLYT_AURORA_GREEN 185
+#define BLYT_AURORA_CYAN 195
+#define BLYT_AURORA_RED 155
+#define BLYT_AURORA_MAGENTA 239
+#define BLYT_AURORA_BROWN 165
+#define BLYT_AURORA_LTGRAY 10
+#define BLYT_AURORA_DKGRAY 5
+#define BLYT_AURORA_BR_BLUE 219
+#define BLYT_AURORA_BR_GREEN 189
+#define BLYT_AURORA_BR_CYAN 201
+#define BLYT_AURORA_BR_RED 160
+#define BLYT_AURORA_BR_MAGENTA 236
+#define BLYT_AURORA_BR_YELLOW 175
+#define BLYT_AURORA_WHITE 15
+
+/* Unprefixed default aliases -> the console-default palette (aurora). */
+#define BLYT_BLACK BLYT_AURORA_BLACK
+#define BLYT_BLUE BLYT_AURORA_BLUE
+#define BLYT_GREEN BLYT_AURORA_GREEN
+#define BLYT_CYAN BLYT_AURORA_CYAN
+#define BLYT_RED BLYT_AURORA_RED
+#define BLYT_MAGENTA BLYT_AURORA_MAGENTA
+#define BLYT_BROWN BLYT_AURORA_BROWN
+#define BLYT_LTGRAY BLYT_AURORA_LTGRAY
+#define BLYT_DKGRAY BLYT_AURORA_DKGRAY
+#define BLYT_BR_BLUE BLYT_AURORA_BR_BLUE
+#define BLYT_BR_GREEN BLYT_AURORA_BR_GREEN
+#define BLYT_BR_CYAN BLYT_AURORA_BR_CYAN
+#define BLYT_BR_RED BLYT_AURORA_BR_RED
+#define BLYT_BR_MAGENTA BLYT_AURORA_BR_MAGENTA
+#define BLYT_BR_YELLOW BLYT_AURORA_BR_YELLOW
+#define BLYT_WHITE BLYT_AURORA_WHITE
+
+/* -------------------------------------------------------------------------
  * Lua export macros (ADR-0111) — hybrid Lua+C carts
  *
  * Usage:

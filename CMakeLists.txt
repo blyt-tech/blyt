@@ -969,6 +969,18 @@ add_executable(test_palettes tests/unit/test_palettes.c
 target_include_directories(test_palettes PRIVATE runtime/shared)
 add_test(NAME test_palettes COMMAND test_palettes)
 
+# test_color_constants: pins the named color-index constants shipped in the SDK
+# header (runtime/guest/include/blyt.h, ADR-0059, issue #203) against the actual
+# bytes of the bundled palettes — a typo'd index would still compile and draw
+# *a* color, so a cart test can't catch it; this cross-checks each name's index.
+# Includes the guest header host-side (declarations-only for the constants
+# read).
+add_executable(test_color_constants tests/unit/test_color_constants.c
+                                    runtime/shared/blyt_palettes.c)
+target_include_directories(test_color_constants PRIVATE runtime/guest/include
+                                                        runtime/shared)
+add_test(NAME test_color_constants COMMAND test_color_constants)
+
 # test_resource_eviction: the host resource eviction mechanism + rehydration
 # (runtime/host/src/libblyt/resource.c, ADR-0027 v2, #137). Links libblyt for
 # the table/entry API + the shared codec; constructs entries directly via the
@@ -1294,6 +1306,7 @@ add_dependencies(
   test_mem_budget
   test_arena
   test_palettes
+  test_color_constants
   test_resource_codec
   test_resource_eviction
   test_resource_budget)
