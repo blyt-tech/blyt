@@ -9,31 +9,56 @@
 
 #include "testcard.h"
 
+#include "blyt_palettes.h" /* runtime/shared: blyt_palette_nearest (#204) */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
-/* ---- Palette indices ---- */
-#define TC_BLACK 0
-#define TC_DARK1 1
-#define TC_DARK2 2
-#define TC_BG 3
-#define TC_DARK3 4
-#define TC_LITE1 5
-#define TC_WHITE 6
-#define TC_YELLOW 7
-#define TC_CYAN 8
-#define TC_GREEN 9
-#define TC_MAGENTA 10
-#define TC_RED 11
-#define TC_BLUE 12
-#define TC_BLUESIDE 13
-#define TC_GOLD 14
-#define TC_TEAL 15
-#define TC_PINK 16
-#define TC_OLIVE 17
-#define TC_PURPLE 18
-#define TC_TEXT 20
+/* ---- Reference colours (#204) ----
+ *
+ * The test card is palette-agnostic: these are *reference RGB targets*, not
+ * palette entries.  The drawing code below works in terms of these logical
+ * slot ids; at draw time each is resolved to the nearest index in the active
+ * palette (blyt_palette_nearest) and only those resolved indices are written to
+ * the framebuffer.  So the bars/wedge track whatever palette the cart declared
+ * (ADR-0088), doubling as a palette-coverage diagnostic.  Slots are contiguous
+ * (0..TC_NREF-1) purely as an index into TC_RGB / the per-frame nidx table. */
+enum {
+    TC_BLACK = 0,
+    TC_DARK1,
+    TC_DARK2,
+    TC_BG,
+    TC_DARK3,
+    TC_LITE1,
+    TC_WHITE,
+    TC_YELLOW,
+    TC_CYAN,
+    TC_GREEN,
+    TC_MAGENTA,
+    TC_RED,
+    TC_BLUE,
+    TC_BLUESIDE,
+    TC_GOLD,
+    TC_TEAL,
+    TC_PINK,
+    TC_OLIVE,
+    TC_PURPLE,
+    TC_TEXT,
+    TC_NREF,
+};
+
+/* XRGB8888 reference targets, indexed by the TC_* slot ids above (formerly the
+ * test card's bespoke palette entries, retired per #204). */
+static const uint32_t TC_RGB[TC_NREF] = {
+    [TC_BLACK] = 0x00000000,  [TC_DARK1] = 0x00343434,    [TC_DARK2] = 0x00666666,
+    [TC_BG] = 0x00777777,     [TC_DARK3] = 0x00999999,    [TC_LITE1] = 0x00CCCCCC,
+    [TC_WHITE] = 0x00FFFFFF,  [TC_YELLOW] = 0x00CCCC00,   [TC_CYAN] = 0x0000CCCC,
+    [TC_GREEN] = 0x0000CC00,  [TC_MAGENTA] = 0x00CC00CC,  [TC_RED] = 0x00CC0000,
+    [TC_BLUE] = 0x000000CC,   [TC_BLUESIDE] = 0x00587FE6, [TC_GOLD] = 0x00A78019,
+    [TC_TEAL] = 0x0026AD80,   [TC_PINK] = 0x00D95280,     [TC_OLIVE] = 0x0080960E,
+    [TC_PURPLE] = 0x008069F1, [TC_TEXT] = 0x00D0D0D0,
+};
 
 #define TC_W 320
 #define TC_H 240
@@ -206,30 +231,6 @@ static int tc_itoa(uint32_t n, char *buf) {
     return i;
 }
 
-static void init_palette(uint32_t *p) {
-    memset(p, 0, 256 * sizeof(uint32_t));
-    p[TC_BLACK] = 0x00000000;
-    p[TC_DARK1] = 0x00343434;
-    p[TC_DARK2] = 0x00666666;
-    p[TC_BG] = 0x00777777;
-    p[TC_DARK3] = 0x00999999;
-    p[TC_LITE1] = 0x00CCCCCC;
-    p[TC_WHITE] = 0x00FFFFFF;
-    p[TC_YELLOW] = 0x00CCCC00;
-    p[TC_CYAN] = 0x0000CCCC;
-    p[TC_GREEN] = 0x0000CC00;
-    p[TC_MAGENTA] = 0x00CC00CC;
-    p[TC_RED] = 0x00CC0000;
-    p[TC_BLUE] = 0x000000CC;
-    p[TC_BLUESIDE] = 0x00587FE6;
-    p[TC_GOLD] = 0x00A78019;
-    p[TC_TEAL] = 0x0026AD80;
-    p[TC_PINK] = 0x00D95280;
-    p[TC_OLIVE] = 0x0080960E;
-    p[TC_PURPLE] = 0x008069F1;
-    p[TC_TEXT] = 0x00D0D0D0;
-}
-
 static uint8_t bar_color(int x) {
     if (x < CB_X1)
         return TC_YELLOW;
@@ -268,12 +269,15 @@ static uint8_t side_color(int x, int y) {
 
 /* ---- Public API ---- */
 
-void blyt_testcard_init_palette(uint32_t *palette_out) {
-    init_palette(palette_out);
-}
-
-void blyt_testcard_draw(uint32_t frame_count, uint8_t *pixels_out) {
+void blyt_testcard_draw(uint32_t frame_count, const uint32_t *palette, uint8_t *pixels_out) {
     s_pixels = pixels_out;
+
+    /* Resolve every reference colour to the nearest index in the active palette
+     * once per frame (#204).  All drawing below produces TC_* slot ids; the
+     * final write maps each through nidx[] to a real palette index. */
+    uint8_t nidx[TC_NREF];
+    for (int i = 0; i < TC_NREF; i++)
+        nidx[i] = blyt_palette_nearest(palette, TC_RGB[i]);
 
     int r2 = TC_CR * TC_CR;
 
@@ -372,13 +376,13 @@ void blyt_testcard_draw(uint32_t frame_count, uint8_t *pixels_out) {
                 }
             }
 
-            s_pixels[y * TC_W + x] = c;
+            s_pixels[y * TC_W + x] = nidx[c];
         }
     }
 
-    tc_draw_text(TC_CX - 35, TBAR_Y1 + (TBAR_Y2 - TBAR_Y1 - 14) / 2, "BLYT32", TC_WHITE, 2);
+    tc_draw_text(TC_CX - 35, TBAR_Y1 + (TBAR_Y2 - TBAR_Y1 - 14) / 2, "BLYT32", nidx[TC_WHITE], 2);
 
     char numstr[12];
     int nlen = tc_itoa(frame_count, numstr);
-    tc_draw_text(TC_CX - (nlen * 6 - 1) / 2, FC_Y, numstr, TC_TEXT, 1);
+    tc_draw_text(TC_CX - (nlen * 6 - 1) / 2, FC_Y, numstr, nidx[TC_TEXT], 1);
 }

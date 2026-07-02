@@ -703,6 +703,21 @@ static uint8_t g_lua_pixels[BLYT_FRAME_W * BLYT_FRAME_H];
 static uint32_t g_lua_gfx_palette[256];
 static bool g_lua_gfx_palette_init = false;
 
+/* Seed the session-less host-Lua fast path's palette to the runtime default
+ * (aurora), matching the pre-init default the emulated legs load into
+ * session->palette (#201/#204).  A pure-Lua cart that never calls palette_set
+ * then renders (and its test card remaps) against the same default palette on
+ * wasm as on blytplay/libretro. */
+static void lua_gfx_palette_ensure_default(void) {
+    if (g_lua_gfx_palette_init)
+        return;
+    const uint32_t *pal =
+        blyt_builtin_palette(BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    for (int i = 0; i < 256; i++)
+        g_lua_gfx_palette[i] = pal[i];
+    g_lua_gfx_palette_init = true;
+}
+
 /* Expand a paletted frame to g_xrgb for presentation and, when BLYT_FRAME_HASH
  * is set, emit the cross-leg "[blyt:fbhash] <hex>" line — the host-Lua fast
  * path's equivalent of the host runtime's frame_done emit (cart_run.c), over the
@@ -718,21 +733,28 @@ static void lua_present_paletted(const uint8_t *pixels, const uint32_t *palette)
         char buf[64];
         snprintf(buf, sizeof(buf), "[blyt:fbhash] %016llx", (unsigned long long)h);
         blyt_js_log(buf);
+        /* Palette-sensitive oracle (#199/#204): mirror the host runtime's
+         * palette-bytes hash so the host-Lua fast path proves colour parity too,
+         * not just index parity. */
+        uint64_t ph = blyt_frame_hash((const uint8_t *)palette, 256 * sizeof(uint32_t));
+        snprintf(buf, sizeof(buf), "[blyt:palhash] %016llx", (unsigned long long)ph);
+        blyt_js_log(buf);
     }
 }
 
-/* Render testcard into g_xrgb — used when draw() produces no gfx output. */
+/* Render testcard into g_xrgb — used when draw() produces no gfx output.  The
+ * test card is palette-agnostic (#204): it remaps its reference colours to the
+ * nearest index in the *active* palette (session palette for a hybrid cart,
+ * else the host-Lua fast path's palette — see lua_gfx_palette) and presents
+ * through that same palette, so its colours track the cart's declared palette
+ * exactly as on every emulated leg. */
+static uint32_t *lua_gfx_palette(void);
 static void render_testcard(void) {
     static uint8_t s_pixels[BLYT_FRAME_W * BLYT_FRAME_H];
-    static uint32_t s_palette[256];
     static uint32_t s_frame = 0;
-    static bool s_tc_init = false;
-    if (!s_tc_init) {
-        blyt_testcard_init_palette(s_palette);
-        s_tc_init = true;
-    }
-    blyt_testcard_draw(s_frame++, s_pixels);
-    lua_present_paletted(s_pixels, s_palette);
+    const uint32_t *pal = lua_gfx_palette();
+    blyt_testcard_draw(s_frame++, pal, s_pixels);
+    lua_present_paletted(s_pixels, pal);
 }
 
 /* The paletted framebuffer the host-Lua gfx bindings rasterize into.  For a
@@ -758,10 +780,7 @@ static uint8_t *lua_gfx_fb(void) {
 static uint32_t *lua_gfx_palette(void) {
     if (g_session)
         return (uint32_t *)blyt_session_get_palette(g_session);
-    if (!g_lua_gfx_palette_init) {
-        blyt_testcard_init_palette(g_lua_gfx_palette);
-        g_lua_gfx_palette_init = true;
-    }
+    lua_gfx_palette_ensure_default();
     return g_lua_gfx_palette;
 }
 
@@ -1022,10 +1041,7 @@ static int lua_wasm_surface_blit(lua_State *L) {
  * initial run_lua_cart setup and the reset/reload re-register, like the state
  * and resource API helpers. */
 static void wasm_register_gfx_api(lua_State *L) {
-    if (!g_lua_gfx_palette_init) {
-        blyt_testcard_init_palette(g_lua_gfx_palette);
-        g_lua_gfx_palette_init = true;
-    }
+    lua_gfx_palette_ensure_default();
     lua_getglobal(L, "blyt32");
     if (!lua_istable(L, -1)) {
         lua_pop(L, 1);

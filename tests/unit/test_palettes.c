@@ -104,6 +104,43 @@ static void test_cga_palette1(void) {
         assert(cga[i] == 0x00000000u);
 }
 
+/* blyt_palette_nearest (#204): the pure nearest-index remap the palette-agnostic
+ * test card relies on. */
+
+/* An exact colour resolves to its own index (distance 0). */
+static void test_nearest_exact_match(void) {
+    uint32_t h = blyt_resource_encode(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
+    const uint32_t *pal = blyt_builtin_palette(h);
+    /* aurora indices 0..15 are the exact grey ramp 0x00..0xFF stepped by 0x11. */
+    assert(blyt_palette_nearest(pal, 0x00000000u) == 0);
+    assert(blyt_palette_nearest(pal, 0x00FFFFFFu) == 15);
+    assert(blyt_palette_nearest(pal, 0x00777777u) == 7);
+    /* The alpha/top byte is ignored: same RGB, different top byte, same index. */
+    assert(blyt_palette_nearest(pal, 0xFF777777u) == 7);
+}
+
+/* A near-miss snaps to the closest entry, not an exact one. In cga palette 1
+ * (black / cyan / magenta / white + black padding) a slightly-off cyan resolves
+ * to index 1 (0x55FFFF). */
+static void test_nearest_snaps_to_closest(void) {
+    uint32_t h = blyt_resource_encode(BLYT_PAL_ID_CGA, BLYT_RESOURCE_PROV_RUNTIME);
+    const uint32_t *pal = blyt_builtin_palette(h);
+    assert(blyt_palette_nearest(pal, 0x0050F0F0u) == 1); /* ~cyan */
+    assert(blyt_palette_nearest(pal, 0x00F040F0u) == 2); /* ~magenta */
+    /* A mid grey is closer to black(0) than to the bright cyan/magenta/white. */
+    assert(blyt_palette_nearest(pal, 0x00202020u) == 0);
+}
+
+/* Ties resolve to the lowest index -- pure and deterministic.  cga has index 0
+ * and indices 4..255 all pure black, so any input equidistant to "black" must
+ * land on index 0. */
+static void test_nearest_ties_lowest_index(void) {
+    uint32_t h = blyt_resource_encode(BLYT_PAL_ID_CGA, BLYT_RESOURCE_PROV_RUNTIME);
+    const uint32_t *pal = blyt_builtin_palette(h);
+    assert(blyt_palette_nearest(pal, 0x00000000u) == 0);
+    assert(blyt_palette_nearest(pal, 0x00010101u) == 0);
+}
+
 int main(void) {
     test_cart_provenance_rejected();
     test_non_resource_rejected();
@@ -113,6 +150,9 @@ int main(void) {
     test_aurora_pinned_endpoints();
     test_vga_low_16_match_ega();
     test_cga_palette1();
+    test_nearest_exact_match();
+    test_nearest_snaps_to_closest();
+    test_nearest_ties_lowest_index();
     printf("test_palettes: all passed\n");
     return 0;
 }

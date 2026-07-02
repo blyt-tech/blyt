@@ -3850,6 +3850,12 @@ static void blyt_emit_frame_hash(blyt_session_t *session) {
     char buf[64];
     snprintf(buf, sizeof(buf), "[blyt:fbhash] %016llx", (unsigned long long)h);
     g_run_ctx->log_fn(buf);
+    /* Palette-sensitive oracle (#199/#204): the index-only fbhash cannot catch a
+     * palette mismatch, so also hash the active palette bytes.  Together the two
+     * hashes pin the fully-expanded XRGB colour output across every leg. */
+    uint64_t ph = blyt_frame_hash((const uint8_t *)session->palette, 256 * sizeof(uint32_t));
+    snprintf(buf, sizeof(buf), "[blyt:palhash] %016llx", (unsigned long long)ph);
+    g_run_ctx->log_fn(buf);
 }
 
 blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
@@ -4069,7 +4075,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
                 fc_gdb_stub_notify_stopped();
             if (session->ctx.frame_done) {
                 if (!session->cart_has_drawn)
-                    blyt_testcard_draw(session->frame_count++, session->pixels);
+                    blyt_testcard_draw(session->frame_count++, session->palette, session->pixels);
             }
             g_run_ctx = NULL;
             return BLYT_RUN_GDB_PAUSED;
@@ -4101,7 +4107,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
 #ifdef __EMSCRIPTEN__
             if (session->ctx.frame_done) {
                 if (!session->cart_has_drawn)
-                    blyt_testcard_draw(session->frame_count++, session->pixels);
+                    blyt_testcard_draw(session->frame_count++, session->palette, session->pixels);
             }
             g_run_ctx = NULL;
             return BLYT_RUN_GDB_PAUSED;
@@ -4120,7 +4126,7 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
 
         if (session->ctx.frame_done) {
             if (!session->cart_has_drawn)
-                blyt_testcard_draw(session->frame_count++, session->pixels);
+                blyt_testcard_draw(session->frame_count++, session->palette, session->pixels);
             blyt_emit_frame_hash(session);
             if (session->trace_frame_open) {
                 blyt_tracef(BLYT_TRACE_FRAME, "end");

@@ -356,6 +356,16 @@ pub mod gfx {
         format!("[blyt:fbhash] {:016x}", fnv1a(fb))
     }
 
+    /// The `[blyt:palhash] <hex>` line — the palette-sensitive oracle (#199/#204).
+    /// FNV-1a over the 256-entry palette's little-endian XRGB8888 bytes, matching
+    /// the runtime's `blyt_frame_hash((uint8_t*)palette, 1024)`.  The index-only
+    /// fbhash cannot distinguish two palettes; this pins the actual RGB content so
+    /// fbhash + palhash together prove fully-expanded colour parity across legs.
+    pub fn expected_palhash_line(palette: &[u32]) -> String {
+        let bytes: Vec<u8> = palette.iter().flat_map(|c| c.to_le_bytes()).collect();
+        format!("[blyt:palhash] {:016x}", fnv1a(&bytes))
+    }
+
     /// A frame exercising every primitive plus edge cases the brief calls out:
     /// off-screen clipping, zero size, negative coords, and i32-overflowing extents.
     pub fn torture_frame() -> Vec<Op> {
@@ -1222,6 +1232,45 @@ pub fn run_cart_libretro_with_env(
         expected,
         String::from_utf8_lossy(&output)
     );
+}
+
+/// Dump frame 0 (XRGB8888, 320x240) of a cart via `blytplay --headless
+/// --dump-frame0` — the host-runtime (blytplay) leg.  The palette-agnostic test
+/// card (#204) is a host-runtime fallback, so its expanded colours are only
+/// observable on the host-runtime legs (blytplay / wasm-emulated / libretro),
+/// not on bare metal.
+pub fn dump_frame0_native(cart: &std::path::Path) -> Vec<u8> {
+    use assert_cmd::Command;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    Command::new(blytplay())
+        .args([
+            "--headless",
+            "--dump-frame0",
+            tmp.path().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    std::fs::read(tmp.path()).unwrap()
+}
+
+/// Dump frame 0 (XRGB8888) of a cart via the WASM runner: `run_cart.js` writes
+/// the first rendered frame's expanded bytes to its 4th-arg path.
+pub fn dump_frame0_wasm(cart: &std::path::Path) -> Vec<u8> {
+    use assert_cmd::Command;
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+    let wasm_dir = find_wasm_dir();
+    let out = tempfile::NamedTempFile::new().unwrap();
+    Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+            out.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    std::fs::read(out.path()).unwrap()
 }
 
 /// Run a cart through the embedded libretro core; assert the driver exits
