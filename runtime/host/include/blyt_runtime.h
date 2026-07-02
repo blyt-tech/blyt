@@ -325,6 +325,45 @@ bool blyt_session_cart_has_drawn(const blyt_session_t *session);
  * gate through the gfx ECALL handlers (#205). */
 void blyt_session_set_phase(blyt_session_t *session, int32_t phase);
 
+/* --- Session surface registry, host-side access (WASM host-Lua fast path) ---
+ *
+ * A WASM hybrid cart runs its Lua half on the host-Lua fast path and its native
+ * half in this rv32 session.  To keep surface handles (and the screen lock)
+ * coherent with every other leg — where a hybrid runs in ONE registry — the
+ * fast path's Lua surface bindings delegate to the session's surface registry
+ * through these host entry points instead of keeping a separate pool (#210).
+ * Because the host-Lua half shares the host address space, materialization is a
+ * direct pointer into the canonical buffer (no ECALL, no copy).  These mirror
+ * the tier-1 BLYT_ECALL_SURFACE_* handlers; they are a no-op / return
+ * BLYT_HANDLE_NONE when session is NULL.
+ *
+ * The frame-loop reap is driven per real frame (blyt_session_reap_surfaces),
+ * NOT at every blyt_session_run_frame() entry, because the fast-path trampoline
+ * calls run_frame once per C-export call — reaping there would destroy a
+ * Lua-created surface mid-frame. */
+
+/* Create a blank off-screen surface (charged against the unified budget, #158).
+ * Returns a SURFACE handle or BLYT_HANDLE_NONE. */
+uint32_t blyt_session_surface_create(blyt_session_t *session, int32_t w, int32_t h);
+
+/* Destroy an off-screen surface by handle.  No-op on the screen, a stale/foreign
+ * handle, or a locked surface (#207 exclusive-lock reject). */
+void blyt_session_surface_destroy(blyt_session_t *session, uint32_t handle);
+
+/* Resolve a surface handle to its canonical drawable buffer for a tier-1 op.
+ * Returns the buffer pointer and writes the dims + screen flag to the outs, or NULL
+ * when the handle is unresolvable (wrong kind / stale generation) or the surface
+ * is held by a tier-2 lock (#207 reject).  The pointer is the canonical buffer,
+ * so writes are immediately coherent with the native half (same registry, same
+ * address space). */
+uint8_t *blyt_session_surface_drawable(blyt_session_t *session, uint32_t handle, int32_t *out_w,
+                                       int32_t *out_h, bool *out_is_screen);
+
+/* Reap the session's draw-scoped off-screen surfaces (frees their buffers, bumps
+ * generations, force-releases any leftover lock).  Called once per real frame by
+ * the fast-path Lua frame loop; see the note above. */
+void blyt_session_reap_surfaces(blyt_session_t *session);
+
 /* Expand the current frame to XRGB8888 via palette lookup.
  * xrgb_out must hold at least BLYT_FRAME_W * BLYT_FRAME_H uint32_t. */
 void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out);

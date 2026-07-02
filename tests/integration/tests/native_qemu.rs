@@ -597,6 +597,43 @@ function draw() end
         None
     };
 
+    // Hybrid cross-registry cart (gate 28, #210): the Lua half creates an
+    // off-screen surface + draws the pattern, then passes the surface HANDLE
+    // across the bridge to a native-C export that blits it to the screen.  On
+    // metal the whole cart shares ONE surface registry (already coherent), so
+    // this anchors the WASM fast-path fix's golden on real hardware — the same
+    // frame + golden as the C off-screen cart (gate 22).
+    let surface_hybrid_handle_cart = if have_lua_gate {
+        let mut draw = format!("  local s = blyt32.surface.create({SURF_SW}, {SURF_SH})\n");
+        draw += &common::gfx::lua_surface_draw_body(&surf_ops, "s");
+        draw += &format!("  blyt32.surface.clear(blyt32.surface.SCREEN, {surf_bg})\n");
+        draw += "  g.blit_surf(s)\n";
+        let project = tmp.path().join("surface_hybrid_handle");
+        CartProject::new()
+            .lib_file(
+                "gfxlib",
+                "gfxlib.c",
+                &format!(
+                    "#include \"blyt.h\"\n\
+                     BLYT_LUA_MODULE_EXPORT_I32(gfxlib, blit_surf, int32_t surf) {{\n\
+                     \x20 blyt_surface_blit(BLYT_SCREEN, (blyt_surface_h)(uint32_t)surf, \
+                     {SURF_BX}, {SURF_BY});\n\
+                     \x20 return 0;\n\
+                     }}\n"
+                ),
+            )
+            .lua(&format!(
+                "local g = require(\"gfxlib\")\n\
+                 function init() end\n\
+                 function update() blyt.quit() end\n\
+                 function draw()\n{draw}end\n"
+            ))
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     // ── Start QEMU ────────────────────────────────────────────────────
     let ssh_port = free_port();
     println!("Starting QEMU (SSH port {ssh_port})...");
@@ -730,6 +767,12 @@ function draw() end
         assert!(
             qemu.scp_to(cart, "/tmp/blyt_gate/"),
             "scp surface_lua.blyt failed"
+        );
+    }
+    if let Some(ref cart) = surface_hybrid_handle_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp surface_hybrid_handle.blyt failed"
         );
     }
     assert!(
@@ -2299,6 +2342,38 @@ void blyt_cart_draw(void) {}
              {surface_locked_tier1_golden:?}; #207)\noutput: {output}"
         );
         println!("  PASS: {surface_locked_tier1_golden}");
+    }
+
+    // ── Gate 28: cross-registry hybrid — Lua-created surface, C blits it (#210) ─
+    //
+    // The bare-metal analog of the WASM cross-registry flagship: the Lua half
+    // creates an off-screen surface and draws the pattern, then hands the surface
+    // handle to a native-C export that blits it to screen.  On metal both halves
+    // share one registry, so the handle resolves and the pattern lands — the same
+    // golden as the C off-screen cart (gate 22).  This anchors the golden the
+    // WASM fast-path fix must match on real hardware.
+    if surface_hybrid_handle_cart.is_some() {
+        println!("Gate 28: cross-registry hybrid (Lua surface, C blit) on metal...");
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/surface_hybrid_handle.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "surface_hybrid_handle.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&surface_offscreen_golden),
+            "native bare-metal hybrid (Lua creates the off-screen surface, C blits its \
+             handle) must hash identically to the C off-screen cart and the emulated \
+             legs (expected {surface_offscreen_golden:?}; #210)\noutput: {output}"
+        );
+        println!("  PASS: {surface_offscreen_golden}");
+    } else {
+        println!("Gate 28: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     println!("Gate tests passed.");
