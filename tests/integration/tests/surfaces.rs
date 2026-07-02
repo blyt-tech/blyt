@@ -730,3 +730,83 @@ fn surface_rust_lock_offscreen_blit_hashes_identically_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &expected);
     run_cart_libretro_with_env(&cart, &env, &expected);
 }
+
+/// FLAGSHIP cross-registry coherence (#210): a hybrid cart where the **Lua** half
+/// creates an *off-screen* surface, draws a known pattern into it, and passes the
+/// surface **handle across the bridge** to a **C** export that blits it onto the
+/// screen. The presented frame must hash bit-identically on every leg and equal
+/// the `common::gfx` golden.
+///
+/// This is the divergence the WASM fast path introduces: a hybrid runs its Lua
+/// half on the host-Lua fast path (its own surface pool) and its native half in
+/// the rv32 session (a separate registry), so the Lua-created off-screen handle
+/// resolves to a *different / invalid* slot when C blits it — the pattern never
+/// lands and the WASM frame diverges from the single-registry legs. Every other
+/// leg runs the hybrid in one registry and is already coherent. Unifying the
+/// fast path onto the session's registry (with a once-per-real-frame reap so the
+/// C-export trampoline does not destroy the surface mid-frame) makes the WASM
+/// leg match. Red on the WASM leg without the fix.
+#[test]
+fn surface_hybrid_lua_offscreen_handle_blit_by_c_coheres_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    const SW: i32 = 120;
+    const SH: i32 = 80;
+    const BX: i32 = 40;
+    const BY: i32 = 30;
+    let bg = 3u8;
+    let surf_ops = [
+        gfx::Op::Clear(5),
+        gfx::Op::Rect(10, 10, 40, 20, 7),
+        gfx::Op::Line(0, 0, 119, 79, 9),
+        gfx::Op::Pixel(60, 40, 11),
+    ];
+
+    // C half: blit the Lua-created surface (handle passed across the bridge as a
+    // scalar) onto the screen.  The SURFACE handle keeps bit 31 clear, so it
+    // round-trips through the i32 bridge arg unchanged.
+    let c_src = format!(
+        "#include \"blyt.h\"\n\
+         BLYT_LUA_EXPORT_I32(blit_surf_to_screen, int32_t surf) {{\n\
+         \x20 blyt_surface_blit(BLYT_SCREEN, (blyt_surface_h)(uint32_t)surf, {BX}, {BY});\n\
+         \x20 return 0;\n\
+         }}\n"
+    );
+    let lua_src = format!(
+        "function init() end\n\
+         function update() blyt.quit() end\n\
+         function draw()\n\
+         \x20 blyt32.surface.clear(blyt32.surface.SCREEN, {bg})\n\
+         \x20 local surf = blyt32.surface.create({SW}, {SH})\n\
+         {}\
+         \x20 blit_surf_to_screen(surf)\n\
+         end\n",
+        gfx::lua_surface_draw_body(&surf_ops, "surf")
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("surface-hybrid-offscreen-handle");
+    CartProject::new().c(&c_src).lua(&lua_src).write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    let src = gfx::render_dims(&surf_ops, SW as usize, SH as usize);
+    let mut screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
+    gfx::blit(
+        &mut screen,
+        gfx::FRAME_W,
+        gfx::FRAME_H,
+        &src,
+        SW as usize,
+        SH as usize,
+        BX,
+        BY,
+    );
+    let expected = gfx::expected_hash_line(&screen);
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &expected);
+    run_cart_wasm_with_env(&cart, &env, &expected);
+    run_cart_libretro_with_env(&cart, &env, &expected);
+}

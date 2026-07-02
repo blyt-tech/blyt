@@ -3832,8 +3832,17 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     blyt_resource_table_force_release_pins(&session->ctx.resources);
     /* Reap the previous frame's off-screen surfaces: they are draw-scoped derived
      * artifacts (#205), so none survive the frame boundary.  Frees their buffers
-     * and drops their bytes from the budget footprint (republished below). */
-    blyt_surface_reap_all(&session->ctx, session->attr.mem);
+     * and drops their bytes from the budget footprint (republished below).
+     *
+     * Only on a real frame entry (trace_fn_addr == 0), NOT when this run_frame is
+     * driving a host-initiated fn call: on the WASM host-Lua fast path a hybrid's
+     * trampoline calls run_frame once per C-export call (begin_fn_call /
+     * begin_bridged_call set trace_fn_addr nonzero), so reaping here would destroy
+     * a Lua-created surface the instant Lua calls any C helper mid-frame.  There
+     * the per-real-frame reap is driven by the Lua frame loop via
+     * blyt_session_reap_surfaces instead (#210). */
+    if (session->trace_fn_addr == 0)
+        blyt_surface_reap_all(&session->ctx, session->attr.mem);
     /* Frame-boundary housekeeping (#158): pins just dropped, so the footprint may
      * have shrunk — republish it and bound the resident evictable cache to the
      * room the current heap+footprint leaves. Covers the "heap grew mid-frame
@@ -4247,6 +4256,56 @@ bool blyt_session_cart_has_drawn(const blyt_session_t *session) {
 void blyt_session_set_phase(blyt_session_t *session, int32_t phase) {
     if (session)
         session->ctx.phase = phase;
+}
+
+/* --- Session surface registry, host-side access (#210) -------------------
+ * These let the WASM host-Lua fast path drive this session's ONE surface
+ * registry directly (host-pointer materialization), so a hybrid cart's Lua and
+ * native halves share surfaces exactly as they do on every other leg.  Each
+ * mirrors the corresponding tier-1 BLYT_ECALL_SURFACE_* handler minus the rv
+ * register plumbing; the phase gate is intentionally omitted (host-Lua surface
+ * ops are ungated today — the emulated Lua legs enforce draw()-only through the
+ * ECALL gate, and draw()-only for host-Lua is separate future work), but the
+ * #207 locked-surface reject IS applied so the exclusive-lock invariant is
+ * uniform across registries. */
+
+uint32_t blyt_session_surface_create(blyt_session_t *session, int32_t w, int32_t h) {
+    if (!session)
+        return BLYT_HANDLE_NONE;
+    return blyt_surface_create_slot(&session->ctx, session->attr.mem, w, h);
+}
+
+void blyt_session_surface_destroy(blyt_session_t *session, uint32_t handle) {
+    if (!session)
+        return;
+    blyt_surface_slot_t *s = blyt_resolve_surface(&session->ctx.surfaces, handle);
+    if (!s || s->locked) /* #207: a locked surface rejects handle-path destroy */
+        return;
+    if (!s->is_screen) {
+        blyt_surface_free_slot(&session->ctx.surfaces, s);
+        mem_acct_publish_footprint(&session->ctx, session->attr.mem);
+    }
+}
+
+uint8_t *blyt_session_surface_drawable(blyt_session_t *session, uint32_t handle, int32_t *out_w,
+                                       int32_t *out_h, bool *out_is_screen) {
+    if (!session)
+        return NULL;
+    blyt_surface_slot_t *s = blyt_resolve_surface(&session->ctx.surfaces, handle);
+    if (!s || s->locked) /* unresolvable, or #207 locked reject */
+        return NULL;
+    if (out_w)
+        *out_w = s->w;
+    if (out_h)
+        *out_h = s->h;
+    if (out_is_screen)
+        *out_is_screen = s->is_screen;
+    return s->pixels;
+}
+
+void blyt_session_reap_surfaces(blyt_session_t *session) {
+    if (session)
+        blyt_surface_reap_all(&session->ctx, session->attr.mem);
 }
 
 void blyt_session_expand_frame(const blyt_session_t *session, uint32_t *xrgb_out) {

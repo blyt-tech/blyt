@@ -842,6 +842,36 @@ static lua_surface_t *lua_surf_resolve_drawable(uint32_t h) {
     return (s && s->locked) ? NULL : s;
 }
 
+/* Unified tier-1 drawable target for the Lua surface bindings (#210).  A hybrid
+ * cart (g_session != NULL) runs its native half in the rv32 session; resolving
+ * against the session's ONE surface registry — via the host API, which
+ * materializes the canonical buffer as a direct pointer (same address space, no
+ * ECALL/copy) — keeps its Lua-created surfaces and handles coherent with that
+ * native half, exactly as every other (single-registry) leg already is.  A
+ * pure-Lua cart (g_session == NULL) has no session, so it resolves against the
+ * local g_lua_surf pool.  Both apply the #207 locked-surface reject.  Returns
+ * false (leaving *t untouched) when the handle is unresolvable or locked. */
+typedef struct {
+    uint8_t *pixels;
+    int32_t w, h;
+    bool is_screen;
+} lua_draw_target_t;
+
+static bool lua_resolve_target(uint32_t h, lua_draw_target_t *t) {
+    if (g_session) {
+        t->pixels = blyt_session_surface_drawable(g_session, h, &t->w, &t->h, &t->is_screen);
+        return t->pixels != NULL;
+    }
+    lua_surface_t *s = lua_surf_resolve_drawable(h);
+    if (!s)
+        return false;
+    t->pixels = s->pixels;
+    t->w = s->w;
+    t->h = s->h;
+    t->is_screen = s->is_screen;
+    return true;
+}
+
 /* Reap draw-scoped off-screen surfaces at the frame boundary (#205). */
 static void lua_surf_reap(void) {
     lua_surf_ensure_init();
@@ -856,9 +886,13 @@ static void lua_surf_reap(void) {
 }
 
 static int lua_wasm_surface_create(lua_State *L) {
-    lua_surf_ensure_init();
     int32_t w = (int32_t)luaL_checkinteger(L, 1);
     int32_t h = (int32_t)luaL_checkinteger(L, 2);
+    if (g_session) { /* hybrid: create in the session's unified registry (#210) */
+        lua_pushinteger(L, (lua_Integer)blyt_session_surface_create(g_session, w, h));
+        return 1;
+    }
+    lua_surf_ensure_init();
     if (w <= 0 || h <= 0 || w > 8192 || h > 8192) {
         lua_pushinteger(L, (lua_Integer)BLYT_HANDLE_NONE);
         return 1;
@@ -885,7 +919,12 @@ static int lua_wasm_surface_create(lua_State *L) {
     return 1;
 }
 static int lua_wasm_surface_destroy(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
+    uint32_t h = (uint32_t)luaL_checkinteger(L, 1);
+    if (g_session) { /* hybrid: destroy in the session's unified registry (#210) */
+        blyt_session_surface_destroy(g_session, h);
+        return 0;
+    }
+    lua_surface_t *s = lua_surf_resolve_drawable(h); /* #207 */
     if (s && !s->is_screen) {
         free(s->pixels);
         s->pixels = NULL;
@@ -895,54 +934,55 @@ static int lua_wasm_surface_destroy(lua_State *L) {
     return 0;
 }
 static int lua_wasm_surface_clear(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
-    if (s) {
-        blyt_raster_clear(s->pixels, s->w, s->w, s->h, (uint8_t)luaL_checkinteger(L, 2));
-        if (s->is_screen)
+    lua_draw_target_t t;
+    if (lua_resolve_target((uint32_t)luaL_checkinteger(L, 1), &t)) { /* #210 / #207 */
+        blyt_raster_clear(t.pixels, t.w, t.w, t.h, (uint8_t)luaL_checkinteger(L, 2));
+        if (t.is_screen)
             g_lua_drawn = true;
     }
     return 0;
 }
 static int lua_wasm_surface_pixel(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
-    if (s) {
-        blyt_raster_pixel(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
+    lua_draw_target_t t;
+    if (lua_resolve_target((uint32_t)luaL_checkinteger(L, 1), &t)) { /* #210 / #207 */
+        blyt_raster_pixel(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
                           (int)luaL_checkinteger(L, 3), (uint8_t)luaL_checkinteger(L, 4));
-        if (s->is_screen)
+        if (t.is_screen)
             g_lua_drawn = true;
     }
     return 0;
 }
 static int lua_wasm_surface_rect_fill(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
-    if (s) {
-        blyt_raster_rect_fill(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
+    lua_draw_target_t t;
+    if (lua_resolve_target((uint32_t)luaL_checkinteger(L, 1), &t)) { /* #210 / #207 */
+        blyt_raster_rect_fill(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
                               (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
                               (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
-        if (s->is_screen)
+        if (t.is_screen)
             g_lua_drawn = true;
     }
     return 0;
 }
 static int lua_wasm_surface_line(lua_State *L) {
-    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1)); /* #207 */
-    if (s) {
-        blyt_raster_line(s->pixels, s->w, s->w, s->h, (int)luaL_checkinteger(L, 2),
+    lua_draw_target_t t;
+    if (lua_resolve_target((uint32_t)luaL_checkinteger(L, 1), &t)) { /* #210 / #207 */
+        blyt_raster_line(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
                          (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
                          (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
-        if (s->is_screen)
+        if (t.is_screen)
             g_lua_drawn = true;
     }
     return 0;
 }
 static int lua_wasm_surface_blit(lua_State *L) {
-    /* Reject if either endpoint is locked — a blit as dst OR src (#207). */
-    lua_surface_t *d = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 1));
-    lua_surface_t *s = lua_surf_resolve_drawable((uint32_t)luaL_checkinteger(L, 2));
-    if (d && s) {
-        blyt_raster_blit(d->pixels, d->w, d->w, d->h, s->pixels, s->w, s->w, s->h,
+    /* Reject if either endpoint is unresolvable or locked — a blit as dst OR
+     * src (#210 unified resolve / #207 locked reject). */
+    lua_draw_target_t d, s;
+    if (lua_resolve_target((uint32_t)luaL_checkinteger(L, 1), &d) &&
+        lua_resolve_target((uint32_t)luaL_checkinteger(L, 2), &s)) {
+        blyt_raster_blit(d.pixels, d.w, d.w, d.h, s.pixels, s.w, s.w, s.h,
                          (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4));
-        if (d->is_screen)
+        if (d.is_screen)
             g_lua_drawn = true;
     }
     return 0;
@@ -2894,9 +2934,15 @@ static void wasm_lua_loop(void) {
     }
     g_lua_drawn = false;
     /* Reap the previous frame's off-screen surfaces (draw-scoped, #205) before
-     * the new frame's draw creates fresh ones — mirrors the host reap at
-     * blyt_session_run_frame start. */
-    lua_surf_reap();
+     * the new frame's draw creates fresh ones.  This is the once-per-real-frame
+     * reap: a hybrid's surfaces live in the session's unified registry (#210), so
+     * reap THAT — the run_frame reap is suppressed for the fast-path trampoline
+     * (it fires once per C-export call, which would reap mid-frame).  A pure-Lua
+     * cart reaps its local g_lua_surf pool. */
+    if (g_session)
+        blyt_session_reap_surfaces(g_session);
+    else
+        lua_surf_reap();
     int nres = 0;
     int status = lua_resume(g_lua_co, g_lua, 0, &nres);
 
