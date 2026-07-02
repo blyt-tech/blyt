@@ -192,7 +192,7 @@ void blyt_gfx_present(void) {
     __asm__ volatile("ecall" : : "r"(a7) : "memory");
 }
 
-void blyt_gfx_palette_set(blyt_resource_id_t palette) {
+void blyt_gfx_palette_set(blyt_palette_t palette) {
     register long a0 __asm__("a0") = (long)palette;
     register long a7 __asm__("a7") = ECALL_GFX_PALETTE_SET;
     __asm__ volatile("ecall" : : "r"(a0), "r"(a7) : "memory");

@@ -63,20 +63,37 @@ pub struct Surface(pub u32);
 /// destroyed. Mirrors `BLYT_SCREEN` in `blyt.h` / `blyt_handle.h`.
 pub const SCREEN: Surface = Surface(0x4000_0000);
 
-/// Console-wide tagged handles of the four runtime-bundled built-in palettes
-/// (issue #201, ADR-0042). Mirrors `BLYT_PALETTE_*` in `blyt.h`.
-pub const PALETTE_AURORA: u32 = 0x2100_0001;
-pub const PALETTE_VGA: u32 = 0x2100_0002;
-pub const PALETTE_EGA: u32 = 0x2100_0003;
-pub const PALETTE_CGA: u32 = 0x2100_0004;
-/// The console default — what an undeclared-palette cart auto-loads.
-pub const PALETTE_DEFAULT: u32 = PALETTE_AURORA;
+/// A palette handle (#201/#214): a built-in [`PALETTE_AURORA`] etc., or a
+/// packer-emitted `R_<NAME>` for a cart-authored `.hex`/`.gpl`/`.pal` palette
+/// file. Passed to [`palette_set`]. A console-wide tagged u32 (ADR-0134);
+/// mirrors `blyt_palette_t` in `blyt.h`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Palette(pub u32);
 
-/// Load a built-in palette wholesale (all 256 entries). A no-op on a handle
-/// that does not resolve to a built-in palette (issue #201).
-pub fn palette_set(palette: u32) {
+impl Palette {
+    /// Wrap a baked palette handle. Used by the packer-generated `R_<NAME>`
+    /// constants (`blyt::Palette::new(0x…)`); `const` so they are usable in
+    /// const context.
+    pub const fn new(handle: u32) -> Palette {
+        Palette(handle)
+    }
+}
+
+/// Console-wide tagged handles of the four runtime-bundled built-in palettes
+/// (issue #201, ADR-0042). Mirror `BLYT_PALETTE_*` in `blyt.h`.
+pub const PALETTE_AURORA: Palette = Palette(0x2100_0001);
+pub const PALETTE_VGA: Palette = Palette(0x2100_0002);
+pub const PALETTE_EGA: Palette = Palette(0x2100_0003);
+pub const PALETTE_CGA: Palette = Palette(0x2100_0004);
+/// The console default — what an undeclared-palette cart auto-loads.
+pub const PALETTE_DEFAULT: Palette = PALETTE_AURORA;
+
+/// Load a palette wholesale (all 256 entries): a built-in [`PALETTE_AURORA`]
+/// etc., or a cart palette asset `R_<NAME>`. A no-op on a handle that does not
+/// resolve to a 256-entry palette (issue #201/#214).
+pub fn palette_set(palette: Palette) {
     // SAFETY: pure scalar ECALL.
-    unsafe { blyt_gfx_palette_set(palette) }
+    unsafe { blyt_gfx_palette_set(palette.0) }
 }
 
 impl Surface {

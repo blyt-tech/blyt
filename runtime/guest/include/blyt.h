@@ -135,6 +135,13 @@ typedef uint32_t blyt_resource_id_t;
 typedef uint32_t blyt_text_resource_t;
 typedef uint32_t blyt_bytes_resource_t;
 
+/* A palette resource handle (#214): a built-in BLYT_PALETTE_* constant, or a
+ * packer-emitted R_<NAME> for a cart-authored .hex/.gpl/.pal palette file
+ * (256-entry XRGB8888).  Passed to blyt_gfx_palette_set.  Like the text/bytes
+ * aliases it is a uint32_t (no C compile enforcement); the typing documents
+ * intent and matches the Rust/Lua typed constants. */
+typedef uint32_t blyt_palette_t;
+
 /* Resources are referenced by their baked compile-time constant directly
  * (ADR-0134, #196): there is no cart-held load handle to track or invalidate.
  * The packer emits each R_<NAME> as a console-wide tagged u32 (kind RESOURCE,
@@ -419,37 +426,40 @@ void blyt_gfx_present(void);
  * Graphics — palette (ADR-0042/0086, issue #201)
  *
  * The screen's 256-entry palette (XRGB8888) is global.  blyt_gfx_palette_set
- * loads one of the four runtime-bundled built-in palettes wholesale.  A cart
- * that declares no palette (`palettes:` in blyt.config.yaml) gets
- * BLYT_PALETTE_DEFAULT (aurora) auto-loaded before init() (ADR-0088).  There
- * is no cart-authored palette yet -- custom palettes are #203.
+ * loads a palette wholesale: one of the four runtime-bundled built-ins
+ * (BLYT_PALETTE_*), or a cart-authored palette file (.hex/.gpl/.pal) the packer
+ * emits as a typed R_<NAME> constant (#214).  A cart that declares no
+ * `palettes: default:` in blyt.config.yaml gets BLYT_PALETTE_DEFAULT (aurora)
+ * auto-loaded before init() (ADR-0088); a declared built-in-or-asset name is
+ * auto-loaded instead.
  *
- * Handles are console-wide tagged resource constants (blyt_handle.h) with
- * runtime provenance -- must equal runtime/shared/blyt_palettes.h's builtin ids
- * encoded via BLYT_RESOURCE_ENCODE(id, BLYT_RESOURCE_PROV_RUNTIME).  Guarded so
- * a guest lib that also includes the canonical blyt_handle.h (native path)
- * gets a single, non-clashing definition, matching the BLYT_SCREEN pattern
- * above. */
+ * Handles are console-wide tagged resource constants (blyt_handle.h): built-ins
+ * carry runtime provenance (ids equal runtime/shared/blyt_palettes.h's, encoded
+ * via BLYT_RESOURCE_ENCODE(id, BLYT_RESOURCE_PROV_RUNTIME)); cart palette assets
+ * carry cart provenance.  Guarded so a guest lib that also includes the
+ * canonical blyt_handle.h (native path) gets a single, non-clashing definition,
+ * matching the BLYT_SCREEN pattern above. */
 #ifndef BLYT_PALETTE_AURORA
-#define BLYT_PALETTE_AURORA ((blyt_resource_id_t)0x21000001u)
+#define BLYT_PALETTE_AURORA ((blyt_palette_t)0x21000001u)
 #endif
 #ifndef BLYT_PALETTE_VGA
-#define BLYT_PALETTE_VGA ((blyt_resource_id_t)0x21000002u)
+#define BLYT_PALETTE_VGA ((blyt_palette_t)0x21000002u)
 #endif
 #ifndef BLYT_PALETTE_EGA
-#define BLYT_PALETTE_EGA ((blyt_resource_id_t)0x21000003u)
+#define BLYT_PALETTE_EGA ((blyt_palette_t)0x21000003u)
 #endif
 #ifndef BLYT_PALETTE_CGA
-#define BLYT_PALETTE_CGA ((blyt_resource_id_t)0x21000004u)
+#define BLYT_PALETTE_CGA ((blyt_palette_t)0x21000004u)
 #endif
 /* The console default -- what an undeclared-palette cart auto-loads. */
 #ifndef BLYT_PALETTE_DEFAULT
 #define BLYT_PALETTE_DEFAULT BLYT_PALETTE_AURORA
 #endif
 
-/* Load a built-in palette wholesale (all 256 entries).  A no-op on a handle
- * that does not resolve to a built-in palette. */
-void blyt_gfx_palette_set(blyt_resource_id_t palette);
+/* Load a palette wholesale (all 256 entries): a built-in BLYT_PALETTE_* or a
+ * cart palette asset R_<NAME>.  A no-op (+ BLYT_TRACE_API diagnostic) on a
+ * handle that does not resolve to a 256-entry palette. */
+void blyt_gfx_palette_set(blyt_palette_t palette);
 
 /* -------------------------------------------------------------------------
  * Graphics — named color-index constants (ADR-0059, issue #203)
