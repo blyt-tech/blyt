@@ -1995,8 +1995,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
      * resolves to neither. */
     case BLYT_ECALL_GFX_PALETTE_SET: {
         uint32_t handle = rv_get_reg(rv, rv_reg_a0);
-        const uint8_t *pal =
-            blyt_resolve_palette(g_run_ctx ? &g_run_ctx->resources : NULL, handle);
+        const uint8_t *pal = blyt_resolve_palette(g_run_ctx ? &g_run_ctx->resources : NULL, handle);
         blyt_tracef(BLYT_TRACE_API, "gfx_palette_set(0x%08x) -> %s", handle, pal ? "ok" : "no-op");
         if (g_run_ctx && g_run_ctx->palette && pal)
             memcpy(g_run_ctx->palette, pal, 256 * sizeof(uint32_t));

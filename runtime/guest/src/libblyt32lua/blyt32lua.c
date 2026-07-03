@@ -392,10 +392,9 @@ static int lua_palette_resource(lua_State *L) {
 /* Palette load (#201/#214): accepts an integer built-in handle (blyt32.PALETTE_*)
  * or a palette constant userdata (R.<NAME>); both carry the same u32 handle. */
 static int lua_blyt_gfx_palette_set(lua_State *L) {
-    lua_resource_const_t *c = (lua_resource_const_t *)luaL_testudata(
-        L, 1, BLYT_RESOURCE_PALETTE_CONST_MT);
-    blyt_palette_t handle =
-        c ? (blyt_palette_t)c->id : (blyt_palette_t)luaL_checkinteger(L, 1);
+    lua_resource_const_t *c =
+        (lua_resource_const_t *)luaL_testudata(L, 1, BLYT_RESOURCE_PALETTE_CONST_MT);
+    blyt_palette_t handle = c ? (blyt_palette_t)c->id : (blyt_palette_t)luaL_checkinteger(L, 1);
     blyt_gfx_palette_set(handle);
     return 0;
 }
