@@ -438,3 +438,84 @@ fn lua_custom_palette_set_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &custom_ph);
     run_cart_libretro_with_env(&cart, &env, &custom_ph);
 }
+
+// ── #219 pure-Lua declared-default palette on the WASM host-Lua fast path ──
+//
+// A pure-Lua cart that DECLARES `palettes: default:` and never calls
+// `palette_set` must render through that palette from frame 0 on EVERY leg.  On
+// wasm a session-less pure-Lua cart runs on the host-Lua fast path, which seeds
+// its own `g_lua_gfx_palette`; before #219 that seed was hardcoded to aurora and
+// ignored the declared default — a cross-runtime divergence (the fast path
+// diverged from native/libretro, which auto-load the declared palette at
+// session-create).  These assert the declared palette's `[blyt:palhash]` is
+// identical across native/wasm/libretro with NO explicit `palette_set` — so they
+// exercise exactly the auto-load path #214's tests sidestepped.
+
+/// A pure-Lua cart declaring a **built-in** default (`vga`) — no `palette_set` —
+/// must present VGA's palhash on every leg, the fast path included.  Red on the
+/// wasm leg before #219 (fast path showed aurora).
+#[test]
+fn lua_declared_builtin_default_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+    require_test_session_api();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("lua_default_vga");
+    CartProject::new()
+        .lua(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw() blyt32.gfx.clear(5) end\n",
+        )
+        .config("palettes:\n  default: vga\n")
+        .write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    let vga_ph = gfx::expected_palhash_line(&declared_palette(&tmp.path().join("vga_decl"), "vga"));
+    let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &fb);
+    run_cart_wasm_with_env(&cart, &env, &fb);
+    run_cart_libretro_with_env(&cart, &env, &fb);
+    run_cart_native_with_env(&cart, &env, &vga_ph);
+    run_cart_wasm_with_env(&cart, &env, &vga_ph);
+    run_cart_libretro_with_env(&cart, &env, &vga_ph);
+}
+
+/// The custom-palette counterpart: a pure-Lua cart declaring a `.hex` **asset**
+/// as its default — no `palette_set` — must present the cart-authored palhash on
+/// every leg.  Exercises the fast path resolving a PROV_CART default at load
+/// time (the resource table must be populated first).
+#[test]
+fn lua_declared_custom_default_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("lua_default_custom");
+    CartProject::new()
+        .lua(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw() blyt32.gfx.clear(5) end\n",
+        )
+        .asset("main.hex", custom_palette_hex())
+        .config("palettes:\n  default: main\n")
+        .write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
+    let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &fb);
+    run_cart_wasm_with_env(&cart, &env, &fb);
+    run_cart_libretro_with_env(&cart, &env, &fb);
+    run_cart_native_with_env(&cart, &env, &custom_ph);
+    run_cart_wasm_with_env(&cart, &env, &custom_ph);
+    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+}
