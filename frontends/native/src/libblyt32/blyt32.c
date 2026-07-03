@@ -90,30 +90,50 @@ static uint8_t s_surfaces_init;
 static uint32_t s_palette[256];
 static uint8_t s_palette_init;
 
+/* Cart-provenance palette bytes from libblytcommon's resource table (#214). */
+extern const uint8_t *blyt_native_cart_palette_bytes(uint32_t handle);
+
+/* Resolve a palette handle to its 256-entry XRGB8888 bytes (#201/#214), the
+ * native mirror of the host's blyt_resolve_palette: dispatch by provenance —
+ * RUNTIME -> the built-in table (embedded in the runtime); CART -> the cart
+ * resource table (1024 bytes or NULL). */
+static const uint8_t *native_resolve_palette(uint32_t handle) {
+    if (blyt_resource_decode_provenance(handle) == BLYT_RESOURCE_PROV_RUNTIME)
+        return (const uint8_t *)blyt_builtin_palette(handle);
+    return blyt_native_cart_palette_bytes(handle);
+}
+
+/* Load 256 little-endian XRGB8888 entries into s_palette.  Byte-wise and
+ * endianness-explicit: the cart-resource bytes may be unaligned, and an
+ * explicit LE decode keeps the result bit-identical to the emulated legs. */
+static void native_palette_load(const uint8_t *b) {
+    for (int i = 0; i < 256; i++)
+        s_palette[i] = (uint32_t)b[i * 4] | ((uint32_t)b[i * 4 + 1] << 8) |
+                       ((uint32_t)b[i * 4 + 2] << 16) | ((uint32_t)b[i * 4 + 3] << 24);
+}
+
 static void native_palette_init(void) {
     if (s_palette_init)
         return;
     uint32_t handle = blyt_native_default_palette();
     if (handle == 0)
         handle = BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
-    const uint32_t *pal = blyt_builtin_palette(handle);
+    const uint8_t *pal = native_resolve_palette(handle);
     if (!pal)
-        pal = blyt_builtin_palette(
+        pal = (const uint8_t *)blyt_builtin_palette(
             BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
-    for (int i = 0; i < 256; i++)
-        s_palette[i] = pal[i];
+    native_palette_load(pal);
     s_palette_init = 1;
 }
 
-/* Load a built-in palette wholesale (#201).  A no-op on a handle that does
- * not resolve to a built-in palette. */
-void blyt_gfx_palette_set(blyt_resource_id_t palette) {
+/* Load a palette wholesale (#201/#214): a built-in BLYT_PALETTE_* or a cart
+ * palette-file asset R_<NAME>.  A no-op on a handle that resolves to neither. */
+void blyt_gfx_palette_set(blyt_palette_t palette) {
     native_palette_init();
-    const uint32_t *pal = blyt_builtin_palette(palette);
+    const uint8_t *pal = native_resolve_palette(palette);
     if (!pal)
         return;
-    for (int i = 0; i < 256; i++)
-        s_palette[i] = pal[i];
+    native_palette_load(pal);
 }
 
 static void native_surfaces_init(void) {

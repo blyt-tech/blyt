@@ -1420,6 +1420,23 @@ static blyt_resource_entry_t *blyt_resolve_resource(blyt_resource_table_t *t, ui
     return blyt_resource_table_find_mut(t, blyt_resource_decode_id(handle));
 }
 
+/* Resolve a palette handle (#201/#214) to its 256-entry XRGB8888 bytes, the
+ * "registry-lite" dispatch by provenance: a RUNTIME handle -> the built-in
+ * palette table (bytes embedded in the runtime binary); a CART handle -> the
+ * cart resource table, which must hold exactly 1024 bytes (256 * u32).  Returns
+ * NULL — the caller no-ops — for an unresolvable, wrong-kind, or wrong-size
+ * handle.  `t` may be NULL (no session), forcing the CART branch to NULL.  The
+ * bytes are read via memcpy by the caller (no alignment assumption on the
+ * cart-resource map alias). */
+static const uint8_t *blyt_resolve_palette(blyt_resource_table_t *t, uint32_t handle) {
+    if (blyt_resource_decode_provenance(handle) == BLYT_RESOURCE_PROV_RUNTIME)
+        return (const uint8_t *)blyt_builtin_palette(handle); /* validates kind+prov+id */
+    blyt_resource_entry_t *e = t ? blyt_resolve_resource(t, handle) : NULL;
+    if (!e || e->len != 256u * sizeof(uint32_t))
+        return NULL;
+    return blyt_resource_entry_data(e);
+}
+
 /* Resolve a surface handle to its live registry slot, mirroring the
  * resolve-at-entry pattern (#196): classify the tagged u32, then validate the
  * slot index and generation.  Returns NULL for a non-surface kind, an
@@ -1973,12 +1990,13 @@ static void blyt_ecall_handler(riscv_t *rv) {
         return;
     }
 
-    /* Palette load (#201): a0=handle. A no-op on a handle that does not
-     * resolve to a built-in palette. */
+    /* Palette load (#201/#214): a0=handle. Resolves a built-in (RUNTIME) or a
+     * cart palette-file asset (CART, 1024 bytes); a no-op on a handle that
+     * resolves to neither. */
     case BLYT_ECALL_GFX_PALETTE_SET: {
         uint32_t handle = rv_get_reg(rv, rv_reg_a0);
-        blyt_tracef(BLYT_TRACE_API, "gfx_palette_set(0x%08x)", handle);
-        const uint32_t *pal = blyt_builtin_palette(handle);
+        const uint8_t *pal = blyt_resolve_palette(g_run_ctx ? &g_run_ctx->resources : NULL, handle);
+        blyt_tracef(BLYT_TRACE_API, "gfx_palette_set(0x%08x) -> %s", handle, pal ? "ok" : "no-op");
         if (g_run_ctx && g_run_ctx->palette && pal)
             memcpy(g_run_ctx->palette, pal, 256 * sizeof(uint32_t));
         rv->PC += 4;
@@ -3730,9 +3748,11 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
         uint32_t pal_handle = blyt_cart_default_palette(cart);
         if (pal_handle == 0)
             pal_handle = BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
-        const uint32_t *pal = blyt_builtin_palette(pal_handle);
+        /* Resources are already populated (load_session_resources above), so a
+         * cart-provenance custom default palette (#214) resolves here too. */
+        const uint8_t *pal = blyt_resolve_palette(&s->ctx.resources, pal_handle);
         if (!pal)
-            pal = blyt_builtin_palette(
+            pal = (const uint8_t *)blyt_builtin_palette(
                 BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
         memcpy(s->palette, pal, sizeof(s->palette));
     }

@@ -102,9 +102,11 @@ fn declared_default_vga_loads_vga() {
     );
 }
 
-/// An unknown `palettes: default:` name is a build error naming the bad value
-/// and the allowed set — no silent fallback (ADR-0088's "all silent handling
-/// is rejected" principle).
+/// An unknown `palettes: default:` name (neither a built-in nor a palette
+/// asset) is a build error naming the bad value and the allowed set — no silent
+/// fallback (ADR-0088's "all silent handling is rejected" principle). Since
+/// #214 the check moved from config-parse to build-time resolution (a name may
+/// be a palette-file asset), so the message is "unknown palette …".
 #[test]
 fn unknown_palette_name_is_a_build_error() {
     require_sdk();
@@ -117,7 +119,7 @@ fn unknown_palette_name_is_a_build_error() {
         .write(&project);
 
     let out = common::build_cart_expect_failure(&project);
-    assert!(out.contains("unknown built-in palette"), "{out}");
+    assert!(out.contains("unknown palette"), "{out}");
     assert!(out.contains("palette_vga"), "{out}");
 }
 
@@ -286,4 +288,153 @@ fn testcard_tracks_declared_palette_across_legs() {
         native, wasm,
         "test card colours must be identical across the blytplay and wasm legs"
     );
+}
+
+// ── #214 custom cart palette (.hex/.gpl/.pal) ─────────────────────────────
+//
+// A cart authors its own 256-colour palette from a palette *file* asset; the
+// packer stages it as a PROV_CART resource and emits a typed `R_<NAME>` /
+// `R.<NAME>` constant.  It becomes the active palette either as the declared
+// `palettes: default:` (pre-init auto-load) or via a runtime `palette_set`.
+// These assert identical `[blyt:palhash]` across the emulated trio; the native
+// bare-metal leg is the QEMU gate (native_qemu.rs).
+
+/// A distinctive 4-colour custom palette as Lospec `.hex` text, and the 256-entry
+/// XRGB8888 table it stages to (colours in 0..3, black-padded) — the bytes the
+/// palhash oracle must observe on every leg.
+fn custom_palette_hex() -> &'static str {
+    "112233\n445566\n778899\naabbcc\n"
+}
+fn custom_palette_table() -> Vec<u32> {
+    let mut t = vec![0u32; 256];
+    t[0] = 0x0011_2233;
+    t[1] = 0x0044_5566;
+    t[2] = 0x0077_8899;
+    t[3] = 0x00AA_BBCC;
+    t
+}
+
+/// `palettes: default: main` naming a `.hex` **asset** (not a built-in)
+/// auto-loads the cart-authored palette before init() — proving the PROV_CART
+/// branch of the session-create resolver.  The staged bytes reach the session
+/// (session_palette), differ from aurora, and every leg's palhash matches.
+#[test]
+fn custom_default_palette_loads_across_legs() {
+    require_sdk();
+    require_wasm();
+    require_libretro_core();
+    require_test_session_api();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("custom_default");
+    CartProject::new()
+        .c(&format!(
+            "#include \"blyt.h\"\n\
+             void blyt_cart_init(void) {{}}\n\
+             void blyt_cart_update(void) {{ blyt_quit(); }}\n\
+             void blyt_cart_draw(void) {{ blyt_gfx_clear(5); }}\n"
+        ))
+        .asset("main.hex", custom_palette_hex())
+        .config("palettes:\n  default: main\n")
+        .write(&dir);
+    let cart = build_cart(&dir);
+
+    // The build+load path delivers the custom bytes to the session palette.
+    assert_eq!(
+        session_palette(&cart),
+        custom_palette_table(),
+        "the .hex asset must auto-load as the session palette"
+    );
+
+    let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
+    let aurora_ph =
+        gfx::expected_palhash_line(&declared_palette(&tmp.path().join("aurora_decl"), "aurora"));
+    assert_ne!(
+        custom_ph, aurora_ph,
+        "sanity: the custom palette must differ from aurora"
+    );
+
+    let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &fb);
+    run_cart_wasm_with_env(&cart, &env, &fb);
+    run_cart_libretro_with_env(&cart, &env, &fb);
+    run_cart_native_with_env(&cart, &env, &custom_ph);
+    run_cart_wasm_with_env(&cart, &env, &custom_ph);
+    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+}
+
+/// A runtime `blyt_gfx_palette_set(R_MAIN)` on a C cart whose default is aurora
+/// switches to the cart-authored palette — proving the PROV_CART branch of the
+/// GFX_PALETTE_SET ECALL resolver.  The switched-to palhash is the custom
+/// palette on every leg.
+#[test]
+fn runtime_palette_set_custom_across_legs() {
+    require_sdk();
+    require_wasm();
+    require_libretro_core();
+    require_test_session_api();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("custom_runtime");
+    CartProject::new()
+        .c(&format!(
+            "#include \"blyt.h\"\n\
+             #include \"cart_resources.h\"\n\
+             void blyt_cart_init(void) {{}}\n\
+             void blyt_cart_update(void) {{ blyt_quit(); }}\n\
+             void blyt_cart_draw(void) {{ blyt_gfx_palette_set(R_MAIN); blyt_gfx_clear(5); }}\n"
+        ))
+        .asset("main.hex", custom_palette_hex())
+        .write(&dir);
+    let cart = build_cart(&dir);
+
+    let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
+    let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &fb);
+    run_cart_wasm_with_env(&cart, &env, &fb);
+    run_cart_libretro_with_env(&cart, &env, &fb);
+    run_cart_native_with_env(&cart, &env, &custom_ph);
+    run_cart_wasm_with_env(&cart, &env, &custom_ph);
+    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+}
+
+/// The pure-Lua counterpart: a Lua cart passes the typed palette constant
+/// `R.MAIN` to `blyt32.gfx.palette_set`.  On wasm this runs on the host-Lua fast
+/// path (g_session == NULL), so it exercises `lua_resolve_palette` against
+/// `g_lua_resources` — the fast-path mirror of the emulated resolver.  Same
+/// custom palhash on native (emulated Lua), wasm (fast path), and libretro.
+#[test]
+fn lua_custom_palette_set_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("custom_lua");
+    CartProject::new()
+        .lua(
+            "local R = require(\"cart_resources\")\n\
+             function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n\
+             \x20 blyt32.gfx.palette_set(R.MAIN)\n\
+             \x20 blyt32.gfx.clear(5)\n\
+             end\n",
+        )
+        .asset("main.hex", custom_palette_hex())
+        .write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
+    let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &fb);
+    run_cart_wasm_with_env(&cart, &env, &fb);
+    run_cart_libretro_with_env(&cart, &env, &fb);
+    run_cart_native_with_env(&cart, &env, &custom_ph);
+    run_cart_wasm_with_env(&cart, &env, &custom_ph);
+    run_cart_libretro_with_env(&cart, &env, &custom_ph);
 }

@@ -39,15 +39,26 @@ use crate::engine::{BuildError, Task, TaskInput, build_err};
 pub(super) enum ResourceType {
     Text,
     Raw,
+    /// A cart-authored palette file (`.hex`/`.gpl`/`.pal`) — the first
+    /// *processed* type (ADR-0088 amendment 2026-07-02, #214). Parsed and
+    /// validated at build time into a fixed 1024-byte XRGB8888 table; at
+    /// runtime it is just resource bytes (the runtime stays byte-blind, #166).
+    Palette,
 }
 
 impl ResourceType {
-    /// An extension listed in `text_extensions` (default `["txt"]`) is text;
+    /// Classify an extension. Reserved palette-file extensions
+    /// (`.hex`/`.gpl`/`.pal`) are the processed `Palette` type and take
+    /// precedence over `text_extensions` (they are auto-scanned, #214); an
+    /// extension listed in `text_extensions` (default `["txt"]`) is text;
     /// every other extension is opaque `raw` bytes (ADR-0088 amendment
-    /// 2026-06-27). When a real transform for an extension lands
-    /// (sprite/audio/...), it gets its own variant here.
+    /// 2026-06-27). When a further transform lands (sprite/audio/...), it gets
+    /// its own variant here.
     fn from_extension(ext: Option<&str>, text_extensions: &[String]) -> Self {
         match ext {
+            Some(e) if super::palette::PaletteFormat::from_extension(e).is_some() => {
+                ResourceType::Palette
+            }
             Some(e) if text_extensions.iter().any(|t| t == e) => ResourceType::Text,
             _ => ResourceType::Raw,
         }
@@ -57,11 +68,47 @@ impl ResourceType {
         match self {
             ResourceType::Text => "text",
             ResourceType::Raw => "raw",
+            ResourceType::Palette => "palette",
         }
     }
 
     fn is_text(self) -> bool {
         matches!(self, ResourceType::Text)
+    }
+
+    /// A *processed* type — parsed/transformed at build time rather than staged
+    /// as opaque bytes. Processed types are auto-scanned by extension (a member
+    /// even without a matching `include:` glob, #214).
+    fn is_processed(self) -> bool {
+        matches!(self, ResourceType::Palette)
+    }
+
+    /// C typedef for the generated `R_<NAME>` constant (typed-by-kind, #166).
+    fn c_type(self) -> &'static str {
+        match self {
+            ResourceType::Text => "blyt_text_resource_t",
+            ResourceType::Raw => "blyt_bytes_resource_t",
+            ResourceType::Palette => "blyt_palette_t",
+        }
+    }
+
+    /// Rust newtype for the generated `R_<NAME>` constant (typed-by-kind, #166).
+    fn rust_type(self) -> &'static str {
+        match self {
+            ResourceType::Text => "TextResource",
+            ResourceType::Raw => "BytesResource",
+            ResourceType::Palette => "Palette",
+        }
+    }
+
+    /// Lua constructor for the generated typed constant object (typed-by-kind,
+    /// #166).
+    fn lua_ctor(self) -> &'static str {
+        match self {
+            ResourceType::Text => "blyt.resource.text_resource",
+            ResourceType::Raw => "blyt.resource.bytes_resource",
+            ResourceType::Palette => "blyt.resource.palette",
+        }
     }
 }
 
@@ -437,9 +484,15 @@ pub(super) fn scan_assets(
         files.sort();
 
         for rel in files {
-            // Membership: an include match that is not excluded. (Auto-scan of
-            // processed types is empty until those transforms land.)
-            if !include.is_match(&rel) || exclude.is_match(&rel) {
+            let resource_type = ResourceType::from_extension(
+                rel.extension().and_then(OsStr::to_str),
+                &config.text_extensions,
+            );
+            // Membership: an include match, OR a processed type (palette)
+            // auto-scanned by extension (ADR-0088 amendment, #214). An `exclude`
+            // still drops either.
+            let included = include.is_match(&rel) || resource_type.is_processed();
+            if !included || exclude.is_match(&rel) {
                 continue;
             }
             let base = resource_name_from_rel(&rel)?;
@@ -454,14 +507,15 @@ pub(super) fn scan_assets(
             let rel_data = format!("resources/{resource_name}-{fingerprint}.data");
             let data_output = resources_dir.join(format!("{resource_name}-{fingerprint}.data"));
             let meta_output = resources_dir.join(format!("{resource_name}-{fingerprint}.meta"));
-            let resource_type = ResourceType::from_extension(
-                rel.extension().and_then(OsStr::to_str),
-                &config.text_extensions,
-            );
-            // The staged `.data` is the source bytes, plus one NUL for text
-            // (AssetTask). This is the runtime entry's `e->len`, so the
-            // persistent-budget guard (#160) sums it.
-            let staged_len = bytes.len() + usize::from(resource_type.is_text());
+            // The staged `.data` length (the runtime entry's `e->len`, summed by
+            // the persistent-budget guard #160): a palette is a fixed 1024-byte
+            // XRGB8888 table, text is the source bytes plus one NUL, raw is the
+            // source bytes verbatim.
+            let staged_len = match resource_type {
+                ResourceType::Palette => super::palette::PALETTE_DATA_LEN,
+                ResourceType::Text => bytes.len() + 1,
+                ResourceType::Raw => bytes.len(),
+            };
             assets.push(AssetInfo {
                 id: 0, // assigned below
                 resource_name,
@@ -527,15 +581,10 @@ pub(super) fn generate_c_header(assets: &[AssetInfo]) -> String {
     s.push_str("#pragma once\n");
     s.push_str("#include <blyt.h>\n\n");
     for a in assets {
-        let ty = if a.resource_type.is_text() {
-            "blyt_text_resource_t"
-        } else {
-            "blyt_bytes_resource_t"
-        };
         s.push_str(&format!(
             "#define {} (({})0x{:08X}u)\n",
             c_constant(&a.resource_name),
-            ty,
+            a.resource_type.c_type(),
             super::handle::resource_encode_cart(a.id)
         ));
     }
@@ -553,15 +602,10 @@ pub(super) fn generate_lua_module(assets: &[AssetInfo]) -> String {
     s.push_str("-- Generated by `blyt build` — do not edit.\n");
     s.push_str("return {\n");
     for a in assets {
-        let ctor = if a.resource_type.is_text() {
-            "blyt.resource.text_resource"
-        } else {
-            "blyt.resource.bytes_resource"
-        };
         s.push_str(&format!(
             "    {} = {}(0x{:08X}),\n",
             a.resource_name.to_ascii_uppercase(),
-            ctor,
+            a.resource_type.lua_ctor(),
             super::handle::resource_encode_cart(a.id)
         ));
     }
@@ -579,11 +623,7 @@ pub(super) fn generate_rust_module(assets: &[AssetInfo]) -> String {
     let mut s = String::new();
     s.push_str("// Generated by `blyt build` — do not edit.\n");
     for a in assets {
-        let ty = if a.resource_type.is_text() {
-            "TextResource"
-        } else {
-            "BytesResource"
-        };
+        let ty = a.resource_type.rust_type();
         s.push_str(&format!(
             "pub const {}: blyt::{ty} = blyt::{ty}::new(0x{:08X});\n",
             c_constant(&a.resource_name),
@@ -643,6 +683,48 @@ impl Task for AssetTask {
         } else {
             fs::copy(&self.source, &self.data_output)?;
         }
+        fs::write(&self.meta_output, &self.meta)?;
+        Ok(())
+    }
+}
+
+/// Phase 1 transform for a palette asset (#214): parse the `.hex`/`.gpl`/`.pal`
+/// source into a canonical 1024-byte XRGB8888 table (LE) and write it as the
+/// staged `.data`. Unlike a text/raw asset this is a *processed* type — parse
+/// errors (bad hex, out-of-range component, > 256 colors, wrong header) surface
+/// here as build errors. A no-op when the content-addressed outputs already
+/// exist (the engine keys on the source fingerprint).
+pub(super) struct PaletteTask {
+    pub resource_name: String,
+    pub source: PathBuf,
+    pub data_output: PathBuf,
+    pub meta_output: PathBuf,
+    pub meta: String,
+    pub format: super::palette::PaletteFormat,
+    pub key_str: String,
+}
+
+impl Task for PaletteTask {
+    fn key(&self) -> &str {
+        &self.key_str
+    }
+    fn label(&self) -> String {
+        format!("palette  {}", self.resource_name)
+    }
+    fn inputs(&self) -> Vec<TaskInput> {
+        vec![TaskInput::File(self.source.clone())]
+    }
+    fn outputs(&self) -> Vec<PathBuf> {
+        vec![self.data_output.clone(), self.meta_output.clone()]
+    }
+    fn run(&self) -> Result<(), BuildError> {
+        if let Some(parent) = self.data_output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let text = fs::read_to_string(&self.source)
+            .map_err(|e| build_err(format!("palette asset {}: {e}", self.source.display())))?;
+        let bytes = super::palette::parse_to_bytes(self.format, &text)?;
+        fs::write(&self.data_output, &bytes)?;
         fs::write(&self.meta_output, &self.meta)?;
         Ok(())
     }
@@ -750,15 +832,35 @@ pub(super) fn plan_assets(
     let mut resource_sections: Vec<(String, PathBuf)> = Vec::new();
 
     for a in assets {
-        tasks.push(Box::new(AssetTask {
-            resource_name: a.resource_name.clone(),
-            source: a.source.clone(),
-            data_output: a.data_output.clone(),
-            meta_output: a.meta_output.clone(),
-            meta: meta_contents(a),
-            is_text: a.resource_type.is_text(),
-            key_str: format!("asset/{}", a.resource_name),
-        }));
+        if a.resource_type == ResourceType::Palette {
+            // A processed type: parse+validate the palette file into its fixed
+            // 1024-byte staged form (#214), rather than the identity/text copy.
+            let format = a
+                .source
+                .extension()
+                .and_then(OsStr::to_str)
+                .and_then(super::palette::PaletteFormat::from_extension)
+                .expect("palette resource_type implies a palette extension");
+            tasks.push(Box::new(PaletteTask {
+                resource_name: a.resource_name.clone(),
+                source: a.source.clone(),
+                data_output: a.data_output.clone(),
+                meta_output: a.meta_output.clone(),
+                meta: meta_contents(a),
+                format,
+                key_str: format!("palette/{}", a.resource_name),
+            }));
+        } else {
+            tasks.push(Box::new(AssetTask {
+                resource_name: a.resource_name.clone(),
+                source: a.source.clone(),
+                data_output: a.data_output.clone(),
+                meta_output: a.meta_output.clone(),
+                meta: meta_contents(a),
+                is_text: a.resource_type.is_text(),
+                key_str: format!("asset/{}", a.resource_name),
+            }));
+        }
         // The packed `.blyt` embeds the *compressed* form (#157, ADR-0026): a
         // PackResourceTask turns the staged `.data` into a `.res` blob (8-byte
         // header + raw|zstd body), and that blob — not the raw `.data` — becomes
@@ -913,6 +1015,21 @@ mod tests {
     }
 
     #[test]
+    fn palette_constants_typed_by_kind() {
+        // A palette asset is a PROV_CART resource (0x20…), typed `Palette` in
+        // each language (#214), consistent with the #166 typed-by-kind scheme.
+        let assets = vec![asset_of(1, "main", "abc123", ResourceType::Palette)];
+        assert!(
+            generate_c_header(&assets).contains("#define R_MAIN ((blyt_palette_t)0x20000001u)")
+        );
+        assert!(generate_lua_module(&assets).contains("MAIN = blyt.resource.palette(0x20000001),"));
+        assert!(
+            generate_rust_module(&assets)
+                .contains("pub const R_MAIN: blyt::Palette = blyt::Palette::new(0x20000001);")
+        );
+    }
+
+    #[test]
     fn rust_module_typed_constants() {
         let assets = vec![
             asset_of(1, "greeting", "abc123", ResourceType::Text),
@@ -994,6 +1111,42 @@ mod tests {
         assert_eq!(lvl.resource_type, ResourceType::Raw);
         assert_eq!(meta_contents(txt), "type=text\nname=greeting\n");
         assert_eq!(meta_contents(lvl), "type=raw\nname=level1\n");
+    }
+
+    #[test]
+    fn palette_files_are_auto_scanned_without_include() {
+        // A processed type (palette) is a member by extension alone — no
+        // `include:` glob needed (#214), unlike text/raw which need one.
+        let assets = scan(
+            "language: lua\n",
+            &[
+                ("assets/main.hex", b"FF0000\n00FF00\n"),
+                ("assets/notes.txt", b"ignored"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(names(&assets), vec!["main"]);
+        let pal = &assets[0];
+        assert_eq!(pal.resource_type, ResourceType::Palette);
+        // Palette stages a fixed 1024-byte table regardless of source size.
+        assert_eq!(pal.staged_len, 1024);
+        assert_eq!(meta_contents(pal), "type=palette\nname=main\n");
+    }
+
+    #[test]
+    fn exclude_still_drops_auto_scanned_palettes() {
+        // Auto-scan does not bypass `exclude:` (#214).
+        let yaml = "language: lua\n\
+                    assets:\n  dirs:\n    - dir: assets/\n      exclude: [\"wip/**\"]\n";
+        let assets = scan(
+            yaml,
+            &[
+                ("assets/keep.gpl", b"GIMP Palette\n0 0 0\n"),
+                ("assets/wip/draft.gpl", b"GIMP Palette\n0 0 0\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(names(&assets), vec!["keep"]);
     }
 
     #[test]
@@ -1090,6 +1243,27 @@ mod tests {
     }
 
     #[test]
+    fn palette_extensions_dispatch_to_processed_type() {
+        let txt = vec!["txt".to_string()];
+        for ext in ["hex", "gpl", "pal", "GPL"] {
+            assert_eq!(
+                ResourceType::from_extension(Some(ext), &txt),
+                ResourceType::Palette,
+                "{ext} should be a palette"
+            );
+        }
+        // Reserved palette extensions win even if listed in text_extensions.
+        let hex_as_text = vec!["hex".to_string()];
+        assert_eq!(
+            ResourceType::from_extension(Some("hex"), &hex_as_text),
+            ResourceType::Palette
+        );
+        assert!(ResourceType::Palette.is_processed());
+        assert!(!ResourceType::Text.is_processed());
+        assert!(!ResourceType::Raw.is_processed());
+    }
+
+    #[test]
     fn default_text_extensions_when_block_present_but_omits_it() {
         // An `assets:` block that omits `text_extensions` still defaults to
         // ["txt"]; `.txt` stays text.
@@ -1179,5 +1353,47 @@ mod tests {
     #[test]
     fn asset_task_text_validation_fails_on_embedded_nul() {
         assert!(run_asset_task(b"hi\x00bye", true).is_err());
+    }
+
+    /// Run a `PaletteTask` over `src_text` (`.hex`/`.gpl`/`.pal` per `format`)
+    /// and return the staged `.data` bytes.
+    fn run_palette_task(
+        src_text: &str,
+        format: super::super::palette::PaletteFormat,
+    ) -> Result<Vec<u8>, BuildError> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("in.hex");
+        fs::write(&src, src_text).unwrap();
+        let data_output = dir.path().join("out.data");
+        let meta_output = dir.path().join("out.meta");
+        let task = PaletteTask {
+            resource_name: "main".into(),
+            source: src,
+            data_output: data_output.clone(),
+            meta_output,
+            meta: "type=palette\nname=main\n".into(),
+            format,
+            key_str: "palette/main".into(),
+        };
+        task.run()?;
+        Ok(fs::read(&data_output).unwrap())
+    }
+
+    #[test]
+    fn palette_task_stages_1024_le_bytes() {
+        use super::super::palette::PaletteFormat;
+        let out = run_palette_task("FF0000\n00FF00\n0000FF\n", PaletteFormat::Hex).unwrap();
+        assert_eq!(out.len(), 1024);
+        // XRGB8888 little-endian (0x00FF0000 -> 00 00 FF 00).
+        assert_eq!(&out[0..4], &[0x00, 0x00, 0xFF, 0x00]);
+        assert_eq!(&out[4..8], &[0x00, 0xFF, 0x00, 0x00]);
+        assert_eq!(&out[8..12], &[0xFF, 0x00, 0x00, 0x00]);
+        assert_eq!(&out[12..16], &[0x00, 0x00, 0x00, 0x00]); // padded black
+    }
+
+    #[test]
+    fn palette_task_reports_parse_errors() {
+        use super::super::palette::PaletteFormat;
+        assert!(run_palette_task("not-a-color\n", PaletteFormat::Hex).is_err());
     }
 }

@@ -819,19 +819,11 @@ static int lua_wasm_gfx_line(lua_State *L) {
     return 0;
 }
 
-/* Palette load (#201).  Routes to the session palette for hybrid carts, the
- * standalone buffer for session-less pure-Lua carts (lua_gfx_palette, #199).
- * A no-op on a handle that does not resolve to a built-in palette. */
-static int lua_wasm_gfx_palette_set(lua_State *L) {
-    uint32_t handle = (uint32_t)luaL_checkinteger(L, 1);
-    const uint32_t *pal = blyt_builtin_palette(handle);
-    if (pal) {
-        uint32_t *dst = lua_gfx_palette();
-        for (int i = 0; i < 256; i++)
-            dst[i] = pal[i];
-    }
-    return 0;
-}
+/* Palette load (#201/#214).  Defined with the resource-constant machinery below
+ * (it resolves CART palette assets against the active resource table and
+ * recognises the typed palette constant R.<NAME>); forward-declared here for the
+ * gfx method table. */
+static int lua_wasm_gfx_palette_set(lua_State *L);
 
 /* Host-Lua surface pool (blyt32.surface.*, #205).  A pure-Lua cart on the wasm
  * fast path has no rv32 session, so its surfaces live here — the host-Lua mirror
@@ -1610,6 +1602,9 @@ static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
  * collapsed accessors onto the constant — no separate loaded handle. */
 #define BLYT_RESOURCE_TEXT_CONST_MT "blyt.resource.text_const"
 #define BLYT_RESOURCE_BYTES_CONST_MT "blyt.resource.bytes_const"
+/* palette constant (#214): mirror of the guest binding — a cart palette asset's
+ * R.<NAME>, consumed by gfx.palette_set (no bytes accessor). */
+#define BLYT_RESOURCE_PALETTE_CONST_MT "blyt.resource.palette_const"
 
 typedef struct {
     uint32_t id; /* the baked console-wide constant (ADR-0134) */
@@ -1626,6 +1621,8 @@ static wasm_resource_const_t *wasm_opt_const(lua_State *L, int idx) {
     void *p = luaL_testudata(L, idx, BLYT_RESOURCE_TEXT_CONST_MT);
     if (!p)
         p = luaL_testudata(L, idx, BLYT_RESOURCE_BYTES_CONST_MT);
+    if (!p)
+        p = luaL_testudata(L, idx, BLYT_RESOURCE_PALETTE_CONST_MT);
     return (wasm_resource_const_t *)p;
 }
 
@@ -1680,6 +1677,52 @@ static int wasm_bytes_resource(lua_State *L) {
     c->is_text = 0;
     luaL_setmetatable(L, BLYT_RESOURCE_BYTES_CONST_MT);
     return 1;
+}
+
+static int wasm_palette_resource(lua_State *L) {
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    wasm_resource_const_t *c = (wasm_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = id;
+    c->is_text = 0; /* unused for a palette constant */
+    luaL_setmetatable(L, BLYT_RESOURCE_PALETTE_CONST_MT);
+    return 1;
+}
+
+static int wasm_palette_tostring(lua_State *L) {
+    wasm_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_PALETTE_CONST_MT);
+    lua_pushfstring(L, "palette<%d>", (int)c->id);
+    return 1;
+}
+
+/* Resolve a palette handle to its 256-entry XRGB8888 bytes on the host-Lua fast
+ * path (#201/#214), the mirror of cart_run.c's blyt_resolve_palette: RUNTIME ->
+ * the built-in table; CART -> the active resource table (session for a hybrid,
+ * g_lua_resources for pure-Lua), which must hold exactly 1024 bytes. */
+static const uint8_t *lua_resolve_palette(uint32_t handle) {
+    if (blyt_resource_decode_provenance(handle) == BLYT_RESOURCE_PROV_RUNTIME)
+        return (const uint8_t *)blyt_builtin_palette(handle);
+    blyt_resource_entry_t *e = wasm_resolve(active_resource_table(), handle);
+    if (!e || e->len != 256u * sizeof(uint32_t))
+        return NULL;
+    return blyt_resource_entry_data(e);
+}
+
+/* Palette load (#201/#214).  Routes to the session palette for hybrid carts, the
+ * standalone buffer for session-less pure-Lua carts (lua_gfx_palette).  Accepts
+ * an integer built-in handle or a palette constant userdata (R.<NAME>); a no-op
+ * on a handle that does not resolve to a 256-entry palette. */
+static int lua_wasm_gfx_palette_set(lua_State *L) {
+    wasm_resource_const_t *c =
+        (wasm_resource_const_t *)luaL_testudata(L, 1, BLYT_RESOURCE_PALETTE_CONST_MT);
+    uint32_t handle = c ? c->id : (uint32_t)luaL_checkinteger(L, 1);
+    const uint8_t *pal = lua_resolve_palette(handle);
+    if (pal) {
+        uint32_t *dst = lua_gfx_palette();
+        for (int i = 0; i < 256; i++)
+            dst[i] = (uint32_t)pal[i * 4] | ((uint32_t)pal[i * 4 + 1] << 8) |
+                     ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
+    }
+    return 0;
 }
 
 static int wasm_const_id(lua_State *L) {
@@ -1782,11 +1825,26 @@ static void wasm_register_resource_api(lua_State *L) {
     wasm_register_const_mt(L, BLYT_RESOURCE_TEXT_CONST_MT, wasm_const_text, "text");
     wasm_register_const_mt(L, BLYT_RESOURCE_BYTES_CONST_MT, wasm_const_bytes, "bytes");
 
+    /* Palette constant metatable (#214): :id()/__eq shared, palette-specific
+     * __tostring, no bytes accessor. */
+    luaL_newmetatable(L, BLYT_RESOURCE_PALETTE_CONST_MT);
+    lua_pushcfunction(L, wasm_const_eq);
+    lua_setfield(L, -2, "__eq");
+    lua_pushcfunction(L, wasm_palette_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_newtable(L);
+    lua_pushcfunction(L, wasm_const_id);
+    lua_setfield(L, -2, "id");
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop mt */
+
     lua_newtable(L); /* resource module */
     lua_pushcfunction(L, wasm_text_resource);
     lua_setfield(L, -2, "text_resource");
     lua_pushcfunction(L, wasm_bytes_resource);
     lua_setfield(L, -2, "bytes_resource");
+    lua_pushcfunction(L, wasm_palette_resource);
+    lua_setfield(L, -2, "palette");
     lua_pushcfunction(L, wasm_resource_pin);
     lua_setfield(L, -2, "pin");
     lua_pushcfunction(L, wasm_resource_unpin);

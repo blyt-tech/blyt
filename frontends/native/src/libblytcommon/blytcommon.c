@@ -1065,6 +1065,22 @@ static const uint8_t *native_res_data(native_res_t *e) {
     return e->data;
 }
 
+/* Resolve a CART-provenance palette handle (#214) to its 256-entry XRGB8888
+ * bytes from the cart resource table, or NULL for a non-cart / absent / wrong-
+ * size resource. libblyt32's palette path dispatches by provenance: a RUNTIME
+ * handle goes to the built-in table, a CART handle here. Not budget-accounted:
+ * palette bytes are memcpy'd into the runtime's palette store, like the built-in
+ * path (ADR-0088 amendment budget note, #214). */
+const uint8_t *blyt_native_cart_palette_bytes(uint32_t handle) {
+    int idx = res_resolve(handle);
+    if (idx < 0)
+        return NULL;
+    native_res_t *e = &s_res[idx];
+    if (e->len != 256u * sizeof(uint32_t))
+        return NULL;
+    return native_res_data(e);
+}
+
 /* Evict one entry's owned/decompressed bytes if it is eviction-eligible
  * (load_count==0 && pin_count==0, not persistent — ADR-0027 v2, #137). Frees
  * `owned` and re-points the entry to its not-resident state; the next pin

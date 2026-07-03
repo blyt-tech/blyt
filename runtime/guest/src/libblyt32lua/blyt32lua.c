@@ -115,12 +115,10 @@ static int lua_blyt_gfx_line(lua_State *L) {
     return 0;
 }
 
-/* Palette load (issue #201). Handles are u32 but fit a positive lua_Integer
- * (i32): RESOURCE-kind constants keep bit 31 clear. */
-static int lua_blyt_gfx_palette_set(lua_State *L) {
-    blyt_gfx_palette_set((blyt_resource_id_t)luaL_checkinteger(L, 1));
-    return 0;
-}
+/* Palette load (#201/#214): lua_blyt_gfx_palette_set is defined with the
+ * resource-constant machinery below (it recognises the typed palette constant
+ * R.<NAME>) and forward-declared here for the gfx method table. */
+static int lua_blyt_gfx_palette_set(lua_State *L);
 
 /* Surface tier-1 bindings (blyt32.surface.*, #205).  Lua is tier-1 only: the
  * canvas is the explicit first argument (blyt32.surface.SCREEN or a handle from
@@ -343,6 +341,9 @@ static int lua_buf_ref_slot(lua_State *L) {
  * onto the constant — there is no longer a separate loaded handle. */
 #define BLYT_RESOURCE_TEXT_CONST_MT "blyt.resource.text_const"
 #define BLYT_RESOURCE_BYTES_CONST_MT "blyt.resource.bytes_const"
+/* palette constant (#214): a cart .hex/.gpl/.pal asset's R.<NAME>, passed to
+ * gfx.palette_set.  No :text()/:bytes() accessor — the runtime consumes it. */
+#define BLYT_RESOURCE_PALETTE_CONST_MT "blyt.resource.palette_const"
 
 /* A typed resource constant (the generated R.<NAME>): the baked console-wide
  * constant value (ADR-0134) plus its kind. */
@@ -351,11 +352,13 @@ typedef struct {
     int is_text;
 } lua_resource_const_t;
 
-/* Fetch a resource constant of either kind (for kind-agnostic metamethods). */
+/* Fetch a resource constant of any kind (for kind-agnostic metamethods :id/__eq). */
 static lua_resource_const_t *lua_opt_const(lua_State *L, int idx) {
     void *p = luaL_testudata(L, idx, BLYT_RESOURCE_TEXT_CONST_MT);
     if (!p)
         p = luaL_testudata(L, idx, BLYT_RESOURCE_BYTES_CONST_MT);
+    if (!p)
+        p = luaL_testudata(L, idx, BLYT_RESOURCE_PALETTE_CONST_MT);
     return (lua_resource_const_t *)p;
 }
 
@@ -377,6 +380,25 @@ static int lua_bytes_resource(lua_State *L) {
     return 1;
 }
 
+static int lua_palette_resource(lua_State *L) {
+    blyt_resource_id_t id = (blyt_resource_id_t)luaL_checkinteger(L, 1);
+    lua_resource_const_t *c = (lua_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = id;
+    c->is_text = 0; /* unused for a palette constant */
+    luaL_setmetatable(L, BLYT_RESOURCE_PALETTE_CONST_MT);
+    return 1;
+}
+
+/* Palette load (#201/#214): accepts an integer built-in handle (blyt32.PALETTE_*)
+ * or a palette constant userdata (R.<NAME>); both carry the same u32 handle. */
+static int lua_blyt_gfx_palette_set(lua_State *L) {
+    lua_resource_const_t *c =
+        (lua_resource_const_t *)luaL_testudata(L, 1, BLYT_RESOURCE_PALETTE_CONST_MT);
+    blyt_palette_t handle = c ? (blyt_palette_t)c->id : (blyt_palette_t)luaL_checkinteger(L, 1);
+    blyt_gfx_palette_set(handle);
+    return 0;
+}
+
 static int lua_const_id(lua_State *L) {
     lua_resource_const_t *c = lua_opt_const(L, 1);
     luaL_argcheck(L, c != NULL, 1, "resource constant expected");
@@ -395,6 +417,12 @@ static int lua_const_tostring(lua_State *L) {
     lua_resource_const_t *c = lua_opt_const(L, 1);
     luaL_argcheck(L, c != NULL, 1, "resource constant expected");
     lua_pushfstring(L, c->is_text ? "text_resource<%d>" : "bytes_resource<%d>", (int)c->id);
+    return 1;
+}
+
+static int lua_palette_tostring(lua_State *L) {
+    lua_resource_const_t *c = luaL_checkudata(L, 1, BLYT_RESOURCE_PALETTE_CONST_MT);
+    lua_pushfstring(L, "palette<%d>", (int)c->id);
     return 1;
 }
 
@@ -478,11 +506,26 @@ static void register_resource_module(lua_State *L) {
     register_const_mt(L, BLYT_RESOURCE_TEXT_CONST_MT, lua_const_text, "text");
     register_const_mt(L, BLYT_RESOURCE_BYTES_CONST_MT, lua_const_bytes, "bytes");
 
+    /* Palette constant metatable (#214): :id()/__eq shared with the others, but
+     * no bytes accessor and a palette-specific __tostring. */
+    luaL_newmetatable(L, BLYT_RESOURCE_PALETTE_CONST_MT);
+    lua_pushcfunction(L, lua_const_eq);
+    lua_setfield(L, -2, "__eq");
+    lua_pushcfunction(L, lua_palette_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_newtable(L); /* __index method table */
+    lua_pushcfunction(L, lua_const_id);
+    lua_setfield(L, -2, "id");
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop mt */
+
     lua_newtable(L); /* resource module */
     lua_pushcfunction(L, lua_text_resource);
     lua_setfield(L, -2, "text_resource");
     lua_pushcfunction(L, lua_bytes_resource);
     lua_setfield(L, -2, "bytes_resource");
+    lua_pushcfunction(L, lua_palette_resource);
+    lua_setfield(L, -2, "palette");
     lua_pushcfunction(L, lua_resource_pin);
     lua_setfield(L, -2, "pin");
     lua_pushcfunction(L, lua_resource_unpin);

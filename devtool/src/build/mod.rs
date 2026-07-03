@@ -5,6 +5,7 @@ mod cpp;
 mod external;
 mod handle;
 mod lua;
+mod palette;
 mod persistent;
 mod resource_pack;
 mod rust;
@@ -183,20 +184,60 @@ fn cart_info_bytes(debug: bool, info: &InfoFields) -> Vec<u8> {
  * read save_version (and, in future, fps) from a single well-known section.
  * ------------------------------------------------------------------------- */
 
-fn cart_config_bytes(cfg: &CartConfig) -> Vec<u8> {
-    // palettes.default (issue #201) -> the encoded runtime-provenance handle;
-    // 0 (unset) means the runtime default (aurora). read_cart_config already
-    // rejected an unknown name, so this only sees a validated one; the
-    // fallback to 0 covers CartConfig values built directly (e.g. in tests)
-    // without going through that validation.
-    let default_palette = cfg
-        .palettes
-        .default
-        .as_deref()
-        .and_then(crate::config::builtin_palette_id)
-        .map(handle::resource_encode_runtime)
-        .unwrap_or(0);
+/// Resolve `palettes.default` to the encoded resource handle stored in
+/// `.cart.config` (issues #201/#214). The name resolves against two namespaces,
+/// built-in-first (so `default: vga` is unambiguous forever):
+///   - a built-in name (aurora/vga/ega/cga) → a `PROV_RUNTIME` handle;
+///   - a palette-file asset's canonical name → a `PROV_CART` handle.
+/// `default:` unset yields 0 (the runtime default, aurora). This also enforces
+/// the reserved-name rule — a palette asset may not canonicalize to a built-in
+/// name — over *all* palette assets, independent of the `default:` selection.
+/// Requires the asset scan to have run, so callers invoke it *after*
+/// `scan_assets` (the reason `.cart.config` emission moved past the scan).
+fn resolve_default_palette(
+    cfg: &CartConfig,
+    assets: &[assets::AssetInfo],
+) -> Result<u32, BuildError> {
+    // Reserved-name check: no palette asset may shadow a built-in name.
+    for a in assets {
+        if a.resource_type == assets::ResourceType::Palette
+            && crate::config::builtin_palette_id(&a.resource_name).is_some()
+        {
+            return Err(build_err(format!(
+                "palette asset canonical name {:?} collides with a reserved built-in \
+                 palette name (aurora/vga/ega/cga); rename the file",
+                a.resource_name
+            )));
+        }
+    }
 
+    let Some(name) = cfg.palettes.default.as_deref() else {
+        return Ok(0);
+    };
+    // Built-in first (reserved), so an asset can never shadow `default: vga`.
+    if let Some(id) = crate::config::builtin_palette_id(name) {
+        return Ok(handle::resource_encode_runtime(id));
+    }
+    // Otherwise it must name a palette-file asset.
+    match assets.iter().find(|a| a.resource_name == name) {
+        Some(a) if a.resource_type == assets::ResourceType::Palette => {
+            Ok(handle::resource_encode_cart(a.id))
+        }
+        Some(_) => Err(build_err(format!(
+            "blyt.config.yaml: palettes.default {name:?} names a non-palette asset; \
+             it must be a built-in (aurora/vga/ega/cga) or a palette-file asset name"
+        ))),
+        None => Err(build_err(format!(
+            "blyt.config.yaml: unknown palette {name:?} (expected a built-in \
+             aurora/vga/ega/cga, or a palette-file asset name)"
+        ))),
+    }
+}
+
+fn cart_config_bytes(cfg: &CartConfig, default_palette: u32) -> Vec<u8> {
+    // `default_palette` is the pre-resolved encoded handle (issues #201/#214)
+    // from `resolve_default_palette`; 0 (unset) means the runtime default
+    // (aurora).
     let mut fbb = FlatBufferBuilder::new();
     let config = FbCartConfig::create(
         &mut fbb,
@@ -1903,8 +1944,8 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     )?;
     let cart_info_file = build_dir.join("cart.info.bin");
     write_bytes_if_changed(&cart_info_file, &cart_info_bytes(debug, &cart_info))?;
-    let cart_config_file = build_dir.join("cart.config.bin");
-    write_bytes_if_changed(&cart_config_file, &cart_config_bytes(&cart_config))?;
+    // `.cart.config` is emitted *after* the asset scan below: its `default_palette`
+    // may reference a palette-file asset, so the name→id map must exist first (#214).
     let entry_stub_src = build_dir.join("_blyt_entry.c");
     write_if_changed(&entry_stub_src, ENTRY_STUB_C)?;
     let interp_src = build_dir.join("_blyt_interp.c");
@@ -1916,6 +1957,16 @@ fn pre_build(project_dir_arg: &Path, debug: bool) -> Result<PreBuild, BuildError
     // resource files, write the resource-id-index, and emit cart_resources.{h,lua}.
     let top_build = project_dir.join("build");
     let scanned_assets = assets::scan_assets(project_dir, &top_build)?;
+
+    // `.cart.config` (deferred from above): resolve `palettes.default` against
+    // both the built-in and palette-asset namespaces now the scan is done (#214).
+    let default_palette = resolve_default_palette(&cart_config, &scanned_assets)?;
+    let cart_config_file = build_dir.join("cart.config.bin");
+    write_bytes_if_changed(
+        &cart_config_file,
+        &cart_config_bytes(&cart_config, default_palette),
+    )?;
+
     let assets::AssetBuild {
         tasks: asset_tasks,
         resource_sections,
@@ -2626,7 +2677,7 @@ mod tests {
             save_version: 7,
             ..Default::default()
         };
-        let b = cart_config_bytes(&cfg);
+        let b = cart_config_bytes(&cfg, 0);
         assert_eq!(&b[0..4], b"CCFG");
         assert_eq!(&b[4..6], &[0, 0], "format_major = 0");
         assert_eq!(&b[6..8], &[0, 0], "format_minor = 0");
@@ -2637,29 +2688,117 @@ mod tests {
 
     #[test]
     fn cart_config_save_version_defaults_zero() {
-        let b = cart_config_bytes(&CartConfig::default());
+        let b = cart_config_bytes(&CartConfig::default(), 0);
         let config = root_as_cart_config(&b[8..]).expect("valid CartConfig");
         assert_eq!(config.save_version(), 0);
     }
 
     #[test]
-    fn cart_config_default_palette_defaults_zero() {
-        let b = cart_config_bytes(&CartConfig::default());
-        let config = root_as_cart_config(&b[8..]).expect("valid CartConfig");
-        assert_eq!(config.default_palette(), 0);
+    fn cart_config_default_palette_stores_resolved_handle() {
+        // `cart_config_bytes` now just stores the pre-resolved handle verbatim.
+        let b = cart_config_bytes(&CartConfig::default(), 0);
+        assert_eq!(
+            root_as_cart_config(&b[8..])
+                .expect("valid CartConfig")
+                .default_palette(),
+            0
+        );
+        let b = cart_config_bytes(&CartConfig::default(), 0x2100_0002);
+        assert_eq!(
+            root_as_cart_config(&b[8..])
+                .expect("valid CartConfig")
+                .default_palette(),
+            0x2100_0002
+        );
+    }
+
+    /// A palette `AssetInfo` with the given canonical name and id (other fields
+    /// are placeholders `resolve_default_palette` never reads).
+    fn palette_asset(id: u32, name: &str) -> assets::AssetInfo {
+        assets::AssetInfo {
+            id,
+            resource_name: name.to_string(),
+            source: PathBuf::from(format!("assets/{name}.hex")),
+            fingerprint: "0".repeat(16),
+            rel_data: format!("resources/{name}-0.data"),
+            data_output: PathBuf::from("x"),
+            meta_output: PathBuf::from("x"),
+            resource_type: assets::ResourceType::Palette,
+            staged_len: 1024,
+        }
+    }
+
+    fn cfg_with_default(name: Option<&str>) -> CartConfig {
+        let mut cfg = CartConfig::default();
+        cfg.palettes.default = name.map(str::to_string);
+        cfg
     }
 
     #[test]
-    fn cart_config_default_palette_encodes_declared_name() {
-        let mut cfg = CartConfig {
-            fps: 60,
-            ..Default::default()
-        };
-        cfg.palettes.default = Some("vga".to_string());
-        let b = cart_config_bytes(&cfg);
-        let config = root_as_cart_config(&b[8..]).expect("valid CartConfig");
+    fn resolve_default_palette_unset_is_zero() {
+        assert_eq!(
+            resolve_default_palette(&cfg_with_default(None), &[]).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn resolve_default_palette_builtin_is_runtime_handle() {
         // vga = built-in id 2, runtime provenance -> 0x2100_0002.
-        assert_eq!(config.default_palette(), 0x2100_0002);
+        assert_eq!(
+            resolve_default_palette(&cfg_with_default(Some("vga")), &[]).unwrap(),
+            0x2100_0002
+        );
+    }
+
+    #[test]
+    fn resolve_default_palette_asset_is_cart_handle() {
+        // A palette asset named `main` at id 3 -> PROV_CART handle 0x2000_0003.
+        let assets = [palette_asset(3, "main")];
+        assert_eq!(
+            resolve_default_palette(&cfg_with_default(Some("main")), &assets).unwrap(),
+            0x2000_0003
+        );
+    }
+
+    #[test]
+    fn resolve_default_palette_builtin_wins_over_asset() {
+        // Built-in-first: even were an asset somehow named `vga`, `default: vga`
+        // resolves to the built-in. (Such an asset is itself rejected below.)
+        let assets = [palette_asset(3, "main")];
+        assert_eq!(
+            resolve_default_palette(&cfg_with_default(Some("vga")), &assets).unwrap(),
+            0x2100_0002
+        );
+    }
+
+    #[test]
+    fn resolve_default_palette_reserved_asset_name_errors() {
+        // A palette asset canonicalizing to a built-in name is a build error,
+        // even when it is not the selected default.
+        let assets = [palette_asset(1, "ega")];
+        let err = resolve_default_palette(&cfg_with_default(None), &assets)
+            .err()
+            .expect("reserved name should be rejected");
+        assert!(err.to_string().contains("reserved built-in"), "{err}");
+    }
+
+    #[test]
+    fn resolve_default_palette_non_palette_asset_errors() {
+        let mut text = palette_asset(2, "readme");
+        text.resource_type = assets::ResourceType::Text;
+        let err = resolve_default_palette(&cfg_with_default(Some("readme")), &[text])
+            .err()
+            .expect("non-palette asset should be rejected");
+        assert!(err.to_string().contains("non-palette asset"), "{err}");
+    }
+
+    #[test]
+    fn resolve_default_palette_unknown_name_errors() {
+        let err = resolve_default_palette(&cfg_with_default(Some("nope")), &[])
+            .err()
+            .expect("unknown name should be rejected");
+        assert!(err.to_string().contains("unknown palette"), "{err}");
     }
 
     #[test]
