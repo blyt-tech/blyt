@@ -1707,6 +1707,32 @@ static const uint8_t *lua_resolve_palette(uint32_t handle) {
     return blyt_resource_entry_data(e);
 }
 
+/* Seed the session-less pure-Lua fast path's palette to the cart's DECLARED
+ * default (#219): the built-in or palette-file asset named by `palettes:
+ * default:` in blyt.config.yaml, or aurora when undeclared/unresolvable.  This
+ * is the fast-path equivalent of cart_run.c's pre-init auto-load — without it a
+ * pure-Lua cart's declared default was ignored and the fast path always showed
+ * aurora, diverging from every emulated leg.  Must run AFTER g_lua_resources is
+ * loaded (a PROV_CART default resolves against that table) and marks the palette
+ * initialised so the lazy aurora seed (lua_gfx_palette_ensure_default) is a
+ * no-op thereafter.  Hybrid carts are unaffected: their palette is the session's
+ * (seeded by blyt_session_create), not g_lua_gfx_palette. */
+static void lua_gfx_seed_declared_default(void) {
+    uint32_t handle = g_cart ? blyt_cart_default_palette(g_cart) : 0;
+    if (handle == 0)
+        handle = BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
+    const uint8_t *pal = lua_resolve_palette(handle);
+    if (!pal)
+        pal = lua_resolve_palette(
+            BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    /* Explicit little-endian decode: the cart-resource bytes may be unaligned,
+     * and an explicit LE reconstruction stays bit-identical to every other leg. */
+    for (int i = 0; i < 256; i++)
+        g_lua_gfx_palette[i] = (uint32_t)pal[i * 4] | ((uint32_t)pal[i * 4 + 1] << 8) |
+                               ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
+    g_lua_gfx_palette_init = true;
+}
+
 /* Palette load (#201/#214).  Routes to the session palette for hybrid carts, the
  * standalone buffer for session-less pure-Lua carts (lua_gfx_palette).  Accepts
  * an integer built-in handle or a palette constant userdata (R.<NAME>); a no-op
@@ -3308,6 +3334,10 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
             }
             g_lua_resources_loaded = true;
             wasm_lua_publish_footprint(&g_lua_resources);
+            /* Auto-load the cart's declared `palettes: default:` (#219), now the
+             * resource table exists (a custom PROV_CART default resolves against
+             * it) — the fast-path mirror of cart_run.c's pre-init auto-load. */
+            lua_gfx_seed_declared_default();
         }
         /* Register state buffer + save/load + resource API. */
         if (active_state_ctx())
