@@ -519,3 +519,90 @@ fn lua_declared_custom_default_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &custom_ph);
     run_cart_libretro_with_env(&cart, &env, &custom_ph);
 }
+
+// ── #221 remaining custom-palette parity cells (hybrid + custom on the fast
+// path) ────────────────────────────────────────────────────────────────────
+//
+// A HYBRID cart resolves a custom palette against the SESSION resource table on
+// the wasm host-Lua fast path (`active_resource_table()` ->
+// `blyt_session_resources(g_session)`) — a branch #214's hybrid test never hit
+// (it used a built-in handle, which skips the CART-resource lookup).  These
+// close that cell for both entry points.
+
+/// #221 cell 1: a hybrid cart whose Lua half calls `palette_set(R.MAIN)` with a
+/// **custom** asset.  Exercises the session-resource-table branch of
+/// `lua_resolve_palette` on wasm.  Custom palhash identical on every leg.
+#[test]
+fn hybrid_custom_palette_set_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("hybrid_custom_set");
+    CartProject::new()
+        .c("#include \"blyt.h\"\nBLYT_LUA_EXPORT_VOID(native_noop) {}\n")
+        .lua(
+            "local R = require(\"cart_resources\")\n\
+             function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n\
+             \x20 native_noop()\n\
+             \x20 blyt32.gfx.palette_set(R.MAIN)\n\
+             \x20 blyt32.gfx.clear(5)\n\
+             end\n",
+        )
+        .asset("main.hex", custom_palette_hex())
+        .write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
+    let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &fb);
+    run_cart_wasm_with_env(&cart, &env, &fb);
+    run_cart_libretro_with_env(&cart, &env, &fb);
+    run_cart_native_with_env(&cart, &env, &custom_ph);
+    run_cart_wasm_with_env(&cart, &env, &custom_ph);
+    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+}
+
+/// #221 cell 2: a hybrid cart declaring a **custom** `.hex` default and NO
+/// `palette_set`.  `cart_run.c` auto-loads it into the session palette at
+/// session-create; on wasm the Lua half reads that session palette.  Custom
+/// palhash identical on every leg.
+#[test]
+fn hybrid_custom_default_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("hybrid_custom_default");
+    CartProject::new()
+        .c("#include \"blyt.h\"\nBLYT_LUA_EXPORT_VOID(native_noop) {}\n")
+        .lua(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n\
+             \x20 native_noop()\n\
+             \x20 blyt32.gfx.clear(5)\n\
+             end\n",
+        )
+        .asset("main.hex", custom_palette_hex())
+        .config("palettes:\n  default: main\n")
+        .write(&dir);
+    let cart = build_lua_cart(&dir);
+
+    let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
+    let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(&cart, &env, &fb);
+    run_cart_wasm_with_env(&cart, &env, &fb);
+    run_cart_libretro_with_env(&cart, &env, &fb);
+    run_cart_native_with_env(&cart, &env, &custom_ph);
+    run_cart_wasm_with_env(&cart, &env, &custom_ph);
+    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+}

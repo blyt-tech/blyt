@@ -434,6 +434,28 @@ function draw() end
         build_cart(&project)
     };
 
+    // Custom palette as DECLARED DEFAULT on bare metal (gate 31, #221/#214): a
+    // `.hex` asset named by `palettes: default:`, NO runtime palette_set — the
+    // native config-default path (native_palette_init reading blyt_native_default_palette
+    // then native_resolve_palette on the PROV_CART handle), distinct from gate
+    // 30's runtime-set path.
+    let gfx_palette_custom_default_cart = {
+        let project = tmp.path().join("gfx_palette_custom_default");
+        let src = format!(
+            "#include \"blyt.h\"\n\
+             void blyt_cart_init(void) {{}}\n\
+             void blyt_cart_update(void) {{ blyt_quit(); }}\n\
+             void blyt_cart_draw(void) {{\n{}}}\n",
+            common::gfx::c_draw_body(&common::gfx::torture_frame())
+        );
+        CartProject::new()
+            .c(&src)
+            .asset("main.hex", "112233\n445566\n778899\naabbcc\n")
+            .config("palettes:\n  default: main\n")
+            .write(&project);
+        build_cart(&project)
+    };
+
     // ── Build the Lua and hybrid gfx carts (gates 20 & 21, #193) ──────
     // Fill the bare-metal cells of the gfx execution matrix the spike left
     // untested: a pure-Lua gfx cart (native RV32 Lua VM → blyt32lua.c binding →
@@ -781,6 +803,10 @@ function draw() end
     assert!(
         qemu.scp_to(&gfx_palette_custom_cart, "/tmp/blyt_gate/"),
         "scp gfx_palette_custom.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&gfx_palette_custom_default_cart, "/tmp/blyt_gate/"),
+        "scp gfx_palette_custom_default.blyt failed"
     );
     if let Some(ref cart) = gfx_lua_cart {
         assert!(
@@ -2499,6 +2525,47 @@ void blyt_cart_draw(void) {}
             output.contains(&expected_pal),
             "native bare-metal must load the CART palette bytes \
              (expected {expected_pal:?}; #214)\noutput: {output}"
+        );
+        println!("  PASS: {expected} + {expected_pal}");
+    }
+
+    // ── Gate 31: custom palette as DECLARED DEFAULT on metal (#221/#214) ──
+    //
+    // A `.hex` asset named by `palettes: default:` (no runtime palette_set): the
+    // native config-default path (native_palette_init resolving the .cart.config
+    // handle via native_resolve_palette), the counterpart to gate 30's runtime
+    // set.  Same torture frame; fbhash unperturbed, palhash = the cart-authored
+    // palette.
+    {
+        println!("Gate 31: custom declared-default palette on metal...");
+        let expected =
+            common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
+        let mut custom = vec![0u32; 256];
+        custom[0] = 0x0011_2233;
+        custom[1] = 0x0044_5566;
+        custom[2] = 0x0077_8899;
+        custom[3] = 0x00AA_BBCC;
+        let expected_pal = common::gfx::expected_palhash_line(&custom);
+        let out = qemu.ssh(
+            "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/gfx_palette_custom_default.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "gfx_palette_custom_default.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(&expected),
+            "native custom declared-default must not perturb the index hash \
+             (expected {expected:?}; #221)\noutput: {output}"
+        );
+        assert!(
+            output.contains(&expected_pal),
+            "native bare-metal must auto-load the CART declared-default palette bytes \
+             (expected {expected_pal:?}; #221)\noutput: {output}"
         );
         println!("  PASS: {expected} + {expected_pal}");
     }
