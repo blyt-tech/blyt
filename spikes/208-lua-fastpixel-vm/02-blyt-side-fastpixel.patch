@@ -1,0 +1,126 @@
+diff --git a/cmake/blyt_guest_libs.cmake b/cmake/blyt_guest_libs.cmake
+index f2e15cb..430052f 100644
+--- a/cmake/blyt_guest_libs.cmake
++++ b/cmake/blyt_guest_libs.cmake
+@@ -41,6 +41,16 @@ endif()
+ 
+ file(MAKE_DIRECTORY "${SDK_LIB}" "${SDK_LIB_DEBUG}" "${SDK_BIN}")
+ 
++# #208 2b (spike): the tier-2 lock get/set VM fast path in libblyt32lua's lvm.c.
++# ON by default; build a baseline (2a, no fast path) lib with -DBLYT_LUA_FASTPIXEL=OFF
++# for the spike comparison.  Pure speed optimization — output is identical either way.
++option(BLYT_LUA_FASTPIXEL "Enable the tier-2 Lua per-pixel VM fast path (#208 2b)" ON)
++if(BLYT_LUA_FASTPIXEL)
++  set(_BLYT_LUA_FASTPIXEL_FLAG "-DBLYT_LUA_FASTPIXEL=1")
++else()
++  set(_BLYT_LUA_FASTPIXEL_FLAG "")
++endif()
++
+ # ── Base flags ───────────────────────────────────────────────────────────────
+ set(RV32_BASE
+     # riscv32-linux-gnu (not bare-metal riscv32): lld injects -static for
+@@ -752,6 +762,14 @@ else()
+       ${_VOPT}
+       -DBLYT_LUA_I32_F64=1
+       -DLUA_USE_LONGJMP=1
++      # #208 2b (spike): OP_CALL-inline + index-opcode fast path for the tier-2
++      # lock get/set in lvm.c.  Only the thick libblyt32lua embeds both the VM and
++      # blyt32lua.c (which defines the fast-path identities the patch resolves), so
++      # the flag lives here.  A pure speed optimization — output is identical to
++      # the slow path, so the host-Lua WASM leg (no flag) stays coherent.  Gated by
++      # the BLYT_LUA_FASTPIXEL option (ON) so a baseline (2a) lib can be built with
++      # -DBLYT_LUA_FASTPIXEL=OFF for the spike comparison.
++      ${_BLYT_LUA_FASTPIXEL_FLAG}
+       ${LUA_SEED_DEF}
+       ${_VLUA_DAP_FLAGS}
+       -I
+diff --git a/runtime/guest/src/libblyt32lua/blyt32lua.c b/runtime/guest/src/libblyt32lua/blyt32lua.c
+index 70f26f1..b398dd7 100644
+--- a/runtime/guest/src/libblyt32lua/blyt32lua.c
++++ b/runtime/guest/src/libblyt32lua/blyt32lua.c
+@@ -180,7 +180,7 @@ static int lua_blyt_surface_blit(lua_State *L) {
+  * one to release, none per pixel).
+  *
+  * Staleness guard: the lock is valid only for the frame it was taken in.  A
+- * per-VM epoch counter (g_lock_epoch) bumps once per frame; the lock captures it
++ * per-VM epoch counter (blyt_lua_lock_epoch) bumps once per frame; the lock captures it
+  * at acquire and get/set/release reject on mismatch, so a lock held across the
+  * frame boundary (where the runtime force-releases + may free the buffer) is a
+  * defined rejection, not a dangling access.  lk:release() also sets `released`.
+@@ -188,11 +188,13 @@ static int lua_blyt_surface_blit(lua_State *L) {
+  * dropped, read → 0) in a release cart — mirroring the surface phase gate. */
+ #define BLYT_SURFACE_LOCK_MT "blyt.surface.lock"
+ 
+-static uint32_t g_lock_epoch = 0;
++/* Non-static so the VM fast path (lvm.c, BLYT_LUA_FASTPIXEL) reads the SAME
++ * counter this binding bumps + captures at acquire (#208 2b). */
++uint32_t blyt_lua_lock_epoch = 0;
+ 
+ typedef struct {
+     blyt_lock_t lock; /* pixels, stride, w, h, token (from blyt_surface_acquire) */
+-    uint32_t epoch; /* g_lock_epoch captured at acquire */
++    uint32_t epoch; /* blyt_lua_lock_epoch captured at acquire */
+     int released; /* explicit lk:release() or force-released */
+ } lua_lock_t;
+ 
+@@ -205,7 +207,7 @@ static int lua_blyt_surface_acquire(lua_State *L) {
+     }
+     lua_lock_t *u = (lua_lock_t *)lua_newuserdatauv(L, sizeof(*u), 0);
+     u->lock = lk;
+-    u->epoch = g_lock_epoch;
++    u->epoch = blyt_lua_lock_epoch;
+     u->released = 0;
+     luaL_setmetatable(L, BLYT_SURFACE_LOCK_MT);
+     return 1;
+@@ -215,7 +217,7 @@ static int lua_blyt_surface_acquire(lua_State *L) {
+  * result is the "rejected" path: dev-error in a debug cart, no-op in release. */
+ static lua_lock_t *lua_lock_live(lua_State *L, int idx) {
+     lua_lock_t *u = (lua_lock_t *)luaL_checkudata(L, idx, BLYT_SURFACE_LOCK_MT);
+-    if (u->released || u->epoch != g_lock_epoch)
++    if (u->released || u->epoch != blyt_lua_lock_epoch)
+         return NULL;
+     return u;
+ }
+@@ -282,16 +284,32 @@ static int lua_lock_line(lua_State *L) {
+ 
+ static int lua_lock_release(lua_State *L) {
+     lua_lock_t *u = (lua_lock_t *)luaL_checkudata(L, 1, BLYT_SURFACE_LOCK_MT);
+-    if (!u->released && u->epoch == g_lock_epoch)
++    if (!u->released && u->epoch == blyt_lua_lock_epoch)
+         blyt_surface_release(&u->lock); /* flush + invalidate; stale token is a host no-op */
+     u->released = 1;
+     return 0;
+ }
+ 
++/* Fast-path builtin identities for the OP_CALL-inline VM patch (#208 2b): the
++ * Lua VM (lvm.c, built with BLYT_LUA_FASTPIXEL for the guest) compares the
++ * OP_CALL callee against these and, for the common case (a live lock, integer
++ * args, in bounds), runs the get/set inline on the materialized buffer — eliding
++ * the Lua C-call frame. Anything unusual (OOB / stale / released / non-integer
++ * args) falls through to the C functions above, which remain the source of truth
++ * for the checked semantics.  Non-static so lvm.c resolves them within the .so. */
++int (*blyt_lua_fp_get)(lua_State *) = lua_lock_get;
++int (*blyt_lua_fp_set)(lua_State *) = lua_lock_set;
++/* Lock metatable identity, captured at registration.  The VM fast path checks
++ * the self userdata's metatable against this before treating it as a lock — so a
++ * cart that calls the get/set builtin with a foreign self falls through to the C
++ * function (which errors via luaL_checkudata) rather than reading raw memory. */
++void *blyt_lua_lock_mt = NULL;
++
+ /* Build the lock metatable: __index method table with get/set/release + the
+  * in-lock bulk primitives. */
+ static void register_surface_lock_mt(lua_State *L) {
+     luaL_newmetatable(L, BLYT_SURFACE_LOCK_MT);
++    blyt_lua_lock_mt = (void *)lua_topointer(L, -1); /* identity for the VM fast path */
+     lua_newtable(L); /* __index */
+     static const luaL_Reg lock_methods[] = {
+         {"get", lua_lock_get},
+@@ -1012,7 +1030,7 @@ void blyt_cart_update(void) {
+     /* Bump the tier-2 lock epoch once per frame (#208): a lock acquired in a
+      * previous frame's draw() is now stale, so its get/set/release reject rather
+      * than touch a buffer the runtime may have force-released/freed. */
+-    g_lock_epoch++;
++    blyt_lua_lock_epoch++;
+     call_global("update");
+ }
+ void blyt_cart_draw(void) {

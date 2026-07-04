@@ -1,0 +1,138 @@
+diff --git a/lvm.c b/lvm.c
+index c70e2b8a..5f24513d 100644
+--- a/lvm.c
++++ b/lvm.c
+@@ -1313,6 +1313,29 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
+         TValue *rb = vRB(i);
+         TValue *rc = vRC(i);
+         lu_byte tag;
++#ifdef BLYT_LUA_FASTPIXEL
++        /* blyt #208 2b candidate 3: index-opcode fast path for `c = lk[i]`.
++         * Read the materialized buffer inline for a lock userdata + integer
++         * (raw linear) key; OOB / stale falls through to the normal __index. */
++        if (ttisfulluserdata(rb) && ttisinteger(rc)) {
++          extern unsigned int blyt_lua_lock_epoch;
++          extern void *blyt_lua_lock_mt;
++          if ((void *)uvalue(rb)->metatable == blyt_lua_lock_mt) {
++            struct blyt_fp_lock {
++              unsigned char *pixels;
++              int stride, w, h;
++              unsigned int token, epoch;
++              int released;
++            } *fp_lk = (struct blyt_fp_lock *)getudatamem(uvalue(rb));
++            lua_Integer fp_i = ivalue(rc);
++            if (!fp_lk->released && fp_lk->epoch == blyt_lua_lock_epoch && fp_i >= 0 &&
++                (unsigned int)fp_i < (unsigned int)fp_lk->stride * (unsigned int)fp_lk->h) {
++              setivalue(s2v(ra), (lua_Integer)fp_lk->pixels[(unsigned int)fp_i]);
++              vmbreak;
++            }
++          }
++        }
++#endif
+         if (ttisinteger(rc)) {  /* fast track for integers? */
+           luaV_fastgeti(rb, ivalue(rc), s2v(ra), tag);
+         }
+@@ -1364,6 +1387,31 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
+         int hres;
+         TValue *rb = vRB(i);  /* key (table is in 'ra') */
+         TValue *rc = RKC(i);  /* value */
++#ifdef BLYT_LUA_FASTPIXEL
++        /* blyt #208 2b candidate 3: index-opcode fast path for `lk[i] = c`.
++         * Intercept a store into the tier-2 lock userdata with an integer key
++         * (a raw linear offset) and write the materialized buffer inline —
++         * eliding OP_SELF + OP_CALL entirely.  OOB / stale falls through to the
++         * normal __newindex path. */
++        if (ttisfulluserdata(s2v(ra)) && ttisinteger(rb) && ttisinteger(rc)) {
++          extern unsigned int blyt_lua_lock_epoch;
++          extern void *blyt_lua_lock_mt;
++          if ((void *)uvalue(s2v(ra))->metatable == blyt_lua_lock_mt) {
++            struct blyt_fp_lock {
++              unsigned char *pixels;
++              int stride, w, h;
++              unsigned int token, epoch;
++              int released;
++            } *fp_lk = (struct blyt_fp_lock *)getudatamem(uvalue(s2v(ra)));
++            lua_Integer fp_i = ivalue(rb);
++            if (!fp_lk->released && fp_lk->epoch == blyt_lua_lock_epoch && fp_i >= 0 &&
++                (unsigned int)fp_i < (unsigned int)fp_lk->stride * (unsigned int)fp_lk->h) {
++              fp_lk->pixels[(unsigned int)fp_i] = (unsigned char)ivalue(rc);
++              vmbreak;
++            }
++          }
++        }
++#endif
+         if (ttisinteger(rb)) {  /* fast track for integers? */
+           luaV_fastseti(s2v(ra), ivalue(rb), rc, hres);
+         }
+@@ -1725,6 +1773,71 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
+         if (b != 0)  /* fixed number of arguments? */
+           L->top.p = ra + b;  /* top signals number of arguments */
+         /* else previous instruction set top */
++#ifdef BLYT_LUA_FASTPIXEL
++        /* blyt #208 2b: OP_CALL-inline fast path for the tier-2 lock get/set
++         * builtins.  Recognize the callee by identity and, for the hot case (our
++         * lock userdata, integer coords, a live lock, in bounds), do the pixel op
++         * inline on the materialized buffer — eliding the C call frame
++         * (precallC/poscall) and the luaL_check* revalidation.  Any unusual case
++         * (foreign self, non-integer args, OOB, stale/released) falls through to
++         * luaD_precall -> the C function, which keeps the checked semantics. */
++        /* The get/set methods are registered via luaL_setfuncs with 0 upvalues,
++         * so they are light C functions (LUA_VLCF), not full C closures. */
++        if (b != 0 && ttislcf(s2v(ra))) {
++          extern int (*blyt_lua_fp_get)(lua_State *);
++          extern int (*blyt_lua_fp_set)(lua_State *);
++          extern unsigned int blyt_lua_lock_epoch;
++          extern void *blyt_lua_lock_mt;
++          lua_CFunction fpf = fvalue(s2v(ra));
++          int fp_set = (fpf == blyt_lua_fp_set);
++          int fp_get = (fpf == blyt_lua_fp_get);
++          if ((fp_set || fp_get) && b >= (fp_set ? 5 : 4)) {
++            TValue *fp_self = s2v(ra + 1);
++            TValue *fp_tx = s2v(ra + 2);
++            TValue *fp_ty = s2v(ra + 3);
++            if (ttisfulluserdata(fp_self) &&
++                (void *)uvalue(fp_self)->metatable == blyt_lua_lock_mt &&
++                ttisinteger(fp_tx) && ttisinteger(fp_ty) &&
++                (fp_get || ttisinteger(s2v(ra + 4)))) {
++              struct blyt_fp_lock {
++                unsigned char *pixels;
++                int stride, w, h;
++                unsigned int token, epoch;
++                int released;
++              } *fp_lk = (struct blyt_fp_lock *)getudatamem(uvalue(fp_self));
++              lua_Integer fp_x = ivalue(fp_tx), fp_y = ivalue(fp_ty);
++              if (!fp_lk->released && fp_lk->epoch == blyt_lua_lock_epoch &&
++                  fp_x >= 0 && fp_x < fp_lk->w && fp_y >= 0 && fp_y < fp_lk->h) {
++                unsigned int fp_off = (unsigned int)fp_y * (unsigned int)fp_lk->stride +
++                                      (unsigned int)fp_x;
++                int fp_nprod;
++                lua_Integer fp_rv = 0;
++                if (fp_set) {
++                  fp_lk->pixels[fp_off] = (unsigned char)ivalue(s2v(ra + 4));
++                  fp_nprod = 0;
++                }
++                else {
++                  fp_rv = (lua_Integer)fp_lk->pixels[fp_off];
++                  fp_nprod = 1;
++                }
++                /* place results per the caller's wanted count (mirrors
++                 * moveresults for the 0/1-result cases we produce). */
++                int fp_wanted = (nresults == LUA_MULTRET) ? fp_nprod : nresults;
++                int fp_k = 0;
++                if (fp_nprod == 1 && fp_wanted >= 1) {
++                  setivalue(s2v(ra), fp_rv);
++                  fp_k = 1;
++                }
++                for (; fp_k < fp_wanted; fp_k++)
++                  setnilvalue(s2v(ra + fp_k));
++                L->top.p = ra + fp_wanted;
++                updatetrap(ci);
++                vmbreak;
++              }
++            }
++          }
++        }
++#endif
+         savepc(ci);  /* in case of errors */
+         if ((newci = luaD_precall(L, ra, nresults)) == NULL)
+           updatetrap(ci);  /* C call; nothing else to be done */
