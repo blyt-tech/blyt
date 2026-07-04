@@ -169,6 +169,35 @@ cap (native-C carts capped ~32, Lua carts ~20). This is Spike B territory; the
 probe here quantifies it so the ADR-0082 cap decision is informed by the
 worst-case authoring path, not just native C.
 
+### Per-frame budget and GC jitter on hardware (Spike B)
+
+The runner records a per-frame instruction distribution when the guest emits a
+frame marker (a private `SYS_BLYT_FRAME` ecall each frame); converted to time at
+the measured MIPS, that gives the direct 60 Hz (16.67 ms) budget verdict — and
+GC pauses land in the high percentiles. Two workloads (`lua-bench.elf <frames>
+[steady|alloc]`), 256 entities, **Pi at -O2**:
+
+| workload | insns/frame (mean / p99 / max) | ms/frame (mean / p99 / max) | vs 16.67 ms |
+|---|---|---|---|
+| **steady** (no per-frame alloc) | 737K / 744K / 744K | 36.5 / 36.9 / 36.9 | 2.2× over |
+| **alloc** (table+string/entity/frame) | 1.26M / 1.62M / 1.62M | 70.4 / 90.3 / 90.3 | 4.2–5.4× over |
+
+Reading:
+- **256 entities of this complexity does not fit** — 36.5 ms/frame steady (2.2×
+  over). The Pi Lua budget at -O2 is 16.67 ms × ~20.5 MIPS ≈ **342K Lua-VM
+  instructions/frame** (full frame), or ~**171K** to leave the spike's ≥ 8 ms
+  headroom. At ~2.9K insns/entity that is **~60 entities (with headroom) to ~120
+  (full budget)** — a non-trivial but bounded retro loop. Lighter per-entity
+  logic (no `sqrt`/`sin`) buys proportionally more.
+- **GC matters.** The steady frame is rock-stable (p99 ≈ mean). The
+  allocation-heavy frame both runs slower *and* shows **p99 ≈ 28 % above mean**
+  (1.62M vs 1.26M insns) — Lua's mark/sweep pauses. A cart must budget to the
+  **p99**, not the mean, and minimize per-frame allocation to hold a steady 60 Hz.
+
+This closes the load-bearing part of Spike B (throughput + fps/headroom + GC on
+real hardware). Remaining Spike B breadth: the lua.org benchmark suite for
+operation-type coverage (string/closure/numeric).
+
 ### The cap value — and why it hinges on the interpreter opt level
 
 **The shipped interpreter optimization level swings the cap ~4× on the Pi:**

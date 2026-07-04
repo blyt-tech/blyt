@@ -68,6 +68,12 @@
 #define SYS_clock_gettime64 403
 #define SYS_gettimeofday64 169
 
+/* Harness-private "frame marker" syscall (not a Linux number). A guest calls it
+ * once per simulated frame; the runner records the retired-instruction delta
+ * since the previous marker, yielding a per-frame instruction distribution that
+ * captures GC/allocation spikes. Chosen well outside the Linux syscall range. */
+#define SYS_BLYT_FRAME 0xB1700001u
+
 /* Guest address-space budget. CoreMark/Embench have tiny footprints; give them
  * a comfortable 256 MiB with well-separated heap / mmap / stack windows so the
  * three allocators never collide. */
@@ -83,9 +89,40 @@ typedef struct {
     uint32_t brk_cur; /* current program break (grows up from _end)   */
     uint32_t mmap_cur; /* next anonymous mmap address (grows up)        */
     int unhandled; /* count of -ENOSYS fallbacks (diagnostic)       */
+    /* Per-frame instruction accounting (SYS_BLYT_FRAME). */
+    uint64_t *frame_insns; /* retired instructions per marked frame      */
+    size_t n_frames;
+    size_t cap_frames;
+    uint64_t last_frame_cycle;
+    int frames_started;
 } runner_state_t;
 
 static runner_state_t g_state;
+
+static void record_frame(uint64_t cycle_now)
+{
+    if (!g_state.frames_started) {
+        g_state.frames_started = 1;
+        g_state.last_frame_cycle = cycle_now;
+        return; /* first marker: baseline only */
+    }
+    if (g_state.n_frames == g_state.cap_frames) {
+        size_t nc = g_state.cap_frames ? g_state.cap_frames * 2 : 1024;
+        uint64_t *p = realloc(g_state.frame_insns, nc * sizeof(uint64_t));
+        if (!p)
+            return; /* drop silently if out of memory */
+        g_state.frame_insns = p;
+        g_state.cap_frames = nc;
+    }
+    g_state.frame_insns[g_state.n_frames++] = cycle_now - g_state.last_frame_cycle;
+    g_state.last_frame_cycle = cycle_now;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *) a, y = *(const uint64_t *) b;
+    return (x > y) - (x < y);
+}
 
 /* AUXV entry types we populate. */
 #define AT_NULL 0
@@ -283,6 +320,10 @@ static void runner_ecall(riscv_t *rv) {
     case SYS_faccessat:
         ret = 0;
         break;
+    case SYS_BLYT_FRAME:
+        record_frame(rv->csr_cycle);
+        ret = 0;
+        break;
     case SYS_exit:
     case SYS_exit_group:
         PRIV(rv)->exit_code = (int)guest_arg(rv, 0);
@@ -443,21 +484,57 @@ int main(int argc, char **argv) {
     const char *base = strrchr(elf_path, '/');
     base = base ? base + 1 : elf_path;
 
+    /* Per-frame instruction distribution (if the guest emitted frame markers).
+     * Converted to per-frame time at the measured effective MIPS: a frame of K
+     * guest instructions takes K / (MIPS * 1e6) seconds on this host — the basis
+     * for the 60 Hz (16.67 ms) budget / headroom judgment. GC/allocation spikes
+     * show up as high-percentile frames. */
+    size_t nf = g_state.n_frames;
+    uint64_t f_mean = 0, f_p50 = 0, f_p95 = 0, f_p99 = 0, f_max = 0;
+    if (nf > 0) {
+        qsort(g_state.frame_insns, nf, sizeof(uint64_t), cmp_u64);
+        uint64_t sum = 0;
+        for (size_t i = 0; i < nf; i++)
+            sum += g_state.frame_insns[i];
+        f_mean = sum / nf;
+        f_p50 = g_state.frame_insns[(size_t)(0.50 * (nf - 1))];
+        f_p95 = g_state.frame_insns[(size_t)(0.95 * (nf - 1))];
+        f_p99 = g_state.frame_insns[(size_t)(0.99 * (nf - 1))];
+        f_max = g_state.frame_insns[nf - 1];
+    }
+#define FRAME_MS(k) (mips > 0 ? (double)(k) / (mips * 1e6) * 1e3 : 0.0)
+
     bool halted = rv_has_halted(rv);
     if (json) {
         printf("{\"benchmark\":\"%s\",\"guest_insns\":%llu,"
                "\"wall_seconds\":%.6f,\"effective_mips\":%.3f,"
                "\"exit_code\":%d,\"halted\":%s,\"capped\":%s,"
-               "\"unhandled_syscalls\":%d}\n",
+               "\"unhandled_syscalls\":%d",
                base, (unsigned long long)insns, secs, mips, attr.exit_code,
                halted ? "true" : "false", capped ? "true" : "false", g_state.unhandled);
+        if (nf > 0)
+            printf(",\"frames\":%zu,\"frame_insns_mean\":%llu,\"frame_insns_p50\":%llu,"
+                   "\"frame_insns_p95\":%llu,\"frame_insns_p99\":%llu,\"frame_insns_max\":%llu,"
+                   "\"frame_ms_mean\":%.4f,\"frame_ms_p99\":%.4f,\"frame_ms_max\":%.4f",
+                   nf, (unsigned long long)f_mean, (unsigned long long)f_p50,
+                   (unsigned long long)f_p95, (unsigned long long)f_p99,
+                   (unsigned long long)f_max, FRAME_MS(f_mean), FRAME_MS(f_p99), FRAME_MS(f_max));
+        printf("}\n");
     } else {
         fprintf(stderr, "[spike-a] %-24s insns=%llu wall=%.4fs MIPS=%.2f exit=%d%s%s%s\n", base,
                 (unsigned long long)insns, secs, mips, attr.exit_code,
                 halted ? "" : " (NOT halted)", capped ? " (CAPPED)" : "",
                 g_state.unhandled ? " (unhandled syscalls!)" : "");
+        if (nf > 0)
+            fprintf(stderr,
+                    "[spike-a]   %zu frames  insns/frame: mean=%llu p99=%llu max=%llu  "
+                    "@%.1f MIPS -> ms/frame: mean=%.2f p99=%.2f max=%.2f (budget 16.67)\n",
+                    nf, (unsigned long long)f_mean, (unsigned long long)f_p99,
+                    (unsigned long long)f_max, mips, FRAME_MS(f_mean), FRAME_MS(f_p99),
+                    FRAME_MS(f_max));
     }
 
+    free(g_state.frame_insns);
     rv_delete(rv);
     return attr.exit_code;
 }

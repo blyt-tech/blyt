@@ -1,22 +1,23 @@
 /*
- * Lua-VM throughput workload for the blyt Spike A harness (a Spike B probe).
+ * Lua-VM throughput + per-frame budget workload for the blyt Spike A harness
+ * (a Spike B probe).
  *
  * Measures the effective guest MIPS of rv32emu running the *Lua bytecode
- * interpreter* — the load-bearing authoring path — rather than native C
- * (CoreMark/Embench). The Lua VM is compiled to the real cart ISA
- * (RV32IMAFDC/ilp32d) with the cart numeric model (BLYT_LUA_I32_F64: lua_Integer
- * = int32, lua_Number = double) and the same fixed hash seed the runtime uses,
- * so the instruction mix matches what a Lua cart actually executes under the
- * emulator. Run through host/runner.c; effective MIPS comes from rv->csr_cycle.
+ * interpreter* — the load-bearing authoring path — and, via the runner's
+ * per-frame marker, the per-frame instruction distribution (mean/p99/max) that
+ * decides whether a Lua game loop fits the 16.67 ms budget on the Pi with
+ * headroom. The Lua VM is the blyt build (BLYT_LUA_I32_F64: lua_Integer = int32,
+ * lua_Number = double) at the real cart ISA (RV32IMAFDC/ilp32d) with the
+ * runtime's fixed hash seed, so the instruction mix matches a real cart.
  *
- * The workload is a steady-state entity `update()` — the pattern a non-trivial
- * retro game loop uses: table-indexed position/velocity integration, boundary
- * checks, and f64 transcendentals (sqrt/sin). It exercises exactly the parts of
- * the Lua VM that stress the interpreter: bytecode dispatch (indirect branches),
- * tagged-value loads/stores, and softfloat-backed f64 math.
+ * C drives the frame loop and emits a marker (SYS_BLYT_FRAME ecall) at the start
+ * of each frame; the runner records per-frame retired instructions. Two
+ * workloads select GC behaviour:
+ *   - "steady" (default): reused tables, ~no per-frame allocation.
+ *   - "alloc": allocates temporary tables/strings each entity each frame, so GC
+ *     runs and its pauses appear as high-percentile frames.
  *
- * Frame count is argv[1] (default 20000), so run length is tunable without a
- * rebuild — like CoreMark's iteration count.
+ * Usage (guest argv): lua-bench.elf <frames> [steady|alloc]
  */
 
 #include <stdio.h>
@@ -27,32 +28,58 @@
 #include "lua.h"
 #include "lualib.h"
 
-/* Steady-state entity update. `FRAMES` is injected as a Lua global from C. */
-static const char *BENCH_LUA = "local N = 256\n"
-                               "local ex, ey, evx, evy = {}, {}, {}, {}\n"
-                               "for i = 1, N do\n"
-                               "  ex[i] = i * 1.0; ey[i] = i * 0.5\n"
-                               "  evx[i] = (i % 7) * 0.13 - 0.4; evy[i] = -(i % 5) * 0.17\n"
-                               "end\n"
-                               "local sqrt, sin = math.sqrt, math.sin\n"
-                               "local function update()\n"
-                               "  for i = 1, N do\n"
-                               "    evy[i] = evy[i] + 0.05        -- gravity\n"
-                               "    ex[i]  = ex[i] + evx[i]\n"
-                               "    ey[i]  = ey[i] + evy[i]\n"
-                               "    if ex[i] < 0 or ex[i] > 320 then evx[i] = -evx[i] end\n"
-                               "    if ey[i] > 240 then ey[i] = 240; evy[i] = -evy[i] * 0.8 end\n"
-                               "    local d = sqrt(evx[i] * evx[i] + evy[i] * evy[i])\n"
-                               "    ex[i] = ex[i] + sin(d) * 0.01\n"
-                               "  end\n"
-                               "end\n"
-                               "for f = 1, FRAMES do update() end\n"
-                               "local s = 0.0\n"
-                               "for i = 1, N do s = s + ex[i] + ey[i] end\n"
-                               "RESULT = s\n";
+/* Per-frame marker: the harness-private SYS_BLYT_FRAME ecall (see runner.c). */
+static void frame_mark(void)
+{
+    register long a7 asm("a7") = 0xB1700001;
+    register long a0 asm("a0") = 0;
+    asm volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+}
 
-int main(int argc, char **argv) {
+/* Steady-state entity update: no per-frame allocation (reuses the arrays). */
+static const char *STEADY_LUA =
+    "local N = 256\n"
+    "ex, ey, evx, evy = {}, {}, {}, {}\n"
+    "for i = 1, N do\n"
+    "  ex[i] = i * 1.0; ey[i] = i * 0.5\n"
+    "  evx[i] = (i % 7) * 0.13 - 0.4; evy[i] = -(i % 5) * 0.17\n"
+    "end\n"
+    "local sqrt, sin = math.sqrt, math.sin\n"
+    "function update()\n"
+    "  for i = 1, N do\n"
+    "    evy[i] = evy[i] + 0.05\n"
+    "    ex[i] = ex[i] + evx[i]; ey[i] = ey[i] + evy[i]\n"
+    "    if ex[i] < 0 or ex[i] > 320 then evx[i] = -evx[i] end\n"
+    "    if ey[i] > 240 then ey[i] = 240; evy[i] = -evy[i] * 0.8 end\n"
+    "    local d = sqrt(evx[i] * evx[i] + evy[i] * evy[i])\n"
+    "    ex[i] = ex[i] + sin(d) * 0.01\n"
+    "  end\n"
+    "end\n"
+    "function checksum() local s = 0.0 for i = 1, N do s = s + ex[i] + ey[i] end return s end\n";
+
+/* Allocation-heavy update: a temporary table + string per entity per frame, so
+ * the Lua GC runs under real pressure and its pauses land in the p99/max frame. */
+static const char *ALLOC_LUA =
+    "local N = 256\n"
+    "ex, ey = {}, {}\n"
+    "for i = 1, N do ex[i] = i * 1.0; ey[i] = i * 0.5 end\n"
+    "local sqrt = math.sqrt\n"
+    "function update()\n"
+    "  local acc = {}\n"
+    "  for i = 1, N do\n"
+    "    local e = { x = ex[i], y = ey[i], tag = 'ent' .. i }\n"
+    "    e.x = e.x + 0.5; e.y = e.y + sqrt(e.x * 0.001 + 1.0)\n"
+    "    acc[i] = e\n"
+    "  end\n"
+    "  for i = 1, N do ex[i] = acc[i].x; ey[i] = acc[i].y end\n"
+    "end\n"
+    "function checksum() local s = 0.0 for i = 1, N do s = s + ex[i] + ey[i] end return s end\n";
+
+int main(int argc, char **argv)
+{
     long frames = (argc > 1) ? atol(argv[1]) : 20000;
+    const char *mode = (argc > 2) ? argv[2] : "steady";
+    const char *script = (strcmp(mode, "alloc") == 0) ? ALLOC_LUA : STEADY_LUA;
 
     lua_State *L = luaL_newstate();
     if (!L) {
@@ -61,22 +88,29 @@ int main(int argc, char **argv) {
     }
     luaL_openlibs(L);
 
-    lua_pushinteger(L, (lua_Integer)frames);
-    lua_setglobal(L, "FRAMES");
-
-    if (luaL_dostring(L, BENCH_LUA) != LUA_OK) {
-        fprintf(stderr, "lua-bench: %s\n", lua_tostring(L, -1));
+    if (luaL_dostring(L, script) != LUA_OK) {
+        fprintf(stderr, "lua-bench: setup: %s\n", lua_tostring(L, -1));
         lua_close(L);
         return 1;
     }
 
-    lua_getglobal(L, "RESULT");
+    for (long f = 0; f < frames; f++) {
+        frame_mark();
+        lua_getglobal(L, "update");
+        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+            fprintf(stderr, "lua-bench: update: %s\n", lua_tostring(L, -1));
+            lua_close(L);
+            return 1;
+        }
+    }
+
+    lua_getglobal(L, "checksum");
+    lua_call(L, 0, 1);
     double r = lua_tonumber(L, -1);
     unsigned long long bits;
     memcpy(&bits, &r, sizeof(bits));
-    /* Integer digest only — avoid %f so musl's long-double printf path (and its
-     * quad soft-float builtins) is never linked. */
-    printf("lua-bench frames=%ld digest=%016llx\n", frames, bits);
+    /* Integer digest only — no %f, to keep musl's long-double printf path out. */
+    printf("lua-bench mode=%s frames=%ld digest=%016llx\n", mode, frames, bits);
 
     lua_close(L);
     return 0;
