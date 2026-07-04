@@ -108,12 +108,24 @@ log "building lua-bench.elf (blyt Lua VM, $GUEST_MARCH / $GUEST_MABI)"
 # blyt's -nostdlib guest; here we link full musl, so let musl's real versions win
 # (--allow-multiple-definition). musl still gets the __*tf* quad builtins it lacks
 # from libsf. Order: libc first (its stubs win), then libsf for the builtins.
-"$CLANG" "${GUEST_TGT[@]}" -O2 -nostdlib -static \
-  -Wl,--allow-multiple-definition \
-  "$MUSL_INSTALL/lib/crt1.o" "$MUSL_INSTALL/lib/crti.o" \
-  lua_bench.o lua-core.o \
-  -L"$MUSL_INSTALL/lib" -lc "$work/libsf.a" "$MUSL_INSTALL/lib/crtn.o" \
-  -o "$GUEST_OUT/lua-bench.elf"
+# lua_suite.c — operation-coverage benchmarks sharing the same Lua core.
+"$CLANG" "${GUEST_TGT[@]}" -O2 "${INC[@]}" "${DEF[@]}" \
+  -c "$PORT/lua_suite.c" -o lua_suite.o
 
-log "built $GUEST_OUT/lua-bench.elf"
+# softfloat_builtins.c redundantly defines a few libc stubs (wctomb, fenv) for
+# blyt's -nostdlib guest; here we link full musl, so let musl's real versions win
+# (--allow-multiple-definition). musl still gets the __*tf* quad builtins it lacks
+# from libsf. Order: libc first (its stubs win), then libsf for the builtins.
+link_elf() { # <main.o> <out.elf>
+  "$CLANG" "${GUEST_TGT[@]}" -O2 -nostdlib -static \
+    -Wl,--allow-multiple-definition \
+    "$MUSL_INSTALL/lib/crt1.o" "$MUSL_INSTALL/lib/crti.o" \
+    "$1" lua-core.o \
+    -L"$MUSL_INSTALL/lib" -lc "$work/libsf.a" "$MUSL_INSTALL/lib/crtn.o" \
+    -o "$2"
+}
+link_elf lua_bench.o "$GUEST_OUT/lua-bench.elf"
+link_elf lua_suite.o "$GUEST_OUT/lua-suite.elf"
+
+log "built $GUEST_OUT/lua-bench.elf and lua-suite.elf"
 file "$GUEST_OUT/lua-bench.elf" | sed 's/^/[spike-a]   /'

@@ -61,6 +61,7 @@
 #define SYS_gettimeofday 169
 #define SYS_brk 214
 #define SYS_munmap 215
+#define SYS_mremap 216
 #define SYS_mmap 222
 #define SYS_madvise 233
 #define SYS_getrandom 278
@@ -99,8 +100,7 @@ typedef struct {
 
 static runner_state_t g_state;
 
-static void record_frame(uint64_t cycle_now)
-{
+static void record_frame(uint64_t cycle_now) {
     if (!g_state.frames_started) {
         g_state.frames_started = 1;
         g_state.last_frame_cycle = cycle_now;
@@ -118,9 +118,8 @@ static void record_frame(uint64_t cycle_now)
     g_state.last_frame_cycle = cycle_now;
 }
 
-static int cmp_u64(const void *a, const void *b)
-{
-    uint64_t x = *(const uint64_t *) a, y = *(const uint64_t *) b;
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
     return (x > y) - (x < y);
 }
 
@@ -233,6 +232,24 @@ static uint64_t rebased_now_ns(void) {
     return ns - g_clock_base_ns;
 }
 
+static uint32_t do_mremap(riscv_t *rv) {
+    /* mremap(old, old_size, new_size, flags, new_addr). Our bump allocator never
+     * frees, so we can't grow in place — always move: allocate new, copy, leak
+     * the old (fine for a benchmark). musl's realloc uses MREMAP_MAYMOVE. */
+    uint32_t old = guest_arg(rv, 0), old_sz = guest_arg(rv, 1), new_sz = guest_arg(rv, 2);
+    if (new_sz <= old_sz)
+        return old; /* shrink / same size: keep in place */
+    uint32_t aligned = (new_sz + GUEST_PAGE - 1) & ~(GUEST_PAGE - 1);
+    uint32_t addr = g_state.mmap_cur;
+    if ((uint64_t)addr + aligned >= GUEST_MEM_SIZE - GUEST_STACK_SIZE)
+        return (uint32_t)-ENOMEM;
+    g_state.mmap_cur += aligned;
+    memory_t *mem = PRIV(rv)->mem;
+    memory_fill(mem, addr, aligned, 0);
+    memmove(mem->mem_base + addr, mem->mem_base + old, old_sz);
+    return addr;
+}
+
 static uint32_t do_clock_gettime(riscv_t *rv) {
     /* clk_id in a0 ignored — always monotonic. */
     uint32_t ts_addr = guest_arg(rv, 1);
@@ -287,6 +304,9 @@ static void runner_ecall(riscv_t *rv) {
         break;
     case SYS_mmap:
         ret = do_mmap(rv);
+        break;
+    case SYS_mremap:
+        ret = do_mremap(rv);
         break;
     case SYS_munmap:
     case SYS_madvise:
@@ -517,8 +537,8 @@ int main(int argc, char **argv) {
                    "\"frame_insns_p95\":%llu,\"frame_insns_p99\":%llu,\"frame_insns_max\":%llu,"
                    "\"frame_ms_mean\":%.4f,\"frame_ms_p99\":%.4f,\"frame_ms_max\":%.4f",
                    nf, (unsigned long long)f_mean, (unsigned long long)f_p50,
-                   (unsigned long long)f_p95, (unsigned long long)f_p99,
-                   (unsigned long long)f_max, FRAME_MS(f_mean), FRAME_MS(f_p99), FRAME_MS(f_max));
+                   (unsigned long long)f_p95, (unsigned long long)f_p99, (unsigned long long)f_max,
+                   FRAME_MS(f_mean), FRAME_MS(f_p99), FRAME_MS(f_max));
         printf("}\n");
     } else {
         fprintf(stderr, "[spike-a] %-24s insns=%llu wall=%.4fs MIPS=%.2f exit=%d%s%s%s\n", base,

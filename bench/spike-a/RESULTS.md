@@ -195,8 +195,31 @@ Reading:
   **p99**, not the mean, and minimize per-frame allocation to hold a steady 60 Hz.
 
 This closes the load-bearing part of Spike B (throughput + fps/headroom + GC on
-real hardware). Remaining Spike B breadth: the lua.org benchmark suite for
-operation-type coverage (string/closure/numeric).
+real hardware).
+
+### Lua operation-type coverage (Spike B breadth)
+
+`lua-suite.elf` runs standard lua.org/Benchmarks-Game micro-benchmarks, each
+stressing a different Lua VM operation class, to check the ~20 MIPS entity figure
+holds across workload types (not just position/velocity math). Effective MIPS:
+
+| benchmark | operation class | Mac -O2 | Pi -O2 |
+|---|---|---:|---:|
+| fib | recursive calls / integer | 566 | 23.0 |
+| tables | table insert / sort / iterate | 537 | 22.1 |
+| mandelbrot | tight f64 numeric loops | 499 | 22.5 |
+| nbody | pairwise gravity, f64 + sqrt | 498 | 21.7 |
+| binarytrees | allocate + walk + discard (GC) | 437 | 20.1 |
+| **strings** | concat / gmatch / gsub | **211** | **17.0** |
+
+All halt with zero unhandled syscalls. Two observations:
+- **On the Pi the band is tight — 17–23 MIPS (1.36×)** — much narrower than the
+  Mac's 211–566 (2.7×). The slow in-order A53 amortises rv32emu's near-constant
+  per-instruction cost across all operation types, so a *single* Lua cap number
+  is representative on hardware. The entity `update()` (20.5) sits mid-band.
+- **Strings are the worst case** (17 MIPS on the Pi; the clear Mac outlier at
+  211) — string hashing/interning + pattern matching are the heaviest Lua ops.
+  A conservative Lua cap should cover it: **≈ 17–20 MIPS**.
 
 ### The cap value — and why it hinges on the interpreter opt level
 
@@ -223,18 +246,15 @@ per-execution-model:
 1. Ship the emulator core built `-O2 -fno-strict-aliasing` (the `-O0` the repo
    builds today would set the cap ~4× too low, ≈ 8 MIPS).
 2. On that basis native-C carts sit at **≈ 32 effective guest MIPS**
-   (CoreMark-anchored). **But Lua carts only sustain ≈ 20 MIPS** (see the Lua
-   probe above), so a single 32-MIPS cap is ~1.57× optimistic for the primary
-   authoring path. Either set the cap conservatively at **≈ 20 MIPS** (safe for
-   every cart type) or make it **per-execution-model** (native ≈ 32, Lua ≈ 20).
+   (CoreMark-anchored). **But Lua carts only sustain ≈ 17–23 MIPS** across
+   operation types — strings the worst at 17, the entity `update()` at 20 (see
+   the Lua sections above) — so a single 32-MIPS cap is ~1.6× optimistic for the
+   primary authoring path. Either set the cap conservatively at **≈ 17–20 MIPS**
+   (safe for every cart type and Lua operation class) or make it
+   **per-execution-model** (native ≈ 32, Lua ≈ 20).
 
 If the interpreter stays at `-O0`, the cap is ≈ 8 MIPS (Lua ≈ 7) and the
 floor-hardware performance story needs re-examination regardless.
-
-| benchmark | Pi MIPS (opt=?) |
-|---|---|
-| coremark | _tbd_ |
-| embench-* | _tbd_ |
 
 ## Findings
 
