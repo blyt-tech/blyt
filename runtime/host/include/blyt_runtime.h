@@ -364,6 +364,20 @@ void blyt_session_surface_destroy(blyt_session_t *session, uint32_t handle);
 uint8_t *blyt_session_surface_drawable(blyt_session_t *session, uint32_t handle, int32_t *out_w,
                                        int32_t *out_h, bool *out_is_screen);
 
+/* Acquire a tier-2 per-pixel lock on a surface for a host-Lua caller (#208).
+ * Marks the slot locked (so tier-1 ops on it are rejected — #207 within-registry,
+ * #210 cross-half for a hybrid's shared screen) and returns a DIRECT pointer to
+ * the canonical buffer (no guest-VA copy); writes the dims + a release token to
+ * the outs.  Returns NULL (token BLYT_HANDLE_NONE) when the handle is
+ * unresolvable or already locked.  Pair with blyt_session_surface_release. */
+uint8_t *blyt_session_surface_acquire(blyt_session_t *session, uint32_t handle, int32_t *out_w,
+                                      int32_t *out_h, uint32_t *out_token);
+
+/* Release a host-Lua tier-2 lock by its token: clears the lock and bumps the
+ * lock generation (so the token goes stale).  A no-op on a stale/foreign token.
+ * No copy-out — a direct lock's writes already landed in the canonical buffer. */
+void blyt_session_surface_release(blyt_session_t *session, uint32_t token);
+
 /* Reap the session's draw-scoped off-screen surfaces (frees their buffers, bumps
  * generations, force-releases any leftover lock).  Called once per real frame by
  * the fast-path Lua frame loop; see the note above. */

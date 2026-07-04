@@ -26,6 +26,16 @@
 #include <string.h>
 
 #include "blyt.h"
+#include "blyt_handle.h" /* BLYT_HANDLE_NONE (tier-2 lock token sentinel) */
+#include "blyt_runtime_flags.h"
+
+/* Host→guest runtime flags block (#208): defined + exported by libblytcommon
+ * (the portable runtime lib this binding already depends on), so it resolves on
+ * both the emulated and native dynamic-link paths.  The host writes cart_is_debug
+ * into it once at session setup; a release cart (or one the host can't resolve it
+ * in) reads cart_is_debug == 0, the defined-no-op path. */
+extern blyt_runtime_flags_t blyt_runtime_flags;
+
 #ifdef BLYT_DAP
 #include "master_hook.h"
 /* Weak default: 0 (hook disabled).  master_hook_ecall.c provides the strong
@@ -163,6 +173,143 @@ static int lua_blyt_surface_blit(lua_State *L) {
                       (blyt_surface_h)luaL_checkinteger(L, 2), (int32_t)luaL_checkinteger(L, 3),
                       (int32_t)luaL_checkinteger(L, 4));
     return 0;
+}
+
+/* --- Tier-2 per-pixel surface lock (blyt32.surface.acquire, #208 Stage 2) ---
+ *
+ * blyt32.surface.acquire(h) binds the C tier-2 lock (blyt_surface_acquire, ECALL
+ * 109): it returns a lock userdata giving checked per-pixel access to the
+ * materialized buffer, or nil on failure (unresolvable / already-locked /
+ * outside draw()).  Per-pixel lk:get/lk:set run guest-side on the materialized
+ * buffer with NO ECALL — the whole point of the tier (one crossing to acquire,
+ * one to release, none per pixel).
+ *
+ * Staleness guard: the lock is valid only for the frame it was taken in.  A
+ * per-VM epoch counter (g_lock_epoch) bumps once per frame; the lock captures it
+ * at acquire and get/set/release reject on mismatch, so a lock held across the
+ * frame boundary (where the runtime force-releases + may free the buffer) is a
+ * defined rejection, not a dangling access.  lk:release() also sets `released`.
+ * A rejected op is a hard Lua error in a debug cart, a defined no-op (write
+ * dropped, read → 0) in a release cart — mirroring the surface phase gate. */
+#define BLYT_SURFACE_LOCK_MT "blyt.surface.lock"
+
+static uint32_t g_lock_epoch = 0;
+
+typedef struct {
+    blyt_lock_t lock; /* pixels, stride, w, h, token (from blyt_surface_acquire) */
+    uint32_t epoch; /* g_lock_epoch captured at acquire */
+    int released; /* explicit lk:release() or force-released */
+} lua_lock_t;
+
+static int lua_blyt_surface_acquire(lua_State *L) {
+    blyt_surface_h h = (blyt_surface_h)luaL_checkinteger(L, 1);
+    blyt_lock_t lk;
+    if (!blyt_surface_acquire(h, &lk) || lk.token == BLYT_HANDLE_NONE) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_lock_t *u = (lua_lock_t *)lua_newuserdatauv(L, sizeof(*u), 0);
+    u->lock = lk;
+    u->epoch = g_lock_epoch;
+    u->released = 0;
+    luaL_setmetatable(L, BLYT_SURFACE_LOCK_MT);
+    return 1;
+}
+
+/* Return the lock iff still live (not released, same frame); else NULL.  A NULL
+ * result is the "rejected" path: dev-error in a debug cart, no-op in release. */
+static lua_lock_t *lua_lock_live(lua_State *L, int idx) {
+    lua_lock_t *u = (lua_lock_t *)luaL_checkudata(L, idx, BLYT_SURFACE_LOCK_MT);
+    if (u->released || u->epoch != g_lock_epoch)
+        return NULL;
+    return u;
+}
+
+static int lua_lock_get(lua_State *L) {
+    lua_lock_t *u = lua_lock_live(L, 1);
+    int32_t x = (int32_t)luaL_checkinteger(L, 2);
+    int32_t y = (int32_t)luaL_checkinteger(L, 3);
+    if (!u || x < 0 || x >= u->lock.w || y < 0 || y >= u->lock.h) {
+        if (blyt_runtime_flags.cart_is_debug)
+            return luaL_error(L, "lk:get out of bounds or on a released lock");
+        lua_pushinteger(L, 0); /* release: read as cleared */
+        return 1;
+    }
+    uint32_t off = (uint32_t)y * (uint32_t)u->lock.stride + (uint32_t)x;
+    lua_pushinteger(L, (lua_Integer)u->lock.pixels[off]);
+    return 1;
+}
+
+static int lua_lock_set(lua_State *L) {
+    lua_lock_t *u = lua_lock_live(L, 1);
+    int32_t x = (int32_t)luaL_checkinteger(L, 2);
+    int32_t y = (int32_t)luaL_checkinteger(L, 3);
+    uint8_t c = (uint8_t)luaL_checkinteger(L, 4);
+    if (!u || x < 0 || x >= u->lock.w || y < 0 || y >= u->lock.h) {
+        if (blyt_runtime_flags.cart_is_debug)
+            return luaL_error(L, "lk:set out of bounds or on a released lock");
+        return 0; /* release: no-op */
+    }
+    uint32_t off = (uint32_t)y * (uint32_t)u->lock.stride + (uint32_t)x;
+    u->lock.pixels[off] = c;
+    return 0;
+}
+
+/* In-lock bulk primitives (parity with the C/Rust SurfaceLock): the freestanding
+ * rasterizer on the materialized buffer, guest-side, clipped to the lock bounds.
+ * A rejected (released/stale) lock is a no-op in both build modes — the guard is
+ * the epoch, and there is no per-pixel coordinate to fault on. */
+static int lua_lock_clear(lua_State *L) {
+    lua_lock_t *u = lua_lock_live(L, 1);
+    if (u)
+        blyt_raster_clear(u->lock.pixels, u->lock.stride, u->lock.w, u->lock.h,
+                          (uint8_t)luaL_checkinteger(L, 2));
+    return 0;
+}
+static int lua_lock_rect_fill(lua_State *L) {
+    lua_lock_t *u = lua_lock_live(L, 1);
+    if (u)
+        blyt_raster_rect_fill(u->lock.pixels, u->lock.stride, u->lock.w, u->lock.h,
+                              (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3),
+                              (int)luaL_checkinteger(L, 4), (int)luaL_checkinteger(L, 5),
+                              (uint8_t)luaL_checkinteger(L, 6));
+    return 0;
+}
+static int lua_lock_line(lua_State *L) {
+    lua_lock_t *u = lua_lock_live(L, 1);
+    if (u)
+        blyt_raster_line(u->lock.pixels, u->lock.stride, u->lock.w, u->lock.h,
+                         (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3),
+                         (int)luaL_checkinteger(L, 4), (int)luaL_checkinteger(L, 5),
+                         (uint8_t)luaL_checkinteger(L, 6));
+    return 0;
+}
+
+static int lua_lock_release(lua_State *L) {
+    lua_lock_t *u = (lua_lock_t *)luaL_checkudata(L, 1, BLYT_SURFACE_LOCK_MT);
+    if (!u->released && u->epoch == g_lock_epoch)
+        blyt_surface_release(&u->lock); /* flush + invalidate; stale token is a host no-op */
+    u->released = 1;
+    return 0;
+}
+
+/* Build the lock metatable: __index method table with get/set/release + the
+ * in-lock bulk primitives. */
+static void register_surface_lock_mt(lua_State *L) {
+    luaL_newmetatable(L, BLYT_SURFACE_LOCK_MT);
+    lua_newtable(L); /* __index */
+    static const luaL_Reg lock_methods[] = {
+        {"get", lua_lock_get},
+        {"set", lua_lock_set},
+        {"clear", lua_lock_clear},
+        {"rect_fill", lua_lock_rect_fill},
+        {"line", lua_lock_line},
+        {"release", lua_lock_release},
+        {NULL, NULL},
+    };
+    luaL_setfuncs(L, lock_methods, 0);
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop mt */
 }
 
 static int lua_blyt_save_write(lua_State *L) {
@@ -713,10 +860,15 @@ static void register_blyt32(lua_State *L) {
         const char *name;
         lua_CFunction fn;
     } surface_fns[] = {
-        {"create", lua_blyt_surface_create},       {"destroy", lua_blyt_surface_destroy},
-        {"clear", lua_blyt_surface_clear},         {"pixel", lua_blyt_surface_pixel},
-        {"rect_fill", lua_blyt_surface_rect_fill}, {"line", lua_blyt_surface_line},
-        {"blit", lua_blyt_surface_blit},           {NULL, NULL},
+        {"create", lua_blyt_surface_create},
+        {"destroy", lua_blyt_surface_destroy},
+        {"clear", lua_blyt_surface_clear},
+        {"pixel", lua_blyt_surface_pixel},
+        {"rect_fill", lua_blyt_surface_rect_fill},
+        {"line", lua_blyt_surface_line},
+        {"blit", lua_blyt_surface_blit},
+        {"acquire", lua_blyt_surface_acquire},
+        {NULL, NULL},
     };
     for (int i = 0; surface_fns[i].name; i++) {
         lua_pushcfunction(L, surface_fns[i].fn);
@@ -778,6 +930,7 @@ static void register_blyt32(lua_State *L) {
 
     lua_pop(L, 1); /* pop blyt.debug (idx A) */
 
+    register_surface_lock_mt(L); /* blyt.surface.lock metatable (tier-2, #208) */
     register_resource_module(L); /* blyt.resource.* + blyt32.resource.* (#93) */
     register_mem_module(L); /* blyt.mem.* + blyt32.mem.* (ADR-0029, #159) */
 
@@ -966,6 +1119,10 @@ void blyt_cart_init(void) {
 }
 
 void blyt_cart_update(void) {
+    /* Bump the tier-2 lock epoch once per frame (#208): a lock acquired in a
+     * previous frame's draw() is now stale, so its get/set/release reject rather
+     * than touch a buffer the runtime may have force-released/freed. */
+    g_lock_epoch++;
     call_global("update");
 }
 void blyt_cart_draw(void) {

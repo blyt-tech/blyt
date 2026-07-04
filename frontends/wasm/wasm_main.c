@@ -913,14 +913,19 @@ static bool lua_resolve_target(uint32_t h, lua_draw_target_t *t) {
     return true;
 }
 
-/* Reap draw-scoped off-screen surfaces at the frame boundary (#205). */
+/* Reap draw-scoped off-screen surfaces at the frame boundary (#205), and
+ * force-release any tier-2 lock the cart forgot (#208) — including the screen
+ * (slot 0), which is never freed but must not carry a lock into the next frame.
+ * The lock userdata's epoch guard makes any stale reuse a defined rejection. */
 static void lua_surf_reap(void) {
     lua_surf_ensure_init();
+    g_lua_surf[0].locked = false; /* force-release a held screen lock */
     for (uint32_t i = 1; i < LUA_SURFACE_MAX; i++) {
         if (g_lua_surf[i].in_use) {
             free(g_lua_surf[i].pixels);
             g_lua_surf[i].pixels = NULL;
             g_lua_surf[i].in_use = false;
+            g_lua_surf[i].locked = false;
             g_lua_surf[i].gen++;
         }
     }
@@ -1029,6 +1034,170 @@ static int lua_wasm_surface_blit(lua_State *L) {
     return 0;
 }
 
+/* --- Tier-2 per-pixel surface lock on the host-Lua fast path (#208 Stage 2) ---
+ *
+ * The host-Lua mirror of the guest binding in blyt32lua.c.  blyt32.surface.
+ * acquire(h) materializes a DIRECT pointer to the canonical buffer — for a
+ * hybrid, the session's unified registry (blyt_session_surface_acquire, #210),
+ * which also marks the slot locked so the native half's tier-1 ops on it are
+ * rejected (#207); for a pure-Lua cart, the g_lua_surf pool.  Per-pixel get/set
+ * then touch host memory with no crossing.  The per-frame epoch (g_lua_lock_
+ * epoch, bumped in blyt_wasm_frame) is the staleness guard. */
+#define BLYT_WASM_LOCK_MT "blyt.surface.lock"
+
+static uint32_t g_lua_lock_epoch = 0;
+/* Chooses hard-error vs defined no-op on a bad get/set (mirrors the guest
+ * runtime-flags block).  The determinism-bearing behaviour is the no-op path,
+ * which is uniform across every leg; the debug hard-error is a dev aid surfaced
+ * on the emulated legs (blyt32.c reads its runtime-flags block).  Left false on
+ * the fast path for now — a debug pure-Lua cart's OOB access no-ops here instead
+ * of erroring; wiring the cart's debug flag through to host-Lua is a follow-up. */
+static bool g_lua_cart_is_debug = false;
+
+typedef struct {
+    uint8_t *pixels;
+    int32_t w, h;
+    uint32_t handle; /* surface handle (pure-Lua release re-resolve) */
+    uint32_t token; /* session release token (hybrid); BLYT_HANDLE_NONE pure-Lua */
+    uint32_t epoch; /* g_lua_lock_epoch captured at acquire */
+    bool released;
+    bool is_screen; /* writes flip g_lua_drawn (displace the boot testcard) */
+} lua_wasm_lock_t;
+
+static int lua_wasm_surface_acquire(lua_State *L) {
+    uint32_t h = (uint32_t)luaL_checkinteger(L, 1);
+    uint8_t *pixels = NULL;
+    int32_t w = 0, hh = 0;
+    uint32_t token = BLYT_HANDLE_NONE;
+    if (g_session) { /* hybrid: the session's unified registry (#210/#207) */
+        pixels = blyt_session_surface_acquire(g_session, h, &w, &hh, &token);
+    } else { /* pure-Lua: the local pool */
+        lua_surface_t *s = lua_surf_resolve(h);
+        if (s && !s->locked) {
+            s->locked = true;
+            pixels = s->pixels;
+            w = s->w;
+            hh = s->h;
+        }
+    }
+    if (!pixels) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_wasm_lock_t *u = (lua_wasm_lock_t *)lua_newuserdatauv(L, sizeof(*u), 0);
+    u->pixels = pixels;
+    u->w = w;
+    u->h = hh;
+    u->handle = h;
+    u->token = token;
+    u->epoch = g_lua_lock_epoch;
+    u->released = false;
+    u->is_screen = (h == (uint32_t)BLYT_SCREEN);
+    luaL_setmetatable(L, BLYT_WASM_LOCK_MT);
+    return 1;
+}
+
+static lua_wasm_lock_t *lua_wasm_lock_live(lua_State *L, int idx) {
+    lua_wasm_lock_t *u = (lua_wasm_lock_t *)luaL_checkudata(L, idx, BLYT_WASM_LOCK_MT);
+    if (u->released || u->epoch != g_lua_lock_epoch)
+        return NULL;
+    return u;
+}
+
+static int lua_wasm_lock_get(lua_State *L) {
+    lua_wasm_lock_t *u = lua_wasm_lock_live(L, 1);
+    int32_t x = (int32_t)luaL_checkinteger(L, 2);
+    int32_t y = (int32_t)luaL_checkinteger(L, 3);
+    if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h) {
+        if (g_lua_cart_is_debug)
+            return luaL_error(L, "lk:get out of bounds or on a released lock");
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    lua_pushinteger(L, (lua_Integer)u->pixels[(uint32_t)y * (uint32_t)u->w + (uint32_t)x]);
+    return 1;
+}
+
+static int lua_wasm_lock_set(lua_State *L) {
+    lua_wasm_lock_t *u = lua_wasm_lock_live(L, 1);
+    int32_t x = (int32_t)luaL_checkinteger(L, 2);
+    int32_t y = (int32_t)luaL_checkinteger(L, 3);
+    uint8_t c = (uint8_t)luaL_checkinteger(L, 4);
+    if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h) {
+        if (g_lua_cart_is_debug)
+            return luaL_error(L, "lk:set out of bounds or on a released lock");
+        return 0;
+    }
+    u->pixels[(uint32_t)y * (uint32_t)u->w + (uint32_t)x] = c;
+    if (u->is_screen)
+        g_lua_drawn = true;
+    return 0;
+}
+
+static int lua_wasm_lock_clear(lua_State *L) {
+    lua_wasm_lock_t *u = lua_wasm_lock_live(L, 1);
+    if (u) {
+        blyt_raster_clear(u->pixels, u->w, u->w, u->h, (uint8_t)luaL_checkinteger(L, 2));
+        if (u->is_screen)
+            g_lua_drawn = true;
+    }
+    return 0;
+}
+static int lua_wasm_lock_rect_fill(lua_State *L) {
+    lua_wasm_lock_t *u = lua_wasm_lock_live(L, 1);
+    if (u) {
+        blyt_raster_rect_fill(u->pixels, u->w, u->w, u->h, (int)luaL_checkinteger(L, 2),
+                              (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                              (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (u->is_screen)
+            g_lua_drawn = true;
+    }
+    return 0;
+}
+static int lua_wasm_lock_line(lua_State *L) {
+    lua_wasm_lock_t *u = lua_wasm_lock_live(L, 1);
+    if (u) {
+        blyt_raster_line(u->pixels, u->w, u->w, u->h, (int)luaL_checkinteger(L, 2),
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                         (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (u->is_screen)
+            g_lua_drawn = true;
+    }
+    return 0;
+}
+
+static int lua_wasm_lock_release(lua_State *L) {
+    lua_wasm_lock_t *u = (lua_wasm_lock_t *)luaL_checkudata(L, 1, BLYT_WASM_LOCK_MT);
+    if (!u->released && u->epoch == g_lua_lock_epoch) {
+        if (g_session) {
+            blyt_session_surface_release(g_session, u->token);
+        } else {
+            lua_surface_t *s = lua_surf_resolve(u->handle);
+            if (s)
+                s->locked = false;
+        }
+    }
+    u->released = true;
+    return 0;
+}
+
+static void wasm_register_surface_lock_mt(lua_State *L) {
+    luaL_newmetatable(L, BLYT_WASM_LOCK_MT);
+    lua_newtable(L); /* __index */
+    static const luaL_Reg lock_methods[] = {
+        {"get", lua_wasm_lock_get},
+        {"set", lua_wasm_lock_set},
+        {"clear", lua_wasm_lock_clear},
+        {"rect_fill", lua_wasm_lock_rect_fill},
+        {"line", lua_wasm_lock_line},
+        {"release", lua_wasm_lock_release},
+        {NULL, NULL},
+    };
+    luaL_setfuncs(L, lock_methods, 0);
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop mt */
+}
+
 /* Register blyt32.gfx.* onto the existing blyt32 global.  Called from both the
  * initial run_lua_cart setup and the reset/reload re-register, like the state
  * and resource API helpers. */
@@ -1082,10 +1251,15 @@ static void wasm_register_gfx_api(lua_State *L) {
         const char *name;
         lua_CFunction fn;
     } surface_fns[] = {
-        {"create", lua_wasm_surface_create},       {"destroy", lua_wasm_surface_destroy},
-        {"clear", lua_wasm_surface_clear},         {"pixel", lua_wasm_surface_pixel},
-        {"rect_fill", lua_wasm_surface_rect_fill}, {"line", lua_wasm_surface_line},
-        {"blit", lua_wasm_surface_blit},           {NULL, NULL},
+        {"create", lua_wasm_surface_create},
+        {"destroy", lua_wasm_surface_destroy},
+        {"clear", lua_wasm_surface_clear},
+        {"pixel", lua_wasm_surface_pixel},
+        {"rect_fill", lua_wasm_surface_rect_fill},
+        {"line", lua_wasm_surface_line},
+        {"blit", lua_wasm_surface_blit},
+        {"acquire", lua_wasm_surface_acquire},
+        {NULL, NULL},
     };
     for (int i = 0; surface_fns[i].name; i++) {
         lua_pushcfunction(L, surface_fns[i].fn);
@@ -1128,6 +1302,8 @@ static void wasm_register_gfx_api(lua_State *L) {
         lua_setfield(L, -2, color_names[i]);
     }
     lua_setfield(L, -2, "color"); /* blyt32.color = color */
+
+    wasm_register_surface_lock_mt(L); /* blyt.surface.lock metatable (tier-2, #208) */
 
     lua_pop(L, 1); /* pop blyt32 */
 }
@@ -3127,6 +3303,10 @@ static void wasm_lua_loop(void) {
         blyt_session_reap_surfaces(g_session);
     else
         lua_surf_reap();
+    /* Bump the tier-2 lock epoch once per real frame (#208): a lock held from a
+     * previous frame is now stale (its surface may have been reaped/freed above),
+     * so its get/set/release reject rather than touch freed memory. */
+    g_lua_lock_epoch++;
     int nres = 0;
     int status = lua_resume(g_lua_co, g_lua, 0, &nres);
 
