@@ -99,13 +99,15 @@ FetchContent_Declare(
 # the fork tags and tarballs exist, clone the fork into third_party/<dep> — the
 # auto-detection macro above will pick it up at configure time.
 
-# lua: blyt-tech fork adds BLYT_LUA_I32_F64 (int32 + float64) for RV32D.
-set(LUA_VERSION "v5.5.0-blyt-v0-p1")
+# lua: blyt-tech fork adds BLYT_LUA_I32_F64 (int32 + float64) for RV32D. p2 adds
+# the ADR-0135 host-Lua FP determinism seam (lmathlib.c/llimits.h route Zone-2
+# transcendentals + pow through blyt_fpm when BLYT_HOSTLUA_FP_SEAM is defined).
+set(LUA_VERSION "v5.5.0-blyt-v0-p2")
 FetchContent_Declare(
   lua
   URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=c2d9a3864e7468b4b3dc8f0548ebe82aa5dd64515f9b715342637b0f796e2feb)
+    SHA256=6c747b2ee58c7aa5525efbeaf1371b1a15bfca19cb2a658f74d9bf100ac552ca)
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
