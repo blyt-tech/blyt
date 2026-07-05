@@ -118,6 +118,51 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# ADR-0135 (blyt#223): host-Lua floating-point determinism seam.
+#
+# The host-Lua fast path must reproduce the emulated softfloat reference
+# bit-for-bit (ADR-0007). Its Zone-2 transcendentals (math.*, and `^` via
+# luai_numpow) previously resolved to Emscripten's bundled libm — a
+# coincidental, unpinned agreement (blyt#223). With BLYT_HOSTLUA_FP_SEAM
+# defined, the fork's lmathlib.c/llimits.h route those ops through blyt_fpm_* to
+# the SAME blyt-tech musl generic-C src/math kernels the emulated legs use,
+# compiled here into the host-Lua VM (in-house libm). On WASM the kernels run on
+# native f64, which equals the softfloat reference on WASM MVP (no scalar FMA) —
+# the parity gate proves it. Zone-1 basic ops stay native. (strtod/number-format
+# is Phase B.)
+#
+# Built as a separate static library so musl's own internal headers apply ONLY
+# to these TUs — they never leak into the rest of the module, which uses
+# Emscripten's sysroot. The library's strong `sin`/`cos`/… definitions override
+# the lazily linked host libm archive, so the host-Lua VM reaches only the
+# pinned kernels.
+set(BLYT_HOSTLUA_FP_SEAM OFF)
+if(BLYT_LUA_SOURCES AND EXISTS "${BLYT_MUSL_SOURCE_DIR}/src/math/sin.c")
+  file(GLOB _BLYT_MUSL_MATH_SRCS "${BLYT_MUSL_SOURCE_DIR}/src/math/*.c")
+  add_library(
+    blyt_hostlua_fpm STATIC "${BLYT_ROOT}/runtime/shared/blyt_fpm_soft.c"
+                            ${_BLYT_MUSL_MATH_SRCS})
+  # musl compiles against its own internal headers. riscv32 == wasm32 for the
+  # ILP32 integer sizes and 128-bit long double, so the reference's bits/ config
+  # matches — maximising parity with the emulated legs.
+  target_include_directories(
+    blyt_hostlua_fpm
+    PRIVATE "${BLYT_ROOT}/runtime/shared" # blyt_fpm.h
+            "${BLYT_MUSL_SOURCE_DIR}/src/include"
+            "${BLYT_MUSL_SOURCE_DIR}/include"
+            "${BLYT_MUSL_SOURCE_DIR}/arch/riscv32"
+            "${BLYT_MUSL_SOURCE_DIR}/arch/generic"
+            "${BLYT_MUSL_SOURCE_DIR}/src/internal")
+  # Determinism (ADR-0007): contraction off, no fast-math, no constant-folding
+  # to the host libm; -w silences musl's intentional idioms (mirrors
+  # LIBBLYTC_CFLAGS).
+  target_compile_options(
+    blyt_hostlua_fpm PRIVATE -ffp-contract=off -fno-fast-math -fno-builtin -w)
+  set(BLYT_HOSTLUA_FP_SEAM ON)
+  message(STATUS "blyt WASM: host-Lua FP seam enabled (in-house musl math)")
+endif()
+
+# -------------------------------------------------------------------------
 # DAP debugging support (Lua source-level via Debug Adapter Protocol)
 #
 # When ON: compile dap_transport_wasm.c + master_hook.c into blytplay and define
@@ -393,6 +438,16 @@ set_target_properties(
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)
   list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 BLYT_LUA_I32_F64=1 LUA_USE_LONGJMP=1)
+  # ADR-0135 (blyt#223): gate the fork's lmathlib.c/llimits.h Zone-2 routing.
+  if(BLYT_HOSTLUA_FP_SEAM)
+    list(APPEND _BLYT_LUA_DEFS BLYT_HOSTLUA_FP_SEAM=1)
+    # Contraction off on the host-Lua VM sources (AC: previously unset on WASM
+    # Lua) so Zone-1 basic ops stay bit-identical to the softfloat reference on
+    # any host with hardware FMA. WASM MVP has no scalar FMA, but pin it anyway.
+    set_source_files_properties(
+      ${BLYT_LUA_SOURCES} PROPERTIES COMPILE_OPTIONS
+                                     "-ffp-contract=off;-fno-fast-math")
+  endif()
   # Fixed Lua hash seed (ADR-0130/ADR-0066): identical string hashing — and
   # therefore pairs()/lua_next order, table.sort pivots, math.random streams —
   # across the rv32 and WASM execution paths.  0x424C5954 = "BLYT". NOTE: must
@@ -468,6 +523,13 @@ target_include_directories(
           ${_BLYT_LUA_INCLUDES}
           ${_BLYT_DAP_INCLUDES}
           ${_BLYT_GDB_INCLUDES})
+
+# ADR-0135 (blyt#223): link the in-house musl math seam. Placed before
+# Emscripten's system libm (appended last) so its strong sin/cos/pow/… override
+# the host libm for the host-Lua VM.
+if(BLYT_HOSTLUA_FP_SEAM)
+  target_link_libraries(blytplay PRIVATE blyt_hostlua_fpm)
+endif()
 
 # Emscripten link options
 target_link_options(

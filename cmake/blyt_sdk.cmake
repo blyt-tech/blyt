@@ -695,6 +695,9 @@ if(EMCC)
         "-DBLYT_RV32EMU_SOURCE_DIR=${BLYT_RV32EMU_SOURCE_DIR}"
         "-DBLYT_FLATCC_SOURCE_DIR=${BLYT_FLATCC_SOURCE_DIR}"
         "-DBLYT_ZSTD_SOURCE_DIR=${BLYT_ZSTD_SOURCE_DIR}"
+        # ADR-0135 (blyt#223): the host-Lua FP seam compiles blyt-tech musl's
+        # generic-C src/math kernels into the host-Lua VM (in-house libm).
+        "-DBLYT_MUSL_SOURCE_DIR=${BLYT_MUSL_SOURCE_DIR}"
         ${CCACHE_LAUNCHER_ARGS} -G Ninja
       RESULT_VARIABLE R
       OUTPUT_QUIET)
