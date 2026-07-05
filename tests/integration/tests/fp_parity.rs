@@ -19,14 +19,22 @@
 //! legs — so a divergence between the host-Lua fast path and the softfloat
 //! reference fails here by construction.
 //!
-//! To regenerate the expected digest after editing the corpus, run any leg (e.g.
-//! `blytplay --headless <cart>`) and copy the emitted `[blyt:fphash]` value.
+//! To regenerate the expected digests after editing the corpus, run any leg
+//! (e.g. `blytplay --headless <cart>`) and copy the emitted `[blyt:fphash]`
+//! (full) and `[blyt:fphash-core]` (transcendental + Zone-1 only) values.
+//!
+//! The CORE digest (`[blyt:fphash-core]`) is the Spike Z / #225 native
+//! cross-arch gate: the native host-Lua leg (the Lua fork compiled for the host,
+//! blyt_fpm seam engaged, `-ffp-contract=off`) must reproduce it bit-for-bit on
+//! FMA silicon (x86-64/arm64). It excludes the Phase-B number-format surface so
+//! a host-libc `strtod` difference cannot masquerade as a seam divergence.
 
 mod common;
 
 use common::{
-    CartProject, build_dir, build_lua_cart, require_libretro_core, require_lua_sdk, require_sdk,
-    require_wasm, run_cart_all_legs,
+    CartProject, build_dir, build_lua_cart, hostlua_native, hostlua_native_fma,
+    require_hostlua_native, require_hostlua_native_fma, require_libretro_core, require_lua_sdk,
+    require_sdk, require_wasm, run_cart_all_legs, run_cart_native_hostlua,
 };
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -47,6 +55,11 @@ local FNV_OFFSET = 0x811c9dc5
 local FNV_PRIME = 0x01000193
 
 local hash = FNV_OFFSET
+-- Snapshot of `hash` taken after the transcendental + Zone-1 surface and before
+-- the Phase-B number-format surface (see run_corpus): the #225 cross-arch gate
+-- value. Defaults to the full hash so a leg that never calls run_corpus still
+-- prints a well-defined line.
+local core_hash = FNV_OFFSET
 
 local function fold_byte(b)
     hash = (hash ~ b) * FNV_PRIME
@@ -205,6 +218,13 @@ local function run_corpus()
         fold_f64(y ^ x)
         fold_f64(math.fmod(y, x))
     end
+    -- CORE digest snapshot (#225 / Spike Z): everything folded so far is the
+    -- Zone-2 transcendental + Zone-1 (sqrt/fmod) surface the ADR-0135 seam pins.
+    -- The native host-Lua leg must reproduce this bit-for-bit on FMA silicon
+    -- (x86-64/arm64) using ONLY the in-house musl kernels — no host libm, no
+    -- strtod/number-format (that surface is Phase B and stays out of the gate,
+    -- else a host-libc strtod difference would masquerade as a seam divergence).
+    core_hash = hash
     -- number formatting: tostring(x) bytes AND tonumber(tostring(x)) round trip.
     -- canon() first so tostring(NaN) is "nan" on every host (an x86-64 sign-set
     -- NaN would otherwise stringify to "-nan"); finite values are unchanged.
@@ -234,17 +254,20 @@ local function run_corpus()
     spotval("ts_0.1", tonumber(tostring(0.1)))
 end
 
-local function digest_hex()
-    local b0 = hash & 0xff
-    local b1 = (hash >> 8) & 0xff
-    local b2 = (hash >> 16) & 0xff
-    local b3 = (hash >> 24) & 0xff
+local function digest_hex(h)
+    local b0 = h & 0xff
+    local b1 = (h >> 8) & 0xff
+    local b2 = (h >> 16) & 0xff
+    local b3 = (h >> 24) & 0xff
     return string.format("%02x%02x%02x%02x", b3, b2, b1, b0)
 end
 
 function init()
     run_corpus()
-    blyt.debug.print("[blyt:fphash] " .. digest_hex())
+    -- Core (transcendental + Zone-1) — the #225 native cross-arch gate value.
+    blyt.debug.print("[blyt:fphash-core] " .. digest_hex(core_hash))
+    -- Full (adds Phase-B number-format) — the #223 Phase-A cross-leg gate value.
+    blyt.debug.print("[blyt:fphash] " .. digest_hex(hash))
     for i = 1, #spot do
         blyt.debug.print("[blyt:fpspot] " .. spot[i])
     end
@@ -260,6 +283,13 @@ function draw() end
 /// The pinned reference digest — the softfloat reference value every leg must
 /// reproduce. Regenerate (see module doc) if the corpus above changes.
 const FP_PARITY_DIGEST: &str = "[blyt:fphash] f7a69261";
+
+/// The CORE reference digest (#225 / Spike Z): the transcendental + Zone-1
+/// surface only, excluding the Phase-B number-format surface. This is the value
+/// the native host-Lua leg must reproduce bit-for-bit on FMA silicon — the
+/// determinism gate for host-Lua-everywhere. Regenerate alongside
+/// `FP_PARITY_DIGEST` if the corpus changes.
+const FP_PARITY_CORE_DIGEST: &str = "[blyt:fphash-core] 031a4987";
 
 /// The host-Lua fast path must compute `math.*`, `^`, and number↔string
 /// conversion bit-identically to the emulated softfloat reference across an
@@ -279,6 +309,95 @@ fn fp_transcendental_parity_across_legs() {
     let cart = build_lua_cart(&project);
 
     run_cart_all_legs(&cart, FP_PARITY_DIGEST);
+}
+
+/// Spike Z / #225 (Q1 + Q3): the native host-Lua leg — the same Lua fork and
+/// cart bytecode as every other leg, but compiled native for the host
+/// (x86-64 / arm64) with the ADR-0135 `blyt_fpm` transcendental seam and
+/// `-ffp-contract=off` — must compute the transcendental + Zone-1 surface
+/// bit-identically to the emulated softfloat reference on **FMA hardware**. This
+/// is the claim WASM structurally cannot test (WASM MVP has no scalar FMA).
+///
+/// The same test binary runs on the arm64 dev host and (via the CI-mirroring
+/// `test-linux-docker` container) on x86-64, so a green run on both is the
+/// cross-arch host-vs-host determinism gate — an x86-64 desktop and an arm64
+/// handheld agreeing to the last bit, which is what netplay/replay need.
+///
+/// Scoped to the CORE digest (`FP_PARITY_CORE_DIGEST`): the number-format /
+/// strtod surface is Phase B (not yet seam-pinned; still resolves to host libc
+/// here), so it is deliberately outside this gate — a host strtod difference
+/// must not masquerade as a transcendental-seam divergence. Q4 folds
+/// conversions in once Phase B lands.
+#[test]
+fn fp_native_hostlua_core_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_hostlua_native();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("fp_parity");
+    CartProject::new().lua(FP_PARITY_CART).write(&project);
+    let cart = build_lua_cart(&project);
+
+    run_cart_native_hostlua(&cart, FP_PARITY_CORE_DIGEST);
+}
+
+/// The `-ffp-contract=off` reference for the runner's C-level contraction
+/// torture — decomposed multiply-add is IEEE correctly-rounded, so this is
+/// stable across arch and compiler. The `-ffp-contract=fast` build must diverge
+/// from it on FMA silicon.
+const FP_TORTURE_OFF_DIGEST: &str = "d002fa13";
+
+/// Extract the `[blyt:fptorture]` digest a native host-Lua runner emits.
+fn hostlua_torture(bin: &Path, cart: &Path) -> String {
+    let out = std::process::Command::new(bin)
+        .arg(cart)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", bin.display()));
+    assert!(out.status.success(), "{} exited nonzero", bin.display());
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.lines()
+        .find_map(|l| l.strip_prefix("[blyt:fptorture] "))
+        .unwrap_or_else(|| panic!("no [blyt:fptorture] line in {} output:\n{s}", bin.display()))
+        .trim()
+        .to_string()
+}
+
+/// Spike Z / #225 (Q1 negative control): prove the parity gate has TEETH on FMA
+/// silicon. The real host-Lua path (interpreter + musl kernels) is
+/// contraction-invariant — a Lua cart's `a*b+c` is two separate rounded VM ops,
+/// and the in-house kernels are contraction-safe — so `fp_native_hostlua_core_parity`
+/// staying green under `-ffp-contract=fast` proves determinism but not detection.
+/// This test flips the flag on a deliberately contraction-prone C Horner /
+/// dot-product chain: under `-ffp-contract=off` it is IEEE decomposed
+/// (== the pinned reference); under `-ffp-contract=fast` on FMA hardware the
+/// compiler fuses it to a single-rounding FMA and the digest MUST move. A green
+/// run confirms FMA is present, the flag is honored, and the harness would catch
+/// an FMA-induced divergence if one reached the real path.
+#[test]
+fn fp_native_hostlua_contraction_teeth() {
+    require_sdk();
+    require_lua_sdk();
+    require_hostlua_native();
+    require_hostlua_native_fma();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("fp_parity");
+    CartProject::new().lua(FP_PARITY_CART).write(&project);
+    let cart = build_lua_cart(&project);
+
+    let off = hostlua_torture(&hostlua_native(), &cart);
+    let fma = hostlua_torture(&hostlua_native_fma(), &cart);
+
+    assert_eq!(
+        off, FP_TORTURE_OFF_DIGEST,
+        "contraction-off torture digest drifted (expected {FP_TORTURE_OFF_DIGEST}, got {off})"
+    );
+    assert_ne!(
+        off, fma,
+        "FMA-contraction control did not diverge from the off build — the gate has no teeth on \
+         this host (no hardware FMA, or -ffp-contract is not being honored)"
+    );
 }
 
 /// The Zone-2 transcendentals the seam routes (ADR-0135). Zone-1 ops

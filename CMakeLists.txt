@@ -751,6 +751,13 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# Native host-Lua determinism leg (Spike Z, issue #225) — the FMA-silicon +
+# cross-arch FP parity probe for the host-Lua-everywhere direction. Guards on
+# host arch internally (x86-64 / arm64 only). Not a shipped player.
+# -------------------------------------------------------------------------
+add_subdirectory(frontends/native-hostlua)
+
+# -------------------------------------------------------------------------
 # blyt_native — LP64 RISC-V launcher for trusted native cart execution
 #
 # Installs the arch-dispatch seccomp filter then execs the ILP32 cart. Only

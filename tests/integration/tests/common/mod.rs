@@ -48,6 +48,23 @@ pub fn blyt_bin() -> PathBuf {
     sdk_dir().join("bin/blyt")
 }
 
+/// The Spike Z native host-Lua determinism leg (issue #225): the Lua fork
+/// compiled native (x86-64 / arm64) with the ADR-0135 blyt_fpm seam, run over
+/// the parity cart. Built directly into the CMake tree (not the SDK) by
+/// `cmake --build build --target blyt_hostlua_native`; only exists on
+/// x86-64/arm64 hosts (the leg guards on arch in CMake).
+pub fn hostlua_native() -> PathBuf {
+    build_dir().join("frontends/native-hostlua/blyt_hostlua_native")
+}
+
+/// The Q1 negative-control variant of [`hostlua_native`]: identical build but
+/// with FMA contraction enabled (`-ffp-contract=fast`). On FMA silicon its
+/// C-level contraction torture must diverge from the `-ffp-contract=off` build,
+/// proving the flag is load-bearing and the gate has teeth (#225 Q1).
+pub fn hostlua_native_fma() -> PathBuf {
+    build_dir().join("frontends/native-hostlua/blyt_hostlua_native_fma")
+}
+
 // -------------------------------------------------------------------------
 // Spike X graphics reference (issue #188)
 //
@@ -894,6 +911,25 @@ pub fn require_wasm() {
     );
 }
 
+/// Require the Spike Z native host-Lua leg (#225). Built into the CMake tree on
+/// x86-64/arm64 hosts by `cmake --build build --target blyt_hostlua_native`.
+pub fn require_hostlua_native() {
+    assert!(
+        hostlua_native().exists(),
+        "native host-Lua leg not built — run \
+         `cmake --build build --target blyt_hostlua_native` (x86-64/arm64 hosts only)"
+    );
+}
+
+/// Require the Q1 negative-control (FMA-contraction) variant (#225).
+pub fn require_hostlua_native_fma() {
+    assert!(
+        hostlua_native_fma().exists(),
+        "native host-Lua FMA control not built — run \
+         `cmake --build build --target blyt_hostlua_native_fma` (x86-64/arm64 hosts only)"
+    );
+}
+
 /// Require the debug WASM runtime (blytdebug.*, DAP/GDB enabled) for the WASM
 /// DAP/GDB tests (ADR-0129).
 pub fn require_wasm_debug() {
@@ -1107,6 +1143,26 @@ pub fn run_cart_native_with_env(
     assert!(
         String::from_utf8_lossy(&output).contains(expected),
         "expected {:?} in native output, got: {}",
+        expected,
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// Run a cart on the native host-Lua determinism leg (Spike Z, #225); assert
+/// `expected` appears in stdout. The cart must be pure Lua (the leg reads its
+/// `.cart.lua` bytecode section) and must terminate itself via `blyt.quit()`.
+pub fn run_cart_native_hostlua(cart: &std::path::Path, expected: &str) {
+    use assert_cmd::Command;
+    let output = Command::new(hostlua_native())
+        .arg(cart.to_str().unwrap())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in native host-Lua output, got: {}",
         expected,
         String::from_utf8_lossy(&output)
     );
