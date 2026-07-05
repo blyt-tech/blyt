@@ -61,10 +61,26 @@ local function fold_str(s)
     fold_byte(0)
 end
 
--- Fold a double's raw little-endian IEEE-754 bits. string.pack("<d") writes the
--- exact bit pattern the VM holds, including the specific NaN payload.
+-- ADR-0010: a NaN's sign and payload are NOT part of the determinism contract —
+-- they are canonicalized at the state-buffer boundary (blyt_canon_f64). WASM
+-- makes an arithmetically-produced NaN's sign bit nondeterministic (x86-64
+-- yields fff8..., arm64 / the softfloat reference yield the RISC-V canonical
+-- 7ff8...), so hashing the raw transient NaN would test something the console
+-- deliberately does not pin. Canonicalize every NaN to 0x7ff8000000000000 before
+-- it enters the digest, exactly as the state-buffer boundary does; finite results
+-- (where the seam's guarantee actually lives) fold through unchanged.
+local CANON_NAN = string.unpack("<d", "\0\0\0\0\0\0\248\127") -- 0x7ff8000000000000
+local function canon(x)
+    if x ~= x then -- x ~= x is true iff x is NaN, regardless of sign/payload
+        return CANON_NAN
+    end
+    return x
+end
+
+-- Fold a double's raw little-endian IEEE-754 bits (NaN canonicalized per above).
+-- string.pack("<d") writes the exact bit pattern the VM holds.
 local function fold_f64(x)
-    fold_str(string.pack("<d", x))
+    fold_str(string.pack("<d", canon(x)))
 end
 
 -- ---- human-readable spot values (localize any divergence) ------------------
@@ -79,7 +95,7 @@ local function packhex(x)
     return table.concat(out)
 end
 local function spotval(name, x)
-    spot[#spot + 1] = name .. "=" .. packhex(x)
+    spot[#spot + 1] = name .. "=" .. packhex(canon(x))
 end
 
 -- ---- adversarial corpus ----------------------------------------------------
@@ -189,9 +205,11 @@ local function run_corpus()
         fold_f64(y ^ x)
         fold_f64(math.fmod(y, x))
     end
-    -- number formatting: tostring(x) bytes AND tonumber(tostring(x)) round trip
+    -- number formatting: tostring(x) bytes AND tonumber(tostring(x)) round trip.
+    -- canon() first so tostring(NaN) is "nan" on every host (an x86-64 sign-set
+    -- NaN would otherwise stringify to "-nan"); finite values are unchanged.
     for i = 1, #inputs do
-        local s = tostring(inputs[i])
+        local s = tostring(canon(inputs[i]))
         fold_str(s)
         -- Lua's tonumber deliberately rejects "inf"/"nan" (-> nil), identically
         -- on every leg; guard so non-finite round-trips fold a constant.
