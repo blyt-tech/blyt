@@ -1,3 +1,4 @@
 # Build outputs and fetched/built dependencies — reproduced by the scripts.
 /artifacts/
 /.deps/
+guest/lua-port/*_lua.h
