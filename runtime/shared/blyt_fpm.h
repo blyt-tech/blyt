@@ -105,4 +105,19 @@ static inline double blyt_fpm_powd(double x, double y) {
     return blyt_fpm_u2d(blyt_fpm_pow(blyt_fpm_d2u(x), blyt_fpm_d2u(y)));
 }
 
+/* ── Zone-2 number-format seam (Phase B, ADR-0135 / blyt#225): string↔number
+ * conversion pinned to the in-house blyt-tech musl `strtod` + `vfprintf` float
+ * path, compiled into the host-Lua VM under a `blyt_fpm_` namespace so the
+ * vendored musl objects do NOT override the module's libc `strtod`/`snprintf`
+ * (see runtime/shared/blyt_fpm_musl_renames.h + blyt_fpm_conv.c). The fork's
+ * luaconf.h routes `lua_str2number` and `l_sprintf` here when
+ * BLYT_HOSTLUA_FP_SEAM is defined, so `tostring`/`tonumber`/`string.format`
+ * reproduce the emulated softfloat reference's conversions bit-for-bit.
+ *
+ * These take ordinary C types (not the uint64_t bit-pattern boundary the Zone-2
+ * transcendentals use): the conversion functions cross bytes and pointers, not
+ * bare doubles, so the ABI-hiding trick is unnecessary here. ───────────────── */
+double blyt_fpm_strtod(const char *s, char **endptr);
+int blyt_fpm_snprintf(char *s, size_t n, const char *fmt, ...);
+
 #endif /* BLYT_FPM_H */

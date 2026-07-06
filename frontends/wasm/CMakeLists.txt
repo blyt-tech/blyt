@@ -139,27 +139,56 @@ endif()
 set(BLYT_HOSTLUA_FP_SEAM OFF)
 if(BLYT_LUA_SOURCES AND EXISTS "${BLYT_MUSL_SOURCE_DIR}/src/math/sin.c")
   file(GLOB _BLYT_MUSL_MATH_SRCS "${BLYT_MUSL_SOURCE_DIR}/src/math/*.c")
+  # Phase B (ADR-0135, #225): the renamed blyt-tech musl string↔number
+  # conversion subset — strtod + floatscan + the vfprintf float-format path —
+  # compiled under a blyt_fpm_ namespace (blyt_fpm_musl_renames.h,
+  # force-included) so it does not override Emscripten's module libc.
+  # blyt_fpm_conv.c re-provides the byte-neutral plumbing leaves. Pins
+  # tostring/tonumber/string.format to the same conversion implementation the
+  # emulated softfloat reference uses (the fork's luaconf.h routes
+  # lua_str2number / l_sprintf here under the seam macro).
+  set(_BLYT_MUSL_CONV_SRCS
+      "${BLYT_MUSL_SOURCE_DIR}/src/stdlib/strtod.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/internal/floatscan.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/internal/shgetc.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/stdio/vfprintf.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/stdio/vsnprintf.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/stdio/snprintf.c"
+      "${BLYT_ROOT}/runtime/shared/blyt_fpm_conv.c")
   add_library(
     blyt_hostlua_fpm STATIC "${BLYT_ROOT}/runtime/shared/blyt_fpm_soft.c"
-                            ${_BLYT_MUSL_MATH_SRCS})
+                            ${_BLYT_MUSL_MATH_SRCS} ${_BLYT_MUSL_CONV_SRCS})
   # musl compiles against its own internal headers. riscv32 == wasm32 for the
   # ILP32 integer sizes and 128-bit long double, so the reference's bits/ config
   # matches — maximising parity with the emulated legs.
   target_include_directories(
     blyt_hostlua_fpm
-    PRIVATE "${BLYT_ROOT}/runtime/shared" # blyt_fpm.h
+    # blyt_fpm_musl_shim (empty syscall_arch.h + bits/syscall.h) shadows musl's
+    # arch/riscv32 syscall stubs — whose RISC-V register asm wasm-ld cannot
+    # parse even though the seam never issues a syscall — so it must come first.
+    PRIVATE "${BLYT_ROOT}/runtime/shared/blyt_fpm_musl_shim"
+            "${BLYT_ROOT}/runtime/shared" # blyt_fpm.h
             "${BLYT_MUSL_SOURCE_DIR}/src/include"
             "${BLYT_MUSL_SOURCE_DIR}/include"
             "${BLYT_MUSL_SOURCE_DIR}/arch/riscv32"
             "${BLYT_MUSL_SOURCE_DIR}/arch/generic"
             "${BLYT_MUSL_SOURCE_DIR}/src/internal")
+  # The vendored conversion TUs (+ plumbing support file) get the rename header
+  # force-included so their public + musl-internal symbols land in the blyt_fpm_
+  # namespace. The math kernels keep their real names (the seam overrides host
+  # libm), so it is NOT applied to them.
+  set_source_files_properties(
+    ${_BLYT_MUSL_CONV_SRCS}
+    PROPERTIES COMPILE_OPTIONS
+               "-include;${BLYT_ROOT}/runtime/shared/blyt_fpm_musl_renames.h")
   # Determinism (ADR-0007): contraction off, no fast-math, no constant-folding
   # to the host libm; -w silences musl's intentional idioms (mirrors
   # LIBBLYTC_CFLAGS).
   target_compile_options(
     blyt_hostlua_fpm PRIVATE -ffp-contract=off -fno-fast-math -fno-builtin -w)
   set(BLYT_HOSTLUA_FP_SEAM ON)
-  message(STATUS "blyt WASM: host-Lua FP seam enabled (in-house musl math)")
+  message(
+    STATUS "blyt WASM: host-Lua FP seam enabled (in-house musl math + conv)")
 endif()
 
 # -------------------------------------------------------------------------
