@@ -60,3 +60,18 @@ docker run --rm --platform linux/arm64 -v "$REPO_ROOT":/work -w /work debian:tri
   gcc -O2 -static /tmp/lua_${NAME}.o /tmp/lua-core.o -lm -o bench/spike-a/artifacts/pi/lua-${NAME}-native
 "
 log "built $GUEST_OUT/lua-${NAME}.elf and $ART_DIR/pi/lua-${NAME}-native"
+
+# --- Native-C twin (emulated-native-C leg): <name>_c.c compiled to RV32 and run
+# --- under the same rv32emu runner. The "host-Lua vs write-it-in-C-and-emulate"
+# --- comparison point. Same double math + i32 wrap as the Lua workload, so it
+# --- lands on the same integer checksum. Built only if the C twin exists.
+if [ -f "$PORT/${NAME}_c.c" ]; then
+  log "building ${NAME}-c.elf (RV32 native-C twin → emulated-native-C leg)"
+  "$CLANG" "${GUEST_TGT[@]}" -O2 -nostdinc -isystem "$RESINC" -isystem "$MI/include" \
+    -c "$PORT/${NAME}_c.c" -o "$W/${NAME}_c.o"
+  "$CLANG" "${GUEST_TGT[@]}" -O2 -nostdlib -static -Wl,--allow-multiple-definition \
+    "$MI/lib/crt1.o" "$MI/lib/crti.o" "$W/${NAME}_c.o" \
+    -L"$MI/lib" -lc "$W/libsf.a" "$MI/lib/crtn.o" -o "$GUEST_OUT/${NAME}-c.elf"
+  log "built $GUEST_OUT/${NAME}-c.elf"
+fi
+
