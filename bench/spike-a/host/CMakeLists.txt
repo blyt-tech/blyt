@@ -141,6 +141,12 @@ target_compile_options(
 # --------------------------------------------------------------------------
 # rv32emu interpreter core (same source subset + feature defs as libblytemu).
 # --------------------------------------------------------------------------
+# Optional T1C JIT (x86_64/arm64 only). Off = the shipped interpreter-only
+# profile; ON adds jit.c (which #includes rv32_jit.c) and flips RV32_FEATURE_JIT.
+# Used to measure the JIT vs interpreter delta for the native/C escape hatch
+# (the emulated tier host-Lua does not accelerate). T2C stays off (needs LLVM).
+option(SPIKE_A_JIT "Enable the rv32emu T1C JIT" OFF)
+
 set(RV32EMU_SOURCES
     ${RV32EMU_DIR}/riscv.c
     ${RV32EMU_DIR}/emulate.c
@@ -154,14 +160,29 @@ set(RV32EMU_SOURCES
     ${RV32EMU_DIR}/utils.c
     ${RV32EMU_DIR}/log.c)
 
+set(_EXTD_DEF "")
+if(SPIKE_A_JIT)
+  set(_JIT_ON 1)
+  list(APPEND RV32EMU_SOURCES ${RV32EMU_DIR}/jit.c)
+  # The blyt-tech fork added the D extension to the INTERPRETER only; jit.c's
+  # RV_INSN_LIST then expects do_f*d fallback handlers the fork never wired up
+  # (JIT was off — see spike-u). So a JIT build must disable EXT_D. Fine for the
+  # integer-only escape-hatch archetype (draw_c: pure fixed-point, no doubles).
+  set(_EXTD_DEF "RV32_FEATURE_EXT_D=0")
+  message(STATUS "spike-a: T1C JIT ENABLED (EXT_D forced off — fork JIT lacks D)")
+else()
+  set(_JIT_ON 0)
+endif()
+
 set(RV32EMU_FEATURE_DEFS
     RV32_FEATURE_SDL=0
     RV32_FEATURE_GDBSTUB=0
-    RV32_FEATURE_JIT=0
+    RV32_FEATURE_JIT=${_JIT_ON}
     RV32_FEATURE_T2C=0
     RV32_FEATURE_SYSTEM=0
     RV32_FEATURE_ELF_LOADER=0
-    RV32_FEATURE_ARCH_TEST=0)
+    RV32_FEATURE_ARCH_TEST=0
+    ${_EXTD_DEF})
 
 # Force-include common.h then, on macOS, override HAVE_MMAP back to 0 (matches
 # the root build's handling of the Tahoe malloc/__OBJC_RO overlap).
