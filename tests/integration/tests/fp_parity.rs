@@ -342,6 +342,105 @@ fn fp_native_hostlua_core_parity() {
     run_cart_native_hostlua(&cart, FP_PARITY_CORE_DIGEST);
 }
 
+/// Spike Z / #225 (Q4 — Phase B, strtod / number-format): the native host-Lua
+/// leg must reproduce the **FULL** parity digest — the core transcendental +
+/// Zone-1 surface *plus* the number↔string conversion surface (`tostring` /
+/// `tonumber` / `string.format`) — bit-identically to the emulated softfloat
+/// reference across x86-64 / arm64.
+///
+/// The difference from [`fp_native_hostlua_core_parity`] is the conversion
+/// surface. Before Phase B it resolved to the host toolchain's `strtod` /
+/// `snprintf` — a coincidental, unpinned agreement (it happens to match on the
+/// dev host's libc). Phase B routes `lua_str2number` / `l_sprintf` through the
+/// pinned in-house musl `strtod` + `vfprintf` subset (`blyt_fpm_strtod` /
+/// `blyt_fpm_snprintf`), so this digest is now pinned to the same conversion
+/// implementation the emulated reference uses. Together with
+/// [`fp_native_hostlua_conversions_hermetic`] (which proves the conversions are
+/// actually routed through the seam, not the host libc) this closes Q4.
+#[test]
+fn fp_native_hostlua_conversions_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_hostlua_native();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("fp_parity");
+    CartProject::new().lua(FP_PARITY_CART).write(&project);
+    let cart = build_lua_cart(&project);
+
+    run_cart_native_hostlua(&cart, FP_PARITY_DIGEST);
+}
+
+/// Spike Z / #225 (Q4 — Phase B hermeticity): prove the native host-Lua leg's
+/// number↔string conversions actually reach the pinned in-house musl subset,
+/// never the host toolchain's `strtod` / `snprintf`. Without this,
+/// [`fp_native_hostlua_conversions_parity`] passing proves nothing about
+/// hermeticity — the dev host's libc `strtod`/`snprintf` happen to agree with
+/// the reference, so a digest match alone cannot distinguish "pinned to musl"
+/// from "using an unpinned host libc that coincidentally matches".
+///
+/// Proven at the symbol level (mirrors
+/// [`fp_seam_hermetic_no_host_libm_transcendentals`], but for the Phase-B
+/// conversion surface): the compiled native VM object (`onelua.c.o`, the whole
+/// Lua fork) must import the `blyt_fpm_strtod` / `blyt_fpm_snprintf` seam
+/// entries (routing engaged) and must NOT import bare `strtod` / `snprintf`
+/// (which would be the host libc). `l_sprintf` is Lua's sole float/integer
+/// formatting choke point and `lua_str2number` its sole string→number one, so
+/// after the seam edit neither host symbol should remain undefined in the object.
+#[test]
+fn fp_native_hostlua_conversions_hermetic() {
+    require_sdk();
+    require_lua_sdk();
+    require_hostlua_native();
+
+    // The native VM object: the Lua fork compiled with the seam engaged. Its
+    // path mirrors the source under the blyt_hostlua_native_vm target's dir.
+    let vm_dir = build_dir().join("frontends/native-hostlua/CMakeFiles/blyt_hostlua_native_vm.dir");
+    let obj = find_file_named(&vm_dir, "onelua.c.o").unwrap_or_else(|| {
+        panic!(
+            "onelua.c.o not found under {} — build blyt_hostlua_native first",
+            vm_dir.display()
+        )
+    });
+
+    // Undefined (imported) symbols. `nm` prints Mach-O names with a leading
+    // underscore (`_strtod`) and ELF names without (`strtod`); normalize by
+    // stripping one leading underscore so the assertions are arch-portable.
+    let out = std::process::Command::new("nm")
+        .arg(&obj)
+        .output()
+        .expect("failed to run nm");
+    assert!(out.status.success(), "nm failed on {}", obj.display());
+    let nm = String::from_utf8_lossy(&out.stdout);
+    let undefined: Vec<String> = nm
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some("U"), Some(sym)) => Some(sym.strip_prefix('_').unwrap_or(sym).to_string()),
+                _ => None,
+            }
+        })
+        .collect();
+
+    // Routing engaged: the pinned seam entries are imported.
+    for fpm in ["blyt_fpm_strtod", "blyt_fpm_snprintf"] {
+        assert!(
+            undefined.iter().any(|s| s == fpm),
+            "expected onelua.c.o to import {fpm} (Phase-B seam not engaged?); imports: {undefined:?}"
+        );
+    }
+
+    // Hermetic: no bare host-libc conversion symbol is imported.
+    for host in ["strtod", "snprintf"] {
+        assert!(
+            !undefined.iter().any(|s| s == host),
+            "onelua.c.o imports host libc `{host}` — number conversion not routed through the \
+             Phase-B seam (imports: {undefined:?})"
+        );
+    }
+}
+
 /// The `-ffp-contract=off` reference for the runner's C-level contraction
 /// torture — decomposed multiply-add is IEEE correctly-rounded, so this is
 /// stable across arch and compiler. The `-ffp-contract=fast` build must diverge
@@ -516,6 +615,101 @@ fn fp_seam_hermetic_no_host_libm_transcendentals() {
         assert!(
             !undefined.contains(&t),
             "lmathlib.c.o imports host libm `{t}` — Zone-2 transcendental not routed through the seam (imports: {undefined:?})"
+        );
+    }
+}
+
+/// Collect every file named `name` under `root` (depth-first), newest first by
+/// mtime. Used to pick the *active* build object when a stale copy from an
+/// earlier configure (e.g. a `_deps/lua-src` object left over before a
+/// `third_party/lua` override) may also linger in the tree.
+fn find_files_named_newest_first(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut hits = Vec::new();
+    fn walk(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, name, out);
+            } else if p.file_name().and_then(|n| n.to_str()) == Some(name) {
+                out.push(p);
+            }
+        }
+    }
+    walk(root, name, &mut hits);
+    hits.sort_by_key(|p| {
+        std::cmp::Reverse(
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH),
+        )
+    });
+    hits
+}
+
+/// Spike Z / #225 (Q4 — Phase B hermeticity, WASM half): the WASM host-Lua
+/// fast path's number↔string conversions must reach the pinned in-house musl
+/// subset, never Emscripten's module libc `strtod` / `snprintf`. This is the
+/// WASM companion to [`fp_native_hostlua_conversions_hermetic`] — Phase B's WASM
+/// half hardens the shipping host-Lua path (blytplay/wasm) regardless of the
+/// strategic host-Lua-everywhere decision.
+///
+/// `lobject.c.o` is where `tostringbuffFloat` lives (it calls both
+/// `lua_str2number` for the readback and `l_sprintf` for the format), so after
+/// the seam edit it must import `blyt_fpm_strtod` / `blyt_fpm_snprintf` and must
+/// NOT import bare `strtod` / `snprintf`. Uses the newest object so a stale
+/// pre-override `_deps/lua-src` copy cannot shadow the active `third_party/lua`
+/// build locally (CI builds a single copy from the pinned fork tag).
+#[test]
+fn fp_seam_hermetic_no_host_libc_conversions() {
+    require_sdk();
+    require_wasm();
+
+    let wasm_tree = build_dir().join("build-wasm");
+    let obj = find_files_named_newest_first(&wasm_tree, "lobject.c.o")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            panic!(
+                "lobject.c.o not found under {} — build the WASM runtime (sdk target) first",
+                wasm_tree.display()
+            )
+        });
+
+    let out = std::process::Command::new(emnm())
+        .arg(&obj)
+        .output()
+        .expect("failed to run emnm");
+    assert!(out.status.success(), "emnm failed on {}", obj.display());
+    let nm = String::from_utf8_lossy(&out.stdout);
+    let undefined: Vec<&str> = nm
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some("U"), Some(sym)) => Some(sym),
+                _ => None,
+            }
+        })
+        .collect();
+
+    // Routing engaged: the pinned conversion seam entries are imported.
+    for fpm in ["blyt_fpm_strtod", "blyt_fpm_snprintf"] {
+        assert!(
+            undefined.contains(&fpm),
+            "expected lobject.c.o to import {fpm} (Phase-B seam not engaged on WASM?); \
+             imports: {undefined:?}"
+        );
+    }
+
+    // Hermetic: no bare Emscripten-libc conversion symbol is imported.
+    for host in ["strtod", "snprintf"] {
+        assert!(
+            !undefined.contains(&host),
+            "lobject.c.o imports host libc `{host}` — number conversion not routed through the \
+             Phase-B seam on WASM (imports: {undefined:?})"
         );
     }
 }

@@ -102,12 +102,14 @@ FetchContent_Declare(
 # lua: blyt-tech fork adds BLYT_LUA_I32_F64 (int32 + float64) for RV32D. p2 adds
 # the ADR-0135 host-Lua FP determinism seam (lmathlib.c/llimits.h route Zone-2
 # transcendentals + pow through blyt_fpm when BLYT_HOSTLUA_FP_SEAM is defined).
-set(LUA_VERSION "v5.5.0-blyt-v0-p2")
+# p3 adds the Phase-B number-format companion (luaconf.h routes lua_str2number /
+# l_sprintf through blyt_fpm_strtod / blyt_fpm_snprintf under the same guard).
+set(LUA_VERSION "v5.5.0-blyt-v0-p3")
 FetchContent_Declare(
   lua
   URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=6c747b2ee58c7aa5525efbeaf1371b1a15bfca19cb2a658f74d9bf100ac552ca)
+    SHA256=29be5dbf25edadd4c751f6fd695efc64a2c97a82b840174b505fe1d52f7c98b7)
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
