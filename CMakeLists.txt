@@ -407,29 +407,47 @@ target_link_libraries(libblytemu PRIVATE libsoftfloat)
 # -------------------------------------------------------------------------
 include(cmake/blyt_rv32_toolchain.cmake)
 include(cmake/blyt_guest_libs.cmake)
+# The shipped native host-Lua VM recipe (issue #238, epic #230). Defines
+# BLYT_HOSTLUA_VM_AVAILABLE + blyt_add_hostlua_vm(); the determinism gate
+# (frontends/native-hostlua) reuses the same helper.
+include(cmake/blyt_hostlua_vm.cmake)
 
 # -------------------------------------------------------------------------
 # Host runtime libraries (stubs for future expansion; only libblyt is real)
 # -------------------------------------------------------------------------
 
-# Host-native Lua static library for cart inspection
-# (blyt_cart_lua_lifecycle_mask). Uses onelua.c which bundles all Lua sources;
-# MAKE_LIB=1 suppresses main().
-set(_LUA_HOST_DIR "${lua_SOURCE_DIR}")
-if(EXISTS "${_LUA_HOST_DIR}/onelua.c")
-  add_library(liblua_host STATIC "${_LUA_HOST_DIR}/onelua.c")
-  # MAKE_LIB=1 suppresses main(). BLYT_LUA_I32_F64=1 matches the ilp32f guest
-  # bytecode integer/float sizes so the host VM can load cart bytecode compiled
-  # for RISC-V. BLYT_LUA_I32_F64=1 is PUBLIC so it propagates to callers
-  # (cart_load.c) that include lua.h — keeping function pointer types consistent
-  # with the library.
+# Host-native Lua static library. Serves BOTH cart inspection
+# (blyt_cart_lua_lifecycle_mask) and — on supported hosts — cart *execution*
+# (the native host-Lua fast path, #238). The linker permits only one
+# onelua.c-derived Lua VM per binary, so inspection and execution share one VM:
+# the seam-compiled deterministic VM where it can be built (x86-64 / arm64),
+# else a plain host-libm VM for inspection only (execution falls back to
+# emulated RV32 Lua).
+#
+# _HOST_LUA_VM_TARGET names the VM libblyt links; _HOST_LUA_EXEC is TRUE when it
+# is the deterministic seam VM (the host-Lua execution path is buildable).
+set(_HOST_LUA_VM_TARGET "")
+set(_HOST_LUA_EXEC FALSE)
+if(BLYT_HOSTLUA_VM_AVAILABLE)
+  # Seam-wired deterministic VM (pinned hash seed, -ffp-contract=off, in-house
+  # musl kernels via blyt_fpm) — the shipped host-Lua fast-path VM (#238).
+  blyt_add_hostlua_vm(blyt_hostlua_vm -ffp-contract=off)
+  set(_HOST_LUA_VM_TARGET blyt_hostlua_vm)
+  set(_HOST_LUA_EXEC TRUE)
+elseif(EXISTS "${lua_SOURCE_DIR}/onelua.c")
+  # Fallback: plain host-libm VM, inspection only (no determinism guarantees, so
+  # not usable for execution). BLYT_LUA_I32_F64=1 matches the ilp32d guest
+  # bytecode sizes so the host VM can load cart bytecode; PUBLIC so it
+  # propagates to callers (cart_load.c) that include lua.h.
+  add_library(liblua_host STATIC "${lua_SOURCE_DIR}/onelua.c")
   target_compile_definitions(
     liblua_host
     PRIVATE MAKE_LIB=1
     PUBLIC BLYT_LUA_I32_F64=1)
-  target_include_directories(liblua_host PUBLIC "${_LUA_HOST_DIR}")
+  target_include_directories(liblua_host PUBLIC "${lua_SOURCE_DIR}")
   target_link_libraries(liblua_host PUBLIC m)
   set_target_properties(liblua_host PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  set(_HOST_LUA_VM_TARGET liblua_host)
 endif()
 
 add_library(libblytcommon INTERFACE)
@@ -480,9 +498,14 @@ target_link_libraries(
   libblyt
   PUBLIC flatccrt
   PRIVATE libblytemu zstd_decode)
-if(TARGET liblua_host)
-  target_link_libraries(libblyt PRIVATE liblua_host)
+if(_HOST_LUA_VM_TARGET)
+  target_link_libraries(libblyt PRIVATE ${_HOST_LUA_VM_TARGET})
   target_compile_definitions(libblyt PRIVATE BLYT_HAVE_HOST_LUA=1)
+  if(_HOST_LUA_EXEC)
+    # The deterministic seam VM is present: the native host-Lua execution path
+    # (cart_run_hostlua.c) is buildable (#238).
+    target_compile_definitions(libblyt PRIVATE BLYT_HOSTLUA_EXEC=1)
+  endif()
 endif()
 add_dependencies(libblyt flatbuffers_generated)
 
@@ -583,9 +606,12 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     libblyt_debug
     PUBLIC flatccrt
     PRIVATE libblytemu zstd_decode)
-  if(TARGET liblua_host)
-    target_link_libraries(libblyt_debug PRIVATE liblua_host)
+  if(_HOST_LUA_VM_TARGET)
+    target_link_libraries(libblyt_debug PRIVATE ${_HOST_LUA_VM_TARGET})
     target_compile_definitions(libblyt_debug PRIVATE BLYT_HAVE_HOST_LUA=1)
+    if(_HOST_LUA_EXEC)
+      target_compile_definitions(libblyt_debug PRIVATE BLYT_HOSTLUA_EXEC=1)
+    endif()
   endif()
   add_dependencies(libblyt_debug flatbuffers_generated)
   if(BLYT_DAP AND TARGET dap)
