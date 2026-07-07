@@ -104,14 +104,12 @@ FetchContent_Declare(
 # transcendentals + pow through blyt_fpm when BLYT_HOSTLUA_FP_SEAM is defined).
 # p3 adds the Phase-B number-format companion (luaconf.h routes lua_str2number /
 # l_sprintf through blyt_fpm_strtod / blyt_fpm_snprintf under the same guard).
-# NOTE: -p3-fpconv is a pre-release tag for blyt#225 CI; replace with the stable
-# v5.5.0-blyt-v0-p3 before merge (see docs/contributing/third-party.md).
-set(LUA_VERSION "v5.5.0-blyt-v0-p3-fpconv")
+set(LUA_VERSION "v5.5.0-blyt-v0-p3")
 FetchContent_Declare(
   lua
   URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=74b6054e0e080800ab5f508e942fea33d0c41f87a9a19ca0ca54faa8562563e2)
+    SHA256=29be5dbf25edadd4c751f6fd695efc64a2c97a82b840174b505fe1d52f7c98b7)
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
