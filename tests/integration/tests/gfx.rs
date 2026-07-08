@@ -171,9 +171,18 @@ fn gfx_acquire_present_raw_framebuffer_hashes_identically_across_legs() {
 /// contract spans emulated-C, emulated-Lua, host-Lua (and, via the QEMU gate,
 /// native), and that the host-Lua fast path stays pixel-identical to the
 /// emulated path it shadows.
+///
+/// The **native** host-Lua fast path (#231, blytplay `--host-lua` /
+/// `BLYT_HOSTLUA=1`) is the fourth leg here: the same pure-Lua cart drawing via
+/// `blyt32.gfx.*`, but rasterizing into the native runner's own framebuffer with
+/// no emulator — it must emit the identical `[blyt:fbhash]` golden, proving the
+/// native host-Lua gfx bindings stay pixel-identical to the emulated path they
+/// shadow (the WASM host-Lua leg's native-player counterpart).
 #[test]
 fn gfx_torture_frame_lua_hashes_identically_across_legs() {
     require_sdk();
+    require_lua_sdk();
+    require_wasm();
     let ops = gfx::torture_frame();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -193,6 +202,12 @@ fn gfx_torture_frame_lua_hashes_identically_across_legs() {
     run_cart_native_with_env(&cart, &env, &expected);
     run_cart_wasm_with_env(&cart, &env, &expected);
     run_cart_libretro_with_env(&cart, &env, &expected);
+    // Native host-Lua fast path (#231): same cart, no emulator, own framebuffer.
+    run_cart_native_with_env(
+        &cart,
+        &[("BLYT_FRAME_HASH", "1"), ("BLYT_HOSTLUA", "1")],
+        &expected,
+    );
 }
 
 /// Build a Lua + native-C **hybrid** cart whose torture frame is split across

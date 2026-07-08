@@ -73,6 +73,18 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn);
 blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl);
 
 /*
+ * The host-Lua framebuffer for presentation (#231).  The runner rasterizes
+ * blyt32.gfx.* into its own paletted back buffer (there is no session), so the
+ * frontend presents by expanding these directly: get_pixels() returns the
+ * BLYT_FRAME_W * BLYT_FRAME_H paletted bytes, get_palette() the active 256-entry
+ * XRGB8888 palette.  Both return NULL for a NULL runner or a build without the
+ * seam VM.  Valid after each blyt_hostlua_run_frame(); the buffers live for the
+ * runner's lifetime.
+ */
+const uint8_t *blyt_hostlua_get_pixels(blyt_hostlua_t *hl);
+const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl);
+
+/*
  * Run one --reset-every-frame save/clear/restore stress cycle (save-state
  * determinism testing): flush transient state via on_save_state(), snapshot +
  * zero the state buffers, rebuild the VM (all Lua globals wiped), re-run init(),

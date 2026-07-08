@@ -38,8 +38,29 @@
 #include "lua.h"
 #include "lualib.h"
 
+#include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
+#include "blyt_handle.h" /* runtime/shared: console-wide handle encoding (ADR-0134) */
+#include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
+#include "blyt_raster.h" /* runtime/shared: integer rasterizer core (#188) */
 #include "save.h" /* blyt_save_write / blyt_save_read */
 #include "state_buffer.h" /* blyt_state_ctx_t + typed accessors */
+#include "testcard.h" /* PM5544 testcard (drawn until the cart draws, #204) */
+
+/* Host-Lua surface pool (blyt32.surface.*, #205/#208, #231).  A pure-Lua cart on
+ * this path has no session, so its surfaces live in the runner (the session-less
+ * mirror of the WASM leg's g_lua_surf pool — none of that leg's hybrid/session
+ * routing applies here).  Slot 0 is the screen: its pixels resolve to the
+ * runner's fb on each access.  Off-screen slots hold malloc'd buffers, freed at
+ * the frame boundary (draw-scoped, #205). */
+#define HL_SURFACE_MAX 64
+typedef struct {
+    uint8_t *pixels;
+    int32_t w, h;
+    uint16_t gen;
+    bool in_use;
+    bool is_screen;
+    bool locked; /* exclusive tier-2 lock held (#207/#208) */
+} hl_surface_t;
 
 struct blyt_hostlua {
     lua_State *L;
@@ -58,6 +79,20 @@ struct blyt_hostlua {
     char cart_name[64]; /* manifest id — the save subdirectory name */
     int quit; /* blyt.quit() latch (mirrors g_quit_requested in blyt_main) */
     bool done; /* on_quit() + cleanup() already run */
+    /* Gfx fast path (#188 / Spike X, #231): a runner-owned paletted framebuffer
+     * the blyt32.gfx.* bindings rasterize into (the host-Lua equivalent of the
+     * emulated path's session->pixels[]) plus the active palette.  The host-Lua
+     * path has no session, so — like the state ctx — the runner owns these
+     * directly (the WASM leg's standalone g_lua_pixels / g_lua_gfx_palette). */
+    uint8_t fb[BLYT_FRAME_W * BLYT_FRAME_H]; /* paletted back buffer (1 byte/px) */
+    uint32_t palette[256]; /* active 256-entry XRGB8888 palette */
+    bool drawn; /* a blyt32.gfx.* op ran ⇒ displace the testcard (sticky) */
+    uint32_t frame_count; /* testcard animation counter (== session->frame_count) */
+    /* Surface pool (#205/#208, #231) + the per-frame tier-2 lock epoch (bumped
+     * each frame so a lock never outlives the draw it was taken in). */
+    hl_surface_t surf[HL_SURFACE_MAX];
+    bool surf_init;
+    uint32_t lock_epoch;
 };
 
 /* The runner is stashed in the lua_State's extra space so the C API callbacks
@@ -575,6 +610,534 @@ static void register_s_proxy(lua_State *L, blyt_state_ctx_t *ctx) {
     free(buf);
 }
 
+/* ── Gfx fast path (#188 / Spike X, #231) ────────────────────────────────────
+ *
+ * blyt32.gfx.* rasterize into the runner's own paletted framebuffer via the
+ * shared integer rasterizer (blyt_raster.c) — the SAME core the emulated gfx
+ * ECALL handlers (cart_run.c) and the WASM host-Lua bindings (wasm_main.c) run,
+ * so the pixels are bit-identical to every other leg.  A pure-Lua cart on this
+ * path has no session (blyt_hostlua_should_use rejects hybrids), so the draw
+ * target is always the runner's standalone fb — none of the WASM leg's
+ * "session buffer when hybrid" routing is needed here. */
+
+/* Seed the palette before init, matching the pre-init auto-load the emulated
+ * legs perform into session->palette (#201/#204, ADR-0088): the cart's declared
+ * `palettes: default:` handle when it names a built-in, else the runtime default
+ * (aurora).  A cart-provenance custom default palette (#214) needs the resource
+ * table (deferred to #231's heap half); until then it falls back to aurora.  So
+ * a cart that never calls palette_set renders — and its testcard remaps —
+ * against the same palette on every leg. */
+static void hl_palette_ensure_default(blyt_hostlua_t *hl) {
+    uint32_t handle = blyt_cart_default_palette(hl->cart);
+    const uint32_t *pal = handle ? blyt_builtin_palette(handle) : NULL;
+    if (!pal)
+        pal = blyt_builtin_palette(
+            BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    for (int i = 0; i < 256; i++)
+        hl->palette[i] = pal[i];
+}
+
+static int l_gfx_clear(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_raster_clear(hl->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                      (uint8_t)luaL_checkinteger(L, 1));
+    hl->drawn = true;
+    return 0;
+}
+static int l_gfx_pixel(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_raster_pixel(hl->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                      (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                      (uint8_t)luaL_checkinteger(L, 3));
+    hl->drawn = true;
+    return 0;
+}
+static int l_gfx_rect_fill(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_raster_rect_fill(hl->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                          (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                          (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                          (uint8_t)luaL_checkinteger(L, 5));
+    hl->drawn = true;
+    return 0;
+}
+static int l_gfx_line(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_raster_line(hl->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, (int)luaL_checkinteger(L, 1),
+                     (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3),
+                     (int)luaL_checkinteger(L, 4), (uint8_t)luaL_checkinteger(L, 5));
+    hl->drawn = true;
+    return 0;
+}
+
+/* blyt32.gfx.palette_set(handle) (#201): load a BUILT-IN palette into the active
+ * palette.  A cart-asset palette (kind RESOURCE / cart provenance) needs the
+ * resource table, which is deferred to #231's heap half; such a handle is
+ * unresolvable here and leaves the palette unchanged — the SAME defined outcome
+ * as the WASM leg's lua_resolve_palette returning NULL. */
+static int l_gfx_palette_set(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    uint32_t handle = (uint32_t)luaL_checkinteger(L, 1);
+    const uint32_t *pal = blyt_builtin_palette(handle);
+    if (pal) {
+        for (int i = 0; i < 256; i++)
+            hl->palette[i] = pal[i];
+    }
+    return 0;
+}
+
+/* Register blyt32.gfx.* onto the existing blyt32 global.  Mirrors the WASM leg's
+ * wasm_register_gfx_api (the session-less subset); called from build_vm so the
+ * fresh VM each reset cycle re-registers it. */
+static void register_gfx_api(lua_State *L) {
+    lua_getglobal(L, "blyt32");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_newtable(L); /* blyt32.gfx */
+    static const struct {
+        const char *name;
+        lua_CFunction fn;
+    } gfx_fns[] = {
+        {"clear", l_gfx_clear},
+        {"pixel", l_gfx_pixel},
+        {"rect_fill", l_gfx_rect_fill},
+        {"line", l_gfx_line},
+        {"palette_set", l_gfx_palette_set},
+        {NULL, NULL},
+    };
+    for (int i = 0; gfx_fns[i].name; i++) {
+        lua_pushcfunction(L, gfx_fns[i].fn);
+        lua_setfield(L, -2, gfx_fns[i].name);
+    }
+    /* Built-in palette constants (#201), mirroring the WASM leg + blyt32lua.c. */
+    lua_pushinteger(
+        L, (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_AURORA");
+    lua_pushinteger(L,
+                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_VGA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_VGA");
+    lua_pushinteger(L,
+                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_EGA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_EGA");
+    lua_pushinteger(L,
+                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_CGA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_CGA");
+    lua_pushinteger(
+        L, (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    lua_setfield(L, -2, "PALETTE_DEFAULT");
+    lua_setfield(L, -2, "gfx"); /* blyt32.gfx = gfx */
+
+    /* blyt32.color: named color-index constants (#203).  Host-side (not cart
+     * code), so these raw indices MUST match blyt.h's BLYT_EGA_* / BLYT_AURORA_*;
+     * the cross-leg frame-hash parity test is the guard against drift.  Byte-for-
+     * byte the WASM leg's blyt32.color registration. */
+    static const char *const color_names[16] = {
+        "BLACK",  "BLUE",    "GREEN",    "CYAN",    "RED",    "MAGENTA",    "BROWN",     "LTGRAY",
+        "DKGRAY", "BR_BLUE", "BR_GREEN", "BR_CYAN", "BR_RED", "BR_MAGENTA", "BR_YELLOW", "WHITE",
+    };
+    static const uint8_t ega_idx[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    static const uint8_t aurora_idx[16] = {0, 223, 185, 195, 155, 239, 165, 10,
+                                           5, 219, 189, 201, 160, 236, 175, 15};
+    lua_newtable(L); /* blyt32.color */
+    for (int pass = 0; pass < 2; pass++) { /* color.ega, color.vga (same set) */
+        lua_newtable(L);
+        for (int i = 0; i < 16; i++) {
+            lua_pushinteger(L, (lua_Integer)ega_idx[i]);
+            lua_setfield(L, -2, color_names[i]);
+        }
+        lua_setfield(L, -2, pass == 0 ? "ega" : "vga");
+    }
+    lua_newtable(L); /* color.aurora */
+    for (int i = 0; i < 16; i++) {
+        lua_pushinteger(L, (lua_Integer)aurora_idx[i]);
+        lua_setfield(L, -2, color_names[i]);
+    }
+    lua_setfield(L, -2, "aurora");
+    for (int i = 0; i < 16; i++) { /* default aliases on color root -> aurora */
+        lua_pushinteger(L, (lua_Integer)aurora_idx[i]);
+        lua_setfield(L, -2, color_names[i]);
+    }
+    lua_setfield(L, -2, "color"); /* blyt32.color = color */
+
+    lua_pop(L, 1); /* pop blyt32 */
+}
+
+/* Emit the deterministic framebuffer + palette hashes when BLYT_FRAME_HASH is
+ * set — the host-Lua fast path's equivalent of the host runtime's
+ * blyt_emit_frame_hash (cart_run.c), over the same paletted bytes so every leg's
+ * hash matches (#188/#204).  Off by default; zero cost when unset. */
+static void hl_emit_frame_hash(blyt_hostlua_t *hl) {
+    static int s_on = -1;
+    if (s_on < 0)
+        s_on = getenv("BLYT_FRAME_HASH") != NULL ? 1 : 0;
+    if (!s_on || !hl->log_fn)
+        return;
+    char buf[64];
+    uint64_t h = blyt_frame_hash(hl->fb, (size_t)BLYT_FRAME_W * (size_t)BLYT_FRAME_H);
+    snprintf(buf, sizeof(buf), "[blyt:fbhash] %016llx", (unsigned long long)h);
+    hl->log_fn(buf);
+    uint64_t ph = blyt_frame_hash((const uint8_t *)hl->palette, 256 * sizeof(uint32_t));
+    snprintf(buf, sizeof(buf), "[blyt:palhash] %016llx", (unsigned long long)ph);
+    hl->log_fn(buf);
+}
+
+/* Finalise a completed frame: while the cart has not drawn, render the testcard
+ * into fb (mirroring the emulated path's !cart_has_drawn testcard in
+ * blyt_session_run_frame), then emit the cross-leg frame hash. */
+static void hl_frame_done(blyt_hostlua_t *hl) {
+    if (!hl->drawn)
+        blyt_testcard_draw(hl->frame_count++, hl->palette, hl->fb);
+    hl_emit_frame_hash(hl);
+}
+
+/* ── Surface fast path (#205/#208, #231) ─────────────────────────────────────
+ *
+ * The session-less half of the WASM leg's blyt32.surface.* bindings.  A pure-Lua
+ * cart's surfaces live in hl->surf; the SAME shared rasterizer draws them, so
+ * they are pixel-identical to every leg.  Tier-1 (create/destroy/clear/pixel/
+ * rect_fill/line/blit) plus the tier-2 per-pixel lock (acquire → get/set/clear/
+ * rect_fill/line → release).  None of the WASM leg's hybrid/session routing is
+ * needed — this path never has a session. */
+
+#define HL_LOCK_MT "blyt.surface.lock"
+
+static void hl_surf_ensure_init(blyt_hostlua_t *hl) {
+    if (hl->surf_init)
+        return;
+    hl->surf[0].in_use = true;
+    hl->surf[0].is_screen = true;
+    hl->surf[0].w = BLYT_FRAME_W;
+    hl->surf[0].h = BLYT_FRAME_H;
+    hl->surf_init = true;
+}
+
+static hl_surface_t *hl_surf_resolve(blyt_hostlua_t *hl, uint32_t h) {
+    hl_surf_ensure_init(hl);
+    if (!blyt_handle_is_surface(h))
+        return NULL;
+    uint32_t idx = blyt_dyn_decode_index(h);
+    if (idx >= HL_SURFACE_MAX)
+        return NULL;
+    hl_surface_t *s = &hl->surf[idx];
+    if (!s->in_use || (uint16_t)blyt_dyn_decode_gen(h) != s->gen)
+        return NULL;
+    if (s->is_screen)
+        s->pixels = hl->fb; /* screen pixels are always the live fb */
+    return s;
+}
+
+/* #207: while a tier-2 lock is held the lock owns the surface, so tier-1 ops /
+ * blit / destroy through the handle are rejected (defined no-op). */
+static hl_surface_t *hl_surf_resolve_drawable(blyt_hostlua_t *hl, uint32_t h) {
+    hl_surface_t *s = hl_surf_resolve(hl, h);
+    return (s && s->locked) ? NULL : s;
+}
+
+typedef struct {
+    uint8_t *pixels;
+    int32_t w, h;
+    bool is_screen;
+} hl_draw_target_t;
+
+static bool hl_resolve_target(blyt_hostlua_t *hl, uint32_t h, hl_draw_target_t *t) {
+    hl_surface_t *s = hl_surf_resolve_drawable(hl, h);
+    if (!s)
+        return false;
+    t->pixels = s->pixels;
+    t->w = s->w;
+    t->h = s->h;
+    t->is_screen = s->is_screen;
+    return true;
+}
+
+/* Reap draw-scoped off-screen surfaces at the frame boundary (#205) and
+ * force-release any lock the cart forgot — including the screen (slot 0), which
+ * is never freed but must not carry a lock into the next frame (#208).  Mirrors
+ * the emulated path's frame-entry reap in blyt_session_run_frame. */
+static void hl_surf_reap(blyt_hostlua_t *hl) {
+    hl_surf_ensure_init(hl);
+    hl->surf[0].locked = false;
+    for (uint32_t i = 1; i < HL_SURFACE_MAX; i++) {
+        if (hl->surf[i].in_use) {
+            free(hl->surf[i].pixels);
+            hl->surf[i].pixels = NULL;
+            hl->surf[i].in_use = false;
+            hl->surf[i].locked = false;
+            hl->surf[i].gen++;
+        }
+    }
+}
+
+static int l_surface_create(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    int32_t w = (int32_t)luaL_checkinteger(L, 1);
+    int32_t h = (int32_t)luaL_checkinteger(L, 2);
+    hl_surf_ensure_init(hl);
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) {
+        lua_pushinteger(L, (lua_Integer)BLYT_HANDLE_NONE);
+        return 1;
+    }
+    uint32_t idx = 0;
+    for (uint32_t i = 1; i < HL_SURFACE_MAX; i++) {
+        if (!hl->surf[i].in_use) {
+            idx = i;
+            break;
+        }
+    }
+    uint8_t *buf = idx ? (uint8_t *)malloc((size_t)w * (size_t)h) : NULL;
+    if (!buf) {
+        lua_pushinteger(L, (lua_Integer)BLYT_HANDLE_NONE);
+        return 1;
+    }
+    blyt_raster_clear(buf, w, w, h, 0); /* blank = palette index 0 */
+    hl->surf[idx].pixels = buf;
+    hl->surf[idx].w = w;
+    hl->surf[idx].h = h;
+    hl->surf[idx].in_use = true;
+    hl->surf[idx].is_screen = false;
+    lua_pushinteger(L, (lua_Integer)blyt_surface_encode(hl->surf[idx].gen, idx));
+    return 1;
+}
+
+static int l_surface_destroy(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_surface_t *s = hl_surf_resolve_drawable(hl, (uint32_t)luaL_checkinteger(L, 1)); /* #207 */
+    if (s && !s->is_screen) {
+        free(s->pixels);
+        s->pixels = NULL;
+        s->in_use = false;
+        s->gen++;
+    }
+    return 0;
+}
+
+static int l_surface_clear(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_draw_target_t t;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &t)) {
+        blyt_raster_clear(t.pixels, t.w, t.w, t.h, (uint8_t)luaL_checkinteger(L, 2));
+        if (t.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_surface_pixel(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_draw_target_t t;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &t)) {
+        blyt_raster_pixel(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
+                          (int)luaL_checkinteger(L, 3), (uint8_t)luaL_checkinteger(L, 4));
+        if (t.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_surface_rect_fill(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_draw_target_t t;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &t)) {
+        blyt_raster_rect_fill(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
+                              (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                              (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (t.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_surface_line(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_draw_target_t t;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &t)) {
+        blyt_raster_line(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                         (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (t.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_surface_blit(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    /* Reject if either endpoint is unresolvable or locked (#207). */
+    hl_draw_target_t d, s;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &d) &&
+        hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 2), &s)) {
+        blyt_raster_blit(d.pixels, d.w, d.w, d.h, s.pixels, s.w, s.w, s.h,
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4));
+        if (d.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+
+/* Tier-2 per-pixel lock (#208).  acquire() materialises a direct pointer to the
+ * surface's canonical buffer and marks it locked; per-pixel get/set then touch
+ * host memory with no crossing.  The per-frame epoch (hl->lock_epoch) is the
+ * staleness guard.  An OOB get/set is a defined no-op (the determinism-bearing
+ * behaviour, uniform across legs; the debug hard-error is not wired on the fast
+ * path, exactly as on the WASM leg). */
+typedef struct {
+    uint8_t *pixels;
+    int32_t w, h;
+    uint32_t handle; /* surface handle (release re-resolve) */
+    uint32_t epoch; /* hl->lock_epoch captured at acquire */
+    bool released;
+    bool is_screen; /* writes flip hl->drawn */
+} hl_lock_t;
+
+static int l_surface_acquire(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    uint32_t h = (uint32_t)luaL_checkinteger(L, 1);
+    hl_surface_t *s = hl_surf_resolve(hl, h);
+    if (!s || s->locked) {
+        lua_pushnil(L);
+        return 1;
+    }
+    s->locked = true;
+    hl_lock_t *u = (hl_lock_t *)lua_newuserdatauv(L, sizeof(*u), 0);
+    u->pixels = s->pixels;
+    u->w = s->w;
+    u->h = s->h;
+    u->handle = h;
+    u->epoch = hl->lock_epoch;
+    u->released = false;
+    u->is_screen = s->is_screen;
+    luaL_setmetatable(L, HL_LOCK_MT);
+    return 1;
+}
+
+static hl_lock_t *hl_lock_live(lua_State *L, int idx) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = (hl_lock_t *)luaL_checkudata(L, idx, HL_LOCK_MT);
+    if (u->released || u->epoch != hl->lock_epoch)
+        return NULL;
+    return u;
+}
+
+static int l_lock_get(lua_State *L) {
+    hl_lock_t *u = hl_lock_live(L, 1);
+    int32_t x = (int32_t)luaL_checkinteger(L, 2);
+    int32_t y = (int32_t)luaL_checkinteger(L, 3);
+    if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    lua_pushinteger(L, (lua_Integer)u->pixels[(uint32_t)y * (uint32_t)u->w + (uint32_t)x]);
+    return 1;
+}
+static int l_lock_set(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    int32_t x = (int32_t)luaL_checkinteger(L, 2);
+    int32_t y = (int32_t)luaL_checkinteger(L, 3);
+    uint8_t c = (uint8_t)luaL_checkinteger(L, 4);
+    if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h)
+        return 0;
+    u->pixels[(uint32_t)y * (uint32_t)u->w + (uint32_t)x] = c;
+    if (u->is_screen)
+        hl->drawn = true;
+    return 0;
+}
+static int l_lock_clear(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    if (u) {
+        blyt_raster_clear(u->pixels, u->w, u->w, u->h, (uint8_t)luaL_checkinteger(L, 2));
+        if (u->is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_lock_rect_fill(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    if (u) {
+        blyt_raster_rect_fill(u->pixels, u->w, u->w, u->h, (int)luaL_checkinteger(L, 2),
+                              (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                              (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (u->is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_lock_line(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    if (u) {
+        blyt_raster_line(u->pixels, u->w, u->w, u->h, (int)luaL_checkinteger(L, 2),
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                         (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (u->is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_lock_release(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = (hl_lock_t *)luaL_checkudata(L, 1, HL_LOCK_MT);
+    if (!u->released && u->epoch == hl->lock_epoch) {
+        hl_surface_t *s = hl_surf_resolve(hl, u->handle);
+        if (s)
+            s->locked = false;
+    }
+    u->released = true;
+    return 0;
+}
+
+static void register_surface_lock_mt(lua_State *L) {
+    luaL_newmetatable(L, HL_LOCK_MT);
+    lua_newtable(L); /* __index */
+    static const luaL_Reg lock_methods[] = {
+        {"get", l_lock_get},
+        {"set", l_lock_set},
+        {"clear", l_lock_clear},
+        {"rect_fill", l_lock_rect_fill},
+        {"line", l_lock_line},
+        {"release", l_lock_release},
+        {NULL, NULL},
+    };
+    luaL_setfuncs(L, lock_methods, 0);
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop mt */
+}
+
+/* Register blyt32.surface.* onto the existing blyt32 global + the lock
+ * metatable.  Mirrors the WASM leg's surface registration (session-less half). */
+static void register_surface_api(lua_State *L) {
+    lua_getglobal(L, "blyt32");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_newtable(L); /* blyt32.surface */
+    static const struct {
+        const char *name;
+        lua_CFunction fn;
+    } surface_fns[] = {
+        {"create", l_surface_create},
+        {"destroy", l_surface_destroy},
+        {"clear", l_surface_clear},
+        {"pixel", l_surface_pixel},
+        {"rect_fill", l_surface_rect_fill},
+        {"line", l_surface_line},
+        {"blit", l_surface_blit},
+        {"acquire", l_surface_acquire},
+        {NULL, NULL},
+    };
+    for (int i = 0; surface_fns[i].name; i++) {
+        lua_pushcfunction(L, surface_fns[i].fn);
+        lua_setfield(L, -2, surface_fns[i].name);
+    }
+    lua_pushinteger(L, (lua_Integer)BLYT_SCREEN); /* blyt32.surface.SCREEN */
+    lua_setfield(L, -2, "SCREEN");
+    lua_setfield(L, -2, "surface"); /* blyt32.surface = surface */
+    lua_pop(L, 1); /* pop blyt32 */
+
+    register_surface_lock_mt(L);
+}
+
 /* Call a global lifecycle function `name` if it is defined.  Returns 0 when the
  * callback ran cleanly (or is undefined) and -1 when it raised a Lua error (the
  * message is logged). */
@@ -622,6 +1185,8 @@ static int build_vm(blyt_hostlua_t *hl) {
 
     open_libs(hl->L);
     register_blyt_api(hl->L);
+    register_gfx_api(hl->L); /* blyt32.gfx.* (#231) */
+    register_surface_api(hl->L); /* blyt32.surface.* + lock mt (#231) */
 
     /* State API + S proxy (before bytecode/init so on_new_state can alloc slots).
      * The ctx itself is initialised once in create() and persists across rebuilds
@@ -665,6 +1230,7 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     hl->cart = cart;
     hl->bytecode = (const unsigned char *)bytecode;
     hl->bytecode_size = lua_size;
+    hl_palette_ensure_default(hl); /* aurora until a cart palette_set (#231) */
 
     /* State buffers: a pure-Lua cart with .cart.layouts gets a standalone ctx
      * (no session/emulator).  Initialised once here; the VM built below registers
@@ -777,11 +1343,28 @@ blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
         return BLYT_RUN_OK;
     }
 
+    /* Frame entry (mirrors blyt_session_run_frame): bump the tier-2 lock epoch so
+     * any lock from the previous frame is now stale, and reap the previous
+     * frame's draw-scoped off-screen surfaces. */
+    hl->lock_epoch++;
+    hl_surf_reap(hl);
+
     if (call_lifecycle(hl, "update") != 0 || call_lifecycle(hl, "draw") != 0) {
         hl->done = true;
         return BLYT_RUN_ERR_ABORT;
     }
+    hl_frame_done(hl);
     return BLYT_RUN_FRAME_DONE;
+}
+
+/* Read-only accessors the frontend uses to present the host-Lua framebuffer
+ * (there is no session, so retro_run cannot go through blyt_session_expand_frame
+ * — it expands these directly into its XRGB buffer). */
+const uint8_t *blyt_hostlua_get_pixels(blyt_hostlua_t *hl) {
+    return hl ? hl->fb : NULL;
+}
+const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl) {
+    return hl ? hl->palette : NULL;
 }
 
 void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
@@ -789,6 +1372,10 @@ void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
         return;
     if (hl->L)
         lua_close(hl->L);
+    /* Free any off-screen surface buffers still resident (slot 0 = screen aliases
+     * fb, never freed).  free(NULL) is a no-op for unused slots. */
+    for (uint32_t i = 1; i < HL_SURFACE_MAX; i++)
+        free(hl->surf[i].pixels);
     if (hl->state_ctx) {
         blyt_state_ctx_destroy(hl->state_ctx);
         free(hl->state_ctx);
@@ -833,6 +1420,16 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
 blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
     (void)hl;
     return BLYT_RUN_ERR_EMU;
+}
+
+const uint8_t *blyt_hostlua_get_pixels(blyt_hostlua_t *hl) {
+    (void)hl;
+    return NULL;
+}
+
+const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl) {
+    (void)hl;
+    return NULL;
 }
 
 void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {

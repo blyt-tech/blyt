@@ -15,8 +15,8 @@ use common::gfx;
 use common::{
     CartProject, build_cart, build_lua_cart, dump_frame0_native, dump_frame0_wasm, repo_root,
     require_libretro_core, require_lua_sdk, require_sdk, require_test_session_api, require_wasm,
-    run_cart_libretro_with_env, run_cart_native_with_env, run_cart_wasm_with_env, sdk_dir,
-    test_session_api,
+    run_cart_libretro_with_env, run_cart_native_hostlua_frame_hash, run_cart_native_with_env,
+    run_cart_wasm_with_env, sdk_dir, test_session_api,
 };
 use tempfile::TempDir;
 
@@ -191,6 +191,61 @@ fn palette_set_changes_only_palhash_across_legs() {
         run_cart_native_with_env(cart, &env, ph);
         run_cart_wasm_with_env(cart, &env, ph);
         run_cart_libretro_with_env(cart, &env, ph);
+    }
+}
+
+/// The pure-Lua counterpart of [`palette_set_changes_only_palhash_across_legs`]
+/// (#231): a Lua cart's `blyt32.gfx.palette_set(blyt32.gfx.PALETTE_VGA)` must
+/// change palhash — not the palette-blind fbhash — identically on every leg,
+/// including blytplay's native host-Lua fast path, whose runner owns the palette
+/// directly (there is no session).  The VGA bytes come from the single built-in
+/// resolver, so the palhash matches the emulated legs' declared-VGA golden.
+#[test]
+fn lua_palette_set_changes_only_palhash_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+    require_test_session_api();
+
+    let tmp = TempDir::new().unwrap();
+    let build_lua = |dir: &std::path::Path, draw: &str| -> std::path::PathBuf {
+        CartProject::new()
+            .lua(&format!(
+                "function init() end\n\
+                 function update() blyt.quit() end\n\
+                 function draw()\n{draw}end\n"
+            ))
+            .write(dir);
+        build_cart(dir)
+    };
+    let plain = build_lua(&tmp.path().join("lua_plain"), "  blyt32.gfx.clear(5)\n");
+    let vga = build_lua(
+        &tmp.path().join("lua_vga"),
+        "  blyt32.gfx.palette_set(blyt32.gfx.PALETTE_VGA)\n  blyt32.gfx.clear(5)\n",
+    );
+
+    let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
+    let aurora_ph = gfx::expected_palhash_line(&session_palette(&plain));
+    let vga_ph =
+        gfx::expected_palhash_line(&declared_palette(&tmp.path().join("lua_vga_decl"), "vga"));
+    assert_ne!(
+        aurora_ph, vga_ph,
+        "sanity: aurora and vga must have distinct palette hashes"
+    );
+
+    let env = [("BLYT_FRAME_HASH", "1")];
+    for (cart, ph) in [(&plain, &aurora_ph), (&vga, &vga_ph)] {
+        // fbhash is palette-blind — identical on all four legs.
+        run_cart_native_with_env(cart, &env, &fb);
+        run_cart_wasm_with_env(cart, &env, &fb);
+        run_cart_libretro_with_env(cart, &env, &fb);
+        run_cart_native_hostlua_frame_hash(cart, &fb);
+        // palhash tracks the active palette on all four legs.
+        run_cart_native_with_env(cart, &env, ph);
+        run_cart_wasm_with_env(cart, &env, ph);
+        run_cart_libretro_with_env(cart, &env, ph);
+        run_cart_native_hostlua_frame_hash(cart, ph);
     }
 }
 

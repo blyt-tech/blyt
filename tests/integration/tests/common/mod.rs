@@ -1148,6 +1148,21 @@ pub fn run_cart_native_with_env(
     );
 }
 
+/// Run a pure-Lua gfx/surface cart on blytplay's native host-Lua fast path
+/// (#231, opt-in `BLYT_HOSTLUA=1`) with framebuffer hashing on, and assert
+/// `expected` (a `[blyt:fbhash]` line) appears in stdout — the fourth leg for
+/// gfx/surface parity carts, alongside emulated-native / wasm / libretro. Unlike
+/// [`run_cart_native_hostlua`] (the minimal Spike Z determinism binary), this
+/// drives the full runtime through blytplay, so the runner's own framebuffer +
+/// surface pool are exercised end to end.
+pub fn run_cart_native_hostlua_frame_hash(cart: &std::path::Path, expected: &str) {
+    run_cart_native_with_env(
+        cart,
+        &[("BLYT_FRAME_HASH", "1"), ("BLYT_HOSTLUA", "1")],
+        expected,
+    );
+}
+
 /// Run a cart on the native host-Lua determinism leg (Spike Z, #225); assert
 /// `expected` appears in stdout. The cart must be pure Lua (the leg reads its
 /// `.cart.lua` bytecode section) and must terminate itself via `blyt.quit()`.

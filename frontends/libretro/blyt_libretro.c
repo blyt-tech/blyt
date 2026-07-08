@@ -318,8 +318,19 @@ RETRO_API void retro_run(void) {
                     g_log_cb(RETRO_LOG_ERROR, "blyt: host-Lua cart aborted\n");
             }
         }
-        /* No framebuffer yet on the host-Lua path (gfx = #231); nothing to
-         * present.  The video callback stays quiet until surfaces land. */
+        /* Present the host-Lua framebuffer (#231).  There is no session, so the
+         * runner owns the paletted back buffer + palette; expand them directly
+         * into g_xrgb (the host-Lua counterpart of blyt_session_expand_frame). */
+        if (g_video_cb) {
+            const uint8_t *px = blyt_hostlua_get_pixels(g_hostlua);
+            const uint32_t *pal = blyt_hostlua_get_palette(g_hostlua);
+            if (px && pal) {
+                for (int i = 0; i < BLYT_FRAME_W * BLYT_FRAME_H; i++)
+                    g_xrgb[i] = pal[px[i]];
+                g_video_cb(g_xrgb, BLYT_FRAME_W, BLYT_FRAME_H,
+                           BLYT_FRAME_W * (uint32_t)sizeof(uint32_t));
+            }
+        }
         return;
     }
 
