@@ -492,6 +492,10 @@ fn lua_custom_palette_set_across_legs() {
     run_cart_native_with_env(&cart, &env, &custom_ph);
     run_cart_wasm_with_env(&cart, &env, &custom_ph);
     run_cart_libretro_with_env(&cart, &env, &custom_ph);
+    // Native host-Lua fast path (#231): R.MAIN resolves against the runner's own
+    // resource table (no session) → hl_resolve_palette → the custom palhash.
+    run_cart_native_hostlua_frame_hash(&cart, &fb);
+    run_cart_native_hostlua_frame_hash(&cart, &custom_ph);
 }
 
 // ── #219 pure-Lua declared-default palette on the WASM host-Lua fast path ──
@@ -538,6 +542,10 @@ fn lua_declared_builtin_default_across_legs() {
     run_cart_native_with_env(&cart, &env, &vga_ph);
     run_cart_wasm_with_env(&cart, &env, &vga_ph);
     run_cart_libretro_with_env(&cart, &env, &vga_ph);
+    // Native host-Lua fast path (#231): declared built-in default seeded into the
+    // runner's palette (hl_palette_ensure_default), no palette_set.
+    run_cart_native_hostlua_frame_hash(&cart, &fb);
+    run_cart_native_hostlua_frame_hash(&cart, &vga_ph);
 }
 
 /// The custom-palette counterpart: a pure-Lua cart declaring a `.hex` **asset**
@@ -573,6 +581,10 @@ fn lua_declared_custom_default_across_legs() {
     run_cart_native_with_env(&cart, &env, &custom_ph);
     run_cart_wasm_with_env(&cart, &env, &custom_ph);
     run_cart_libretro_with_env(&cart, &env, &custom_ph);
+    // Native host-Lua fast path (#231): declared PROV_CART default resolved at
+    // load time against the runner's resource table (hl_palette_ensure_default).
+    run_cart_native_hostlua_frame_hash(&cart, &fb);
+    run_cart_native_hostlua_frame_hash(&cart, &custom_ph);
 }
 
 // ── #221 remaining custom-palette parity cells (hybrid + custom on the fast

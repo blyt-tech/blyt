@@ -192,7 +192,18 @@ void *blyt_resource_bytes_get(blyt_bytes_resource_t id, size_t *len);
  *   game logic on:
  *     - budget_cap (always 16 MB)
  *     - the *outcome* of an allocation: a blyt_resource_load / malloc returning
- *       BLYT_RESOURCE_INVALID / NULL at the cap (see ADR-0008 / #158).
+ *       BLYT_RESOURCE_INVALID / NULL at the cap (see ADR-0008 / #158).  What is
+ *       guaranteed is that allocation FAILS at the 16 MB cap — a cart can never
+ *       exceed the budget.  The exact *count* of allocations that fit before
+ *       exhaustion is NOT bit-identical for workloads dominated by many tiny
+ *       objects: on a 64-bit host (the native host-Lua fast path, ADR-0136) Lua
+ *       objects carry wider pointers than on the 32-bit guest, so
+ *       cart_allocations (itself advisory, below) reaches the cap a few percent
+ *       sooner.  For realistic workloads — a handful of large buffers / resource
+ *       pins — the fail-point coincides exactly across every leg; only a cart
+ *       that allocates tiny objects to exhaustion and branches on the precise
+ *       count would see a difference, which it must not do (ADR-0008 amendment,
+ *       #231).
  *
  *   Advisory — history-dependent (LRU/eviction order differs across platforms),
  *   MUST NOT feed deterministic game state.  They are a *tuning* signal for

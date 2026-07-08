@@ -38,10 +38,14 @@
 #include "lua.h"
 #include "lualib.h"
 
+#include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
 #include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
 #include "blyt_handle.h" /* runtime/shared: console-wide handle encoding (ADR-0134) */
+#include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
 #include "blyt_raster.h" /* runtime/shared: integer rasterizer core (#188) */
+#include "blyt_resource_codec.h" /* runtime/shared: BLYT_RES_ALGO_NONE (#157) */
+#include "resource.h" /* blyt_resource_table_t + lifecycle (#93/#158) */
 #include "save.h" /* blyt_save_write / blyt_save_read */
 #include "state_buffer.h" /* blyt_state_ctx_t + typed accessors */
 #include "testcard.h" /* PM5544 testcard (drawn until the cart draws, #204) */
@@ -93,6 +97,20 @@ struct blyt_hostlua {
     hl_surface_t surf[HL_SURFACE_MAX];
     bool surf_init;
     uint32_t lock_epoch;
+    /* Cart heap (#158, #231-measurement): the Lua VM allocates through the shared
+     * 16 MB arena instead of the default realloc allocator, so guest_heap_used is
+     * accounted + capped identically to the emulated/native libblytc arena.  NB
+     * on a 64-bit host Lua objects are larger than rv32 (8-byte pointers), so the
+     * accounted bytes are host-sized here — see the measurement in mem_budget.rs
+     * for how far the fail-point diverges from rv32. */
+    blyt_mem_accounting_t mem_acct;
+    blyt_arena_t arena;
+    /* Resource table (#93/#158/#231): a pure-Lua cart has no session, so its
+     * blyt.resource.* table lives in the runner (the session-less mirror of the
+     * WASM leg's g_lua_resources).  non_evictable_footprint in mem_acct above is
+     * published from it, feeding the same unified 16 MB budget predicate. */
+    blyt_resource_table_t resources;
+    bool resources_loaded;
 };
 
 /* The runner is stashed in the lua_State's extra space so the C API callbacks
@@ -100,6 +118,30 @@ struct blyt_hostlua {
  * the WASM leg's g_lua — a native player could in principle host more than one). */
 static blyt_hostlua_t *hl_from(lua_State *L) {
     return *(blyt_hostlua_t **)lua_getextraspace(L);
+}
+
+/* lua_Alloc backed by the shared 16 MB arena (#158) — the SAME arena impl the
+ * emulated/native libblytc runs, so guest_heap_used is accounted and the 16 MB
+ * cap enforced through one allocator.  Mirrors the WASM leg's wasm_lua_alloc; the
+ * region is lazily malloc'd on first allocation.  On the WASM leg this makes the
+ * count byte-match rv32 (wasm32 == rv32 object sizes); on this 64-bit host the
+ * objects are larger, which is exactly what the mem_budget measurement gauges. */
+static void *hl_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    (void)osize;
+    blyt_hostlua_t *hl = (blyt_hostlua_t *)ud;
+    if (!hl->arena.base) {
+        void *region = malloc(BLYT_MEM_BUDGET_BYTES);
+        if (!region)
+            return NULL;
+        hl->arena.base = region;
+        hl->arena.size = BLYT_MEM_BUDGET_BYTES;
+        hl->arena.acct = &hl->mem_acct;
+    }
+    if (nsize == 0) {
+        blyt_arena_free(&hl->arena, ptr);
+        return NULL;
+    }
+    return blyt_arena_realloc(&hl->arena, ptr, nsize);
 }
 
 /* blyt.debug.print(s) / blyt32.debug.print(s): the cart's cross-leg output
@@ -140,9 +182,36 @@ static int l_require(lua_State *L) {
                       name);
 }
 
+/* Derive a require()-able module name from a loaded chunk's embedded source
+ * (basename minus ".lua"); the chunk function must be on the stack top and is
+ * left untouched.  Mirrors chunk_module_name in libblyt32lua / the WASM leg. */
+static void hl_chunk_module_name(lua_State *L, char *out, size_t outsz) {
+    out[0] = '\0';
+    lua_Debug ar;
+    lua_pushvalue(L, -1);
+    if (lua_getinfo(L, ">S", &ar) && ar.source) {
+        const char *src = ar.source;
+        if (*src == '@' || *src == '=')
+            src++;
+        const char *base = src;
+        for (const char *p = src; *p; p++)
+            if (*p == '/' || *p == '\\')
+                base = p + 1;
+        size_t len = strlen(base);
+        if (len > 4 && strcmp(base + len - 4, ".lua") == 0)
+            len -= 4;
+        if (len >= outsz)
+            len = outsz - 1;
+        memcpy(out, base, len);
+        out[len] = '\0';
+    }
+}
+
 /* Load the cart's .cart.lua: a single raw bytecode chunk, or the BLMC
- * multi-chunk container (issue #54).  Byte-for-byte the WASM leg's loader.
- * Returns 0 on success; on failure leaves an error string on the stack top. */
+ * multi-chunk container (issue #54).  A chunk returning a non-nil table is
+ * registered as a require()-able module (cart_resources, ADR-0040), keyed by
+ * source basename — byte-for-byte the WASM leg's loader.  Returns 0 on success;
+ * on failure leaves an error string on the stack top. */
 static int load_lua_bytecode(lua_State *L, const unsigned char *data, size_t size) {
     if (size >= 8 && data[0] == 'B' && data[1] == 'L' && data[2] == 'M' && data[3] == 'C') {
         unsigned int nchunks = (unsigned int)data[4] | ((unsigned int)data[5] << 8) |
@@ -164,8 +233,17 @@ static int load_lua_bytecode(lua_State *L, const unsigned char *data, size_t siz
             }
             if (luaL_loadbuffer(L, (const char *)data, csz, "@chunk") != LUA_OK)
                 return 1;
-            if (lua_pcall(L, 0, 0, 0) != LUA_OK)
+            char modname[64];
+            hl_chunk_module_name(L, modname, sizeof(modname));
+            if (lua_pcall(L, 0, 1, 0) != LUA_OK)
                 return 1;
+            if (modname[0] != '\0' && !lua_isnil(L, -1)) {
+                luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+                lua_pushvalue(L, -2);
+                lua_setfield(L, -2, modname);
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1); /* chunk return value */
             data += csz;
             size -= csz;
         }
@@ -610,6 +688,22 @@ static void register_s_proxy(lua_State *L, blyt_state_ctx_t *ctx) {
     free(buf);
 }
 
+/* Typed resource-constant userdata (ADR-0068/0134, #166/#214): typed-ness is the
+ * metatable.  Declared up here so the gfx palette_set (below) can accept a palette
+ * constant (R.<NAME>); the accessors/registration live in the resource section. */
+#define HL_RESOURCE_TEXT_CONST_MT "blyt.resource.text_const"
+#define HL_RESOURCE_BYTES_CONST_MT "blyt.resource.bytes_const"
+#define HL_RESOURCE_PALETTE_CONST_MT "blyt.resource.palette_const"
+
+typedef struct {
+    uint32_t id; /* the baked console-wide constant (ADR-0134) */
+    int is_text;
+} hl_resource_const_t;
+
+/* Resolve a palette handle to 256-entry XRGB8888 bytes (built-in or cart asset);
+ * defined in the resource section. */
+static const uint8_t *hl_resolve_palette(blyt_hostlua_t *hl, uint32_t handle);
+
 /* ── Gfx fast path (#188 / Spike X, #231) ────────────────────────────────────
  *
  * blyt32.gfx.* rasterize into the runner's own paletted framebuffer via the
@@ -629,12 +723,17 @@ static void register_s_proxy(lua_State *L, blyt_state_ctx_t *ctx) {
  * against the same palette on every leg. */
 static void hl_palette_ensure_default(blyt_hostlua_t *hl) {
     uint32_t handle = blyt_cart_default_palette(hl->cart);
-    const uint32_t *pal = handle ? blyt_builtin_palette(handle) : NULL;
+    if (handle == 0)
+        handle = BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
+    const uint8_t *pal = hl_resolve_palette(hl, handle); /* built-in OR cart asset (#214) */
     if (!pal)
-        pal = blyt_builtin_palette(
+        pal = (const uint8_t *)blyt_builtin_palette(
             BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    /* Explicit little-endian decode: cart-resource bytes may be unaligned, and an
+     * explicit LE reconstruction stays bit-identical to every other leg. */
     for (int i = 0; i < 256; i++)
-        hl->palette[i] = pal[i];
+        hl->palette[i] = (uint32_t)pal[i * 4] | ((uint32_t)pal[i * 4 + 1] << 8) |
+                         ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
 }
 
 static int l_gfx_clear(lua_State *L) {
@@ -670,18 +769,20 @@ static int l_gfx_line(lua_State *L) {
     return 0;
 }
 
-/* blyt32.gfx.palette_set(handle) (#201): load a BUILT-IN palette into the active
- * palette.  A cart-asset palette (kind RESOURCE / cart provenance) needs the
- * resource table, which is deferred to #231's heap half; such a handle is
- * unresolvable here and leaves the palette unchanged — the SAME defined outcome
- * as the WASM leg's lua_resolve_palette returning NULL. */
+/* blyt32.gfx.palette_set(handle|R.<NAME>) (#201/#214): load a built-in OR a
+ * cart-asset palette into the active palette.  Accepts an integer built-in handle
+ * or a palette-constant userdata; a no-op on a handle that does not resolve to a
+ * 256-entry palette (the SAME defined outcome as the WASM leg). */
 static int l_gfx_palette_set(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
-    uint32_t handle = (uint32_t)luaL_checkinteger(L, 1);
-    const uint32_t *pal = blyt_builtin_palette(handle);
+    hl_resource_const_t *c =
+        (hl_resource_const_t *)luaL_testudata(L, 1, HL_RESOURCE_PALETTE_CONST_MT);
+    uint32_t handle = c ? c->id : (uint32_t)luaL_checkinteger(L, 1);
+    const uint8_t *pal = hl_resolve_palette(hl, handle);
     if (pal) {
         for (int i = 0; i < 256; i++)
-            hl->palette[i] = pal[i];
+            hl->palette[i] = (uint32_t)pal[i * 4] | ((uint32_t)pal[i * 4 + 1] << 8) |
+                             ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
     }
     return 0;
 }
@@ -1138,6 +1239,307 @@ static void register_surface_api(lua_State *L) {
     register_surface_lock_mt(L);
 }
 
+/* ── Resource table + mem.stats (#93/#158/#159, #231) ────────────────────────
+ *
+ * The session-less half of the WASM leg's blyt.resource.* / blyt32.mem.stats
+ * bindings.  A pure-Lua cart reads the runner's own resource table directly (no
+ * ECALL, no session); the pin/refcount/footprint semantics replicate the rv32
+ * RESOURCE_* ECALL handlers in cart_run.c, so the host-Lua path is behaviourally
+ * identical to every emulated leg.  Footprint is published into mem_acct's
+ * non_evictable_footprint, feeding the SAME unified budget predicate the cart
+ * heap uses. */
+
+static blyt_resource_table_t *hl_active_resources(blyt_hostlua_t *hl) {
+    return hl->resources_loaded ? &hl->resources : NULL;
+}
+
+/* Republish the non-evictable footprint from the table and bound the resident
+ * evictable cache to the room it leaves — the host-Lua mirror of the host
+ * mem_acct_publish_footprint (#158).  Call after any pin/unpin. */
+static void hl_publish_footprint(blyt_hostlua_t *hl, blyt_resource_table_t *t) {
+    if (!t)
+        return;
+    uint32_t footprint = blyt_resource_table_footprint(t);
+    hl->mem_acct.non_evictable_footprint = footprint;
+    blyt_resource_table_evict_to_fit(t,
+                                     blyt_mem_cache_room(hl->mem_acct.guest_heap_used, footprint));
+}
+
+/* Would newly pinning `e` (adding e->len to the footprint when it is so far
+ * evictable) still fit the unified budget?  Mirrors mem_acct_reference_fits. */
+static int hl_reference_fits(blyt_hostlua_t *hl, blyt_resource_table_t *t,
+                             const blyt_resource_entry_t *e, int was_evictable) {
+    uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
+    return blyt_mem_alloc_fits(hl->mem_acct.guest_heap_used, blyt_resource_table_footprint(t),
+                               incoming);
+}
+
+/* Resolve a baked resource constant to its table entry (ADR-0134): a cart-bundled
+ * RESOURCE only.  NULL for a non-resource kind, runtime provenance, or absent id. */
+static blyt_resource_entry_t *hl_resolve(blyt_resource_table_t *t, uint32_t handle) {
+    if (!t || !blyt_handle_is_resource(handle) ||
+        blyt_resource_decode_provenance(handle) != BLYT_RESOURCE_PROV_CART)
+        return NULL;
+    return blyt_resource_table_find_mut(t, blyt_resource_decode_id(handle));
+}
+
+/* Pin exactly as the rv32 RESOURCE_PIN handler does: budget-gate, materialize,
+ * bump pin, touch for LRU, republish footprint.  *out = resident bytes (NULL/0
+ * is a valid success), false on absent / over budget / decode failure. */
+static bool hl_pin_entry(blyt_hostlua_t *hl, blyt_resource_table_t *t, blyt_resource_entry_t *e,
+                         const uint8_t **out) {
+    *out = NULL;
+    if (!e || !hl_reference_fits(hl, t, e, blyt_rl_is_evictable(&e->rl)))
+        return false;
+    const uint8_t *bytes = blyt_resource_entry_data(e);
+    if (!bytes && e->len)
+        return false; /* decode failed */
+    blyt_rl_pin(&e->rl);
+    blyt_resource_table_touch(t, e); /* recency for LRU (#158) */
+    hl_publish_footprint(hl, t); /* footprint grew; bound cache */
+    *out = bytes;
+    return true;
+}
+
+static void hl_unpin_entry(blyt_hostlua_t *hl, blyt_resource_table_t *t, blyt_resource_entry_t *e) {
+    blyt_rl_unpin(&e->rl);
+    hl_publish_footprint(hl, t); /* footprint may have shrunk (#158) */
+}
+
+/* Resolve a palette handle to its 256-entry XRGB8888 bytes (#201/#214): RUNTIME
+ * -> built-in table; CART -> the resource table (must hold exactly 1024 bytes). */
+static const uint8_t *hl_resolve_palette(blyt_hostlua_t *hl, uint32_t handle) {
+    if (blyt_resource_decode_provenance(handle) == BLYT_RESOURCE_PROV_RUNTIME)
+        return (const uint8_t *)blyt_builtin_palette(handle);
+    blyt_resource_entry_t *e = hl_resolve(hl_active_resources(hl), handle);
+    if (!e || e->len != 256u * sizeof(uint32_t))
+        return NULL;
+    return blyt_resource_entry_data(e);
+}
+
+static hl_resource_const_t *hl_opt_const(lua_State *L, int idx) {
+    void *p = luaL_testudata(L, idx, HL_RESOURCE_TEXT_CONST_MT);
+    if (!p)
+        p = luaL_testudata(L, idx, HL_RESOURCE_BYTES_CONST_MT);
+    if (!p)
+        p = luaL_testudata(L, idx, HL_RESOURCE_PALETTE_CONST_MT);
+    return (hl_resource_const_t *)p;
+}
+
+static int l_res_text_resource(lua_State *L) {
+    hl_resource_const_t *c = (hl_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = (uint32_t)luaL_checkinteger(L, 1);
+    c->is_text = 1;
+    luaL_setmetatable(L, HL_RESOURCE_TEXT_CONST_MT);
+    return 1;
+}
+static int l_res_bytes_resource(lua_State *L) {
+    hl_resource_const_t *c = (hl_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = (uint32_t)luaL_checkinteger(L, 1);
+    c->is_text = 0;
+    luaL_setmetatable(L, HL_RESOURCE_BYTES_CONST_MT);
+    return 1;
+}
+static int l_res_palette_resource(lua_State *L) {
+    hl_resource_const_t *c = (hl_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = (uint32_t)luaL_checkinteger(L, 1);
+    c->is_text = 0;
+    luaL_setmetatable(L, HL_RESOURCE_PALETTE_CONST_MT);
+    return 1;
+}
+static int l_res_palette_tostring(lua_State *L) {
+    hl_resource_const_t *c = luaL_checkudata(L, 1, HL_RESOURCE_PALETTE_CONST_MT);
+    lua_pushfstring(L, "palette<%d>", (int)c->id);
+    return 1;
+}
+static int l_res_const_id(lua_State *L) {
+    hl_resource_const_t *c = hl_opt_const(L, 1);
+    luaL_argcheck(L, c != NULL, 1, "resource constant expected");
+    lua_pushinteger(L, (lua_Integer)c->id);
+    return 1;
+}
+static int l_res_const_eq(lua_State *L) {
+    hl_resource_const_t *a = hl_opt_const(L, 1);
+    hl_resource_const_t *b = hl_opt_const(L, 2);
+    lua_pushboolean(L, a && b && a->id == b->id && a->is_text == b->is_text);
+    return 1;
+}
+static int l_res_const_tostring(lua_State *L) {
+    hl_resource_const_t *c = hl_opt_const(L, 1);
+    luaL_argcheck(L, c != NULL, 1, "resource constant expected");
+    lua_pushfstring(L, c->is_text ? "text_resource<%d>" : "bytes_resource<%d>", (int)c->id);
+    return 1;
+}
+/* text constant :text() — owned copy, trailing storage NUL stripped (#166). */
+static int l_res_const_text(lua_State *L) {
+    hl_resource_const_t *c = luaL_checkudata(L, 1, HL_RESOURCE_TEXT_CONST_MT);
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    blyt_resource_entry_t *e = hl_resolve(t, c->id);
+    const uint8_t *bytes = NULL;
+    if (!hl_pin_entry(hl, t, e, &bytes)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    size_t content = (e->len >= 1 && bytes[e->len - 1] == '\0') ? e->len - 1 : e->len;
+    lua_pushlstring(L, (const char *)bytes, content);
+    hl_unpin_entry(hl, t, e);
+    return 1;
+}
+/* bytes constant :bytes() — owned copy of the exact bytes, verbatim (#162). */
+static int l_res_const_bytes(lua_State *L) {
+    hl_resource_const_t *c = luaL_checkudata(L, 1, HL_RESOURCE_BYTES_CONST_MT);
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    blyt_resource_entry_t *e = hl_resolve(t, c->id);
+    const uint8_t *bytes = NULL;
+    if (!hl_pin_entry(hl, t, e, &bytes)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, (const char *)bytes, e->len);
+    hl_unpin_entry(hl, t, e);
+    return 1;
+}
+/* Module-level pin/unpin: kind-agnostic raw escape hatch, takes the constant. */
+static int l_res_pin(lua_State *L) {
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    blyt_resource_entry_t *e = hl_resolve(t, id);
+    const uint8_t *bytes = NULL;
+    if (!hl_pin_entry(hl, t, e, &bytes)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlightuserdata(L, (void *)(uintptr_t)bytes);
+    lua_pushinteger(L, (lua_Integer)e->len);
+    return 2;
+}
+static int l_res_unpin(lua_State *L) {
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    blyt_resource_entry_t *e = hl_resolve(t, id);
+    if (e)
+        hl_unpin_entry(hl, t, e);
+    return 0;
+}
+
+static void hl_register_const_mt(lua_State *L, const char *mt_name, lua_CFunction accessor,
+                                 const char *accessor_name) {
+    luaL_newmetatable(L, mt_name);
+    lua_pushcfunction(L, l_res_const_eq);
+    lua_setfield(L, -2, "__eq");
+    lua_pushcfunction(L, l_res_const_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_newtable(L);
+    lua_pushcfunction(L, accessor);
+    lua_setfield(L, -2, accessor_name);
+    lua_pushcfunction(L, l_res_const_id);
+    lua_setfield(L, -2, "id");
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1); /* pop mt */
+}
+
+/* Register blyt.resource.* + blyt32.resource.* — mirror of the guest
+ * register_resource_module / the WASM leg.  Call after blyt/blyt32 exist. */
+static void register_resource_api(lua_State *L) {
+    hl_register_const_mt(L, HL_RESOURCE_TEXT_CONST_MT, l_res_const_text, "text");
+    hl_register_const_mt(L, HL_RESOURCE_BYTES_CONST_MT, l_res_const_bytes, "bytes");
+
+    luaL_newmetatable(L, HL_RESOURCE_PALETTE_CONST_MT); /* :id()/__eq shared, no bytes (#214) */
+    lua_pushcfunction(L, l_res_const_eq);
+    lua_setfield(L, -2, "__eq");
+    lua_pushcfunction(L, l_res_palette_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_newtable(L);
+    lua_pushcfunction(L, l_res_const_id);
+    lua_setfield(L, -2, "id");
+    lua_setfield(L, -2, "__index");
+    lua_pop(L, 1);
+
+    lua_newtable(L); /* resource module */
+    lua_pushcfunction(L, l_res_text_resource);
+    lua_setfield(L, -2, "text_resource");
+    lua_pushcfunction(L, l_res_bytes_resource);
+    lua_setfield(L, -2, "bytes_resource");
+    lua_pushcfunction(L, l_res_palette_resource);
+    lua_setfield(L, -2, "palette");
+    lua_pushcfunction(L, l_res_pin);
+    lua_setfield(L, -2, "pin");
+    lua_pushcfunction(L, l_res_unpin);
+    lua_setfield(L, -2, "unpin");
+
+    lua_getglobal(L, "blyt");
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, "resource");
+    lua_pop(L, 1);
+    lua_getglobal(L, "blyt32");
+    if (lua_istable(L, -1)) {
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, "resource");
+    }
+    lua_pop(L, 1);
+    lua_pop(L, 1); /* pop resource module */
+}
+
+/* blyt32.mem.stats() (ADR-0029, #159): reads the accounting block + resource
+ * table directly (no ECALL).  Byte-for-byte behaviourally the WASM/guest path;
+ * see the determinism-vs-advisory contract on blyt_mem_stats in blyt.h. */
+static int l_mem_stats(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    uint32_t cache_used = t ? blyt_resource_table_resident_decompressed(t) : 0u;
+    uint32_t heap_used = hl->mem_acct.guest_heap_used;
+
+    lua_createtable(L, 0, 5);
+    lua_pushinteger(L, (lua_Integer)cache_used);
+    lua_setfield(L, -2, "resource_cache_used");
+    lua_pushinteger(L, (lua_Integer)heap_used);
+    lua_setfield(L, -2, "cart_allocations");
+    lua_pushinteger(L, (lua_Integer)(heap_used + cache_used));
+    lua_setfield(L, -2, "total_used");
+    lua_pushinteger(L, (lua_Integer)BLYT_MEM_BUDGET_BYTES);
+    lua_setfield(L, -2, "budget_cap");
+
+    lua_newtable(L); /* resources_loaded */
+    uint32_t shown = 0;
+    if (t) {
+        for (size_t i = 0; i < t->count; i++) {
+            const blyt_resource_entry_t *e = &t->entries[i];
+            if (!(e->persistent || e->owned != NULL ||
+                  (e->algo == BLYT_RES_ALGO_NONE && e->last_access > 0)))
+                continue;
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, (lua_Integer)blyt_resource_encode(e->id, BLYT_RESOURCE_PROV_CART));
+            lua_setfield(L, -2, "id");
+            lua_pushinteger(L, (lua_Integer)(uint32_t)e->len);
+            lua_setfield(L, -2, "size");
+            lua_rawseti(L, -2, (lua_Integer)(++shown));
+        }
+    }
+    lua_setfield(L, -2, "resources_loaded");
+    return 1;
+}
+
+static void register_mem_api(lua_State *L) {
+    lua_newtable(L); /* mem module */
+    lua_pushcfunction(L, l_mem_stats);
+    lua_setfield(L, -2, "stats");
+    lua_getglobal(L, "blyt");
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, "mem");
+    lua_pop(L, 1);
+    lua_getglobal(L, "blyt32");
+    if (lua_istable(L, -1)) {
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, "mem");
+    }
+    lua_pop(L, 1);
+    lua_pop(L, 1); /* pop mem module */
+}
+
 /* Call a global lifecycle function `name` if it is defined.  Returns 0 when the
  * callback ran cleanly (or is undefined) and -1 when it raised a Lua error (the
  * message is logged). */
@@ -1176,9 +1578,10 @@ bool blyt_hostlua_available(void) {
  * (mirroring the WASM leg's wasm_lua_rebuild).  Returns 0 on success (hl->L
  * live), -1 on failure (hl->L closed and NULLed, error logged). */
 static int build_vm(blyt_hostlua_t *hl) {
-    /* luaL_newstate uses the seam VM's pinned hash seed (luai_makeseed ==
-     * 0x424C5954) — the SAME VM construction every other leg uses. */
-    hl->L = luaL_newstate();
+    /* lua_newstate with the arena-backed allocator (#158) + the seam VM's pinned
+     * hash seed (luaL_makeseed(NULL) == luai_makeseed override 0x424C5954) — the
+     * SAME seed luaL_newstate uses, kept for determinism (mirrors the WASM leg). */
+    hl->L = lua_newstate(hl_lua_alloc, hl, luaL_makeseed(NULL));
     if (!hl->L)
         return -1;
     *(blyt_hostlua_t **)lua_getextraspace(hl->L) = hl;
@@ -1187,6 +1590,8 @@ static int build_vm(blyt_hostlua_t *hl) {
     register_blyt_api(hl->L);
     register_gfx_api(hl->L); /* blyt32.gfx.* (#231) */
     register_surface_api(hl->L); /* blyt32.surface.* + lock mt (#231) */
+    register_resource_api(hl->L); /* blyt.resource.* + typed consts (#231) */
+    register_mem_api(hl->L); /* blyt32.mem.stats (#231) */
 
     /* State API + S proxy (before bytecode/init so on_new_state can alloc slots).
      * The ctx itself is initialised once in create() and persists across rebuilds
@@ -1230,7 +1635,25 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     hl->cart = cart;
     hl->bytecode = (const unsigned char *)bytecode;
     hl->bytecode_size = lua_size;
-    hl_palette_ensure_default(hl); /* aurora until a cart palette_set (#231) */
+
+    /* Resource table (#93/#158/#231): load the cart's bundled + persistent
+     * resources so blyt.resource.*, mem.stats, and cart-asset palettes resolve
+     * (session-less mirror of the WASM leg).  Must precede the palette seed below,
+     * which may resolve a cart-provenance declared default (#214). */
+    blyt_resource_table_init(&hl->resources);
+    blyt_resource_table_load_for_cart(&hl->resources, cart);
+    blyt_resource_table_load_persistent_from_cart(&hl->resources, cart);
+    if (blyt_resource_table_preload_persistent(&hl->resources) != 0) {
+        if (log_fn)
+            log_fn("blyt-hostlua: persistent resource preload failed");
+        blyt_resource_table_clear(&hl->resources);
+        free(hl);
+        return NULL;
+    }
+    hl->resources_loaded = true;
+    hl_publish_footprint(hl, &hl->resources);
+
+    hl_palette_ensure_default(hl); /* built-in or cart-asset declared default (#214) */
 
     /* State buffers: a pure-Lua cart with .cart.layouts gets a standalone ctx
      * (no session/emulator).  Initialised once here; the VM built below registers
@@ -1298,6 +1721,12 @@ void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
      * wiped — the host-Lua equivalent of zeroing guest BSS). */
     lua_close(hl->L);
     hl->L = NULL;
+    /* Empty the cart heap so the reloaded VM's allocations are bit-identical to a
+     * first load (mirrors the WASM leg's wasm_lua_arena_reset).  lua_close already
+     * frees the old VM's objects through the allocator; this zeroes any residual
+     * accounting so guest_heap_used restarts from 0. */
+    if (hl->arena.base)
+        blyt_arena_reset(&hl->arena);
     if (build_vm(hl) != 0) {
         /* Rebuild failed: the runner is unusable; mark done so run_frame stops. */
         if (snap)
@@ -1376,6 +1805,9 @@ void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
      * fb, never freed).  free(NULL) is a no-op for unused slots. */
     for (uint32_t i = 1; i < HL_SURFACE_MAX; i++)
         free(hl->surf[i].pixels);
+    free(hl->arena.base); /* the 16 MB cart-heap region (#158) */
+    if (hl->resources_loaded)
+        blyt_resource_table_clear(&hl->resources);
     if (hl->state_ctx) {
         blyt_state_ctx_destroy(hl->state_ctx);
         free(hl->state_ctx);

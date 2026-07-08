@@ -474,7 +474,9 @@ add_library(
   runtime/shared/blyt_blys.c
   runtime/shared/blyt_raster.c
   runtime/shared/blyt_frame_hash.c
-  runtime/shared/blyt_palettes.c)
+  runtime/shared/blyt_palettes.c
+  # cart-heap arena for the native host-Lua VM's allocator (#158, #231)
+  runtime/shared/blyt_arena.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
 # same static library is usable in both executables and shared objects.
@@ -595,7 +597,9 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     runtime/shared/blyt_blys.c
     runtime/shared/blyt_raster.c
     runtime/shared/blyt_frame_hash.c
-    runtime/shared/blyt_palettes.c)
+    runtime/shared/blyt_palettes.c
+    # cart-heap arena for the native host-Lua VM's allocator (#158, #231)
+    runtime/shared/blyt_arena.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
   target_include_directories(
