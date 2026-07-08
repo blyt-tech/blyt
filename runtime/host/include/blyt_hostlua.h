@@ -72,6 +72,16 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn);
  */
 blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl);
 
+/*
+ * Run one --reset-every-frame save/clear/restore stress cycle (save-state
+ * determinism testing): flush transient state via on_save_state(), snapshot +
+ * zero the state buffers, rebuild the VM (all Lua globals wiped), re-run init(),
+ * restore the snapshot, and replay on_load_state(HOT_RELOAD).  Mirrors
+ * blyt_reset_every_frame_cycle on the emulated path; a cart's output must be
+ * identical with and without it.  No-op after the cart has quit.
+ */
+void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl);
+
 /* Destroy a runner and free its VM.  NULL-safe. */
 void blyt_hostlua_destroy(blyt_hostlua_t *hl);
 

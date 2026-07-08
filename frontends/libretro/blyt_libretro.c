@@ -434,7 +434,9 @@ blyt_cart_run_err_t blyt_libretro_run_err(void) {
 }
 
 void retro_reset_every_frame_cycle(void) {
-    if (g_session)
+    if (g_hostlua)
+        blyt_hostlua_reset_every_frame_cycle(g_hostlua);
+    else if (g_session)
         blyt_reset_every_frame_cycle(g_session);
 }
 
