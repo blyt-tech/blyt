@@ -41,6 +41,7 @@
 #include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
 #include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
 #include "blyt_handle.h" /* runtime/shared: console-wide handle encoding (ADR-0134) */
+#include "blyt_hostlua_heap.h" /* runtime/shared: rv32 heap-seam handoff (#231) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
 #include "blyt_raster.h" /* runtime/shared: integer rasterizer core (#188) */
@@ -97,12 +98,14 @@ struct blyt_hostlua {
     hl_surface_t surf[HL_SURFACE_MAX];
     bool surf_init;
     uint32_t lock_epoch;
-    /* Cart heap (#158, #231-measurement): the Lua VM allocates through the shared
-     * 16 MB arena instead of the default realloc allocator, so guest_heap_used is
-     * accounted + capped identically to the emulated/native libblytc arena.  NB
-     * on a 64-bit host Lua objects are larger than rv32 (8-byte pointers), so the
-     * accounted bytes are host-sized here — see the measurement in mem_budget.rs
-     * for how far the fail-point diverges from rv32. */
+    /* Cart heap (#158, #231): on this 64-bit host the Lua VM's objects carry
+     * 8-byte pointers, so physical bytes come from plain host malloc (unbounded —
+     * a 16 MB-budget cart may use ~2× host RAM, fine on desktop).  `arena` is a
+     * separate rv32-sized SHADOW allocator: the fork (BLYT_HOSTLUA_HEAP_SEAM)
+     * publishes each allocation's rv32-equivalent size (blyt_hostlua_heap_rv_pending),
+     * and hl_lua_alloc drives this arena at those sizes so guest_heap_used and the
+     * 16 MB fail-point are byte-identical to the wasm32 leg (DIRECTION 1).  Each
+     * physical block carries a small prefix holding its shadow-arena offset. */
     blyt_mem_accounting_t mem_acct;
     blyt_arena_t arena;
     /* Resource table (#93/#158/#231): a pure-Lua cart has no session, so its
@@ -120,16 +123,40 @@ static blyt_hostlua_t *hl_from(lua_State *L) {
     return *(blyt_hostlua_t **)lua_getextraspace(L);
 }
 
-/* lua_Alloc backed by the shared 16 MB arena (#158) — the SAME arena impl the
- * emulated/native libblytc runs, so guest_heap_used is accounted and the 16 MB
- * cap enforced through one allocator.  Mirrors the WASM leg's wasm_lua_alloc; the
- * region is lazily malloc'd on first allocation.  On the WASM leg this makes the
- * count byte-match rv32 (wasm32 == rv32 object sizes); on this 64-bit host the
- * objects are larger, which is exactly what the mem_budget measurement gauges. */
+/* Per-physical-block prefix holding the block's rv32 shadow-arena offset. 16
+ * bytes keeps the object pointer (raw + prefix) 16-byte aligned — the max
+ * natural alignment of any Lua value (the f64 in the Value union), matching the
+ * arena's own guarantee. */
+#define HL_HEAP_PREFIX 16u
+
+/* lua_Alloc for the native host-Lua fast path (#231).  Physical bytes come from
+ * plain host malloc (unbounded); a separate rv32-sized SHADOW arena (hl->arena)
+ * produces the canonical guest_heap_used and the 16 MB fail-point.  The fork
+ * (BLYT_HOSTLUA_HEAP_SEAM) publishes each allocation's rv32-equivalent size in
+ * blyt_hostlua_heap_rv_pending just before calling here; we size the shadow block
+ * from that so the count is byte-identical to the wasm32 host-Lua leg (which runs
+ * the identical runner but at 32-bit object sizes).  Each physical block carries
+ * a prefix storing its shadow-arena offset so free/realloc can locate the twin.
+ *
+ * Shadow region is 16 MB — the exact rv32 budget — so blyt_arena_malloc returns
+ * NULL (→ Lua ENOMEM) at precisely the point rv32/wasm32 hit the cap; the
+ * physical host allocation is never the limiting factor.  The unified budget's
+ * non-evictable resource footprint feeds the same predicate via mem_acct. */
 static void *hl_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     (void)osize;
     blyt_hostlua_t *hl = (blyt_hostlua_t *)ud;
-    if (!hl->arena.base) {
+
+    if (nsize == 0) { /* free */
+        if (ptr) {
+            char *raw = (char *)ptr - HL_HEAP_PREFIX;
+            uint32_t soff = *(uint32_t *)(void *)raw;
+            blyt_arena_free(&hl->arena, (char *)hl->arena.base + soff);
+            free(raw);
+        }
+        return NULL;
+    }
+
+    if (!hl->arena.base) { /* lazily create the rv32 shadow region */
         void *region = malloc(BLYT_MEM_BUDGET_BYTES);
         if (!region)
             return NULL;
@@ -137,11 +164,34 @@ static void *hl_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         hl->arena.size = BLYT_MEM_BUDGET_BYTES;
         hl->arena.acct = &hl->mem_acct;
     }
-    if (nsize == 0) {
-        blyt_arena_free(&hl->arena, ptr);
-        return NULL;
+
+    /* rv32-equivalent size the fork just published for this request. */
+    size_t rv = blyt_hostlua_heap_rv_pending;
+
+    if (!ptr) { /* malloc */
+        void *sp = blyt_arena_malloc(&hl->arena, rv);
+        if (!sp)
+            return NULL; /* rv32 budget exceeded → Lua sees ENOMEM */
+        char *raw = (char *)malloc(nsize + HL_HEAP_PREFIX);
+        if (!raw) {
+            blyt_arena_free(&hl->arena, sp);
+            return NULL;
+        }
+        *(uint32_t *)(void *)raw = (uint32_t)((char *)sp - (char *)hl->arena.base);
+        return raw + HL_HEAP_PREFIX;
     }
-    return blyt_arena_realloc(&hl->arena, ptr, nsize);
+
+    /* realloc */
+    char *raw = (char *)ptr - HL_HEAP_PREFIX;
+    uint32_t old_soff = *(uint32_t *)(void *)raw;
+    void *new_sp = blyt_arena_realloc(&hl->arena, (char *)hl->arena.base + old_soff, rv);
+    if (!new_sp)
+        return NULL; /* rv32 budget exceeded */
+    char *new_raw = (char *)realloc(raw, nsize + HL_HEAP_PREFIX);
+    if (!new_raw)
+        return NULL; /* true host OOM (shadow already resized; process is dying) */
+    *(uint32_t *)(void *)new_raw = (uint32_t)((char *)new_sp - (char *)hl->arena.base);
+    return new_raw + HL_HEAP_PREFIX;
 }
 
 /* blyt.debug.print(s) / blyt32.debug.print(s): the cart's cross-leg output
@@ -1261,8 +1311,8 @@ static void hl_publish_footprint(blyt_hostlua_t *hl, blyt_resource_table_t *t) {
         return;
     uint32_t footprint = blyt_resource_table_footprint(t);
     hl->mem_acct.non_evictable_footprint = footprint;
-    blyt_resource_table_evict_to_fit(t,
-                                     blyt_mem_cache_room(hl->mem_acct.guest_heap_used, footprint));
+    blyt_resource_table_evict_to_fit(
+        t, blyt_mem_cache_room(blyt_mem_cart_heap(&hl->mem_acct), footprint));
 }
 
 /* Would newly pinning `e` (adding e->len to the footprint when it is so far
@@ -1270,8 +1320,8 @@ static void hl_publish_footprint(blyt_hostlua_t *hl, blyt_resource_table_t *t) {
 static int hl_reference_fits(blyt_hostlua_t *hl, blyt_resource_table_t *t,
                              const blyt_resource_entry_t *e, int was_evictable) {
     uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
-    return blyt_mem_alloc_fits(hl->mem_acct.guest_heap_used, blyt_resource_table_footprint(t),
-                               incoming);
+    return blyt_mem_alloc_fits(blyt_mem_cart_heap(&hl->mem_acct),
+                               blyt_resource_table_footprint(t), incoming);
 }
 
 /* Resolve a baked resource constant to its table entry (ADR-0134): a cart-bundled
@@ -1491,7 +1541,7 @@ static int l_mem_stats(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
     blyt_resource_table_t *t = hl_active_resources(hl);
     uint32_t cache_used = t ? blyt_resource_table_resident_decompressed(t) : 0u;
-    uint32_t heap_used = hl->mem_acct.guest_heap_used;
+    uint32_t heap_used = blyt_mem_cart_heap(&hl->mem_acct);
 
     lua_createtable(L, 0, 5);
     lua_pushinteger(L, (lua_Integer)cache_used);
@@ -1616,6 +1666,15 @@ static int build_vm(blyt_hostlua_t *hl) {
         hl->L = NULL;
         return -1;
     }
+
+    /* Capture the runtime-scaffolding baseline (#231): everything allocated up to
+     * here — the VM, stdlibs, blyt/blyt32 API, S proxy, and the loaded cart
+     * bytecode — is runtime overhead, identical for a given cart but different in
+     * amount from the wasm leg (which additionally builds driver coroutines) and
+     * the emulated leg. Excluding it makes guest_heap_used / cart_allocations and
+     * the 16 MB fail-point count only the cart's own runtime allocations, so they
+     * are byte-identical across legs. Re-captured on every (re)build. */
+    hl->mem_acct.guest_heap_baseline = hl->mem_acct.guest_heap_used;
     return 0;
 }
 

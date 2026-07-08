@@ -150,6 +150,42 @@ if(NOT DEFINED _BLYT_HOSTLUA_VM_SETUP_DONE)
           set(_BHLV_FMA_ENABLE -mfma)
         endif()
 
+        # rv32 object-size table for the host-Lua heap-accounting seam (#231,
+        # epic #230). Compile the probe (runtime/shared/blyt_lua_rv32_sizeof_probe.c)
+        # with the ACTUAL rv32 (ilp32d) guest toolchain, then read each type's
+        # size back out of the ELF symbol table into a generated header
+        # (blyt_lua_rv32_sizeof.h). Correct-by-construction: the seam counts
+        # guest_heap_used at these 32-bit-canonical sizes on the 64-bit desktop
+        # so it matches wasm + rv32 hardware (DIRECTION 1). Needs the rv32
+        # compiler + llvm-nm; the same musl include set the guest Lua uses (so
+        # the probe sees the identical layout). LIBBLYTC_ALLTYPES_H / MUSL_DIR /
+        # LIBBLYTC_BITS_DIR come from cmake/blyt_guest_libs.cmake (included first).
+        set(BLYT_LUA_RV32_SIZEOF_H "${_BHLV_DIR}/blyt_lua_rv32_sizeof.h")
+        if(BLYT_RV32_CLANG AND BLYT_RV32_NM AND MUSL_DIR)
+          set(_BHLV_SZPROBE_SRC "${CMAKE_SOURCE_DIR}/runtime/shared/blyt_lua_rv32_sizeof_probe.c")
+          set(_BHLV_SZPROBE_OBJ "${_BHLV_DIR}/blyt_lua_rv32_sizeof_probe.o")
+          add_custom_command(
+            OUTPUT "${BLYT_LUA_RV32_SIZEOF_H}"
+            COMMAND
+              "${BLYT_RV32_CLANG}" --target=riscv32-linux-gnu -march=rv32imafdc -mabi=ilp32d
+              -DBLYT_LUA_I32_F64=1 -DLUA_USE_LONGJMP=1 -I "${lua_SOURCE_DIR}" -I
+              "${MUSL_DIR}/include" -I "${MUSL_DIR}/arch/riscv32" -I "${MUSL_DIR}/arch/generic" -I
+              "${LIBBLYTC_BITS_DIR}/.." -c "${_BHLV_SZPROBE_SRC}" -o "${_BHLV_SZPROBE_OBJ}"
+            COMMAND
+              "${CMAKE_COMMAND}" "-DNM=${BLYT_RV32_NM}" "-DOBJ=${_BHLV_SZPROBE_OBJ}"
+              "-DOUT=${BLYT_LUA_RV32_SIZEOF_H}" -P
+              "${CMAKE_SOURCE_DIR}/cmake/blyt_gen_rv32_sizeof.cmake"
+            DEPENDS "${_BHLV_SZPROBE_SRC}"
+                    "${CMAKE_SOURCE_DIR}/cmake/blyt_gen_rv32_sizeof.cmake" "${LIBBLYTC_ALLTYPES_H}"
+            COMMENT "Generating rv32 Lua sizeof table (host-Lua heap seam, #231)"
+            VERBATIM)
+          add_custom_target(blyt_lua_rv32_sizeof_header DEPENDS "${BLYT_LUA_RV32_SIZEOF_H}")
+        else()
+          message(
+            STATUS
+            "blyt host-Lua VM: rv32 sizeof probe unavailable (need rv32 clang + llvm-nm) — heap seam header not generated")
+        endif()
+
         set(BLYT_HOSTLUA_VM_AVAILABLE TRUE)
         message(STATUS "blyt host-Lua VM: available (${_BHLV_MUSL_ARCH}) — native host-Lua path enabled")
       endif()
@@ -214,7 +250,13 @@ function(blyt_add_hostlua_vm NAME CONTRACT_FLAG)
   # "BLYT". The shipped native player MUST carry this (Spike Z Q5).
   target_compile_options(${NAME} PRIVATE "-Dluai_makeseed()=0x424C5954u")
   target_include_directories(${NAME} PUBLIC "${lua_SOURCE_DIR}"
-                             PRIVATE "${CMAKE_SOURCE_DIR}/runtime/shared")
+                             PRIVATE "${CMAKE_SOURCE_DIR}/runtime/shared" "${_BHLV_DIR}")
+  # The generated rv32 sizeof table (#231): on the include path and built first
+  # so the host-Lua heap-accounting seam can bake it in. Generated even before
+  # the seam consumes it, so a plain build keeps it fresh with the fork layout.
+  if(TARGET blyt_lua_rv32_sizeof_header)
+    add_dependencies(${NAME} blyt_lua_rv32_sizeof_header)
+  endif()
   target_compile_options(${NAME} PRIVATE -O2 ${CONTRACT_FLAG} ${_EXTRA} -fno-fast-math)
   # Hermetic: the VM reaches ONLY the in-house musl kernels via the seam lib —
   # never the host libm. (Zone-1 sqrt/floor/fmod/… also resolve to the seam lib's

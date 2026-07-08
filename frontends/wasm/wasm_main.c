@@ -202,6 +202,7 @@ static void wasm_lua_arena_reset(void) {
     if (g_lua_arena.base)
         blyt_arena_reset(&g_lua_arena); /* zeroes guest_heap_used + empties arena */
     g_lua_mem_acct.non_evictable_footprint = 0;
+    g_lua_mem_acct.guest_heap_baseline = 0; /* re-captured after the rebuild (#231) */
 }
 
 /* Recompute the non-evictable footprint from the active resource table and
@@ -214,7 +215,7 @@ static void wasm_lua_publish_footprint(blyt_resource_table_t *t) {
     uint32_t footprint = blyt_resource_table_footprint(t);
     g_lua_mem_acct.non_evictable_footprint = footprint;
     blyt_resource_table_evict_to_fit(
-        t, blyt_mem_cache_room(g_lua_mem_acct.guest_heap_used, footprint));
+        t, blyt_mem_cache_room(blyt_mem_cart_heap(&g_lua_mem_acct), footprint));
 }
 
 /* Would newly loading/pinning `e` (adding e->len to the footprint when it is so
@@ -222,8 +223,8 @@ static void wasm_lua_publish_footprint(blyt_resource_table_t *t) {
 static int wasm_lua_reference_fits(blyt_resource_table_t *t, const blyt_resource_entry_t *e,
                                    int was_evictable) {
     uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
-    return blyt_mem_alloc_fits(g_lua_mem_acct.guest_heap_used, blyt_resource_table_footprint(t),
-                               incoming);
+    return blyt_mem_alloc_fits(blyt_mem_cart_heap(&g_lua_mem_acct),
+                               blyt_resource_table_footprint(t), incoming);
 }
 #ifdef BLYT_DAP
 static bool g_lua_dap_paused = false; /* hook yielded, waiting for DAP */
@@ -2075,7 +2076,7 @@ static void wasm_register_resource_api(lua_State *L) {
 static int wasm_mem_stats(lua_State *L) {
     blyt_resource_table_t *t = active_resource_table();
     uint32_t cache_used = t ? blyt_resource_table_resident_decompressed(t) : 0u;
-    uint32_t heap_used = g_lua_mem_acct.guest_heap_used;
+    uint32_t heap_used = blyt_mem_cart_heap(&g_lua_mem_acct);
 
     lua_createtable(L, 0, 5);
     lua_pushinteger(L, (lua_Integer)cache_used);
@@ -3592,6 +3593,14 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         g_lua = NULL;
         return 1;
     }
+
+    /* Runtime-scaffolding baseline (#231): everything allocated so far — VM,
+     * stdlibs, blyt/blyt32 API, S proxy, the loaded cart bytecode, and the INIT +
+     * (later) RUNNING driver coroutines — is per-leg runtime overhead the native /
+     * emulated legs don't share (they drive frames from C, not a Lua coroutine).
+     * Excluding it makes cart_allocations + the 16 MB fail-point count only the
+     * cart's own runtime allocations, byte-identical across legs. */
+    g_lua_mem_acct.guest_heap_baseline = g_lua_mem_acct.guest_heap_used;
 
 #ifdef BLYT_DAP
     {

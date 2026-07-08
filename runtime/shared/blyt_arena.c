@@ -44,7 +44,10 @@ static inline uint32_t align_up(uint32_t n, uint32_t al) {
 static inline int cap_allows(const blyt_arena_t *a, uint32_t consumed) {
     if (!a->acct)
         return 1;
-    return blyt_mem_alloc_fits(a->acct->guest_heap_used, a->acct->non_evictable_footprint,
+    /* Budget the cart-attributable heap (excludes the runtime-scaffolding
+     * baseline, #231) so the fail-point is cross-leg deterministic. Baseline is 0
+     * where unset (C carts, emulated), so this is the plain guest_heap_used there. */
+    return blyt_mem_alloc_fits(blyt_mem_cart_heap(a->acct), a->acct->non_evictable_footprint,
                                consumed);
 }
 

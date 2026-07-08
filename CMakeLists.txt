@@ -432,6 +432,15 @@ if(BLYT_HOSTLUA_VM_AVAILABLE)
   # Seam-wired deterministic VM (pinned hash seed, -ffp-contract=off, in-house
   # musl kernels via blyt_fpm) — the shipped host-Lua fast-path VM (#238).
   blyt_add_hostlua_vm(blyt_hostlua_vm -ffp-contract=off)
+  # Engage the rv32 heap-accounting seam (#231) on the shipped libblyt VM only —
+  # NOT the determinism-gate VM (frontends/native-hostlua), which has no runner to
+  # drive the shadow arena and must stay a plain link.  The generated rv32 sizeof
+  # header + its include dir + build dependency are wired in by blyt_add_hostlua_vm.
+  if(TARGET blyt_lua_rv32_sizeof_header)
+    target_compile_definitions(blyt_hostlua_vm PRIVATE BLYT_HOSTLUA_HEAP_SEAM=1)
+  else()
+    message(WARNING "blyt#231: rv32 sizeof header unavailable — host-Lua heap seam OFF (guest_heap_used will over-report on the 64-bit native leg)")
+  endif()
   set(_HOST_LUA_VM_TARGET blyt_hostlua_vm)
   set(_HOST_LUA_EXEC TRUE)
 elseif(EXISTS "${lua_SOURCE_DIR}/onelua.c")
