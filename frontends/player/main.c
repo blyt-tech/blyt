@@ -164,6 +164,7 @@ static int16_t input_state(unsigned port, unsigned device, unsigned index, unsig
 static int g_dap_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static int g_gdb_port = -1; /* -1 = disabled, 0 = OS-assigned, >0 = fixed */
 static const char *g_trace = NULL; /* --trace: BLYT_TRACE channel list */
+static bool g_host_lua = false; /* --host-lua: opt into the native host-Lua fast path (#238) */
 static int g_quit_after = -1; /* -1 = disabled; >=0 = exit after N frames */
 static bool g_reset_every_frame =
     false; /* --reset-every-frame: run a save/clear/restore cycle after each frame */
@@ -280,6 +281,8 @@ static const char *parse_args(int argc, char *argv[], bool *headless) {
             g_trace = argv[++i];
         } else if (strncmp(argv[i], "--trace=", 8) == 0) {
             g_trace = argv[i] + 8;
+        } else if (strcmp(argv[i], "--host-lua") == 0) {
+            g_host_lua = true;
         } else if (strcmp(argv[i], "--reset-every-frame") == 0) {
             g_reset_every_frame = true;
         } else if (strcmp(argv[i], "--evict-every-frame") == 0) {
@@ -646,6 +649,12 @@ int main(int argc, char *argv[]) {
      * as --debug → BLYT_DAP_PORT); set it before retro_init(). */
     if (g_trace)
         setenv("BLYT_TRACE", g_trace, 1);
+
+    /* --host-lua is the flag form of the BLYT_HOSTLUA opt-in (#238): a pure-Lua
+     * cart runs in the native host-Lua VM instead of rv32emu.  Set before
+     * retro_load_game() so the dispatch predicate sees it. */
+    if (g_host_lua)
+        setenv("BLYT_HOSTLUA", "1", 1);
 
 #ifdef BLYT_DAP
     if (g_dap_port >= 0) {

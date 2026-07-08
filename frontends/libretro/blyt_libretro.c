@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "blyt_hostlua.h"
 #include "blyt_runtime.h"
 #include "libretro.h"
 
@@ -49,6 +50,11 @@ static retro_log_printf_t g_log_cb = NULL;
 
 static blyt_cart_t *g_cart = NULL;
 static blyt_session_t *g_session = NULL;
+/* Native host-Lua fast path (#238): non-NULL when the cart runs in a host-Lua VM
+ * instead of the rv32 session (opt-in BLYT_HOSTLUA + pure-Lua cart).  Exactly one
+ * of g_session / g_hostlua is active per loaded cart; both dispatch through the
+ * same retro_run / is_done / run_err seam so blytplay and the .so honor it. */
+static blyt_hostlua_t *g_hostlua = NULL;
 static bool g_cart_done = false;
 static blyt_cart_run_err_t g_run_err = BLYT_RUN_OK;
 static bool g_dap_active = false;
@@ -174,6 +180,25 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
     fprintf(stderr, "Blyt %s - %s (%s %s)\n", blyt_runtime_version(), blyt_cart_title(g_cart),
             blyt_cart_id(g_cart), blyt_cart_version(g_cart));
 
+    /* Native host-Lua fast path (#238): opt-in BLYT_HOSTLUA + pure-Lua cart runs
+     * in a host-Lua VM instead of the rv32 session.  Failing to build the runner
+     * for a cart it was selected for is a hard error (anti-#98) — do NOT silently
+     * fall back to rv32, which would mask a broken host-Lua path. */
+    if (blyt_hostlua_should_use(g_cart)) {
+        g_hostlua = blyt_hostlua_create(g_cart, libretro_log);
+        if (!g_hostlua) {
+            if (g_log_cb)
+                g_log_cb(RETRO_LOG_ERROR, "blyt: failed to create host-Lua runner\n");
+            blyt_cart_close(g_cart);
+            g_cart = NULL;
+            free(g_cart_path);
+            g_cart_path = NULL;
+            return false;
+        }
+        g_cart_done = false;
+        return true;
+    }
+
     g_session = blyt_session_create(g_cart, libretro_log);
     if (!g_session) {
         if (g_log_cb)
@@ -244,6 +269,8 @@ RETRO_API void retro_unload_game(void) {
     if (g_session)
         blyt_session_gdb_shutdown(g_session);
 #endif
+    blyt_hostlua_destroy(g_hostlua);
+    g_hostlua = NULL;
     blyt_session_destroy(g_session);
     g_session = NULL;
     blyt_cart_close(g_cart);
@@ -255,6 +282,16 @@ RETRO_API void retro_unload_game(void) {
 }
 
 RETRO_API void retro_reset(void) {
+    if (g_hostlua) {
+        /* Host-Lua reset: tear down and re-boot the runner (re-runs init()). */
+        blyt_hostlua_destroy(g_hostlua);
+        g_hostlua = g_cart ? blyt_hostlua_create(g_cart, libretro_log) : NULL;
+        if (!g_hostlua && g_log_cb)
+            g_log_cb(RETRO_LOG_ERROR, "blyt: reset failed to recreate the host-Lua runner\n");
+        g_cart_done = false;
+        g_run_err = BLYT_RUN_OK;
+        return;
+    }
     blyt_session_destroy(g_session);
     g_session = g_cart ? blyt_session_create(g_cart, libretro_log) : NULL;
     if (!g_session && g_log_cb)
@@ -266,6 +303,25 @@ RETRO_API void retro_reset(void) {
 RETRO_API void retro_run(void) {
     if (g_input_poll_cb)
         g_input_poll_cb();
+
+    /* Native host-Lua fast path (#238): one run_frame == one update+draw, same
+     * one-frame-per-call contract as the rv32 session (ADR-0087). */
+    if (g_hostlua) {
+        if (!g_cart_done) {
+            blyt_cart_run_err_t err = blyt_hostlua_run_frame(g_hostlua);
+            if (err == BLYT_RUN_FRAME_DONE) {
+                /* normal frame */
+            } else {
+                g_cart_done = true;
+                g_run_err = (err == BLYT_RUN_OK) ? BLYT_RUN_OK : err;
+                if (err == BLYT_RUN_ERR_ABORT && g_log_cb)
+                    g_log_cb(RETRO_LOG_ERROR, "blyt: host-Lua cart aborted\n");
+            }
+        }
+        /* No framebuffer yet on the host-Lua path (gfx = #231); nothing to
+         * present.  The video callback stays quiet until surfaces land. */
+        return;
+    }
 
     if (!g_cart_done && g_session) {
         blyt_cart_run_err_t err = blyt_session_run_frame(g_session);
@@ -378,7 +434,9 @@ blyt_cart_run_err_t blyt_libretro_run_err(void) {
 }
 
 void retro_reset_every_frame_cycle(void) {
-    if (g_session)
+    if (g_hostlua)
+        blyt_hostlua_reset_every_frame_cycle(g_hostlua);
+    else if (g_session)
         blyt_reset_every_frame_cycle(g_session);
 }
 
