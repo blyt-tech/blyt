@@ -88,6 +88,16 @@ fn lua_heap_budget_shrinks_with_resident_resource_all_legs() {
     // guest_heap_used byte-parity acceptance criterion (#158). The counts happen
     // to equal BUDGET_C's because the arena block accounting is the same.
     run_cart_all_legs(&cart, "BUDGET a=255 b=191 loaded=1 shrank=1");
+    // Native host-Lua fast path (#231): the VM allocates through the same shared
+    // 16 MB arena, and the resource footprint feeds the same budget predicate —
+    // a=255/b=191 here too (measurement: the 64 KiB body dominates, so the
+    // 64-bit-vs-rv32 object-size delta never moves the fail-point). The exact
+    // count for small-object exhaustion is host-heap-dependent (advisory).
+    run_cart_native_with_env(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        "BUDGET a=255 b=191 loaded=1 shrank=1",
+    );
 }
 
 /// A C cart that measures guest-heap headroom (64 KiB allocations until `malloc`

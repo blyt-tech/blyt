@@ -1148,6 +1148,67 @@ pub fn run_cart_native_with_env(
     );
 }
 
+/// Run a cart on blytplay --headless with extra env and return its full stdout,
+/// for tests that parse a printed value (rather than assert a fixed line) and
+/// compare it across legs — e.g. the cross-leg `guest_heap_used` equality oracle
+/// (#231): capture the emulated-rv32 count and the native host-Lua (`BLYT_HOSTLUA=1`)
+/// count and require them identical.
+pub fn capture_cart_native(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(blytplay());
+    cmd.args(["--headless", cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.assert().success().get_output().stdout.clone();
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+/// Run a cart on the WASM runner with extra env and return its full stdout — the
+/// wasm32 companion to [`capture_cart_native`] for cross-leg value comparison.
+pub fn capture_cart_wasm(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
+    use assert_cmd::Command;
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+    let wasm_dir = find_wasm_dir();
+    let mut cmd = Command::new("node");
+    cmd.args([
+        driver.to_str().unwrap(),
+        wasm_dir.to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ]);
+    if !extra_env.is_empty() {
+        let pairs: Vec<String> = extra_env
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "\"{}\":\"{}\"",
+                    k,
+                    v.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect();
+        let env_json = format!("{{{}}}", pairs.join(","));
+        cmd.args(["", &env_json]);
+    }
+    let output = cmd.assert().success().get_output().stdout.clone();
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+/// Run a pure-Lua gfx/surface cart on blytplay's native host-Lua fast path
+/// (#231, opt-in `BLYT_HOSTLUA=1`) with framebuffer hashing on, and assert
+/// `expected` (a `[blyt:fbhash]` line) appears in stdout — the fourth leg for
+/// gfx/surface parity carts, alongside emulated-native / wasm / libretro. Unlike
+/// [`run_cart_native_hostlua`] (the minimal Spike Z determinism binary), this
+/// drives the full runtime through blytplay, so the runner's own framebuffer +
+/// surface pool are exercised end to end.
+pub fn run_cart_native_hostlua_frame_hash(cart: &std::path::Path, expected: &str) {
+    run_cart_native_with_env(
+        cart,
+        &[("BLYT_FRAME_HASH", "1"), ("BLYT_HOSTLUA", "1")],
+        expected,
+    );
+}
+
 /// Run a cart on the native host-Lua determinism leg (Spike Z, #225); assert
 /// `expected` appears in stdout. The cart must be pure Lua (the leg reads its
 /// `.cart.lua` bytecode section) and must terminate itself via `blyt.quit()`.

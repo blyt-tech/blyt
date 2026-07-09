@@ -54,6 +54,14 @@ void blyt_arena_free(blyt_arena_t *a, void *p);
 void *blyt_arena_realloc(blyt_arena_t *a, void *p, size_t n);
 void *blyt_arena_calloc(blyt_arena_t *a, size_t nmemb, size_t sz);
 
+/* No-acct variants (#231): the block is physically allocated but excluded from
+ * guest_heap_used and the 16 MB budget — used for VM execution scratch (a Lua
+ * thread's data stack + CallInfo) so the cart-attributable heap is independent of
+ * how the runtime drives the cart. free() detects the marker itself, so no
+ * no-acct free variant is needed. */
+void *blyt_arena_malloc_noacct(blyt_arena_t *a, size_t n);
+void *blyt_arena_realloc_noacct(blyt_arena_t *a, void *p, size_t n);
+
 /* Re-initialise to a fresh-load-identical state (hot-swap, #133): empties the
  * free list, restarts the bump pointer at the base, and zeroes
  * acct->guest_heap_used so a reloaded cart's allocations are bit-identical to a
