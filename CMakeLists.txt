@@ -104,12 +104,16 @@ FetchContent_Declare(
 # transcendentals + pow through blyt_fpm when BLYT_HOSTLUA_FP_SEAM is defined).
 # p3 adds the Phase-B number-format companion (luaconf.h routes lua_str2number /
 # l_sprintf through blyt_fpm_strtod / blyt_fpm_snprintf under the same guard).
-set(LUA_VERSION "v5.5.0-blyt-v0-p3")
+# -heapseam adds the #231 rv32 heap-accounting seam (BLYT_HOSTLUA_HEAP_SEAM /
+# _ACCT: rv32 object sizing + LUAL_BUFFERSIZE pin + stack/CallInfo exclusion for
+# byte-identical guest_heap_used on the 64-bit host). PRE-RELEASE feature tag —
+# replace with a stable v5.5.0-blyt-v0-p4 at the #231 pre-merge gate.
+set(LUA_VERSION "v5.5.0-blyt-v0-p3-heapseam")
 FetchContent_Declare(
   lua
   URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=29be5dbf25edadd4c751f6fd695efc64a2c97a82b840174b505fe1d52f7c98b7)
+    SHA256=a35b31eefa0249976234db2d3b71ce43501d3d0daca4c07cdf85f3e33b942f97)
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
@@ -433,13 +437,19 @@ if(BLYT_HOSTLUA_VM_AVAILABLE)
   # musl kernels via blyt_fpm) — the shipped host-Lua fast-path VM (#238).
   blyt_add_hostlua_vm(blyt_hostlua_vm -ffp-contract=off)
   # Engage the rv32 heap-accounting seam (#231) on the shipped libblyt VM only —
-  # NOT the determinism-gate VM (frontends/native-hostlua), which has no runner to
-  # drive the shadow arena and must stay a plain link.  The generated rv32 sizeof
-  # header + its include dir + build dependency are wired in by blyt_add_hostlua_vm.
+  # NOT the determinism-gate VM (frontends/native-hostlua), which has no runner
+  # to drive the shadow arena and must stay a plain link.  The generated rv32
+  # sizeof header + its include dir + build dependency are wired in by
+  # blyt_add_hostlua_vm.
   if(TARGET blyt_lua_rv32_sizeof_header)
+    # BLYT_HOSTLUA_HEAP_SEAM implies the stack-exclusion accounting layer
+    # (BLYT_HOSTLUA_HEAP_ACCT, #231) via lmem.h; wasm defines ACCT directly.
     target_compile_definitions(blyt_hostlua_vm PRIVATE BLYT_HOSTLUA_HEAP_SEAM=1)
   else()
-    message(WARNING "blyt#231: rv32 sizeof header unavailable — host-Lua heap seam OFF (guest_heap_used will over-report on the 64-bit native leg)")
+    message(
+      WARNING
+        "blyt#231: rv32 sizeof header unavailable — host-Lua heap seam OFF (guest_heap_used will over-report on the 64-bit native leg)"
+    )
   endif()
   set(_HOST_LUA_VM_TARGET blyt_hostlua_vm)
   set(_HOST_LUA_EXEC TRUE)

@@ -191,19 +191,25 @@ void *blyt_resource_bytes_get(blyt_bytes_resource_t id, size_t *len);
  *   Deterministic — bit-identical across every peer/platform, SAFE to branch
  *   game logic on:
  *     - budget_cap (always 16 MB)
+ *     - cart_allocations (guest_heap_used): counted at the 32-bit-canonical
+ *       object sizes on every leg.  The cart heap runs through one arena
+ *       (ADR-0008 / #158), and on a 64-bit host (the native host-Lua fast path,
+ *       ADR-0136) the accounting seam (#231) models Lua object sizes down to
+ *       their rv32 widths, so wider host pointers do NOT inflate the count — a
+ *       given allocation sequence yields the same cart_allocations on wasm32, on
+ *       rv32 hardware, and on the 64-bit desktop.
  *     - the *outcome* of an allocation: a blyt_resource_load / malloc returning
- *       BLYT_RESOURCE_INVALID / NULL at the cap (see ADR-0008 / #158).  What is
- *       guaranteed is that allocation FAILS at the 16 MB cap — a cart can never
- *       exceed the budget.  The exact *count* of allocations that fit before
- *       exhaustion is NOT bit-identical for workloads dominated by many tiny
- *       objects: on a 64-bit host (the native host-Lua fast path, ADR-0136) Lua
- *       objects carry wider pointers than on the 32-bit guest, so
- *       cart_allocations (itself advisory, below) reaches the cap a few percent
- *       sooner.  For realistic workloads — a handful of large buffers / resource
- *       pins — the fail-point coincides exactly across every leg; only a cart
- *       that allocates tiny objects to exhaustion and branches on the precise
- *       count would see a difference, which it must not do (ADR-0008 amendment,
- *       #231).
+ *       BLYT_RESOURCE_INVALID / NULL when cart_allocations would exceed the 16 MB
+ *       cap.  A cart can never exceed the budget, and the fail-point coincides
+ *       across every leg.
+ *     (Caveat, pending epic #230: because the wasm runner drives lifecycle
+ *      functions through a coroutine while the native runner calls them from C,
+ *      a few constructs — short-string interning, aux-buffer-boxed large strings,
+ *      closures with open upvalues, coroutine threads — still carry a small
+ *      bounded execution-model residual in cart_allocations, closed when the two
+ *      runners unify into one.  It is far below the 16 MB granularity, so the
+ *      fail-point still coincides for realistic workloads; a cart must still not
+ *      branch on the *exact* running count, only on the fail *outcome*.)
  *
  *   Advisory — history-dependent (LRU/eviction order differs across platforms),
  *   MUST NOT feed deterministic game state.  They are a *tuning* signal for
@@ -217,7 +223,7 @@ void *blyt_resource_bytes_get(blyt_bytes_resource_t id, size_t *len);
 /* Scalar memory stats.  total_used == cart_allocations + resource_cache_used. */
 typedef struct {
     uint32_t resource_cache_used; /* advisory: resident decompressed resource bytes */
-    uint32_t cart_allocations; /* live cart heap bytes (guest_heap_used) */
+    uint32_t cart_allocations; /* deterministic: live cart heap bytes (guest_heap_used) */
     uint32_t total_used; /* advisory: cart_allocations + resource_cache_used */
     uint32_t budget_cap; /* deterministic: 16 MB working-memory cap */
 } blyt_mem_stats_t;

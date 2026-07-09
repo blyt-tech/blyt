@@ -77,9 +77,8 @@ typedef struct {
  * introspection API (cart_allocations) use, so both are identical across legs for
  * the same cart regardless of each leg's runtime overhead (#231). */
 static inline uint32_t blyt_mem_cart_heap(const blyt_mem_accounting_t *a) {
-    return a->guest_heap_used > a->guest_heap_baseline
-               ? a->guest_heap_used - a->guest_heap_baseline
-               : 0u;
+    return a->guest_heap_used > a->guest_heap_baseline ? a->guest_heap_used - a->guest_heap_baseline
+                                                       : 0u;
 }
 
 /* Does an allocation of `incoming` bytes fit the unified budget, given the

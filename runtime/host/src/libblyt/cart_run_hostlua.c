@@ -165,11 +165,33 @@ static void *hl_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         hl->arena.acct = &hl->mem_acct;
     }
 
-    /* rv32-equivalent size the fork just published for this request. */
+    /* rv32-equivalent size the fork just published for this request, consumed
+     * atomically (single-threaded VM).  A request the fork routed through its
+     * luaM typed layer carries a real published size; one that reached the raw
+     * lua_Alloc callback directly (the auxlib buffer's heap box / external-string
+     * body — lauxlib.c resizebox) leaves the pending size UNSET, and a raw byte
+     * buffer holds no pointers, so its rv32 size is just the host `nsize`.  Reset
+     * so the NEXT allocation is only credited a published size if the fork
+     * actually published one for it (else a stale value would mis-size a raw
+     * buffer — the cause of multi-KB external strings under-counting to nothing). */
     size_t rv = blyt_hostlua_heap_rv_pending;
+    blyt_hostlua_heap_rv_pending = BLYT_HOSTLUA_HEAP_RV_UNSET;
+    if (rv == BLYT_HOSTLUA_HEAP_RV_UNSET)
+        rv = nsize;
+
+    /* VM execution scratch (a thread's data stack / CallInfo, #231): allocate the
+     * shadow block no-acct so it is excluded from guest_heap_used and the 16 MB
+     * budget — the cart-attributable heap must not depend on how the runtime
+     * drives the cart (this leg calls lifecycle fns from C; the wasm leg resumes
+     * them in a driver coroutine).  Consumed atomically, identical logic to the
+     * wasm runner so any residual is cross-leg-identical.  free() reads the
+     * marker from the shadow block itself, so the free path is unchanged. */
+    int noacct = blyt_hostlua_heap_stack_pending;
+    blyt_hostlua_heap_stack_pending = 0;
 
     if (!ptr) { /* malloc */
-        void *sp = blyt_arena_malloc(&hl->arena, rv);
+        void *sp =
+            noacct ? blyt_arena_malloc_noacct(&hl->arena, rv) : blyt_arena_malloc(&hl->arena, rv);
         if (!sp)
             return NULL; /* rv32 budget exceeded → Lua sees ENOMEM */
         char *raw = (char *)malloc(nsize + HL_HEAP_PREFIX);
@@ -184,7 +206,9 @@ static void *hl_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     /* realloc */
     char *raw = (char *)ptr - HL_HEAP_PREFIX;
     uint32_t old_soff = *(uint32_t *)(void *)raw;
-    void *new_sp = blyt_arena_realloc(&hl->arena, (char *)hl->arena.base + old_soff, rv);
+    void *base_sp = (char *)hl->arena.base + old_soff;
+    void *new_sp = noacct ? blyt_arena_realloc_noacct(&hl->arena, base_sp, rv)
+                          : blyt_arena_realloc(&hl->arena, base_sp, rv);
     if (!new_sp)
         return NULL; /* rv32 budget exceeded */
     char *new_raw = (char *)realloc(raw, nsize + HL_HEAP_PREFIX);
@@ -1320,8 +1344,8 @@ static void hl_publish_footprint(blyt_hostlua_t *hl, blyt_resource_table_t *t) {
 static int hl_reference_fits(blyt_hostlua_t *hl, blyt_resource_table_t *t,
                              const blyt_resource_entry_t *e, int was_evictable) {
     uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
-    return blyt_mem_alloc_fits(blyt_mem_cart_heap(&hl->mem_acct),
-                               blyt_resource_table_footprint(t), incoming);
+    return blyt_mem_alloc_fits(blyt_mem_cart_heap(&hl->mem_acct), blyt_resource_table_footprint(t),
+                               incoming);
 }
 
 /* Resolve a baked resource constant to its table entry (ADR-0134): a cart-bundled
@@ -1673,7 +1697,16 @@ static int build_vm(blyt_hostlua_t *hl) {
      * amount from the wasm leg (which additionally builds driver coroutines) and
      * the emulated leg. Excluding it makes guest_heap_used / cart_allocations and
      * the 16 MB fail-point count only the cart's own runtime allocations, so they
-     * are byte-identical across legs. Re-captured on every (re)build. */
+     * are byte-identical across legs. Re-captured on every (re)build.
+     *
+     * Collect first (#231): the baseline must be the *settled* scaffolding
+     * footprint, not a snapshot that still holds this leg's build-time transient
+     * garbage — the amount of that garbage differs between legs (native builds the
+     * VM from C, wasm additionally builds driver coroutines), and any uncollected
+     * remainder biases the subtraction. A full collection here pins the baseline
+     * to the reachable scaffolding on every leg, so guest_heap_used − baseline is
+     * the byte-identical cart-attributable heap. */
+    lua_gc(hl->L, LUA_GCCOLLECT);
     hl->mem_acct.guest_heap_baseline = hl->mem_acct.guest_heap_used;
     return 0;
 }

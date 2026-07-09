@@ -467,6 +467,12 @@ set_target_properties(
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)
   list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 BLYT_LUA_I32_F64=1 LUA_USE_LONGJMP=1)
+  # blyt#231: exclude a Lua thread's data stack / CallInfo (VM execution
+  # scratch) from guest_heap_used so the count matches the native host-Lua leg,
+  # which drives lifecycle fns from C rather than through the co_body coroutine.
+  # Enables the stack-exclusion layer in the fork's lmem.h + wasm_main.c's
+  # lua_Alloc.
+  list(APPEND _BLYT_LUA_DEFS BLYT_HOSTLUA_HEAP_ACCT=1)
   # ADR-0135 (blyt#223): gate the fork's lmathlib.c/llimits.h Zone-2 routing.
   if(BLYT_HOSTLUA_FP_SEAM)
     list(APPEND _BLYT_LUA_DEFS BLYT_HOSTLUA_FP_SEAM=1)
