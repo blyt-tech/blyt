@@ -13,6 +13,13 @@ const BP_ASSIGN_X = 26; // S.character[slot].x = x   (x,y already computed)
 const BP_PRINT = 28; // blyt.debug.print(...)
 const BP_INIT = 6; // frame = 0   (first statement inside init())
 
+/* This spec runs twice from runTests.js: once on the emulated rv32 Lua VM and
+ * once with BLYT_HOSTLUA=1 on the native host-Lua VM (#234) — the debugger
+ * behaviour must be identical.  The one exception is hot reload: the native
+ * host-Lua path has no reload mechanism yet (deferred follow-up of #234), so its
+ * reload test is skipped on the host-Lua leg. */
+const HOSTLUA = !!process.env.BLYT_HOSTLUA;
+
 describe('Lua cart (native debug)', () => {
 	afterEach(async () => h.reset());
 
@@ -73,39 +80,45 @@ describe('Lua cart (native debug)', () => {
 	 * rebuilt Lua state without a session restart.  The extension now wires the
 	 * Lua path to startDevtool + startNativeDebug(--dev-ctrl-connect) so the
 	 * file-watcher rebuild reaches the live DAP session. */
-	it('rebinds an init() breakpoint across a Lua hot reload', async () => {
-		const wf = h.folder('hello');
-		const uri = h.fileUri(wf, LUA);
-		h.addBreakpoint(uri, BP_INIT);
-		await h.startNative(wf);
+	(HOSTLUA ? it.skip : it)(
+		'rebinds an init() breakpoint across a Lua hot reload',
+		async () => {
+			const wf = h.folder('hello');
+			const uri = h.fileUri(wf, LUA);
+			h.addBreakpoint(uri, BP_INIT);
+			await h.startNative(wf);
 
-		const session = await h.waitForSession(h.byMode('lua'), 'lua session');
+			const session = await h.waitForSession(
+				h.byMode('lua'),
+				'lua session',
+			);
 
-		/* Breakpoint fires when init() runs at boot. */
-		const stop1 = await h.waitStopped(session, 'initial init() stop');
-		assert.strictEqual(stop1.body.reason, 'breakpoint');
-		const f1 = await h.topFrame(session, stop1.body.threadId);
-		assert.strictEqual(f1.line, BP_INIT);
-		await h.cont(session, stop1.body.threadId);
+			/* Breakpoint fires when init() runs at boot. */
+			const stop1 = await h.waitStopped(session, 'initial init() stop');
+			assert.strictEqual(stop1.body.reason, 'breakpoint');
+			const f1 = await h.topFrame(session, stop1.body.threadId);
+			assert.strictEqual(f1.line, BP_INIT);
+			await h.cont(session, stop1.body.threadId);
 
-		/* Edit + save → `blyt debug` watcher rebuilds → dev-control `reload` →
-		 * blytdebug hot-swaps the Lua state (same base, breakpoints persist in
-		 * g_dap.bps[], no session restart).  The re-armed init() breakpoint
-		 * surfaces on the same DAP connection with reason 'breakpoint'. */
-		h.touchRebuildLua(uri);
-		const stop2 = await h.waitStopped(
-			session,
-			'post-reload init() stop',
-			60000,
-		);
-		assert.strictEqual(stop2.body.reason, 'breakpoint');
-		const f2 = await h.topFrame(session, stop2.body.threadId);
-		assert.strictEqual(
-			f2.line,
-			BP_INIT,
-			'init() breakpoint re-fired after the Lua reload',
-		);
-	});
+			/* Edit + save → `blyt debug` watcher rebuilds → dev-control `reload` →
+			 * blytdebug hot-swaps the Lua state (same base, breakpoints persist in
+			 * g_dap.bps[], no session restart).  The re-armed init() breakpoint
+			 * surfaces on the same DAP connection with reason 'breakpoint'. */
+			h.touchRebuildLua(uri);
+			const stop2 = await h.waitStopped(
+				session,
+				'post-reload init() stop',
+				60000,
+			);
+			assert.strictEqual(stop2.body.reason, 'breakpoint');
+			const f2 = await h.topFrame(session, stop2.body.threadId);
+			assert.strictEqual(
+				f2.line,
+				BP_INIT,
+				'init() breakpoint re-fired after the Lua reload',
+			);
+		},
+	);
 
 	it('honors breakpoints added and removed while running', async () => {
 		const wf = h.folder('hello');

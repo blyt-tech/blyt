@@ -228,6 +228,136 @@ fn sdl_dap_breakpoint_step_inspect() {
         .success();
 }
 
+/// Native host-Lua DAP gate (#234): the SAME breakpoint/step/inspect flow as
+/// `sdl_dap_breakpoint_step_inspect`, but with BLYT_HOSTLUA=1 so blytdebug runs
+/// the cart in the native host-Lua VM (cart_run_hostlua.c) instead of the rv32
+/// emulated Lua VM.  Exercises the native TCP DAP transport + shared inspection
+/// core against a real host lua_State — parity with the emulated + WASM legs.
+///
+/// (On x86-64/arm64 the deterministic seam VM is always compiled into
+/// libblyt_debug, so BLYT_HOSTLUA selects the host-Lua path here; a build
+/// without it would transparently fall back to the emulated path.)
+#[test]
+fn sdl_dap_hostlua_breakpoint_step_inspect() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(
+        blytdebug().exists(),
+        "blytdebug not built — run `cmake --build build` first"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_HOSTLUA", "1")
+        .assert()
+        .success();
+}
+
+/// Native host-Lua DAP (#234): conditional breakpoint parity — the local `x` is
+/// visible to the condition, evaluated in-frame by the shared inspection core
+/// against the host lua_State (mirrors sdl_dap_conditional_breakpoint / the WASM
+/// leg).
+#[test]
+fn sdl_dap_hostlua_conditional_breakpoint() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua_cond");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_CONDITIONAL_COND", "x > 10")
+        .env("BLYT_HOSTLUA", "1")
+        .assert()
+        .success();
+}
+
+/// Native host-Lua DAP (#234): evaluate parity — an arbitrary expression is
+/// evaluated in the paused frame context (not just a name lookup), running a
+/// nested lua_pcall on the parked host lua_State (mirrors sdl_dap_evaluate_expr).
+#[test]
+fn sdl_dap_hostlua_evaluate_expr() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua_eval");
+    CartProject::new()
+        .lua(
+            "function init()\n\
+             \x20   local x = 42\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_EVALUATE_EXPR", "x + 1")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "43")
+        .env("BLYT_HOSTLUA", "1")
+        .assert()
+        .success();
+}
+
 /// SDL2 DAP: verify loadedSources returns the cart's Lua source after a stop.
 #[test]
 fn sdl_dap_loaded_sources() {

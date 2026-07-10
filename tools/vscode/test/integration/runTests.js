@@ -34,9 +34,23 @@ const { runTests } = require('@vscode/test-electron');
  * cacheable in CI. Bump deliberately. */
 const VSCODE_VERSION = '1.125.1';
 
-/* Each cart runs in its own VS Code window with only its own spec. */
+/* Each cart runs in its own VS Code window with only its own spec.
+ *
+ * `name` (optional) is the display + throwaway-workspace key; it defaults to
+ * `dir` and only needs setting when two entries share a dir (so their
+ * workspaces don't collide).  `env` (optional) is merged into extensionTestsEnv
+ * for that window — used to select a runtime variant of the SAME cart+spec, e.g.
+ * BLYT_HOSTLUA=1 runs the pure-Lua debug flow through the native host-Lua VM
+ * (#234) instead of the emulated rv32 Lua VM, asserting identical debugger
+ * behaviour across both. */
 const CARTS = [
 	{ dir: 'hello', spec: 'lua.test.js' },
+	{
+		dir: 'hello',
+		spec: 'lua.test.js',
+		name: 'hello-hostlua',
+		env: { BLYT_HOSTLUA: '1' },
+	},
 	{ dir: 'hello-c', spec: 'c.test.js' },
 	{ dir: 'hello-c', spec: 'wasm.test.js' },
 	{ dir: 'hello-lua-c', spec: 'hybrid.test.js' },
@@ -54,8 +68,11 @@ function selectCarts(carts) {
 	const sel = process.env.BLYT_IT_CART;
 	if (!sel) return carts;
 	const filtered = carts.filter(
-		({ dir, spec }) =>
-			dir === sel || spec === sel || `${dir}/${spec}`.includes(sel),
+		({ dir, spec, name }) =>
+			dir === sel ||
+			spec === sel ||
+			name === sel ||
+			`${name || dir}/${spec}`.includes(sel),
 	);
 	if (filtered.length === 0)
 		fail(
@@ -88,16 +105,22 @@ async function main() {
 	const cachePath = process.env.BLYT_VSCODE_TEST_CACHE || undefined;
 
 	let anyFailed = false;
-	for (const { dir, spec } of selectCarts(CARTS)) {
+	for (const { dir, spec, name, env: cartEnv } of selectCarts(CARTS)) {
+		const key =
+			name || dir; /* display + workspace key (unique per entry) */
 		/* Each cart is its own single-folder workspace. Copy (minus build/) and
-		 * build --debug; the extension rebuilds incrementally in-session. */
+		 * build --debug; the extension rebuilds incrementally in-session.  The
+		 * workspace folder keeps its example basename (`dir`) — the specs look it
+		 * up by name via h.folder(dir) — under a per-entry parent (`key`) so two
+		 * entries sharing a dir (e.g. the emulated + host-Lua `hello` legs) get
+		 * distinct workspaces. */
 		const src = path.join(repoRoot, 'examples', dir);
-		const workspace = path.join(tmpRoot, dir);
+		const workspace = path.join(tmpRoot, key, dir);
 		fs.cpSync(src, workspace, {
 			recursive: true,
 			filter: (s) => path.basename(s) !== 'build',
 		});
-		console.log(`[runTests] blyt build --debug ${dir} …`);
+		console.log(`[runTests] blyt build --debug ${key} …`);
 		const r = cp.spawnSync(
 			path.join(sdkDir, 'bin', 'blyt'),
 			['build', '--debug', workspace],
@@ -108,7 +131,7 @@ async function main() {
 		const userDataDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), 'blyt-vscode-ud-'),
 		);
-		console.log(`[runTests] running ${spec} in a ${dir} window …`);
+		console.log(`[runTests] running ${spec} in a ${key} window …`);
 		try {
 			await runTests({
 				version: VSCODE_VERSION,
@@ -138,12 +161,15 @@ async function main() {
 					BLYT_TRACE: '',
 					BLYT_IT_SPEC: spec,
 					BLYT_IT_GREP: process.env.BLYT_IT_GREP || '',
+					/* Per-entry overrides (e.g. BLYT_HOSTLUA=1); the extension's
+					 * spawned blytdebug inherits the extension-host env. */
+					...(cartEnv || {}),
 				},
 			});
 		} catch (err) {
 			anyFailed = true;
 			console.error(
-				`[runTests] ${dir} (${spec}) failed: ${err?.message ? err.message : err}`,
+				`[runTests] ${key} (${spec}) failed: ${err?.message ? err.message : err}`,
 			);
 		}
 

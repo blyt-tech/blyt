@@ -194,9 +194,11 @@ endif()
 # -------------------------------------------------------------------------
 # DAP debugging support (Lua source-level via Debug Adapter Protocol)
 #
-# When ON: compile dap_transport_wasm.c + master_hook.c into blytplay and define
-# BLYT_DAP=1.  Pausing the Lua VM uses Lua coroutine yield (not ASYNCIFY), so no
-# special link options are needed.
+# When ON: compile dap_transport_wasm.c + dap_lua_inspect.c + master_hook.c into
+# blytplay and define BLYT_DAP=1.  Pausing the Lua VM uses Lua coroutine yield
+# (not ASYNCIFY), so no special link options are needed.  dap_lua_inspect.c is
+# the transport-neutral protocol/inspection core shared with the native TCP
+# transport (issue #234).
 # -------------------------------------------------------------------------
 set(BLYT_DAP_DIR "${BLYT_ROOT}/runtime/host/src/dap")
 option(BLYT_DAP "Enable DAP Lua debugger support" ON)
@@ -206,7 +208,7 @@ set(BLYT_DAP_DEFS "")
 set(BLYT_DAP_LINK_OPTS "")
 if(BLYT_DAP AND EXISTS "${LUA_DIR}/lvm.c")
   list(APPEND BLYT_DAP_SOURCES "${BLYT_DAP_DIR}/dap_transport_wasm.c"
-       "${BLYT_DAP_DIR}/master_hook.c")
+       "${BLYT_DAP_DIR}/dap_lua_inspect.c" "${BLYT_DAP_DIR}/master_hook.c")
   list(APPEND BLYT_DAP_DEFS BLYT_DAP=1)
   # wdap_dequeue_json (EM_JS) calls _malloc/_free from JavaScript.
   list(APPEND BLYT_DAP_LINK_OPTS "-sEXPORTED_FUNCTIONS=_main,_malloc,_free")

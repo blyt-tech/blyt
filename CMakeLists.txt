@@ -643,6 +643,19 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     target_compile_definitions(libblyt_debug PRIVATE BLYT_DAP=1)
     target_include_directories(libblyt_debug PRIVATE "${BLYT_DAP_DIR}")
     target_link_libraries(libblyt_debug PRIVATE dap)
+    # Native host-Lua DAP (#234): the master hook + shared inspection core +
+    # native TCP transport run host-side against the fork Lua VM
+    # (blyt_hostlua_vm supplies the lua/lstate headers via its PUBLIC includes).
+    # Distinct from the dap_server.c ECALL path already in libdap.a.  Needs
+    # pthreads for the reader thread / blocking pause.
+    if(_HOST_LUA_EXEC AND TARGET Threads::Threads)
+      target_sources(
+        libblyt_debug
+        PRIVATE "${BLYT_DAP_DIR}/master_hook.c"
+                "${BLYT_DAP_DIR}/dap_lua_inspect.c"
+                "${BLYT_DAP_DIR}/dap_transport_tcp_lua.c")
+      target_link_libraries(libblyt_debug PRIVATE Threads::Threads)
+    endif()
   endif()
   if(BLYT_GDB AND TARGET gdb_stub)
     target_compile_definitions(libblyt_debug PRIVATE BLYT_GDB=1)
