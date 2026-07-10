@@ -3096,6 +3096,24 @@ void blyt_dev_ctrl_reload_fetched(int ok) {
     g_lua_bytecode = bc;
     g_lua_bytecode_size = bc_size;
 
+    /* Reload the host-Lua resource table from the NEW cart before the reloaded
+     * init() (in wasm_lua_rebuild) can read a resource (issue #246).  Entries are
+     * zero-copy aliases into the cart map (resource.c e->data = body); the old
+     * cart was just closed, so without this every entry dangles into freed memory
+     * → a use-after-free / stale read on the first post-swap resource access.
+     * Mirrors the native blyt_hostlua_reload (#244) and the update_assets sibling
+     * above: clear → load_for_cart → re-apply persistent (#160) → preload →
+     * publish footprint.  blyt_resource_table_clear frees only owned/src_path
+     * buffers, never the old zero-copy aliases, so clearing after the old cart is
+     * freed is safe. */
+    if (g_lua_resources_loaded) {
+        blyt_resource_table_clear(&g_lua_resources);
+        blyt_resource_table_load_for_cart(&g_lua_resources, g_cart);
+        blyt_resource_table_load_persistent_from_cart(&g_lua_resources, g_cart);
+        blyt_resource_table_preload_persistent(&g_lua_resources);
+        wasm_lua_publish_footprint(&g_lua_resources);
+    }
+
     /* Rebuild from the new bytecode, restoring the pre-swap snapshot and
      * replaying on_load_state(HOT_RELOAD).  rebuild() takes ownership of snap.
      * Pure-Lua carts have no native (rv32) GDB breakpoints to re-arm, so the

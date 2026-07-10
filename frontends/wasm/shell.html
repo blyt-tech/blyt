@@ -142,13 +142,26 @@
           if (ws.readyState === WebSocket.OPEN) ws.send(json);
         };
         globalThis.blyt_dev_ctrl_fetch_cart = function () {
-          fetch("cart.blyt")
-            .then(function (r) {
-              if (!r.ok) throw new Error("HTTP " + r.status);
-              return r.arrayBuffer();
-            })
-            .then(function (buf) {
-              FS.writeFile("/cart.blyt", new Uint8Array(buf));
+          /* Refetch the rebuilt cart ELF AND refresh the MEMFS resource staging
+           * dir before handing back to C (issue #246).  A dispatch `reload` fires
+           * on an asset-set change (add/rename) with NO accompanying update_assets,
+           * so the staging dir must be re-materialised here — otherwise the C-side
+           * table reload (blyt_dev_ctrl_reload_fetched) re-reads the stale
+           * pre-reload staging files and the swapped-in cart serves old resource
+           * bytes.  On disk the native player sees the freshly rebuilt staging
+           * already; MEMFS is not auto-synced, so the browser must refetch it. */
+          Promise.all([
+            fetch("cart.blyt")
+              .then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.arrayBuffer();
+              })
+              .then(function (buf) {
+                FS.writeFile("/cart.blyt", new Uint8Array(buf));
+              }),
+            blyt_materialise_resources(),
+          ])
+            .then(function () {
               Module.ccall("blyt_dev_ctrl_reload_fetched", null, ["int"], [1]);
             })
             .catch(function (e) {

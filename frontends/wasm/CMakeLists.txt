@@ -462,9 +462,16 @@ set(BLYT_WASM_OUT_DIR
     CACHE PATH "Output directory for the WASM player artifacts")
 set_target_properties(
   blytplay
-  PROPERTIES OUTPUT_NAME "${BLYT_WASM_NAME}"
-             SUFFIX ".html"
-             RUNTIME_OUTPUT_DIRECTORY "${BLYT_WASM_OUT_DIR}")
+  PROPERTIES
+    OUTPUT_NAME "${BLYT_WASM_NAME}"
+    SUFFIX ".html"
+    RUNTIME_OUTPUT_DIRECTORY "${BLYT_WASM_OUT_DIR}"
+    # The HTML shell + pre-js are consumed at LINK time via --shell-file
+    # / --pre-js; declare them so an edit relinks (ninja does not infer
+    # link-flag file inputs).
+    LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/shell.html;${CMAKE_CURRENT_SOURCE_DIR}/module_pre.js"
+)
 
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)

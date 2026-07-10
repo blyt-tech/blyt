@@ -12,8 +12,8 @@
 mod common;
 
 use common::{
-    CartProject, blyt_bin, blytplay, build_lua_cart, require_lua_sdk, require_sdk, require_wasm,
-    sdk_dir,
+    CartProject, blyt_bin, blytplay, build_lua_cart, libretro_so, require_libretro_core,
+    require_lua_sdk, require_sdk, require_wasm, sdk_dir, test_libretro_core,
 };
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -164,8 +164,22 @@ fn spawn_player_with_dev_ctrl(
     cart: &std::path::Path,
     save_dir: &std::path::Path,
 ) -> (std::process::Child, u16, Arc<Mutex<Vec<String>>>) {
+    spawn_player_with_dev_ctrl_args(cart, save_dir, &[])
+}
+
+/// As `spawn_player_with_dev_ctrl`, but prepends `extra_args` before the cart —
+/// used to opt into the host-Lua fast path (`--host-lua`, #238) so a dev-ctrl
+/// reload drives `blyt_hostlua_reload` (#244) instead of the rv32 session swap.
+fn spawn_player_with_dev_ctrl_args(
+    cart: &std::path::Path,
+    save_dir: &std::path::Path,
+    extra_args: &[&str],
+) -> (std::process::Child, u16, Arc<Mutex<Vec<String>>>) {
+    let mut args: Vec<&str> = vec!["--headless", "--dev-ctrl-port", "0"];
+    args.extend_from_slice(extra_args);
+    args.push(cart.to_str().unwrap());
     let mut child = std::process::Command::new(blytplay())
-        .args(["--headless", "--dev-ctrl-port", "0", cart.to_str().unwrap()])
+        .args(&args)
         .env("BLYT_SAVE_DIR", save_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -431,6 +445,229 @@ fn native_dev_control_reload_arena_steady_state() {
              All probes:\n{addrs:#?}"
         );
     }
+}
+
+/// Pure-Lua cart that reads an uncompressed bundled resource in on_load_state and
+/// echoes it (issue #246).  Byte-identical Lua across v1/v2, so the ONLY thing a
+/// reload can change is the bundled resource content — proving it is the resource
+/// TABLE, not the code, that reloaded from the new cart.
+/// 0x20000001 = R_GREETING baked constant (kind RESOURCE, id 1; ADR-0134).
+const RELOAD_RESOURCE_LUA: &str = r#"
+local function greeting()
+    return blyt.resource.text_resource(0x20000001):text() or "<nil>"
+end
+function init()
+    blyt.debug.print("init greeting=" .. greeting())
+end
+function update() end
+function draw() end
+function on_load_state(info)
+    blyt.debug.print("reload greeting=" .. greeting() .. " reason=" .. tostring(info.reason))
+end
+"#;
+
+/// Drive an in-place dev-ctrl `reload` cart-swap on the native player, swapping a
+/// cart whose bundled resource content changed (RES_V1 → RES_V2), and assert the
+/// post-swap on_load_state read returns the NEW content (issue #246).
+///
+/// `extra_args` selects the runner: `&[]` = the rv32 session path
+/// (`blyt_session_swap_cart` reloads ctx.resources — a regression guard);
+/// `&["--host-lua"]` = the host-Lua fast path (`blyt_hostlua_reload`, #244), whose
+/// resource reload was never exercised because `hello` has no resources.  Both
+/// must surface RES_V2; a stale RES_V1 would mean the resource table still aliases
+/// the freed old cart map (resource.c e->data = body).
+fn native_reload_resource_leg(extra_args: &[&str], leg: &str) {
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+
+    let project_v1 = tmp.path().join("reload_res_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V1")
+        .write(&project_v1);
+    let v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("reload_res_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V2")
+        .write(&project_v2);
+    let v2 = build_lua_cart(&project_v2);
+
+    // Run on a copy we overwrite in place, reproducing `blyt debug`'s in-place
+    // rebuild-then-reload (the reload reopens g_cart_path).
+    let work = tmp.path().join("cart.blyt");
+    std::fs::copy(&v1, &work).unwrap();
+
+    let (mut child, port, lines) =
+        spawn_player_with_dev_ctrl_args(&work, save_dir.path(), extra_args);
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect dev control");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let read_half = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(read_half);
+
+    // Wait for cart_v1's init() to run and read its bundled resource BEFORE
+    // reloading.  Sending the reload immediately races boot: on a fast runner the
+    // swap can happen before frame 0 runs, so v1's init never prints RES_V1 (the
+    // CI-observed flake).  This also anchors the pre-swap value the post-reload
+    // read must differ from.
+    let wait_line = |needle: &str, what: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if lines.lock().unwrap().iter().any(|l| l.contains(needle)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{leg}: timed out waiting for {what} ({needle:?}); player output:\n{}",
+                lines.lock().unwrap().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_line("init greeting=RES_V1", "cart_v1 init resource read");
+
+    // Rebuild in place (overwrite with v2, whose resource ships RES_V2), then
+    // hot reload — the swap must reload the resource table from the new cart.
+    std::fs::copy(&v2, &work).unwrap();
+    let resp = dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":1,"cmd":"reload"}"#);
+    assert!(
+        resp.contains("\"id\":1") && resp.contains("\"status\":\"ok\""),
+        "{leg}: reload did not succeed: {resp}"
+    );
+
+    // The reload's on_load_state runs synchronously inside the reload handler
+    // (before the ok response), so RES_V2 is already printed; poll to be robust.
+    wait_line(
+        "reload greeting=RES_V2 reason=3",
+        "post-reload resource read",
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Guard against a stale read masquerading as success: the post-reload value
+    // must be RES_V2, never the pre-swap RES_V1 (which would mean the table still
+    // aliased the freed old cart, #246).
+    let out = lines.lock().unwrap().join("\n");
+    assert!(
+        !out.contains("reload greeting=RES_V1"),
+        "{leg}: post-reload read returned the stale old-cart content RES_V1 (#246); \
+         player output:\n{out}"
+    );
+}
+
+/// rv32 session path (default player): `blyt_session_swap_cart` reloads
+/// ctx.resources on the swap.  Regression guard for the already-correct path.
+#[test]
+fn native_dev_control_reload_reloads_resource_session() {
+    require_sdk();
+    require_lua_sdk();
+    native_reload_resource_leg(&[], "native session");
+}
+
+/// Host-Lua fast path (`--host-lua`, #238): the dev-ctrl reload drives
+/// `blyt_hostlua_reload` (#244), which reloads its resource table from the new
+/// cart before the old cart is freed.  Pins that #244 handling — `hello` (its only
+/// prior reload cart) has zero resources, so this path was never exercised.
+#[test]
+fn native_dev_control_reload_reloads_resource_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+    native_reload_resource_leg(&["--host-lua"], "native host-Lua");
+}
+
+/// Drive a cart-swap `reload` through the embedded libretro core
+/// (test_libretro_core dlopens blyt_libretro.so with its OWN embedded guest
+/// libs — a distinct artifact from the sdk/lib blobs blytplay loads).  At frame
+/// `after` the harness calls blyt_libretro_reload_at(cart_v2); `extra_env` selects
+/// the runner (`BLYT_HOSTLUA=1` → the host-Lua fast path, else the rv32 session).
+/// Returns the captured stderr (cart debug output arrives via the libretro log
+/// callback).
+fn libretro_reload_capture(
+    cart_v1: &std::path::Path,
+    cart_v2: &std::path::Path,
+    after: u32,
+    frames: u32,
+    extra_env: &[(&str, &str)],
+) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    cmd.arg("--run-frames")
+        .arg(frames.to_string())
+        .arg("--reload-after")
+        .arg(after.to_string())
+        .arg("--reload-path")
+        .arg(cart_v2)
+        .arg(libretro_so())
+        .arg(cart_v1);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.assert().success().get_output().stderr.clone();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// libretro leg of #246: build a pure-Lua cart pair whose bundled resource
+/// content differs (RES_V1 → RES_V2), reload-swap v1→v2 mid-run, and assert the
+/// post-swap on_load_state read surfaces RES_V2.  `extra_env` picks the runner:
+/// the rv32 session (`reload_impl` → `blyt_session_swap_cart`) or the host-Lua
+/// fast path (`hostlua_reload_impl` → `blyt_hostlua_reload`, #244).  A stale
+/// RES_V1 would mean the resource table still aliases the freed old cart map.
+fn libretro_reload_resource_leg(extra_env: &[(&str, &str)], leg: &str) {
+    let tmp = TempDir::new().unwrap();
+
+    let project_v1 = tmp.path().join("reload_res_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V1")
+        .write(&project_v1);
+    let v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("reload_res_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V2")
+        .write(&project_v2);
+    let v2 = build_lua_cart(&project_v2);
+
+    let out = libretro_reload_capture(&v1, &v2, 2, 6, extra_env);
+    assert!(
+        out.contains("init greeting=RES_V1"),
+        "{leg}: cart_v1 did not read its bundled resource at init; core output:\n{out}"
+    );
+    assert!(
+        out.contains("reload greeting=RES_V2 reason=3"),
+        "{leg}: post-reload resource read did NOT return the new cart's content \
+         (expected RES_V2) — resource table still aliases the freed old cart (#246); \
+         core output:\n{out}"
+    );
+}
+
+/// libretro embedded core, rv32 session path.  Regression guard on the distinct
+/// .so artifact.
+#[test]
+fn libretro_dev_control_reload_reloads_resource_session() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    libretro_reload_resource_leg(&[], "libretro session");
+}
+
+/// libretro embedded core, host-Lua fast path (`BLYT_HOSTLUA=1`, #238): pins the
+/// #244 `blyt_hostlua_reload` resource handling on the embedded-guest-lib artifact.
+#[test]
+fn libretro_dev_control_reload_reloads_resource_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    libretro_reload_resource_leg(&[("BLYT_HOSTLUA", "1")], "libretro host-Lua");
 }
 
 /* ── native player as an outbound dev-control client (issue #90, option 2) ──── */

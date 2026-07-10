@@ -631,6 +631,107 @@ fn run_wasm_dev_hotswap_asset(
     );
 }
 
+/// Like `run_wasm_dev_hotswap_asset`, but drives the ASSET-SET-CHANGE → `reload`
+/// path (issue #246): the browser driver adds `new_asset_rel` (a resource-id-set
+/// change → devtool dispatches a bare `reload`, no `update_assets`) while editing
+/// `assets/greeting.txt` from `v1` to `v2` in the same coalesced rebuild.  A
+/// working reload reloads the host-Lua resource table from the swapped-in cart, so
+/// the per-frame reader sees `v2`; pre-fix it aliases the freed old cart map (#246).
+fn run_wasm_dev_add_reload(
+    project: &std::path::Path,
+    new_asset_rel: &str,
+    v1: &str,
+    v2: &str,
+    context: &str,
+) {
+    use std::process::{Command as StdCommand, Stdio};
+    use std::sync::{Arc, Mutex};
+
+    let sdk = sdk_dir();
+    let mut child = StdCommand::new(blyt_bin())
+        .args(["run", project.to_str().unwrap()])
+        .env("BLYT_SDK_DIR", &sdk)
+        .env("BLYT_OBJCOPY", sdk.join("bin/blyt-objcopy"))
+        .env("BLYT_CLANG", sdk.join("bin/blyt-clang"))
+        .env("BLYT_WASM_DIR", find_wasm_dir())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn blyt run");
+
+    let mut stdout = child.stdout.take().unwrap();
+    let buf = Arc::new(Mutex::new(String::new()));
+    let buf_t = buf.clone();
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf_t
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&chunk[..n])),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let url = wait_for_serving_url(&buf, Duration::from_secs(30));
+    let driver = repo_root().join("tests/wasm/dev_asset_add_reload_test.mjs");
+    let greeting = project.join("assets/greeting.txt");
+    let new_asset = project.join("assets").join(new_asset_rel);
+    let status = std::process::Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            &url,
+            greeting.to_str().unwrap(),
+            new_asset.to_str().unwrap(),
+            v1,
+            v2,
+        ])
+        .status()
+        .expect("run dev_asset_add_reload_test.mjs");
+
+    let _ = child.kill();
+    let _ = reader.join();
+    assert!(
+        status.success(),
+        "{context}: dev_asset_add_reload_test.mjs failed; blyt run output:\n{}",
+        buf.lock().unwrap()
+    );
+}
+
+/// End-to-end reachability for #246: adding an asset to a running pure-Lua
+/// WASM-dev cart forces devtool's dispatch_signals to emit a bare `reload` (no
+/// `update_assets` — the resource-id set changed), which is the real flow that
+/// makes the host-Lua resource-table use-after-free reachable in normal dev use.
+/// The greeting the cart reads every frame is edited to v2 in the same rebuild, so
+/// the post-reload read reveals whether the table reloaded from the swapped-in
+/// cart (v2) or still aliases the freed old cart (stale v1).  Pre-fix this times
+/// out on v2; post-fix v2 appears.  (The dispatch decision itself is unit-tested
+/// in devtool: dispatch_resource_set_change_forces_reload.)
+#[test]
+fn asset_add_forces_reload_reloads_resource_lua_wasm() {
+    require_lua_sdk();
+    require_wasm();
+    require_playwright();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("assets_wasm_add_reload_lua");
+    CartProject::new()
+        .lua(PER_FRAME_LOADER_LUA)
+        .asset("greeting.txt", "VERSION_ONE")
+        .write(&project);
+
+    build_dev_elf(&project);
+    run_wasm_dev_add_reload(
+        &project,
+        "extra.txt",
+        "VERSION_ONE",
+        "VERSION_TWO",
+        "pure-Lua asset-add forces reload",
+    );
+}
+
 /// WASM dev-mode hot-swap, pure-Lua fast path (issue #120): same browser path as
 /// the C test above, but the cart is pure-Lua so it runs host-side in g_lua with
 /// g_session == NULL.  The swap must reach it through the host-Lua resource table
