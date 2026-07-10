@@ -62,6 +62,35 @@ bool blyt_hostlua_should_use(const blyt_cart_t *cart);
 blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn);
 
 /*
+ * Debug variant of blyt_hostlua_create (BLYT_DAP builds only): build the VM and
+ * arm the DAP master hook on it, but DO NOT run init()/on_new_state() yet — the
+ * boot is deferred to blyt_hostlua_dap_wait_ready() so a breakpoint set in
+ * init() can fire.  Mirrors blyt_session_create + the debug-gated boot on the
+ * emulated path.  Returns NULL on failure or in a build without DAP / the seam
+ * VM.  Pair with blyt_hostlua_dap_listen() (start the server) then
+ * blyt_hostlua_dap_wait_ready() (gate + boot).
+ */
+blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn);
+
+/*
+ * Start the native host-Lua DAP server (TCP, 127.0.0.1:port; port 0 =
+ * OS-assigned).  Writes the actual bound port to *actual_port when non-NULL.
+ * Returns 0 on success, -1 on failure or a runner not created for debug.  The
+ * host-Lua analog of blyt_session_dap_listen; the frontend reports the port.
+ */
+int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port);
+
+/*
+ * Block until the DAP client sends configurationDone, then run the deferred
+ * boot phase — init() + on_new_state() — under the armed master hook, so any
+ * breakpoint in init() pauses.  Returns non-zero once the cart has booted; 0 if
+ * the server shut down / the client never connected.  The host-Lua analog of
+ * blyt_session_dap_wait_ready, called from the player's main loop before the
+ * frame loop.  No-op returning 0 for a runner not created for debug.
+ */
+int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl);
+
+/*
  * Run one frame: update() then draw(), mirroring one iteration of the guest
  * blyt_main loop.  Returns BLYT_RUN_FRAME_DONE when a frame completed and the
  * cart is still running; BLYT_RUN_OK once the cart has requested quit (the final

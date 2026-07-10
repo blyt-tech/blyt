@@ -38,6 +38,11 @@
 #include "lua.h"
 #include "lualib.h"
 
+#ifdef BLYT_DAP
+#include "dap_transport_tcp_lua.h" /* native host-Lua DAP server (#234) */
+#include "master_hook.h" /* fc_consolelua_master_hook_install + fc_master_hook_cfg */
+#endif
+
 #include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
 #include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
 #include "blyt_handle.h" /* runtime/shared: console-wide handle encoding (ADR-0134) */
@@ -114,6 +119,11 @@ struct blyt_hostlua {
      * published from it, feeding the same unified 16 MB budget predicate. */
     blyt_resource_table_t resources;
     bool resources_loaded;
+    /* Source-level debugging (#234): when set, build_vm arms the DAP master hook
+     * on hl->L (re-armed on every reset/reload rebuild), init() is deferred to
+     * blyt_hostlua_dap_wait_ready(), and destroy shuts the DAP server down. */
+    bool dap_enabled;
+    bool booted; /* init()/on_new_state() have run (the deferred debug boot) */
 };
 
 /* The runner is stashed in the lua_State's extra space so the C API callbacks
@@ -1708,10 +1718,25 @@ static int build_vm(blyt_hostlua_t *hl) {
      * the byte-identical cart-attributable heap. */
     lua_gc(hl->L, LUA_GCCOLLECT);
     hl->mem_acct.guest_heap_baseline = hl->mem_acct.guest_heap_used;
+
+#ifdef BLYT_DAP
+    /* Arm the DAP master hook on the fresh VM so breakpoints/steps fire in the
+     * lifecycle callbacks (#234).  Re-run on every rebuild (reset/reload), the
+     * native equivalent of the WASM leg re-installing the hook per coroutine. */
+    if (hl->dap_enabled) {
+        fc_master_hook_cfg.dap_enabled = true;
+        fc_consolelua_master_hook_install(hl->L);
+    }
+#endif
     return 0;
 }
 
-blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
+/* Allocate a runner and build its VM (resources + palette + state ctx + VM),
+ * but do NOT run the init() boot — the caller decides when (immediately for a
+ * plain run, or after configurationDone for a debug session).  `debug` arms the
+ * DAP master hook inside build_vm.  Returns the runner (VM live, uninitialised)
+ * or NULL on failure. */
+static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool debug) {
     if (!cart)
         return NULL;
 
@@ -1727,6 +1752,7 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     hl->cart = cart;
     hl->bytecode = (const unsigned char *)bytecode;
     hl->bytecode_size = lua_size;
+    hl->dap_enabled = debug; /* build_vm arms the master hook when set (#234) */
 
     /* Resource table (#93/#158/#231): load the cart's bundled + persistent
      * resources so blyt.resource.*, mem.stats, and cart-asset palettes resolve
@@ -1777,14 +1803,70 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
         free(hl);
         return NULL;
     }
+    return hl;
+}
+
+blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
+    blyt_hostlua_t *hl = hl_new(cart, log_fn, false);
+    if (!hl)
+        return NULL;
 
     /* Boot phase of the guest blyt_main loop: init() then on_new_state(). */
     if (call_lifecycle(hl, "init") != 0 || call_lifecycle(hl, "on_new_state") != 0) {
         blyt_hostlua_destroy(hl);
         return NULL;
     }
-
+    hl->booted = true;
     return hl;
+}
+
+blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn) {
+#ifdef BLYT_DAP
+    /* Build + arm the hook, but DEFER init() to blyt_hostlua_dap_wait_ready() so
+     * a breakpoint set in init() fires (the native equivalent of the WASM leg
+     * gating init on configurationDone). */
+    return hl_new(cart, log_fn, true);
+#else
+    (void)cart;
+    (void)log_fn;
+    return NULL;
+#endif
+}
+
+int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port) {
+#ifdef BLYT_DAP
+    if (!hl || !hl->dap_enabled)
+        return -1;
+    int p = fc_hostlua_dap_listen(0); /* OS-assigned, mirroring the emulated path */
+    if (p < 0)
+        return -1;
+    if (actual_port)
+        *actual_port = p;
+    return 0;
+#else
+    (void)hl;
+    (void)actual_port;
+    return -1;
+#endif
+}
+
+int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
+#ifdef BLYT_DAP
+    if (!hl || !hl->dap_enabled)
+        return 0;
+    if (!fc_hostlua_dap_wait_ready()) /* blocks until configurationDone / shutdown */
+        return 0;
+    /* Run the deferred boot under the armed hook so an init() breakpoint pauses. */
+    if (!hl->booted) {
+        call_lifecycle(hl, "init");
+        call_lifecycle(hl, "on_new_state");
+        hl->booted = true;
+    }
+    return 1;
+#else
+    (void)hl;
+    return 0;
+#endif
 }
 
 void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
@@ -1891,6 +1973,10 @@ const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl) {
 void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
     if (!hl)
         return;
+#ifdef BLYT_DAP
+    if (hl->dap_enabled)
+        fc_hostlua_dap_shutdown();
+#endif
     if (hl->L)
         lua_close(hl->L);
     /* Free any off-screen surface buffers still resident (slot 0 = screen aliases
@@ -1939,6 +2025,23 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     (void)cart;
     (void)log_fn;
     return NULL;
+}
+
+blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn) {
+    (void)cart;
+    (void)log_fn;
+    return NULL;
+}
+
+int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port) {
+    (void)hl;
+    (void)actual_port;
+    return -1;
+}
+
+int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
+    (void)hl;
+    return 0;
 }
 
 blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {

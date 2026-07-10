@@ -185,7 +185,29 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
      * for a cart it was selected for is a hard error (anti-#98) — do NOT silently
      * fall back to rv32, which would mask a broken host-Lua path. */
     if (blyt_hostlua_should_use(g_cart)) {
-        g_hostlua = blyt_hostlua_create(g_cart, libretro_log);
+#ifdef BLYT_DAP
+        /* Source-level debugging on the native host-Lua path (#234): build the
+         * runner with the DAP hook armed + init() deferred, then start the DAP
+         * server.  The wait_ready gate (main loop) boots the cart once the
+         * client sends configurationDone.  GDB does not apply here — a pure-Lua
+         * cart has no rv32 machine code to attach an RSP stub to (a future hybrid
+         * cart, #232, would run an rv32 session alongside for that). */
+        const char *dap_port_str = getenv("BLYT_DAP_PORT");
+        if (dap_port_str) {
+            g_hostlua = blyt_hostlua_create_debug(g_cart, libretro_log);
+            if (g_hostlua) {
+                int actual_port = 0;
+                if (blyt_hostlua_dap_listen(g_hostlua, &actual_port) >= 0) {
+                    g_dap_active = true;
+                    if (g_log_cb)
+                        g_log_cb(RETRO_LOG_INFO, "blyt: DAP listening on port %d\n", actual_port);
+                    else
+                        fprintf(stderr, "blyt: DAP listening on port %d\n", actual_port);
+                }
+            }
+        } else
+#endif
+            g_hostlua = blyt_hostlua_create(g_cart, libretro_log);
         if (!g_hostlua) {
             if (g_log_cb)
                 g_log_cb(RETRO_LOG_ERROR, "blyt: failed to create host-Lua runner\n");
@@ -412,6 +434,10 @@ bool blyt_libretro_is_done(void) {
 /* Block until the DAP client sends configurationDone (breakpoints set) or the
  * server shuts down.  Called by the SDL frontend before starting the game loop. */
 bool blyt_libretro_dap_wait_ready(void) {
+    /* Native host-Lua path (#234): gate + boot the deferred init() under the
+     * armed hook.  Otherwise the emulated rv32 session. */
+    if (g_hostlua)
+        return blyt_hostlua_dap_wait_ready(g_hostlua) != 0;
     return g_session && blyt_session_dap_wait_ready(g_session) != 0;
 }
 #endif
