@@ -22,8 +22,9 @@ mod common;
 use common::gfx;
 use common::{
     CartProject, build_cart, require_lua_sdk, require_rust_riscv_target, require_sdk,
-    run_cart_libretro_with_env, run_cart_native_hostlua_frame_hash, run_cart_native_with_env,
-    run_cart_wasm_with_env, write_c_cart_project,
+    run_cart_libretro_hostlua_frame_hash, run_cart_libretro_with_env,
+    run_cart_native_hostlua_frame_hash, run_cart_native_with_env, run_cart_wasm_with_env,
+    write_c_cart_project,
 };
 
 /// One horizontal band of the shared test picture: filled with palette index
@@ -209,6 +210,7 @@ fn named_color_sets_hash_identically_across_langs_and_legs() {
     run_cart_wasm_with_env(&lua_cart, &env, &expected);
     run_cart_libretro_with_env(&lua_cart, &env, &expected);
     run_cart_native_hostlua_frame_hash(&lua_cart, &expected); // #231 (blyt32.color)
+    run_cart_libretro_hostlua_frame_hash(&lua_cart, &expected); // #233 (blyt32.color)
 
     // Rust.
     require_rust_riscv_target();

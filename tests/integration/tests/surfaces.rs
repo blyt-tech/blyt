@@ -20,8 +20,8 @@ use common::{
     write_c_cart_project,
 };
 use common::{
-    run_cart_libretro_with_env, run_cart_native_hostlua_frame_hash, run_cart_native_with_env,
-    run_cart_wasm_with_env,
+    run_cart_libretro_hostlua_frame_hash, run_cart_libretro_with_env,
+    run_cart_native_hostlua_frame_hash, run_cart_native_with_env, run_cart_wasm_with_env,
 };
 
 /// Build a C cart whose `blyt_cart_draw` runs `draw_body` once, then quits.
@@ -511,6 +511,7 @@ fn surface_lua_screen_torture_hashes_identically_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &expected);
     run_cart_libretro_with_env(&cart, &env, &expected);
     run_cart_native_hostlua_frame_hash(&cart, &expected); // #231
+    run_cart_libretro_hostlua_frame_hash(&cart, &expected); // #233
 }
 
 /// #208 Stage 2: the Lua tier-2 per-pixel lock (`blyt32.surface.acquire` →
@@ -542,6 +543,7 @@ fn surface_lua_lock_tier2_screen_torture_hashes_identically_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &expected);
     run_cart_libretro_with_env(&cart, &env, &expected);
     run_cart_native_hostlua_frame_hash(&cart, &expected); // #231
+    run_cart_libretro_hostlua_frame_hash(&cart, &expected); // #233
 }
 
 /// #208: `lk:get` reads back what `lk:set` wrote (per-pixel round-trip), and an
@@ -583,6 +585,7 @@ fn surface_lua_lock_get_roundtrip_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &expected);
     run_cart_libretro_with_env(&cart, &env, &expected);
     run_cart_native_hostlua_frame_hash(&cart, &expected); // #231
+    run_cart_libretro_hostlua_frame_hash(&cart, &expected); // #233
 }
 
 /// #208: using a lock after `lk:release()` is a defined no-op in a release cart
@@ -616,6 +619,7 @@ fn surface_lua_lock_use_after_release_is_noop_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &expected);
     run_cart_libretro_with_env(&cart, &env, &expected);
     run_cart_native_hostlua_frame_hash(&cart, &expected); // #231
+    run_cart_libretro_hostlua_frame_hash(&cart, &expected); // #233
 }
 
 /// #208: in a DEBUG cart, an out-of-bounds `lk:set` is a hard Lua error — not the
@@ -700,6 +704,7 @@ fn surface_lua_offscreen_draw_then_blit_hashes_identically_across_legs() {
     run_cart_wasm_with_env(&cart, &env, &expected);
     run_cart_libretro_with_env(&cart, &env, &expected);
     run_cart_native_hostlua_frame_hash(&cart, &expected); // #231
+    run_cart_libretro_hostlua_frame_hash(&cart, &expected); // #233
 }
 
 /// #208 cross-half screen-lock coherence: while the host-Lua half holds a tier-2

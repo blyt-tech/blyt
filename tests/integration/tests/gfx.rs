@@ -18,8 +18,8 @@ mod common;
 use common::gfx;
 use common::{
     CartProject, build_cart, build_lua_cart, require_lua_sdk, require_sdk, require_wasm,
-    run_cart_libretro_with_env, run_cart_native_with_env, run_cart_wasm_with_env,
-    write_c_cart_project,
+    run_cart_libretro_hostlua_frame_hash, run_cart_libretro_with_env, run_cart_native_with_env,
+    run_cart_wasm_with_env, write_c_cart_project,
 };
 
 /// Build a C cart whose `blyt_cart_draw` runs `draw_body` once, then quits.
@@ -208,6 +208,9 @@ fn gfx_torture_frame_lua_hashes_identically_across_legs() {
         &[("BLYT_FRAME_HASH", "1"), ("BLYT_HOSTLUA", "1")],
         &expected,
     );
+    // Same host-Lua fast path inside the libretro core (#233): the present path
+    // #231 added to blyt_libretro.so must emit the identical golden.
+    run_cart_libretro_hostlua_frame_hash(&cart, &expected);
 }
 
 /// Build a Lua + native-C **hybrid** cart whose torture frame is split across
