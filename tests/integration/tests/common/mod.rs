@@ -1209,6 +1209,27 @@ pub fn run_cart_native_hostlua_frame_hash(cart: &std::path::Path, expected: &str
     );
 }
 
+/// Run a pure-Lua gfx/surface cart through the embedded libretro core's native
+/// host-Lua fast path (#233, opt-in `BLYT_HOSTLUA=1`) with framebuffer hashing
+/// on, and assert `expected` (a `[blyt:fbhash]`/`[blyt:palhash]` line) appears
+/// in the core's output — the libretro-`.so` host-Lua leg of the gfx/surface
+/// frame-hash matrix, alongside libretro-rv32 / blytplay-host-Lua / wasm-host-Lua.
+///
+/// This exercises the framebuffer *present* path that #231 added to
+/// `blyt_libretro.so` (`blyt_hostlua_get_pixels`/`get_palette` → `g_xrgb`): the
+/// frame-hash lines emitted by the shared host-Lua runner (`hl_frame_done` in
+/// `cart_run_hostlua.c`) route through the runner's `log_fn`, which the core
+/// wires to `libretro_log` → the libretro `RETRO_LOG_INFO` callback — the same
+/// channel the rv32 leg's frame hashes flow through, captured by
+/// `test_libretro_core`.
+pub fn run_cart_libretro_hostlua_frame_hash(cart: &std::path::Path, expected: &str) {
+    run_cart_libretro_with_env(
+        cart,
+        &[("BLYT_FRAME_HASH", "1"), ("BLYT_HOSTLUA", "1")],
+        expected,
+    );
+}
+
 /// Run a cart on the native host-Lua determinism leg (Spike Z, #225); assert
 /// `expected` appears in stdout. The cart must be pure Lua (the leg reads its
 /// `.cart.lua` bytecode section) and must terminate itself via `blyt.quit()`.
