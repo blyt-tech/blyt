@@ -589,10 +589,55 @@ static bool reload_impl(const char *open_path, uint32_t load_base, const char *r
     return true;
 }
 
+/* Host-Lua hot reload (issue #244, epic #230): the g_hostlua counterpart of
+ * reload_impl.  Open the freshly rebuilt cart from `open_path`, hand it to the
+ * runner (which snapshots state, rebuilds the VM against the new bytecode and —
+ * in a debug session — re-arms the persisted DAP breakpoints so an init()
+ * breakpoint re-fires), then retire the old cart handle and adopt the new one.
+ * There is no rv32 session, so no solib/base handling applies — the Lua
+ * source-level DAP breakpoints re-bind host-side on the VM rebuild.
+ *
+ * Failure contract: a rejected new image (open error, or a cart without a
+ * .cart.lua section — blyt_hostlua_reload returns false without touching the live
+ * VM) leaves the old runner + cart running.  A rebuild failure mid-swap is
+ * can't-happen-in-practice (same bytecode format, only teardown+rebuild) and, as
+ * with the reset-every-frame cycle, marks the runner done — the run ends; the
+ * runner holds no live references to close new_cart against. */
+static bool hostlua_reload_impl(const char *open_path) {
+    if (!g_hostlua || !open_path)
+        return false;
+
+    blyt_cart_t *new_cart = NULL;
+    blyt_cart_err_t err = blyt_cart_open(open_path, &new_cart);
+    if (err != BLYT_CART_OK) {
+        if (g_log_cb)
+            g_log_cb(RETRO_LOG_ERROR, "blyt: host-Lua reload failed to open cart: %s\n",
+                     blyt_cart_err_str(err));
+        return false; /* old runner keeps running the old code */
+    }
+
+    /* The runner re-points its cart/bytecode/resources at new_cart; the old cart
+     * must stay valid until it returns, then we close it. */
+    if (!blyt_hostlua_reload(g_hostlua, new_cart)) {
+        if (g_log_cb)
+            g_log_cb(RETRO_LOG_ERROR, "blyt: host-Lua reload failed to rebuild the VM\n");
+        blyt_cart_close(new_cart);
+        return false;
+    }
+
+    blyt_cart_close(g_cart);
+    g_cart = new_cart;
+    g_cart_done = false;
+    g_run_err = BLYT_RUN_OK;
+    return true;
+}
+
 bool blyt_libretro_reload(void) {
     /* Run-mode reload: same base, no debug solib event. */
     if (!g_cart_path)
         return false;
+    if (g_hostlua)
+        return hostlua_reload_impl(g_cart_path);
     return reload_impl(g_cart_path, 0u, NULL, false);
 }
 
@@ -602,6 +647,8 @@ bool blyt_libretro_reload_at(const char *path) {
     const char *open_path = (path && path[0]) ? path : g_cart_path;
     if (!open_path)
         return false;
+    if (g_hostlua)
+        return hostlua_reload_impl(open_path);
     return reload_impl(open_path, 0u, NULL, false);
 }
 
@@ -614,6 +661,13 @@ bool blyt_libretro_reload_for_debug(const char *reported_path) {
     const char *path = (reported_path && reported_path[0]) ? reported_path : g_cart_path;
     if (!path)
         return false;
+    /* Pure-Lua carts have no rv32 session/lldb — the host-Lua runner re-binds its
+     * source-level DAP breakpoints host-side on the VM rebuild, so there is no
+     * solib event or fresh base to arrange (a pure-Lua debug session is DAP-only
+     * and reaches reload via blyt_libretro_reload_at, never here — this guard just
+     * keeps the two entry points behaviourally consistent). */
+    if (g_hostlua)
+        return hostlua_reload_impl(path);
     uint32_t base = blyt_session_next_reload_base(g_session);
     return reload_impl(path, base, reported_path, true);
 }

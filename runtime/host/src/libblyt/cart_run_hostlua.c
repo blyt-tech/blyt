@@ -1869,6 +1869,53 @@ int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
 #endif
 }
 
+/* Shared tail of the reset-every-frame cycle and the hot reload (#244): tear the
+ * VM down, rebuild it from hl->bytecode (re-arming the DAP master hook), re-run
+ * init(), then restore `snap` over the fresh buffers and replay
+ * on_load_state(HOT_RELOAD).  Consumes `snap` (freed here).  On rebuild failure
+ * the runner is marked done and false is returned; true on success. */
+static bool hl_rebuild_and_restore(blyt_hostlua_t *hl, blyt_state_snapshot_t *snap) {
+    /* Tear down the VM and rebuild it (all Lua globals wiped — the host-Lua
+     * equivalent of zeroing guest BSS; build_vm re-arms the DAP hook, #234). */
+    lua_close(hl->L);
+    hl->L = NULL;
+    /* Empty the cart heap so the reloaded VM's allocations are bit-identical to a
+     * first load (mirrors the WASM leg's wasm_lua_arena_reset).  lua_close already
+     * frees the old VM's objects through the allocator; this zeroes any residual
+     * accounting so guest_heap_used restarts from 0. */
+    if (hl->arena.base)
+        blyt_arena_reset(&hl->arena);
+    if (build_vm(hl) != 0) {
+        /* Rebuild failed: the runner is unusable; mark done so run_frame stops. */
+        if (snap)
+            blyt_state_snapshot_free(snap);
+        hl->done = true;
+        return false;
+    }
+
+    /* Re-run init() on the fresh VM (under the re-armed hook, an init()
+     * breakpoint pauses here — the reload-while-debug re-fire, #244). */
+    call_lifecycle(hl, "init");
+
+    /* Restore state buffers + notify the cart (BLYT_LOAD_HOT_RELOAD = 3). */
+    if (snap) {
+        blyt_state_ctx_restore_snapshot(hl->state_ctx, snap);
+        blyt_state_snapshot_free(snap);
+    }
+    lua_getglobal(hl->L, "on_load_state");
+    if (lua_isfunction(hl->L, -1)) {
+        lua_newtable(hl->L);
+        lua_pushinteger(hl->L, 3); /* BLYT_LOAD_HOT_RELOAD */
+        lua_setfield(hl->L, -2, "reason");
+        lua_pushinteger(hl->L, 0);
+        lua_setfield(hl->L, -2, "saved_cart_version");
+        lua_pcall(hl->L, 1, 0, 0);
+    } else {
+        lua_pop(hl->L, 1);
+    }
+    return true;
+}
+
 void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
     if (!hl || hl->done)
         return;
@@ -1891,43 +1938,52 @@ void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
         blyt_state_ctx_zero_data(hl->state_ctx);
     }
 
-    /* 4. Tear down the VM and rebuild it from the same bytecode (all Lua globals
-     * wiped — the host-Lua equivalent of zeroing guest BSS). */
-    lua_close(hl->L);
-    hl->L = NULL;
-    /* Empty the cart heap so the reloaded VM's allocations are bit-identical to a
-     * first load (mirrors the WASM leg's wasm_lua_arena_reset).  lua_close already
-     * frees the old VM's objects through the allocator; this zeroes any residual
-     * accounting so guest_heap_used restarts from 0. */
-    if (hl->arena.base)
-        blyt_arena_reset(&hl->arena);
-    if (build_vm(hl) != 0) {
-        /* Rebuild failed: the runner is unusable; mark done so run_frame stops. */
-        if (snap)
-            blyt_state_snapshot_free(snap);
-        hl->done = true;
-        return;
+    /* 4–6. Rebuild from the SAME bytecode, restore, notify. */
+    hl_rebuild_and_restore(hl, snap);
+}
+
+bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
+    if (!hl || hl->done || !new_cart)
+        return false;
+
+    /* Validate the new image BEFORE disturbing the live VM: a cart without a
+     * .cart.lua section can't run on this path, so keep the old VM running and
+     * let the caller keep the old cart (mirrors reload_impl's pre-swap open). */
+    size_t lua_size = 0;
+    const void *bytecode = blyt_cart_find_section(new_cart, ".cart.lua", &lua_size);
+    if (!bytecode || !lua_size)
+        return false;
+
+    /* Snapshot live state from the CURRENT VM first (on_save_state runs in the
+     * old VM, before the swap) — the same order as the reset cycle and the WASM
+     * pure-Lua reload. */
+    call_lifecycle(hl, "on_save_state");
+    blyt_state_snapshot_t *snap = NULL;
+    if (hl->state_ctx) {
+        snap = blyt_state_ctx_snapshot(hl->state_ctx);
+        blyt_state_ctx_zero_data(hl->state_ctx);
     }
 
-    /* 5. Re-run init() on the fresh VM. */
-    call_lifecycle(hl, "init");
+    /* Swap the cart image into the runner.  Resource-table entries alias the cart
+     * map zero-copy (resource.c), so the table must be re-pointed at new_cart now,
+     * while the old cart is still valid — the caller closes the old cart only
+     * after we return.  Re-seed the default palette from the new cart's assets
+     * too (the new init() may still override it). */
+    if (hl->resources_loaded) {
+        blyt_resource_table_clear(&hl->resources);
+        blyt_resource_table_load_for_cart(&hl->resources, new_cart);
+        blyt_resource_table_load_persistent_from_cart(&hl->resources, new_cart);
+        if (blyt_resource_table_preload_persistent(&hl->resources) != 0 && hl->log_fn)
+            hl->log_fn("blyt-hostlua: reload persistent resource preload failed");
+        hl_publish_footprint(hl, &hl->resources);
+    }
+    hl->cart = new_cart;
+    hl->bytecode = (const unsigned char *)bytecode;
+    hl->bytecode_size = lua_size;
+    hl_palette_ensure_default(hl);
 
-    /* 6. Restore state buffers + notify the cart (BLYT_LOAD_HOT_RELOAD = 3). */
-    if (snap) {
-        blyt_state_ctx_restore_snapshot(hl->state_ctx, snap);
-        blyt_state_snapshot_free(snap);
-    }
-    lua_getglobal(hl->L, "on_load_state");
-    if (lua_isfunction(hl->L, -1)) {
-        lua_newtable(hl->L);
-        lua_pushinteger(hl->L, 3); /* BLYT_LOAD_HOT_RELOAD */
-        lua_setfield(hl->L, -2, "reason");
-        lua_pushinteger(hl->L, 0);
-        lua_setfield(hl->L, -2, "saved_cart_version");
-        lua_pcall(hl->L, 1, 0, 0);
-    } else {
-        lua_pop(hl->L, 1);
-    }
+    /* Rebuild the VM from the NEW bytecode, restore, notify (HOT_RELOAD). */
+    return hl_rebuild_and_restore(hl, snap);
 }
 
 blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
@@ -2061,6 +2117,12 @@ const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl) {
 
 void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
     (void)hl;
+}
+
+bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
+    (void)hl;
+    (void)new_cart;
+    return false;
 }
 
 void blyt_hostlua_destroy(blyt_hostlua_t *hl) {

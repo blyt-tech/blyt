@@ -123,6 +123,28 @@ const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl);
  */
 void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl);
 
+/*
+ * Hot-reload the running cart against a freshly built image (#244, epic #230).
+ * `new_cart` is a distinct, already-open cart handle (the rebuilt bytecode +
+ * resources); the runner snapshots live state from the current VM, re-points its
+ * cart/bytecode/resource table at `new_cart`, rebuilds the VM (re-running init()
+ * and — in a debug build with the DAP hook armed — re-arming breakpoints so an
+ * init() breakpoint re-fires), then restores the snapshot and replays
+ * on_load_state(HOT_RELOAD).  The native counterpart of the WASM pure-Lua
+ * fast-path reload (wasm_main.c blyt_dev_ctrl_reload_fetched) and of the emulated
+ * path's reload_impl.
+ *
+ * The runner keeps its resource table pointed at `new_cart` (resources alias the
+ * cart map zero-copy), so the caller MUST keep the old cart handle valid until
+ * this returns, then may close it and adopt `new_cart` as the live cart.
+ *
+ * Returns true on success (VM rebuilt against `new_cart`, state restored); false
+ * without disturbing the live VM if `new_cart` lacks a .cart.lua section, or —
+ * after marking the runner done — if the VM rebuild failed.  No-op returning
+ * false for a NULL/finished runner or a build without the seam VM.
+ */
+bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart);
+
 /* Destroy a runner and free its VM.  NULL-safe. */
 void blyt_hostlua_destroy(blyt_hostlua_t *hl);
 
