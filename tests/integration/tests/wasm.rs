@@ -515,3 +515,70 @@ fn wasm_dev_control_hybrid_reload() {
         .assert()
         .success();
 }
+
+/// Pure-Lua fast-path `reload` cart-swap must reload the host-Lua resource table
+/// from the NEW cart (issue #246).  A pure-Lua cart (g_session == NULL) bundles an
+/// uncompressed resource (`greeting.txt`); v1 ships RES_V1, v2 ships RES_V2 with
+/// byte-identical Lua code, so the ONLY observable difference across the swap is
+/// the bundled resource content.  The cart reads the resource in on_load_state and
+/// prints it.
+///
+/// Resource-table entries are zero-copy aliases into the cart map (resource.c
+/// `e->data = body`).  The reload closes cart_v1 and opens cart_v2, so unless
+/// `blyt_dev_ctrl_reload_fetched` reloads `g_lua_resources` from cart_v2 (mirroring
+/// the native `blyt_hostlua_reload` from #244), every entry dangles into the freed
+/// cart_v1 map — the post-swap read returns stale RES_V1 / garbage (a
+/// use-after-free), never RES_V2.  Pre-fix this fails; post-fix it re-reads RES_V2.
+///
+/// This is the WASM leg of the bug #246 characterises; dev_ctrl_test.js only
+/// reloads `hello` (zero resources), which is why it slipped through.
+const RELOAD_RESOURCE_LUA: &str = r#"
+-- 0x20000001 = R_GREETING baked constant (kind RESOURCE, id 1; ADR-0134).
+local function greeting()
+    return blyt.resource.text_resource(0x20000001):text() or "<nil>"
+end
+function init()
+    blyt.debug.print("init greeting=" .. greeting())
+end
+function update() end
+function draw() end
+function on_load_state(info)
+    blyt.debug.print("reload greeting=" .. greeting() .. " reason=" .. tostring(info.reason))
+end
+"#;
+
+#[test]
+fn wasm_dev_control_reload_reloads_resource_table() {
+    require_wasm();
+    require_lua_sdk();
+    let wasm_dir = find_wasm_dir();
+
+    let tmp = TempDir::new().unwrap();
+
+    let project_v1 = tmp.path().join("reload_res_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V1")
+        .write(&project_v1);
+    let cart_v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("reload_res_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V2")
+        .write(&project_v2);
+    let cart_v2 = build_lua_cart(&project_v2);
+
+    let driver = repo_root().join("tests/wasm/reload_resource_test.js");
+    Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart_v1.to_str().unwrap(),
+            cart_v2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}

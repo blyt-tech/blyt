@@ -93,6 +93,12 @@ int main(int argc, char *argv[]) {
     const char *resource_dir_v2 = NULL;
     uint32_t asset_ids[64];
     size_t asset_n = 0;
+    /* Dev-mode cart-swap reload trigger (issue #124/#246): at frame `reload_after`
+     * drive the core's blyt_libretro_reload_at(reload_path), simulating the
+     * `reload` dev-control command — the whole cart (code + bundled resources) is
+     * swapped, not just the resource index.  -1 = no trigger. */
+    long reload_after = -1;
+    const char *reload_path = NULL;
     /* Run exactly this many frames then exit 0, for hot-swap tests whose cart
      * intentionally never quits (it is observed via its per-frame output).
      * -1 = run until the cart quits / MAX_FRAMES (the default). */
@@ -113,6 +119,12 @@ int main(int argc, char *argv[]) {
             argi += 2;
         } else if (strcmp(argv[argi], "--resource-dir-v2") == 0 && argi + 1 < argc) {
             resource_dir_v2 = argv[argi + 1];
+            argi += 2;
+        } else if (strcmp(argv[argi], "--reload-after") == 0 && argi + 1 < argc) {
+            reload_after = strtol(argv[argi + 1], NULL, 10);
+            argi += 2;
+        } else if (strcmp(argv[argi], "--reload-path") == 0 && argi + 1 < argc) {
+            reload_path = argv[argi + 1];
             argi += 2;
         } else if (strcmp(argv[argi], "--asset-ids") == 0 && argi + 1 < argc) {
             const char *s = argv[argi + 1];
@@ -210,6 +222,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* blyt_libretro_reload_at: blyt-private dev-mode cart-swap reload (#124/#246). */
+    bool (*p_reload_at)(const char *) = NULL;
+    if (reload_after >= 0) {
+        p_reload_at = (bool (*)(const char *))dlsym(lib, "blyt_libretro_reload_at");
+        if (!p_reload_at) {
+            fprintf(stderr, "dlsym(blyt_libretro_reload_at): %s\n", dlerror());
+            dlclose(lib);
+            return 1;
+        }
+    }
+
     p_retro_set_environment(env_cb);
     p_retro_set_video_refresh(video_refresh);
     p_retro_set_audio_sample(audio_sample);
@@ -235,6 +258,13 @@ int main(int argc, char *argv[]) {
                 setenv("BLYT_RESOURCE_DIR", resource_dir_v2, 1);
             if (!p_update_assets(asset_ids, asset_n))
                 fprintf(stderr, "blyt_libretro_update_assets failed\n");
+        }
+        /* Fire the cart-swap reload before this frame's retro_run so the reloaded
+         * cart's init()/on_load_state runs and this frame already prints the new
+         * resource content (#124/#246). */
+        if (p_reload_at && frame == reload_after) {
+            if (!p_reload_at(reload_path))
+                fprintf(stderr, "blyt_libretro_reload_at failed\n");
         }
         p_retro_run();
         /* Force-evict after each frame's reads so the *next* frame rehydrates
