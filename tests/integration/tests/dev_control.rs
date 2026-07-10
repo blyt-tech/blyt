@@ -511,6 +511,27 @@ fn native_reload_resource_leg(extra_args: &[&str], leg: &str) {
     let read_half = stream.try_clone().unwrap();
     let mut reader = BufReader::new(read_half);
 
+    // Wait for cart_v1's init() to run and read its bundled resource BEFORE
+    // reloading.  Sending the reload immediately races boot: on a fast runner the
+    // swap can happen before frame 0 runs, so v1's init never prints RES_V1 (the
+    // CI-observed flake).  This also anchors the pre-swap value the post-reload
+    // read must differ from.
+    let wait_line = |needle: &str, what: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if lines.lock().unwrap().iter().any(|l| l.contains(needle)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{leg}: timed out waiting for {what} ({needle:?}); player output:\n{}",
+                lines.lock().unwrap().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_line("init greeting=RES_V1", "cart_v1 init resource read");
+
     // Rebuild in place (overwrite with v2, whose resource ships RES_V2), then
     // hot reload — the swap must reload the resource table from the new cart.
     std::fs::copy(&v2, &work).unwrap();
@@ -520,20 +541,19 @@ fn native_reload_resource_leg(extra_args: &[&str], leg: &str) {
         "{leg}: reload did not succeed: {resp}"
     );
 
-    // Let the reload's on_load_state output flush.
-    std::thread::sleep(Duration::from_millis(300));
+    // The reload's on_load_state runs synchronously inside the reload handler
+    // (before the ok response), so RES_V2 is already printed; poll to be robust.
+    wait_line("reload greeting=RES_V2 reason=3", "post-reload resource read");
     let _ = child.kill();
     let _ = child.wait();
 
+    // Guard against a stale read masquerading as success: the post-reload value
+    // must be RES_V2, never the pre-swap RES_V1 (which would mean the table still
+    // aliased the freed old cart, #246).
     let out = lines.lock().unwrap().join("\n");
     assert!(
-        out.contains("init greeting=RES_V1"),
-        "{leg}: cart_v1 did not read its bundled resource at init; player output:\n{out}"
-    );
-    assert!(
-        out.contains("reload greeting=RES_V2 reason=3"),
-        "{leg}: post-reload resource read did NOT return the new cart's content \
-         (expected RES_V2) — resource table still aliases the freed old cart (#246); \
+        !out.contains("reload greeting=RES_V1"),
+        "{leg}: post-reload read returned the stale old-cart content RES_V1 (#246); \
          player output:\n{out}"
     );
 }
