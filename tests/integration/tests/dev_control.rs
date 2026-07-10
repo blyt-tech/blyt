@@ -543,7 +543,10 @@ fn native_reload_resource_leg(extra_args: &[&str], leg: &str) {
 
     // The reload's on_load_state runs synchronously inside the reload handler
     // (before the ok response), so RES_V2 is already printed; poll to be robust.
-    wait_line("reload greeting=RES_V2 reason=3", "post-reload resource read");
+    wait_line(
+        "reload greeting=RES_V2 reason=3",
+        "post-reload resource read",
+    );
     let _ = child.kill();
     let _ = child.wait();
 
