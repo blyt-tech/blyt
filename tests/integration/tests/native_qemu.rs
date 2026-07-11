@@ -376,6 +376,32 @@ function draw() end
         None
     };
 
+    // ── Build the non-FP parity carts (gate 33, #235 / Spike Z Q5) ────
+    // The RISC-V hardware-path leg of the non-FP determinism matrix: the same
+    // carts `nonfp_parity.rs` runs on the host-Lua legs, run here through the
+    // native RV32 guest-lib path, must emit the same pinned golden digests
+    // (NaN-boundary canonicalization + GC finalization order). Shared source /
+    // goldens live in `common::nonfp`.
+    let nonfp_nan_cart = if have_lua_gate {
+        let project = tmp.path().join("nonfp_nan");
+        CartProject::new()
+            .config(common::nonfp::NAN_CONFIG)
+            .lua(common::nonfp::NAN_CART)
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+    let nonfp_gc_cart = if have_lua_gate {
+        let project = tmp.path().join("nonfp_gc");
+        CartProject::new()
+            .lua(common::nonfp::GC_CART)
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     // ── Build the gfx carts (gates 16 & 17, #188 / Spike X) ───────────
     // Two probes drawing the SAME frames the emulated legs draw: the torture
     // frame via the gfx primitives (which rasterize natively on bare metal, no
@@ -810,6 +836,18 @@ function draw() end
         assert!(
             qemu.scp_to(cart, "/tmp/blyt_gate/"),
             "scp hybrid_metal.blyt failed"
+        );
+    }
+    if let Some(ref cart) = nonfp_nan_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp nonfp_nan.blyt failed"
+        );
+    }
+    if let Some(ref cart) = nonfp_gc_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp nonfp_gc.blyt failed"
         );
     }
     assert!(
@@ -2629,6 +2667,64 @@ void blyt_cart_draw(void) {}
         println!("  PASS: {surface_lock_golden}");
     } else {
         println!("Gate 32: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 33: non-FP determinism parity on metal (#235 / Spike Z Q5) ──
+    // The RISC-V hardware-path leg of the non-FP matrix. The same carts
+    // `nonfp_parity.rs` runs on the host-Lua legs must emit the same pinned
+    // golden digests through the native RV32 guest-lib path — closing the
+    // ADR-0136 reference model (host-Lua legs + golden + QEMU native gate).
+    if nonfp_nan_cart.is_some() {
+        println!("Gate 33a: non-FP NaN-boundary canonicalization on metal...");
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/nonfp_nan.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "nonfp_nan.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(common::nonfp::NAN_DIGEST),
+            "native bare-metal NaN-boundary digest must match the host-Lua legs' \
+             golden (expected {:?}; #235)\noutput: {output}",
+            common::nonfp::NAN_DIGEST
+        );
+        assert!(
+            output.contains(common::nonfp::NAN_CANON_LINE),
+            "native bare-metal f64 state-buffer NaN must canonicalize to \
+             0x7FF8000000000000 (ADR-0010; expected {:?})\noutput: {output}",
+            common::nonfp::NAN_CANON_LINE
+        );
+        println!("  PASS: {}", common::nonfp::NAN_DIGEST);
+    } else {
+        println!("Gate 33a: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+    if nonfp_gc_cart.is_some() {
+        println!("Gate 33b: non-FP GC finalization order on metal...");
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/nonfp_gc.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "nonfp_gc.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(common::nonfp::GC_DIGEST),
+            "native bare-metal GC finalization-order digest must match the \
+             host-Lua legs' golden (expected {:?}; #235)\noutput: {output}",
+            common::nonfp::GC_DIGEST
+        );
+        println!("  PASS: {}", common::nonfp::GC_DIGEST);
+    } else {
+        println!("Gate 33b: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     println!("Gate tests passed.");
