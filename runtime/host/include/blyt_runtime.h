@@ -180,6 +180,14 @@ typedef struct blyt_state_ctx blyt_state_ctx_t;
  * The cart must outlive the session. */
 blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn);
 
+/* Create a session in ADR-0130 host-Lua bridge mode (#232): the cart's native
+ * half runs under rv32emu but links the bridge stub (libblyt32lua-bridge.so)
+ * instead of the in-guest Lua VM, so its Lua C API calls trap to a host-side Lua
+ * VM.  Used by the host-Lua fast path (WASM run_lua_cart, native
+ * cart_run_hostlua) for hybrid carts; pair with blyt_session_lua_bridge_attach.
+ * Identical to blyt_session_create otherwise.  Returns NULL on failure. */
+blyt_session_t *blyt_session_create_lua_bridge(blyt_cart_t *cart, blyt_log_fn log_fn);
+
 /*
  * Run the cart until the next BLYT_ECALL_FRAME_DONE boundary or until it
  * halts.  Returns BLYT_RUN_FRAME_DONE when the frame completed normally.
