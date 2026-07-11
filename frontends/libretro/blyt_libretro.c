@@ -29,6 +29,10 @@ extern const unsigned int blyt32_so_len;
 #ifdef BLYT_EMBED_LUA
 extern const unsigned char blyt32lua_so[];
 extern const unsigned int blyt32lua_so_len;
+/* ADR-0130 bridge stub — links the emulated native half of a hybrid cart on the
+ * core's host-Lua path (#232); the loader DT_NEEDED-remaps libblyt32lua.so to it. */
+extern const unsigned char blyt32lua_bridge_so[];
+extern const unsigned int blyt32lua_bridge_so_len;
 #endif /* BLYT_EMBED_LUA */
 #endif /* BLYT_EMBED_LIBS */
 
@@ -125,6 +129,7 @@ RETRO_API void retro_init(void) {
     blyt_register_lib("libblyt32.so", blyt32_so, blyt32_so_len);
 #ifdef BLYT_EMBED_LUA
     blyt_register_lib("libblyt32lua.so", blyt32lua_so, blyt32lua_so_len);
+    blyt_register_lib("libblyt32lua-bridge.so", blyt32lua_bridge_so, blyt32lua_bridge_so_len);
 #endif
 #endif
 }

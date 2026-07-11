@@ -6,24 +6,30 @@
 //! stays EMULATED under rv32emu, bridged via the ADR-0130 ECALL Lua C API — the
 //! native counterpart of the WASM host-Lua hybrid path (`wasm_main.c`
 //! run_lua_cart). Determinism across every leg is the core contract (ADR-0007),
-//! so each test asserts the SAME cart-visible output on:
-//!   * the emulated leg      (`run_cart_native` — blytplay, rv32emu),
+//! so each test asserts the SAME cart-visible output on all five legs:
+//!   * the emulated leg        (`run_cart_native` — blytplay, rv32emu),
 //!   * the native host-Lua leg (`run_cart_native_with_env` + `BLYT_HOSTLUA=1`),
-//!   * the WASM host-Lua leg (`run_cart_wasm`),
-//! and, once the libretro leg lands (S5), the libretro emulated + host-Lua `.so`
-//! legs. A divergence between the native host-Lua bridge and the reference fails
-//! here by construction rather than relying on per-leg smoke (anti-#98).
+//!   * the WASM host-Lua leg   (`run_cart_wasm`),
+//!   * the libretro emulated `.so` leg (`run_cart_libretro`), and
+//!   * the libretro host-Lua `.so` leg (`run_cart_libretro_with_env` +
+//!     `BLYT_HOSTLUA=1`) — the embedded core's host-Lua path with the ADR-0130
+//!     bridge stub embedded (#232 S5).
+//! A divergence between the native host-Lua bridge and the reference fails here
+//! by construction rather than relying on per-leg smoke (anti-#98).
 //!
 //! Slices land incrementally: S1 typed export, S2 raw/bridged export, S3 state
 //! buffers + save/restore + reset-every-frame, S4 native-lifecycle, S5 libretro
-//! + C++ + actual examples.
+//! + C++ + Rust bridged + the actual hello-lua-c / hello-lua-rust examples.
 
 mod common;
 
 use common::{
-    build_lua_cart, require_lua_sdk, require_sdk, require_wasm, run_cart_native,
-    run_cart_native_with_env, run_cart_wasm, run_cart_wasm_with_env, CartProject,
+    build_lua_cart, require_cpp_sdk, require_libretro_core, require_lua_sdk,
+    require_rust_riscv_target, require_sdk, require_wasm, run_cart_libretro,
+    run_cart_libretro_with_env, run_cart_libretro_with_env_and_flags, run_cart_libretro_with_flags,
+    run_cart_native, run_cart_native_with_env, run_cart_wasm, run_cart_wasm_with_env, CartProject,
 };
+use std::path::Path;
 use tempfile::TempDir;
 
 /// Run blytplay --headless with both extra env (e.g. BLYT_HOSTLUA=1) and flags
@@ -53,6 +59,7 @@ fn hostlua_hybrid_typed_export_parity() {
     require_sdk();
     require_lua_sdk();
     require_wasm();
+    require_libretro_core();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hostlua_hybrid_typed");
@@ -81,6 +88,9 @@ function draw() end
     run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
     // WASM host-Lua fast path — the existing hybrid host-Lua leg.
     run_cart_wasm(&cart, expected);
+    // libretro core — emulated + host-Lua (embedded bridge stub, #232 S5).
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
 }
 
 /// S2 — a raw/bridged export (`BLYT_LUA_MODULE_EXPORT_RAW`, ADR-0130): the guest
@@ -93,6 +103,7 @@ fn hostlua_hybrid_bridged_export_parity() {
     require_sdk();
     require_lua_sdk();
     require_wasm();
+    require_libretro_core();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hostlua_hybrid_bridged");
@@ -134,6 +145,8 @@ function draw() end
     run_cart_native(&cart, expected);
     run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
     run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
 }
 
 /// S3 — the hello-lua-c acceptance surface: state buffers (S proxy) + entity ref
@@ -148,6 +161,7 @@ fn hostlua_hybrid_state_buffers_save_restore_parity() {
     require_sdk();
     require_lua_sdk();
     require_wasm();
+    require_libretro_core();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hostlua_hybrid_state");
@@ -230,10 +244,12 @@ end
     let cart = build_lua_cart(&project);
     let expected = "update frame 20 player pos: 162, 122";
 
-    // Plain run — the three execution models agree.
+    // Plain run — every execution model agrees.
     run_cart_native(&cart, expected);
     run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
     run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
 
     // Reset-every-frame — the host-Lua VM-rebuild cycle must reach the SAME
     // trajectory as the emulated (BSS-zero) and WASM legs, with the state buffers
@@ -241,6 +257,13 @@ end
     run_native_env_flags(&cart, &[], &["--reset-every-frame"], expected);
     run_native_env_flags(&cart, &[("BLYT_HOSTLUA", "1")], &["--reset-every-frame"], expected);
     run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
+    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], expected);
+    run_cart_libretro_with_env_and_flags(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        &["--reset-every-frame"],
+        expected,
+    );
 }
 
 /// S4 — a native-lifecycle hybrid: the C half defines `blyt_cart_update`,
@@ -258,6 +281,7 @@ fn hostlua_hybrid_native_lifecycle_parity() {
     require_sdk();
     require_lua_sdk();
     require_wasm();
+    require_libretro_core();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hostlua_hybrid_native_lifecycle");
@@ -295,4 +319,193 @@ function draw() end
     run_native_env_flags(&cart, &[("BLYT_HOSTLUA", "1")], &["--quit-after", "60"], expected);
     // WASM host-Lua fast path — the existing native-lifecycle hybrid leg.
     run_cart_wasm(&cart, expected);
+    // libretro core — emulated + host-Lua. The cart self-quits at tick 5, so no
+    // frame cap is needed; --run-frames guards against a broken host-Lua bridge.
+    run_cart_libretro_with_flags(&cart, &["--run-frames", "60"], expected);
+    run_cart_libretro_with_env_and_flags(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        &["--run-frames", "60"],
+        expected,
+    );
+}
+
+/// S5 — a C++ typed-export hybrid: `BLYT_LUA_EXPORT_I32` from `extern "C"` over a
+/// C++ helper. Proves the host-Lua bridge is language-agnostic across the native
+/// half (C in S1, C++ here) — the same typed marshalling path, five-leg identical.
+#[test]
+fn hostlua_hybrid_cpp_typed_export_parity() {
+    require_sdk();
+    require_cpp_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_cpp");
+
+    CartProject::new()
+        .cpp(r#"#include "blyt.h"
+static int cpp_cube(int x) { return x * x * x; }
+extern "C" {
+BLYT_LUA_EXPORT_I32(cube, int32_t x) { return (int32_t)cpp_cube((int)x); }
+}
+"#)
+        .lua(
+            r#"
+function init()
+    blyt.debug.print("lua+cpp cube=" .. cube(3))
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let expected = "lua+cpp cube=27";
+
+    run_cart_native(&cart, expected);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+}
+
+/// S5 — a Rust raw/bridged export hybrid: the exact `#[lua_export(module =
+/// "greeting", raw)]` shape hello-lua-rust ships, exercising the Rust bridge
+/// codegen (ADR-0130) end-to-end through the host-Lua exchange thread, five-leg
+/// identical. Complements the C bridged export (S2) so both native languages'
+/// raw-export macros are covered on the native host-Lua path.
+#[test]
+fn hostlua_hybrid_rust_bridged_export_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_rust_bridged");
+
+    CartProject::new()
+        .rust(
+            r#"#![no_std]
+extern crate blyt;
+use blyt::lua::{api, lua_export, LuaState};
+
+#[lua_export(module = "greeting", raw)]
+fn log(l: LuaState) {
+    let (s, _len) = api::check_lstring(l, 1);
+    blyt::console_debug_ptr(s);
+}
+"#,
+        )
+        .lua(
+            r#"
+local greeting = require("greeting")
+function init()
+    greeting.log("lua+rust bridged log line")
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let expected = "lua+rust bridged log line";
+
+    run_cart_native(&cart, expected);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+}
+
+/// Copy the tree at `src` into `dst`, skipping any generated `build/` dir, so an
+/// in-repo example can be built in a scratch dir without polluting the checkout
+/// or racing a parallel test that builds the same example.
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == "build" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
+}
+
+/// Build the verbatim in-repo example `example` into a scratch dir, appending a
+/// bounded quit to its `main.lua` so the (otherwise never-quitting) example
+/// terminates cleanly on every leg. Only a terminator is added — its
+/// update/draw/greeting logic and native half stay verbatim. `main.lua` is a
+/// single chunk, so the appended wrapper closes over the same `frame`/`update`.
+fn build_example_capped(example: &str, tmp: &Path) -> std::path::PathBuf {
+    let src = common::repo_root().join("examples").join(example);
+    let dst = tmp.join(example);
+    copy_tree(&src, &dst);
+    let main_lua = dst.join("src/game/lua/main.lua");
+    let mut body = std::fs::read_to_string(&main_lua).unwrap();
+    body.push_str(
+        "\nlocal __blyt_orig_update = update\n\
+         function update()\n\
+         \x20   __blyt_orig_update()\n\
+         \x20   if frame >= 20 then blyt.quit() end\n\
+         end\n",
+    );
+    std::fs::write(&main_lua, body).unwrap();
+    build_lua_cart(&dst)
+}
+
+/// S5 acceptance — the actual `examples/hello-lua-c` (Lua + a C `greeting.log`
+/// raw export + state buffers) runs on the native host-Lua path with output
+/// identical to the emulated + WASM + libretro legs (the PLAN.md acceptance
+/// criterion, using the real example sources rather than a synthetic clone).
+#[test]
+fn hostlua_hybrid_example_hello_lua_c_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let cart = build_example_capped("hello-lua-c", tmp.path());
+    let expected = "update frame 20 player pos: 162, 122";
+
+    run_cart_native(&cart, expected);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+}
+
+/// S5 acceptance — the actual `examples/hello-lua-rust` (Lua + a Rust
+/// `#[lua_export(module = "greeting", raw)]` half) runs on the native host-Lua
+/// path with output identical across every leg. This is the real Rust bridge
+/// example, the second half of PLAN.md's acceptance criterion.
+#[test]
+fn hostlua_hybrid_example_hello_lua_rust_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_rust_riscv_target();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let cart = build_example_capped("hello-lua-rust", tmp.path());
+    let expected = "update frame 20 player pos: 162, 122";
+
+    run_cart_native(&cart, expected);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
 }

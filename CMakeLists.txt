@@ -785,6 +785,12 @@ if(LIBBLYTC_OUT)
   if(LIBBLYT32LUA_OUT)
     list(APPEND _bin2c_args blyt32lua_so "${LIBBLYT32LUA_OUT}")
     list(APPEND _bin2c_deps "${LIBBLYT32LUA_OUT}")
+    # ADR-0130 bridge stub — the core's host-Lua path (#238/#232) links it into
+    # the emulated native half of a hybrid cart, remapping libblyt32lua.so.
+    if(LIBBLYT32LUA_BRIDGE_OUT)
+      list(APPEND _bin2c_args blyt32lua_bridge_so "${LIBBLYT32LUA_BRIDGE_OUT}")
+      list(APPEND _bin2c_deps "${LIBBLYT32LUA_BRIDGE_OUT}")
+    endif()
   endif()
   add_custom_command(
     OUTPUT "${EMBEDDED_LIBS_C}"
