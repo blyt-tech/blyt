@@ -24,17 +24,22 @@
 mod common;
 
 use common::{
-    build_lua_cart, require_cpp_sdk, require_libretro_core, require_lua_sdk,
+    CartProject, build_lua_cart, require_cpp_sdk, require_libretro_core, require_lua_sdk,
     require_rust_riscv_target, require_sdk, require_wasm, run_cart_libretro,
     run_cart_libretro_with_env, run_cart_libretro_with_env_and_flags, run_cart_libretro_with_flags,
-    run_cart_native, run_cart_native_with_env, run_cart_wasm, run_cart_wasm_with_env, CartProject,
+    run_cart_native, run_cart_native_with_env, run_cart_wasm, run_cart_wasm_with_env,
 };
 use std::path::Path;
 use tempfile::TempDir;
 
 /// Run blytplay --headless with both extra env (e.g. BLYT_HOSTLUA=1) and flags
 /// (e.g. --reset-every-frame); assert `expected` in stdout. (Mirrors hostlua.rs.)
-fn run_native_env_flags(cart: &std::path::Path, env: &[(&str, &str)], flags: &[&str], expected: &str) {
+fn run_native_env_flags(
+    cart: &std::path::Path,
+    env: &[(&str, &str)],
+    flags: &[&str],
+    expected: &str,
+) {
     use assert_cmd::Command;
     let mut cmd = Command::new(common::blytplay());
     cmd.arg("--headless");
@@ -47,7 +52,10 @@ fn run_native_env_flags(cart: &std::path::Path, env: &[(&str, &str)], flags: &[&
     }
     let out = cmd.assert().success().get_output().stdout.clone();
     let s = String::from_utf8_lossy(&out);
-    assert!(s.contains(expected), "expected {expected:?} (env={env:?} flags={flags:?}): {s}");
+    assert!(
+        s.contains(expected),
+        "expected {expected:?} (env={env:?} flags={flags:?}): {s}"
+    );
 }
 
 /// S1 — a typed export (`BLYT_LUA_EXPORT_I32`, ≤4 scalar args, no bridge ECALLs):
@@ -255,7 +263,12 @@ end
     // trajectory as the emulated (BSS-zero) and WASM legs, with the state buffers
     // shared with the persisting rv32 session across each rebuild.
     run_native_env_flags(&cart, &[], &["--reset-every-frame"], expected);
-    run_native_env_flags(&cart, &[("BLYT_HOSTLUA", "1")], &["--reset-every-frame"], expected);
+    run_native_env_flags(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        &["--reset-every-frame"],
+        expected,
+    );
     run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
     run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], expected);
     run_cart_libretro_with_env_and_flags(
@@ -316,7 +329,12 @@ function draw() end
     // Emulated (rv32emu) — the reference; native blyt_cart_update drives directly.
     run_native_env_flags(&cart, &[], &["--quit-after", "60"], expected);
     // Native host-Lua fast path (#232 S4) — native lifecycle injected as a global.
-    run_native_env_flags(&cart, &[("BLYT_HOSTLUA", "1")], &["--quit-after", "60"], expected);
+    run_native_env_flags(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        &["--quit-after", "60"],
+        expected,
+    );
     // WASM host-Lua fast path — the existing native-lifecycle hybrid leg.
     run_cart_wasm(&cart, expected);
     // libretro core — emulated + host-Lua. The cart self-quits at tick 5, so no
@@ -345,12 +363,14 @@ fn hostlua_hybrid_cpp_typed_export_parity() {
     let project = tmp.path().join("hostlua_hybrid_cpp");
 
     CartProject::new()
-        .cpp(r#"#include "blyt.h"
+        .cpp(
+            r#"#include "blyt.h"
 static int cpp_cube(int x) { return x * x * x; }
 extern "C" {
 BLYT_LUA_EXPORT_I32(cube, int32_t x) { return (int32_t)cpp_cube((int)x); }
 }
-"#)
+"#,
+        )
         .lua(
             r#"
 function init()

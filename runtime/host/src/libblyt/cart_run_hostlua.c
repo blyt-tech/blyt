@@ -1937,8 +1937,7 @@ static int hl_inject_native_lifecycle(blyt_hostlua_t *hl) {
         if (has_lua) {
             char buf[128];
             snprintf(buf, sizeof(buf),
-                     "blyt-hostlua: lifecycle '%s' defined in both native and Lua",
-                     cbs[i].name);
+                     "blyt-hostlua: lifecycle '%s' defined in both native and Lua", cbs[i].name);
             if (hl->log_fn)
                 hl->log_fn(buf);
             else
