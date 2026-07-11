@@ -2282,6 +2282,19 @@ bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
     if (!hl || hl->done || !new_cart)
         return false;
 
+    /* Hybrid hot-reload is deferred to a #232 follow-up: rebuilding only the Lua
+     * half (this VM) while the emulated native half keeps the OLD image is a
+     * silent half-reload — the exact anti-pattern #98 warns against.  Refuse it
+     * outright, BEFORE any state snapshot or cart swap, so the live VM (and its
+     * session) is left completely untouched.  A real hybrid reload needs a
+     * coordinated Lua-VM rebuild + blyt_session_swap_cart of the native half. */
+    if (hl->session) {
+        if (hl->log_fn)
+            hl->log_fn("blyt-hostlua: hot-reload of a hybrid cart is not supported "
+                       "yet; keeping the current cart");
+        return false;
+    }
+
     /* Validate the new image BEFORE disturbing the live VM: a cart without a
      * .cart.lua section can't run on this path, so keep the old VM running and
      * let the caller keep the old cart (mirrors reload_impl's pre-swap open). */

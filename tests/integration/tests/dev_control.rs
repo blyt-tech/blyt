@@ -581,6 +581,119 @@ fn native_dev_control_reload_reloads_resource_hostlua() {
     native_reload_resource_leg(&["--host-lua"], "native host-Lua");
 }
 
+/// S7 (#232) — a HYBRID cart on the host-Lua path (`--host-lua`) refuses a
+/// hot-reload, leaving the live VM untouched (anti-#98).  Reloading only the Lua
+/// half while the emulated native half keeps the old image would be a silent
+/// half-reload, so `blyt_hostlua_reload` returns false → the dev-ctrl `reload`
+/// errors, the new cart's markers never appear, and the ORIGINAL cart keeps
+/// running (a second reload still gets a clean refusal; the process stays alive).
+/// A coordinated hybrid reload (`blyt_session_swap_cart` + Lua-VM rebuild) is a
+/// tracked follow-up.
+#[test]
+fn native_dev_control_reload_hybrid_refused_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+
+    // A hybrid: Lua half + a native C export it calls at init.  v1 and v2 differ
+    // only in the strings they print, so a silent half-reload would surface a v2
+    // marker while the native half stayed v1.
+    let hybrid_c = "#include \"blyt.h\"\n\
+                    BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n";
+    let hybrid_lua = |tag: &str| {
+        format!(
+            "function init() blyt.debug.print(\"hybrid {tag} init add_one=\" .. add_one(41)) end\n\
+             function update() end\n\
+             function draw() end\n\
+             function on_load_state(info) blyt.debug.print(\"hybrid {tag} RELOADED\") end\n"
+        )
+    };
+
+    let project_v1 = tmp.path().join("hybrid_reload_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(hybrid_c)
+        .lua(&hybrid_lua("V1"))
+        .write(&project_v1);
+    let v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("hybrid_reload_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(hybrid_c)
+        .lua(&hybrid_lua("V2"))
+        .write(&project_v2);
+    let v2 = build_lua_cart(&project_v2);
+
+    // Run on a copy we overwrite in place (as `blyt debug`'s rebuild-then-reload).
+    let work = tmp.path().join("cart.blyt");
+    std::fs::copy(&v1, &work).unwrap();
+
+    let (mut child, port, lines) =
+        spawn_player_with_dev_ctrl_args(&work, save_dir.path(), &["--host-lua"]);
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect dev control");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let read_half = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(read_half);
+
+    let wait_line = |needle: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if lines.lock().unwrap().iter().any(|l| l.contains(needle)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {needle:?}; player output:\n{}",
+                lines.lock().unwrap().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_line("hybrid V1 init add_one=42");
+
+    // Overwrite with v2 and attempt reload — the host-Lua hybrid path must refuse.
+    std::fs::copy(&v2, &work).unwrap();
+    let resp = dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":1,"cmd":"reload"}"#);
+    assert!(
+        resp.contains("\"id\":1")
+            && resp.contains("\"status\":\"error\"")
+            && resp.contains("reload failed"),
+        "hybrid reload must be refused on the host-Lua path: {resp}"
+    );
+
+    // Still responsive: a second reload gets the same clean refusal — the VM (and
+    // dev-ctrl handler) is alive and the runner is not `done`.
+    let resp2 = dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":2,"cmd":"reload"}"#);
+    assert!(
+        resp2.contains("\"id\":2") && resp2.contains("\"status\":\"error\""),
+        "second hybrid reload should also be refused (live VM responsive): {resp2}"
+    );
+
+    // The process is still running (a corrupted half-reload could crash on the
+    // next frame); give it a moment then confirm it has not exited.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        matches!(child.try_wait(), Ok(None)),
+        "player must still be running the original cart after a refused reload"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // No part of the new cart may have run — no silent half-reload (anti-#98).
+    let out = lines.lock().unwrap().join("\n");
+    assert!(
+        !out.contains("hybrid V2 init") && !out.contains("hybrid V2 RELOADED"),
+        "a refused hybrid reload must not have run any of the new cart:\n{out}"
+    );
+}
+
 /// Drive a cart-swap `reload` through the embedded libretro core
 /// (test_libretro_core dlopens blyt_libretro.so with its OWN embedded guest
 /// libs — a distinct artifact from the sdk/lib blobs blytplay loads).  At frame
