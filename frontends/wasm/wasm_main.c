@@ -3477,7 +3477,12 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         int has_native_lifecycle = blyt_cart_has_native_lifecycle(g_cart);
         int has_layouts = blyt_cart_has_layouts(g_cart);
         if (g_has_lua_exports || has_native_lifecycle) {
-            g_session = blyt_session_create(g_cart, wasm_log);
+            /* Hybrid: the host-side Lua VM drives; the native half traps its Lua
+             * C API through the ECALL bridge (ADR-0130).  Bridge mode resolves
+             * .lua_exports host-side for the trampolines below.  On WASM the
+             * bridge stub is already embedded as libblyt32lua.so, so no DT_NEEDED
+             * remap is needed (that is the native-only path, #232). */
+            g_session = blyt_session_create_lua_bridge(g_cart, wasm_log);
             if (!g_session) {
                 blyt_js_error("hybrid session failed");
                 lua_close(g_lua);

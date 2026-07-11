@@ -358,6 +358,54 @@ fn sdl_dap_hostlua_evaluate_expr() {
         .success();
 }
 
+/// Native host-Lua DAP for a HYBRID cart (#232 S6): a breakpoint in the Lua half,
+/// set on the line AFTER it calls a native export (`add_one`, driven through the
+/// ADR-0130 ECALL bridge), hits under blytdebug's host-Lua path, and the
+/// native-derived local is evaluable in the paused frame (`x + 1 == 43`, with
+/// `x == add_one(41) == 42`). Proves `blyt_hostlua_create_debug` builds the
+/// bridge session AND arms the Lua master hook together — the Lua-half
+/// source-debug path of a hybrid, parity with the emulated + WASM legs. Native-
+/// half GDB is deferred to a follow-up (#232 close-out).
+#[test]
+fn sdl_dap_hostlua_hybrid_breakpoint_evaluate() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua_hybrid");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n")
+        .lua(
+            "function init()\n\
+             \x20   local x = add_one(41)\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_EVALUATE_EXPR", "x + 1")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "43")
+        .env("BLYT_HOSTLUA", "1")
+        .assert()
+        .success();
+}
+
 /// SDL2 DAP: verify loadedSources returns the cart's Lua source after a stop.
 #[test]
 fn sdl_dap_loaded_sources() {

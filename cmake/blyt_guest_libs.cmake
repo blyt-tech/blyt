@@ -801,6 +801,9 @@ else()
       "${_VDIR}/libblyt32.so")
     list(APPEND _guest_lib_outputs "${_VDIR}/libblyt32lua-bridge.so")
   endforeach()
+  # Release bridge stub — embedded into the libretro core so its host-Lua path
+  # can run hybrid carts (the native half links the bridge, #232 S5).
+  set(LIBBLYT32LUA_BRIDGE_OUT "${SDK_LIB}/libblyt32lua-bridge.so")
 
   # blyt-luac — host-native Lua bytecode compiler (BLYT_LUA_I32_F64=1 to match
   # the guest VMs' 4-byte lua_Integer / lua_Number).

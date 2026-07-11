@@ -40,10 +40,18 @@
 #include "elf32.h"
 #include "testcard.h"
 
-#ifdef BLYT_LUA
-/* ECALL-bridged Lua C API (ADR-0130).  Only the WASM frontend builds libblyt
- * sources with BLYT_LUA; the host-side Lua state lives in the frontend and is
- * attached via blyt_session_lua_bridge_attach(). */
+/* ECALL-bridged Lua C API (ADR-0130) — the host-side bridge machinery.  Present
+ * whenever a host-side Lua VM exists to bridge into: the WASM frontend (BLYT_LUA,
+ * guest-Lua-in-host) OR the native host-Lua fast path (BLYT_HAVE_HOST_LUA, the
+ * deterministic seam VM on libblyt; #232).  On WASM the exchange thread lives in
+ * the frontend and is attached via blyt_session_lua_bridge_attach(); on native
+ * cart_run_hostlua.c owns it.  Gated by this one umbrella so the two targets
+ * share a single bridge implementation. */
+#if defined(BLYT_LUA) || defined(BLYT_HAVE_HOST_LUA)
+#define BLYT_LUA_BRIDGE 1
+#endif
+
+#ifdef BLYT_LUA_BRIDGE
 #include <lauxlib.h>
 #include <lua.h>
 #endif
@@ -156,7 +164,7 @@ void blyt_clear_libs(void) {
  * Must have the same binary layout; used to parse .lua_exports ELF sections.
  * ------------------------------------------------------------------------- */
 
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
 typedef struct {
     char lua_name[32];
     char fn_sym[64];
@@ -241,7 +249,7 @@ typedef struct {
     bool gdb_single_step; /* set when vCont;s received; cleared after one step */
     bool gdb_ebreak_pending; /* ebreak fired inside rv_step; cleared by post-step handler */
     uint32_t gdb_bp_resume_addr; /* WASM: bp addr we paused at; cleared when stepping over */
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
     /* ECALL-bridged Lua C API (ADR-0130). */
     struct lua_State *lua_exch; /* exchange thread; set by lua_bridge_attach */
     bool lua_bridge_active; /* a bridged Lua→native call is in flight */
@@ -333,7 +341,14 @@ struct blyt_session {
     uint32_t frame_count;
     bool cart_has_drawn;
 
-#ifdef BLYT_LUA
+    /* ADR-0130 bridge mode (#232): true when a host-side Lua VM drives this
+     * session's native half via the ECALL Lua C API bridge (WASM host-Lua, or
+     * the native host-Lua hybrid path).  Set by blyt_session_create_lua_bridge.
+     * Ungated (the DT_NEEDED remap that swaps libblyt32lua.so → the bridge stub
+     * reads it in the dynamic loader, which is not itself Lua-gated). */
+    bool use_lua_bridge;
+
+#ifdef BLYT_LUA_BRIDGE
     /* Resolved export table for WASM hybrid trampolines.  Populated by dynlink
      * when the cart has a .lua_exports section (hybrid Lua+C carts only). */
     struct {
@@ -686,7 +701,7 @@ static bool inject_exit_trampoline(memory_t *mem) {
  * the guest stub never resumes; the frontend raises from the trampoline
  * continuation inside the game coroutine.
  * ------------------------------------------------------------------------- */
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
 
 #define BLYT_BRIDGE_STR_MAX (16u * 1024u * 1024u) /* host-OOM guard */
 
@@ -1328,7 +1343,7 @@ static void bridge_lua_op(riscv_t *rv) {
     rv_set_reg(rv, rv_reg_a2, aux);
     rv->PC += 4;
 }
-#endif /* BLYT_LUA */
+#endif /* BLYT_LUA_BRIDGE */
 
 /* -------------------------------------------------------------------------
  * ECALL handler (ADR-0085: a0=ptr, a1=len, a7=ecall_number)
@@ -2396,7 +2411,7 @@ static void blyt_ecall_handler(riscv_t *rv) {
     }
 #endif /* BLYT_DAP */
 
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
     case BLYT_ECALL_LUA_OP: {
         bridge_lua_op(rv);
         return;
@@ -3059,10 +3074,11 @@ static void resolve_cart_entry_points(blyt_session_t *s, const blyt_symtab_t *al
     s->fn_is_quit_requested = symtab_lookup(all, "blyt_is_quit_requested");
 }
 
-#if defined(BLYT_LUA) && defined(__EMSCRIPTEN__)
-/* Resolve .lua_exports for WASM hybrid trampolines.  The section contains one
- * blyt_lua_export_entry_t per BLYT_LUA_EXPORT_* macro; cache the resolved guest
- * addresses so run_lua_cart() can register host-side trampolines without
+#ifdef BLYT_LUA_BRIDGE
+/* Resolve .lua_exports for host-Lua hybrid trampolines (WASM and native #232).
+ * The section contains one blyt_lua_export_entry_t per BLYT_LUA_EXPORT_* macro;
+ * cache the resolved guest addresses so the host-Lua runner can register
+ * trampolines without
  * re-parsing the ELF.  Resets the table so it is correct after a swap. */
 static void resolve_cart_lua_exports(blyt_session_t *s, const blyt_cart_t *cart,
                                      const blyt_symtab_t *all) {
@@ -3188,10 +3204,24 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
     while (qhead < qtail && nlibs < MAX_RUNTIME_LIBS) {
         const char *lib_name = name_buf[qhead++];
 
+        /* ADR-0130 host-Lua hybrid (#232): the native half must link the bridge
+         * stub (no in-guest Lua VM) so its lua_* calls trap to the host Lua VM
+         * via BLYT_ECALL_LUA_OP.  Swap the cart's DT_NEEDED libblyt32lua.so for
+         * libblyt32lua-bridge.so at open time only; lib_name (the recorded soname
+         * used for symbol resolution and library reporting) stays unchanged, and
+         * the stub exports the same lua_* symbols the cart's PLT resolves.  Native
+         * only: on WASM the bridge stub is already embedded under the name
+         * libblyt32lua.so at build time, so no remap is needed there. */
+        const char *open_name = lib_name;
+#ifndef __EMSCRIPTEN__
+        if (s->use_lua_bridge && strcmp(lib_name, "libblyt32lua.so") == 0)
+            open_name = "libblyt32lua-bridge.so";
+#endif
+
         const uint8_t *lmap;
         size_t lsz;
         bool mmapped;
-        if (!open_lib(lib_dir, lib_name, &lmap, &lsz, &mmapped)) {
+        if (!open_lib(lib_dir, open_name, &lmap, &lsz, &mmapped)) {
             ok = false;
             break;
         }
@@ -3328,8 +3358,12 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
     for (int i = 0; i < nlibs && i < MAX_RUNTIME_LIBS; i++)
         s->retained_libs[i] = libs[i];
 
-#if defined(BLYT_LUA) && defined(__EMSCRIPTEN__)
-    if (ok)
+#ifdef BLYT_LUA_BRIDGE
+    /* Only a bridge-mode session (host-Lua VM drives; native half traps its Lua
+     * C API through the bridge) needs the exports resolved host-side.  A plain
+     * emulated session registers wrappers in-guest via .lua_regtab and never
+     * reads s->lua_exports, so skip the parse. */
+    if (ok && s->use_lua_bridge)
         resolve_cart_lua_exports(s, cart, all_syms);
 #endif
 
@@ -3520,8 +3554,9 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
     /* 4. Re-resolve the cart's lifecycle entry points (and WASM hybrid exports)
      *    and re-record its image layout / BSS regions. */
     resolve_cart_entry_points(s, all);
-#if defined(BLYT_LUA) && defined(__EMSCRIPTEN__)
-    resolve_cart_lua_exports(s, new_cart, all);
+#ifdef BLYT_LUA_BRIDGE
+    if (s->use_lua_bridge)
+        resolve_cart_lua_exports(s, new_cart, all);
 #endif
     free(all);
     record_cart_image_layout(s, new_cart, load_base);
@@ -3629,10 +3664,12 @@ int blyt_session_check_guest_quit(blyt_session_t *s) {
     return (int)blyt_session_fn_return_value(s) != 0;
 }
 
-blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
+static blyt_session_t *session_create_impl(blyt_cart_t *cart, blyt_log_fn log_fn,
+                                           bool use_lua_bridge) {
     blyt_session_t *s = calloc(1, sizeof(*s));
     if (!s)
         return NULL;
+    s->use_lua_bridge = use_lua_bridge;
 #ifdef BLYT_GDB
     s->gdb_cart_lib_idx = -1; /* set when the cart is registered as a library */
 #endif
@@ -3810,7 +3847,22 @@ blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     return s;
 }
 
-#ifdef BLYT_LUA
+blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
+    return session_create_impl(cart, log_fn, false);
+}
+
+/* ADR-0130 host-Lua hybrid (#232): create a session whose native half traps its
+ * Lua C API through the ECALL bridge into a host-side Lua VM.  Two effects vs the
+ * plain create: the dynamic loader remaps the cart's DT_NEEDED libblyt32lua.so to
+ * the bridge stub (libblyt32lua-bridge.so, no in-guest VM), and the .lua_exports
+ * section is resolved host-side so the host-Lua runner can register trampolines.
+ * The caller (WASM run_lua_cart / native cart_run_hostlua) then attaches its
+ * exchange thread via blyt_session_lua_bridge_attach. */
+blyt_session_t *blyt_session_create_lua_bridge(blyt_cart_t *cart, blyt_log_fn log_fn) {
+    return session_create_impl(cart, log_fn, true);
+}
+
+#ifdef BLYT_LUA_BRIDGE
 /* ADR-0130: a bridged wrapper raised a Lua error.  Restore the register
  * snapshot taken at begin_bridged_call so the abandoned guest frame does not
  * leak guest stack, and clear the bridged-call window.  The error value is
@@ -4174,14 +4226,14 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
             return BLYT_RUN_FRAME_DONE;
         }
         if (session->ctx.fn_return_done) {
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
             session->ctx.lua_bridge_active = false;
 #endif
             trace_fn_return(session);
             g_run_ctx = NULL;
             return BLYT_RUN_FN_DONE;
         }
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
         if (session->ctx.lua_bridge_error) {
             blyt_bridge_error_unwind(session);
             session->trace_fn_addr = 0;
@@ -4192,14 +4244,14 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     }
 
     if (session->ctx.fn_return_done) {
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
         session->ctx.lua_bridge_active = false;
 #endif
         trace_fn_return(session);
         g_run_ctx = NULL;
         return BLYT_RUN_FN_DONE;
     }
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
     if (session->ctx.lua_bridge_error) {
         blyt_bridge_error_unwind(session);
         session->trace_fn_addr = 0;
@@ -4268,7 +4320,7 @@ uint32_t blyt_session_fn_return_value(const blyt_session_t *s) {
 }
 
 void blyt_session_lua_bridge_attach(blyt_session_t *s, struct lua_State *exch) {
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
     s->ctx.lua_exch = exch;
 #else
     (void)s;
@@ -4277,7 +4329,7 @@ void blyt_session_lua_bridge_attach(blyt_session_t *s, struct lua_State *exch) {
 }
 
 int blyt_session_begin_bridged_call(blyt_session_t *s, uint32_t wrap_addr) {
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
     if (!s->ctx.lua_exch)
         return -1;
     /* Snapshot registers so a Lua error can unwind the abandoned frame. */
@@ -4303,7 +4355,7 @@ int blyt_session_begin_bridged_call(blyt_session_t *s, uint32_t wrap_addr) {
 
 void blyt_session_visit_lua_exports(blyt_session_t *s, blyt_lua_export_visitor_t cb,
                                     void *userdata) {
-#ifdef BLYT_LUA
+#ifdef BLYT_LUA_BRIDGE
     for (int i = 0; i < s->lua_nexports; i++)
         cb(s->lua_exports[i].lua_name, s->lua_exports[i].fn_guest_addr,
            s->lua_exports[i].wrap_guest_addr, s->lua_exports[i].flags, s->lua_exports[i].nargs,

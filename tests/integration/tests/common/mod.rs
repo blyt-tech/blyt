@@ -1401,6 +1401,38 @@ pub fn run_cart_libretro_with_env(
     );
 }
 
+/// Run a cart through the embedded libretro core with BOTH driver flags (e.g.
+/// `--run-frames N`, `--reset-every-frame`) AND extra process environment (e.g.
+/// `BLYT_HOSTLUA=1` to select the core's native host-Lua fast path); assert
+/// `expected` appears in the output. Used by the host-Lua hybrid legs (#232 S5),
+/// which need the frame cap for a never-quitting example cart and the env to
+/// opt into the host-Lua path in one invocation.
+pub fn run_cart_libretro_with_env_and_flags(
+    cart: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    flags: &[&str],
+    expected: &str,
+) {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    for f in flags {
+        cmd.arg(f);
+    }
+    cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.assert().success().get_output().stderr.clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in libretro core output (env={:?} flags={:?}), got: {}",
+        expected,
+        extra_env,
+        flags,
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// Dump frame 0 (XRGB8888, 320x240) of a cart via `blytplay --headless
 /// --dump-frame0` — the host-runtime (blytplay) leg.  The palette-agnostic test
 /// card (#204) is a host-runtime fallback, so its expanded colours are only
