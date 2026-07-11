@@ -700,7 +700,8 @@ static void register_state_api(lua_State *L) {
  * ECALL).  Byte-for-byte the WASM leg's wasm_register_s_proxy, reading the
  * runner's own ctx. */
 static void register_s_proxy(lua_State *L, blyt_state_ctx_t *ctx) {
-    static const char *type_names[] = {"i8", "u8", "i16", "u16", "i32", "u32", "f32", "bool"};
+    static const char *type_names[] = {"i8",  "u8",  "i16",  "u16", "i32",
+                                       "u32", "f32", "bool", "f64"};
 
     if (!ctx || ctx->n_buffers == 0)
         return;
@@ -767,7 +768,7 @@ static void register_s_proxy(lua_State *L, blyt_state_ctx_t *ctx) {
         APPENDF("_b%u_rmt.__index=function(t,k)\nlocal s=rawget(t,1)\n", buf_id);
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             uint8_t tag = bc->field_types[fi];
-            const char *tname = (tag < 8) ? type_names[tag] : "i32";
+            const char *tname = (tag < 9) ? type_names[tag] : "i32";
             APPENDF("%s k==\"%s\" then return _buf.get_%s(%u,s,%u)\n", fi == 0 ? "if" : "elseif",
                     bc->field_names[fi], tname, buf_id, fi + 1);
         }
@@ -776,7 +777,7 @@ static void register_s_proxy(lua_State *L, blyt_state_ctx_t *ctx) {
         APPENDF("_b%u_rmt.__newindex=function(t,k,v)\nlocal s=rawget(t,1)\n", buf_id);
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             uint8_t tag = bc->field_types[fi];
-            const char *tname = (tag < 8) ? type_names[tag] : "i32";
+            const char *tname = (tag < 9) ? type_names[tag] : "i32";
             APPENDF("%s k==\"%s\" then _buf.set_%s(%u,s,%u,v)\n", fi == 0 ? "if" : "elseif",
                     bc->field_names[fi], tname, buf_id, fi + 1);
         }

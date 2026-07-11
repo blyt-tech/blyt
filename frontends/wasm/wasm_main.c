@@ -1584,7 +1584,8 @@ static int wasm_lua_save_read(lua_State *L) {
  * that the packer generates as native C in __blyt_lua_glue.c, but uses
  * blyt.buf.get_T/set_T instead of ECALL stubs so it runs without rv32emu. */
 static void wasm_register_s_proxy(lua_State *L) {
-    static const char *type_names[] = {"i8", "u8", "i16", "u16", "i32", "u32", "f32", "bool"};
+    static const char *type_names[] = {"i8",  "u8",  "i16",  "u16", "i32",
+                                       "u32", "f32", "bool", "f64"};
 
     /* active_state_ctx() — not g_lua_state_ctx directly — so the S proxy is
      * registered for HYBRID carts too (whose state ctx lives in g_session;
@@ -1660,7 +1661,7 @@ static void wasm_register_s_proxy(lua_State *L) {
         APPENDF("_b%u_rmt.__index=function(t,k)\nlocal s=rawget(t,1)\n", buf_id);
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             uint8_t tag = bc->field_types[fi];
-            const char *tname = (tag < 8) ? type_names[tag] : "i32";
+            const char *tname = (tag < 9) ? type_names[tag] : "i32";
             APPENDF("%s k==\"%s\" then return _buf.get_%s(%u,s,%u)\n", fi == 0 ? "if" : "elseif",
                     bc->field_names[fi], tname, buf_id, fi + 1);
         }
@@ -1670,7 +1671,7 @@ static void wasm_register_s_proxy(lua_State *L) {
         APPENDF("_b%u_rmt.__newindex=function(t,k,v)\nlocal s=rawget(t,1)\n", buf_id);
         for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
             uint8_t tag = bc->field_types[fi];
-            const char *tname = (tag < 8) ? type_names[tag] : "i32";
+            const char *tname = (tag < 9) ? type_names[tag] : "i32";
             APPENDF("%s k==\"%s\" then _buf.set_%s(%u,s,%u,v)\n", fi == 0 ? "if" : "elseif",
                     bc->field_names[fi], tname, buf_id, fi + 1);
         }

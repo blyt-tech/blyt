@@ -79,6 +79,176 @@ pub fn hostlua_native_fma() -> PathBuf {
 // Shared here (rather than per-suite) so the emulated trio (gfx.rs) and the
 // native QEMU gate (native_qemu.rs) hash against ONE golden and cannot drift.
 // -------------------------------------------------------------------------
+/// Shared carts + pinned goldens for the non-FP determinism parity matrix
+/// (#235, Spike Z Q5). Referenced by both `nonfp_parity.rs` (the host-Lua-leg
+/// suite) and `native_qemu.rs` (the RISC-V hardware-path gate) so the cart
+/// source and golden digests have a single source of truth — a regenerated
+/// golden updates every leg at once. See `nonfp_parity.rs` for the reference
+/// model (ADR-0136) and rationale.
+pub mod nonfp {
+    /// State-buffer config with a single f64 field, for the NaN-boundary cart.
+    pub const NAN_CONFIG: &str = "\
+records:
+  NanBuf:
+    fields:
+      - { name: v, type: f64 }
+state_buffers:
+  nanbuf:
+    record: NanBuf
+    count: 1
+";
+
+    /// Writes non-canonical NaNs (sign-set quiet, signaling, negative
+    /// signaling, payload-bearing) + finite f64 controls through the `S`
+    /// proxy's f64 field, reads each back, and folds the *stored* bits into an
+    /// i32 FNV-1a digest. The store path canonicalizes (ADR-0010), so the
+    /// digest only matches across legs if every leg canonicalizes identically.
+    /// Also prints the explicit canonical value for a positive contract check.
+    ///
+    /// `lua_Integer` is 32-bit (BLYT_LUA_I32_F64), so a 64-bit NaN pattern
+    /// can't be a literal — doubles are assembled from two little-endian 32-bit
+    /// halves.
+    pub const NAN_CART: &str = r#"
+local FNV_OFFSET = 0x811c9dc5
+local FNV_PRIME = 0x01000193
+local hash = FNV_OFFSET
+local function fold_byte(b)
+    hash = (hash ~ (b & 0xff)) * FNV_PRIME
+end
+local function fold_i32(x)
+    fold_byte(x & 0xff)
+    fold_byte((x >> 8) & 0xff)
+    fold_byte((x >> 16) & 0xff)
+    fold_byte((x >> 24) & 0xff)
+end
+local function bits_to_double(lo, hi)
+    return (string.unpack("<d", string.pack("<I4I4", lo & 0xffffffff, hi & 0xffffffff)))
+end
+local function double_bits(d)
+    return string.unpack("<I4I4", string.pack("<d", d))
+end
+local function fold_double(d)
+    local lo, hi = double_bits(d)
+    fold_i32(lo)
+    fold_i32(hi)
+end
+local function digest_hex()
+    local b0, b1, b2, b3 = hash & 0xff, (hash >> 8) & 0xff, (hash >> 16) & 0xff, (hash >> 24) & 0xff
+    return string.format("%02x%02x%02x%02x", b3, b2, b1, b0)
+end
+
+function init()
+    local slot = blyt.buf.alloc_slot(S.NANBUF)
+    local inputs = {
+        bits_to_double(0x00000000, 0xFFF80000), -- sign-set quiet NaN
+        bits_to_double(0x00000001, 0x7FF00000), -- signaling NaN
+        bits_to_double(0x00000001, 0xFFF00000), -- negative signaling NaN
+        bits_to_double(0xDEADBEEF, 0x7FF80000), -- quiet NaN with payload
+        bits_to_double(0x00000000, 0x40090000), -- finite 3.125 control
+        bits_to_double(0x00000000, 0xC0000000), -- finite -2.0 control
+    }
+    for i = 1, #inputs do
+        S.nanbuf[slot].v = inputs[i]
+        fold_double(S.nanbuf[slot].v)
+    end
+    blyt.debug.print("[blyt:nonfphash] " .. digest_hex())
+    -- Explicit ADR-0010 contract: a non-canonical sign-set NaN reads back as the
+    -- canonical positive quiet NaN 0x7FF8000000000000 on every leg.
+    S.nanbuf[slot].v = bits_to_double(0x00000000, 0xFFF80000)
+    local lo, hi = double_bits(S.nanbuf[slot].v)
+    blyt.debug.print(string.format("[blyt:canon-f64] %08x:%08x", hi & 0xffffffff, lo & 0xffffffff))
+end
+function update()
+    blyt.quit()
+end
+function draw() end
+"#;
+
+    /// Pinned golden for the NaN-boundary digest. Regenerate by running any leg
+    /// and copying the `[blyt:nonfphash]` value.
+    pub const NAN_DIGEST: &str = "[blyt:nonfphash] e2d2f194";
+    /// The canonical f64 NaN (ADR-0010, 0x7FF8000000000000) printed hi:lo.
+    pub const NAN_CANON_LINE: &str = "[blyt:canon-f64] 7ff80000:00000000";
+
+    /// Folds finalizer (`__gc`) execution order across three collection phases
+    /// into an i32 FNV-1a digest. Finalization order is a pure function of
+    /// allocation / collection order under the shared Lua 5.4 GC, so only a
+    /// GC-order divergence can move the digest.
+    pub const GC_CART: &str = r#"
+local FNV_OFFSET = 0x811c9dc5
+local FNV_PRIME = 0x01000193
+local hash = FNV_OFFSET
+local function fold_byte(b)
+    hash = (hash ~ (b & 0xff)) * FNV_PRIME
+end
+local function fold_str(s)
+    for i = 1, #s do
+        fold_byte(s:byte(i))
+    end
+    fold_byte(0)
+end
+local function fold_i32(x)
+    fold_byte(x & 0xff)
+    fold_byte((x >> 8) & 0xff)
+    fold_byte((x >> 16) & 0xff)
+    fold_byte((x >> 24) & 0xff)
+end
+local function digest_hex()
+    local b0, b1, b2, b3 = hash & 0xff, (hash >> 8) & 0xff, (hash >> 16) & 0xff, (hash >> 24) & 0xff
+    return string.format("%02x%02x%02x%02x", b3, b2, b1, b0)
+end
+
+local order = {}
+local function finalizable(tag)
+    return setmetatable({}, { __gc = function() order[#order + 1] = tag end })
+end
+
+function init()
+    -- Phase 1: create finalizable objects, drop all refs, collect.
+    do
+        local objs = {}
+        for i = 1, 12 do
+            objs[i] = finalizable(string.format("a%02d", i))
+        end
+        objs = nil
+    end
+    collectgarbage("collect")
+    fold_str("phase1:" .. table.concat(order, ","))
+
+    -- Phase 2: interleave survivors with garbage to exercise mark order.
+    order = {}
+    local keep = {}
+    do
+        for i = 1, 20 do
+            local o = finalizable(string.format("b%02d", i))
+            if i % 3 == 0 then
+                keep[#keep + 1] = o -- survives this collection
+            end
+        end
+    end
+    collectgarbage("collect")
+    fold_str("phase2:" .. table.concat(order, ","))
+    fold_i32(#keep)
+
+    -- Phase 3: drop survivors, final sweep (two cycles to drain finalizers).
+    keep = nil
+    order = {}
+    collectgarbage("collect")
+    collectgarbage("collect")
+    fold_str("phase3:" .. table.concat(order, ","))
+
+    blyt.debug.print("[blyt:gchash] " .. digest_hex())
+end
+function update()
+    blyt.quit()
+end
+function draw() end
+"#;
+
+    /// Pinned golden for the GC finalization-order digest.
+    pub const GC_DIGEST: &str = "[blyt:gchash] 12522721";
+}
+
 pub mod gfx {
     pub const FRAME_W: usize = 320;
     pub const FRAME_H: usize = 240;
