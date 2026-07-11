@@ -242,3 +242,57 @@ end
     run_native_env_flags(&cart, &[("BLYT_HOSTLUA", "1")], &["--reset-every-frame"], expected);
     run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
 }
+
+/// S4 — a native-lifecycle hybrid: the C half defines `blyt_cart_update`,
+/// overriding libblyt32lua's Lua-driver stub, so the runtime drives the native
+/// update each frame while `init`/`draw` stay in Lua. On the native host-Lua leg
+/// the native lifecycle fn is injected as a zero-arg Lua-global trampoline so the
+/// runner's `call_lifecycle` drives it through the ADR-0130 bridge (the native
+/// counterpart of wasm_main.c's `maybe_inject_lifecycle_cb`), and the native
+/// half's `blyt_quit()` during update must propagate to end the loop identically
+/// on every leg. A `--quit-after` safety cap on the native legs turns a broken
+/// bridge (native update never runs → cart never quits) into a clean assertion
+/// failure rather than a hang.
+#[test]
+fn hostlua_hybrid_native_lifecycle_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_native_lifecycle");
+
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+/* Native lifecycle: this cart's own blyt_cart_update overrides libblyt32lua's
+ * Lua-driver stub, so the runtime calls it natively each frame while init()/draw()
+ * stay in Lua. blyt_quit() from the native half must end the loop on every leg. */
+static int32_t ticks = 0;
+void blyt_cart_update(void) {
+    ticks++;
+    if (ticks == 5) {
+        blyt_console_debug("native update reached tick 5");
+        blyt_quit();
+    }
+}
+"#)
+        .lua(
+            r#"
+function init()
+    blyt.debug.print("lua init before native update loop")
+end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let expected = "native update reached tick 5";
+
+    // Emulated (rv32emu) — the reference; native blyt_cart_update drives directly.
+    run_native_env_flags(&cart, &[], &["--quit-after", "60"], expected);
+    // Native host-Lua fast path (#232 S4) — native lifecycle injected as a global.
+    run_native_env_flags(&cart, &[("BLYT_HOSTLUA", "1")], &["--quit-after", "60"], expected);
+    // WASM host-Lua fast path — the existing native-lifecycle hybrid leg.
+    run_cart_wasm(&cart, expected);
+}

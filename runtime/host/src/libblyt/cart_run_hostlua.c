@@ -49,6 +49,7 @@
 #include "blyt_hostlua_heap.h" /* runtime/shared: rv32 heap-seam handoff (#231) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
+#include "blyt_phase.h" /* runtime/shared: lifecycle phase (draw()-only gate, #205) */
 #include "blyt_raster.h" /* runtime/shared: integer rasterizer core (#188) */
 #include "blyt_resource_codec.h" /* runtime/shared: BLYT_RES_ALGO_NONE (#157) */
 #include "resource.h" /* blyt_resource_table_t + lifecycle (#93/#158) */
@@ -1891,6 +1892,64 @@ static void hl_wire_hybrid(blyt_hostlua_t *hl) {
     blyt_session_visit_lua_exports(hl->session, hl_visit_export_cb, hl->L);
 }
 
+/* Install a cart-native lifecycle fn `fn_guest_addr` as the zero-arg void Lua
+ * global `name` so call_lifecycle picks it up like a Lua-defined callback.  The
+ * native counterpart of wasm_main.c's maybe_inject_lifecycle_cb — a plain typed
+ * trampoline with nargs=0 and VOID arg/return types. */
+static void hl_inject_lifecycle_cb(lua_State *L, const char *name, uint32_t fn_guest_addr) {
+    lua_pushlightuserdata(L, (void *)(uintptr_t)fn_guest_addr);
+    lua_pushinteger(L, 0); /* nargs = 0 */
+    lua_pushinteger(L, HL_LUA_TYPE_VOID); /* arg_types[0..3] */
+    lua_pushinteger(L, HL_LUA_TYPE_VOID);
+    lua_pushinteger(L, HL_LUA_TYPE_VOID);
+    lua_pushinteger(L, HL_LUA_TYPE_VOID);
+    lua_pushinteger(L, HL_LUA_TYPE_VOID); /* ret_type */
+    lua_pushcclosure(L, hl_typed_trampoline, 7);
+    lua_setglobal(L, name);
+}
+
+/* Inject a hybrid cart's native lifecycle callbacks as Lua-global trampolines
+ * (#232 S4).  Called from build_vm AFTER the cart bytecode has run, so the Lua
+ * halves' globals already exist and a conflict (a callback defined in BOTH the
+ * native and Lua halves) can be detected.  Returns 0 on success, -1 on conflict
+ * (error logged; the caller closes the VM).  No-op for a pure-Lua runner. */
+static int hl_inject_native_lifecycle(blyt_hostlua_t *hl) {
+    if (!hl->session)
+        return 0;
+    static const struct {
+        const char *name;
+        uint32_t (*fn)(blyt_session_t *);
+    } cbs[] = {
+        {"init", blyt_session_cart_fn_init},
+        {"on_new_state", blyt_session_cart_fn_on_new_state},
+        {"update", blyt_session_cart_fn_update},
+        {"draw", blyt_session_cart_fn_draw},
+        {"on_quit", blyt_session_cart_fn_on_quit},
+        {"cleanup", blyt_session_cart_fn_cleanup},
+    };
+    for (size_t i = 0; i < sizeof(cbs) / sizeof(cbs[0]); i++) {
+        uint32_t fn = cbs[i].fn(hl->session);
+        if (!fn)
+            continue; /* callback lives in a runtime stub, not the cart itself. */
+        lua_getglobal(hl->L, cbs[i].name);
+        int has_lua = lua_isfunction(hl->L, -1);
+        lua_pop(hl->L, 1);
+        if (has_lua) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "blyt-hostlua: lifecycle '%s' defined in both native and Lua",
+                     cbs[i].name);
+            if (hl->log_fn)
+                hl->log_fn(buf);
+            else
+                fprintf(stderr, "%s\n", buf);
+            return -1;
+        }
+        hl_inject_lifecycle_cb(hl->L, cbs[i].name, fn);
+    }
+    return 0;
+}
+
 static int build_vm(blyt_hostlua_t *hl) {
     /* lua_newstate with the arena-backed allocator (#158) + the seam VM's pinned
      * hash seed (luaL_makeseed(NULL) == luai_makeseed override 0x424C5954) — the
@@ -1933,6 +1992,17 @@ static int build_vm(blyt_hostlua_t *hl) {
             fprintf(stderr, "blyt-hostlua: failed to load cart bytecode: %s\n",
                     msg ? msg : "(no message)");
         }
+        lua_close(hl->L);
+        hl->L = NULL;
+        return -1;
+    }
+
+    /* Hybrid native-lifecycle injection (#232 S4): install the cart's own native
+     * lifecycle callbacks (blyt_cart_update etc.) as Lua-global trampolines now
+     * that the bytecode has run and the Lua halves' globals exist, so a callback
+     * defined in both halves is caught.  Before the baseline so these scaffolding
+     * closures are excluded from the cart-attributable heap. */
+    if (hl_inject_native_lifecycle(hl) != 0) {
         lua_close(hl->L);
         hl->L = NULL;
         return -1;
@@ -2011,12 +2081,16 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool debug)
 
     hl_palette_ensure_default(hl); /* built-in or cart-asset declared default (#214) */
 
-    /* Hybrid (#232): a .lua_exports cart has a native C/Rust half.  Create the
-     * rv32 session that runs it — in bridge mode, so it links the bridge stub
+    /* Hybrid (#232): a cart has a native C/Rust half if it exports Lua-callable
+     * functions (.lua_exports) OR defines native lifecycle callbacks
+     * (blyt_cart_update etc. in its own code — #232 S4).  Create the rv32 session
+     * that runs it — in bridge mode, so it links the bridge stub
      * (libblyt32lua-bridge.so) and its Lua C API calls trap to this host VM.  The
      * session persists across VM rebuilds; build_vm re-attaches the exchange
-     * thread and re-installs the export trampolines each rebuild. */
-    if (blyt_cart_find_section(cart, ".lua_exports", NULL)) {
+     * thread, re-installs the export trampolines, and re-injects the native
+     * lifecycle globals each rebuild. */
+    if (blyt_cart_find_section(cart, ".lua_exports", NULL) ||
+        blyt_cart_has_native_lifecycle(cart)) {
         hl->session = blyt_session_create_lua_bridge(cart, log_fn);
         if (!hl->session) {
             if (log_fn)
@@ -2271,10 +2345,28 @@ blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
     hl->lock_epoch++;
     hl_surf_reap(hl);
 
-    if (call_lifecycle(hl, "update") != 0 || call_lifecycle(hl, "draw") != 0) {
+    /* Phase brackets (#205, #232 S4): a hybrid cart's emulated native half reads
+     * the phase off the session run-ctx to gate surface access to draw().  The
+     * native counterpart of the WASM leg's __blyt_phase_* globals; a no-op for a
+     * session-less pure-Lua runner (blyt_session_set_phase(NULL)). */
+    blyt_session_set_phase(hl->session, BLYT_PHASE_UPDATE);
+    if (call_lifecycle(hl, "update") != 0) {
         hl->done = true;
         return BLYT_RUN_ERR_ABORT;
     }
+    blyt_session_set_phase(hl->session, BLYT_PHASE_DRAW);
+    if (call_lifecycle(hl, "draw") != 0) {
+        hl->done = true;
+        return BLYT_RUN_ERR_ABORT;
+    }
+    blyt_session_set_phase(hl->session, BLYT_PHASE_NONE);
+
+    /* A native lifecycle callback may have latched a quit through the trampoline
+     * loop; also poll the session directly so a quit requested by the emulated
+     * half ends the loop on the next frame (mirrors blyt_main's post-frame check). */
+    if (hl->session && !hl->quit && blyt_session_check_guest_quit(hl->session))
+        hl->quit = 1;
+
     hl_frame_done(hl);
     return BLYT_RUN_FRAME_DONE;
 }
@@ -2317,19 +2409,17 @@ void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
 }
 
 /* Opt-in dispatch predicate.  Routes to the native host-Lua path when the cart
- * has a .cart.lua section.  A `.lua_exports` hybrid (typed/bridged native
- * exports the Lua half calls) IS supported here via the ADR-0130 ECALL bridge
- * (#232): the Lua half runs on the host VM, the native half stays emulated under
- * rv32emu.  A cart that defines native lifecycle callbacks still falls back to
- * the rv32 session for now (#232 S4). */
+ * has a .cart.lua section.  A hybrid cart IS supported here via the ADR-0130
+ * ECALL bridge (#232): the Lua half runs on the host VM, the native half stays
+ * emulated under rv32emu — for both `.lua_exports` (typed/bridged native exports
+ * the Lua half calls) and native lifecycle callbacks (`blyt_cart_update` etc.,
+ * injected as zero-arg Lua-global trampolines — #232 S4). */
 bool blyt_hostlua_should_use(const blyt_cart_t *cart) {
     if (!cart)
         return false;
     if (!getenv("BLYT_HOSTLUA"))
         return false;
     if (!blyt_cart_find_section(cart, ".cart.lua", NULL))
-        return false;
-    if (blyt_cart_has_native_lifecycle(cart))
         return false;
     return true;
 }
