@@ -9,10 +9,11 @@
 //! oracle that the wiring actually enforces the budget through a real cart.
 //!
 //! The C carts exercise the rv32 heap on all three legs; the Lua cart additionally
-//! pins the `guest_heap_used` byte-parity AC — its Lua VM runs as wasm32 on the
-//! WASM host-Lua fast path but rv32 on blytplay/libretro, and the single shared
-//! arena must make the count identical regardless (#158). The native bare-metal
-//! leg is covered by the QEMU gate (native_qemu.rs Gate 16).
+//! pins the `guest_heap_used` byte-parity AC — its Lua VM runs host-Lua on every
+//! leg now (ADR-0136: native on blytplay/libretro, wasm32 on WASM; #236 retired
+//! the emulated RV32 Lua VM as a shipped path), and the single shared arena must
+//! make the count identical regardless (#158). The RV32 guest-lib Lua heap on real
+//! RISC-V is covered by the QEMU gate (native_qemu.rs Gate 16).
 
 mod common;
 use common::*;
@@ -84,20 +85,12 @@ fn lua_heap_budget_shrinks_with_resident_resource_all_legs() {
 
     // a=255 (full 16 MB), b=191 (12 MB after the 4 MiB load), load succeeds, and
     // b<a (unified budget). The exact counts are asserted identically on every
-    // leg — including the host-Lua wasm32 fast path — which is the cross-leg
-    // guest_heap_used byte-parity acceptance criterion (#158). The counts happen
-    // to equal BUDGET_C's because the arena block accounting is the same.
+    // leg — host-Lua is the default for a pure-Lua cart on non-RISC-V hosts
+    // (ADR-0136), and all three legs allocate through the same shared 16 MB arena
+    // feeding the same budget predicate — which is the cross-leg guest_heap_used
+    // byte-parity acceptance criterion (#158). The counts happen to equal
+    // BUDGET_C's because the arena block accounting is the same.
     run_cart_all_legs(&cart, "BUDGET a=255 b=191 loaded=1 shrank=1");
-    // Native host-Lua fast path (#231): the VM allocates through the same shared
-    // 16 MB arena, and the resource footprint feeds the same budget predicate —
-    // a=255/b=191 here too (measurement: the 64 KiB body dominates, so the
-    // 64-bit-vs-rv32 object-size delta never moves the fail-point). The exact
-    // count for small-object exhaustion is host-heap-dependent (advisory).
-    run_cart_native_with_env(
-        &cart,
-        &[("BLYT_HOSTLUA", "1")],
-        "BUDGET a=255 b=191 loaded=1 shrank=1",
-    );
 }
 
 /// A C cart that measures guest-heap headroom (64 KiB allocations until `malloc`

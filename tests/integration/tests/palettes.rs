@@ -15,9 +15,7 @@ use common::gfx;
 use common::{
     CartProject, build_cart, build_lua_cart, dump_frame0_native, dump_frame0_wasm, repo_root,
     require_libretro_core, require_lua_sdk, require_sdk, require_test_session_api, require_wasm,
-    run_cart_libretro_hostlua_frame_hash, run_cart_libretro_with_env,
-    run_cart_native_hostlua_frame_hash, run_cart_native_with_env, run_cart_wasm_with_env, sdk_dir,
-    test_session_api,
+    run_cart_all_legs_frame_hash, sdk_dir, test_session_api,
 };
 use tempfile::TempDir;
 
@@ -182,16 +180,11 @@ fn palette_set_changes_only_palhash_across_legs() {
         "sanity: aurora and vga must have distinct palette hashes"
     );
 
-    let env = [("BLYT_FRAME_HASH", "1")];
     for (cart, ph) in [(&plain, &aurora_ph), (&vga, &vga_ph)] {
         // Same index hash under both palettes — fbhash is palette-blind.
-        run_cart_native_with_env(cart, &env, &fb);
-        run_cart_wasm_with_env(cart, &env, &fb);
-        run_cart_libretro_with_env(cart, &env, &fb);
+        run_cart_all_legs_frame_hash(cart, &fb);
         // Palette hash tracks the active palette — the oracle #199 needs.
-        run_cart_native_with_env(cart, &env, ph);
-        run_cart_wasm_with_env(cart, &env, ph);
-        run_cart_libretro_with_env(cart, &env, ph);
+        run_cart_all_legs_frame_hash(cart, ph);
     }
 }
 
@@ -235,20 +228,11 @@ fn lua_palette_set_changes_only_palhash_across_legs() {
         "sanity: aurora and vga must have distinct palette hashes"
     );
 
-    let env = [("BLYT_FRAME_HASH", "1")];
     for (cart, ph) in [(&plain, &aurora_ph), (&vga, &vga_ph)] {
-        // fbhash is palette-blind — identical on all five legs.
-        run_cart_native_with_env(cart, &env, &fb);
-        run_cart_wasm_with_env(cart, &env, &fb);
-        run_cart_libretro_with_env(cart, &env, &fb);
-        run_cart_native_hostlua_frame_hash(cart, &fb);
-        run_cart_libretro_hostlua_frame_hash(cart, &fb); // #233
-        // palhash tracks the active palette on all five legs.
-        run_cart_native_with_env(cart, &env, ph);
-        run_cart_wasm_with_env(cart, &env, ph);
-        run_cart_libretro_with_env(cart, &env, ph);
-        run_cart_native_hostlua_frame_hash(cart, ph);
-        run_cart_libretro_hostlua_frame_hash(cart, ph); // #233
+        // fbhash is palette-blind — identical on every host-Lua leg.
+        run_cart_all_legs_frame_hash(cart, &fb);
+        // palhash tracks the active palette on every host-Lua leg.
+        run_cart_all_legs_frame_hash(cart, ph);
     }
 }
 
@@ -289,13 +273,8 @@ fn hybrid_lua_palette_set_routes_to_session_across_legs() {
     let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
     let vga_ph = gfx::expected_palhash_line(&declared_palette(&tmp.path().join("vga_decl"), "vga"));
 
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &fb);
-    run_cart_wasm_with_env(&cart, &env, &fb);
-    run_cart_libretro_with_env(&cart, &env, &fb);
-    run_cart_native_with_env(&cart, &env, &vga_ph);
-    run_cart_wasm_with_env(&cart, &env, &vga_ph);
-    run_cart_libretro_with_env(&cart, &env, &vga_ph);
+    run_cart_all_legs_frame_hash(&cart, &fb);
+    run_cart_all_legs_frame_hash(&cart, &vga_ph);
 }
 
 // ── #204 palette-agnostic test card ───────────────────────────────────────
@@ -413,13 +392,8 @@ fn custom_default_palette_loads_across_legs() {
     );
 
     let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &fb);
-    run_cart_wasm_with_env(&cart, &env, &fb);
-    run_cart_libretro_with_env(&cart, &env, &fb);
-    run_cart_native_with_env(&cart, &env, &custom_ph);
-    run_cart_wasm_with_env(&cart, &env, &custom_ph);
-    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+    run_cart_all_legs_frame_hash(&cart, &fb);
+    run_cart_all_legs_frame_hash(&cart, &custom_ph);
 }
 
 /// A runtime `blyt_gfx_palette_set(R_MAIN)` on a C cart whose default is aurora
@@ -449,13 +423,8 @@ fn runtime_palette_set_custom_across_legs() {
 
     let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
     let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &fb);
-    run_cart_wasm_with_env(&cart, &env, &fb);
-    run_cart_libretro_with_env(&cart, &env, &fb);
-    run_cart_native_with_env(&cart, &env, &custom_ph);
-    run_cart_wasm_with_env(&cart, &env, &custom_ph);
-    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+    run_cart_all_legs_frame_hash(&cart, &fb);
+    run_cart_all_legs_frame_hash(&cart, &custom_ph);
 }
 
 /// The pure-Lua counterpart: a Lua cart passes the typed palette constant
@@ -488,20 +457,9 @@ fn lua_custom_palette_set_across_legs() {
 
     let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
     let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &fb);
-    run_cart_wasm_with_env(&cart, &env, &fb);
-    run_cart_libretro_with_env(&cart, &env, &fb);
-    run_cart_native_with_env(&cart, &env, &custom_ph);
-    run_cart_wasm_with_env(&cart, &env, &custom_ph);
-    run_cart_libretro_with_env(&cart, &env, &custom_ph);
-    // Native host-Lua fast path (#231): R.MAIN resolves against the runner's own
+    run_cart_all_legs_frame_hash(&cart, &fb);
+    run_cart_all_legs_frame_hash(&cart, &custom_ph);
     // resource table (no session) → hl_resolve_palette → the custom palhash.
-    run_cart_native_hostlua_frame_hash(&cart, &fb);
-    run_cart_native_hostlua_frame_hash(&cart, &custom_ph);
-    // Same fast path inside the libretro core (#233).
-    run_cart_libretro_hostlua_frame_hash(&cart, &fb);
-    run_cart_libretro_hostlua_frame_hash(&cart, &custom_ph);
 }
 
 // ── #219 pure-Lua declared-default palette on the WASM host-Lua fast path ──
@@ -541,20 +499,9 @@ fn lua_declared_builtin_default_across_legs() {
 
     let vga_ph = gfx::expected_palhash_line(&declared_palette(&tmp.path().join("vga_decl"), "vga"));
     let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &fb);
-    run_cart_wasm_with_env(&cart, &env, &fb);
-    run_cart_libretro_with_env(&cart, &env, &fb);
-    run_cart_native_with_env(&cart, &env, &vga_ph);
-    run_cart_wasm_with_env(&cart, &env, &vga_ph);
-    run_cart_libretro_with_env(&cart, &env, &vga_ph);
-    // Native host-Lua fast path (#231): declared built-in default seeded into the
+    run_cart_all_legs_frame_hash(&cart, &fb);
+    run_cart_all_legs_frame_hash(&cart, &vga_ph);
     // runner's palette (hl_palette_ensure_default), no palette_set.
-    run_cart_native_hostlua_frame_hash(&cart, &fb);
-    run_cart_native_hostlua_frame_hash(&cart, &vga_ph);
-    // Same fast path inside the libretro core (#233).
-    run_cart_libretro_hostlua_frame_hash(&cart, &fb);
-    run_cart_libretro_hostlua_frame_hash(&cart, &vga_ph);
 }
 
 /// The custom-palette counterpart: a pure-Lua cart declaring a `.hex` **asset**
@@ -583,20 +530,9 @@ fn lua_declared_custom_default_across_legs() {
 
     let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
     let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &fb);
-    run_cart_wasm_with_env(&cart, &env, &fb);
-    run_cart_libretro_with_env(&cart, &env, &fb);
-    run_cart_native_with_env(&cart, &env, &custom_ph);
-    run_cart_wasm_with_env(&cart, &env, &custom_ph);
-    run_cart_libretro_with_env(&cart, &env, &custom_ph);
-    // Native host-Lua fast path (#231): declared PROV_CART default resolved at
+    run_cart_all_legs_frame_hash(&cart, &fb);
+    run_cart_all_legs_frame_hash(&cart, &custom_ph);
     // load time against the runner's resource table (hl_palette_ensure_default).
-    run_cart_native_hostlua_frame_hash(&cart, &fb);
-    run_cart_native_hostlua_frame_hash(&cart, &custom_ph);
-    // Same fast path inside the libretro core (#233).
-    run_cart_libretro_hostlua_frame_hash(&cart, &fb);
-    run_cart_libretro_hostlua_frame_hash(&cart, &custom_ph);
 }
 
 // ── #221 remaining custom-palette parity cells (hybrid + custom on the fast
@@ -638,13 +574,8 @@ fn hybrid_custom_palette_set_across_legs() {
 
     let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
     let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &fb);
-    run_cart_wasm_with_env(&cart, &env, &fb);
-    run_cart_libretro_with_env(&cart, &env, &fb);
-    run_cart_native_with_env(&cart, &env, &custom_ph);
-    run_cart_wasm_with_env(&cart, &env, &custom_ph);
-    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+    run_cart_all_legs_frame_hash(&cart, &fb);
+    run_cart_all_legs_frame_hash(&cart, &custom_ph);
 }
 
 /// #221 cell 2: a hybrid cart declaring a **custom** `.hex` default and NO
@@ -677,11 +608,6 @@ fn hybrid_custom_default_across_legs() {
 
     let custom_ph = gfx::expected_palhash_line(&custom_palette_table());
     let fb = gfx::expected_hash_line(&gfx::render(&[gfx::Op::Clear(5)]));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &fb);
-    run_cart_wasm_with_env(&cart, &env, &fb);
-    run_cart_libretro_with_env(&cart, &env, &fb);
-    run_cart_native_with_env(&cart, &env, &custom_ph);
-    run_cart_wasm_with_env(&cart, &env, &custom_ph);
-    run_cart_libretro_with_env(&cart, &env, &custom_ph);
+    run_cart_all_legs_frame_hash(&cart, &fb);
+    run_cart_all_legs_frame_hash(&cart, &custom_ph);
 }

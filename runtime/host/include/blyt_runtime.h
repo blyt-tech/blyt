@@ -63,6 +63,13 @@ void blyt_cart_close(blyt_cart_t *cart);
  */
 int blyt_cart_has_native_lifecycle(const blyt_cart_t *cart);
 
+/* True iff the cart carries a native half (a C/Rust/C++ half) — i.e. it defines
+ * any non-local FUNC symbol beyond the Lua bootstrap (`_blyt_entry`,
+ * `cart_lua_modules`).  Distinguishes a pure-Lua cart from a hybrid for the
+ * host-Lua dispatch predicate, catching even an unexported native helper (kept in
+ * `.dynsym` by the cart's `--export-dynamic` link). */
+int blyt_cart_has_native_code(const blyt_cart_t *cart);
+
 /*
  * Bitmask of lifecycle callbacks defined in native (.dynsym) or Lua (.cart.lua).
  * Bit 0=init, 1=update, 2=draw, 3=on_new_state, 4=on_save_state,

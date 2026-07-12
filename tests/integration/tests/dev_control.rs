@@ -168,8 +168,7 @@ fn spawn_player_with_dev_ctrl(
 }
 
 /// As `spawn_player_with_dev_ctrl`, but prepends `extra_args` before the cart —
-/// used to opt into the host-Lua fast path (`--host-lua`, #238) so a dev-ctrl
-/// reload drives `blyt_hostlua_reload` (#244) instead of the rv32 session swap.
+/// a general hook for passing extra player flags to a dev-ctrl reload test.
 fn spawn_player_with_dev_ctrl_args(
     cart: &std::path::Path,
     save_dir: &std::path::Path,
@@ -351,18 +350,30 @@ fn native_dev_control_lifecycle_commands() {
     );
 }
 
-/// Build a pure-Lua cart that prints the guest address of a freshly allocated
-/// table on every init(): `probe addr=table: 0x...`.  That address is where the
-/// libblytc arena placed the new Lua state, so it is identical on every load
-/// **iff** the arena allocator is reset on a hot swap (issue #133).  Without the
-/// reset it climbs monotonically from the very first reload, as each reload's
-/// Lua state is allocated past the previous cart's un-reclaimed arena.
+/// Build a pure-Lua cart that prints its `guest_heap_used` byte count on every
+/// init(): `probe heap=<n>`.  It allocates a deterministic, kept-alive table so
+/// the count is a fixed non-zero baseline, then reads it via
+/// `blyt32.mem.stats().cart_allocations`.  That count is identical on every load
+/// **iff** the reload resets the cart-heap accounting to a fresh-load baseline
+/// (issue #133 memory hygiene).  Without the reset it climbs monotonically from
+/// the first reload, as each reload's allocations stack on the previous cart's
+/// un-reclaimed heap.
+///
+/// (Pure-Lua carts run host-Lua by default after #236, whose allocator draws
+/// physical bytes from host malloc with a shadow arena for byte-accounting, #231 —
+/// so raw pointer addresses are host-determined and NOT a determinism signal.
+/// `guest_heap_used` is the deterministic hygiene signal, reset by
+/// `hl_rebuild_and_restore` on every hot swap; this is the host-Lua-appropriate
+/// form of the emulated-path arena-reset check.)
 fn arena_probe_cart(tmp: &TempDir) -> std::path::PathBuf {
     let project = tmp.path().join("arena_probe");
     CartProject::new()
         .lua(
-            "function init()\n\
-             \tblyt.debug.print('probe addr=' .. tostring({}))\n\
+            "local keep\n\
+             function init()\n\
+             \tkeep = {}\n\
+             \tfor i = 1, 64 do keep[i] = i * 2 end\n\
+             \tblyt.debug.print('probe heap=' .. tostring(blyt32.mem.stats().cart_allocations))\n\
              end\n\
              function update() end\n\
              function draw() end\n",
@@ -372,14 +383,14 @@ fn arena_probe_cart(tmp: &TempDir) -> std::path::PathBuf {
 }
 
 /// N consecutive hot reloads of the same cart must reach a stable steady state:
-/// every reload's arena allocations land at the same guest addresses as the very
-/// first (fresh) load — i.e. the hot-reloaded VM is bit-identical to a fresh load
-/// (issue #133, spike-W gate G4).  The cart prints the address of a fresh table
-/// in init(); `blyt_session_swap_cart` must reset the libblytc arena allocator's
-/// bump pointer + free list so that address does not drift (and, accumulated over
-/// many reloads, does not exhaust the 16 MiB arena).  Pre-fix this fails on the
-/// first reload, as the address climbs the moment a second cart load reuses the
-/// persistent arena.
+/// every reload's `guest_heap_used` equals the very first (fresh) load's — i.e.
+/// the hot-reloaded VM's cart-heap accounting is reset to a fresh-load baseline
+/// (issue #133 memory hygiene, spike-W gate G4).  The cart prints its
+/// `guest_heap_used` in init(); the reload path must empty the cart heap (reset
+/// the accounting) so the count does not drift (and, accumulated over many
+/// reloads, does not exhaust the 16 MiB budget).  Pre-fix this fails on the first
+/// reload, as the count climbs the moment a second cart load stacks on the
+/// persistent heap.
 #[test]
 fn native_dev_control_reload_arena_steady_state() {
     require_sdk();
@@ -422,27 +433,27 @@ fn native_dev_control_reload_arena_steady_state() {
     let _ = child.wait();
 
     let out = lines.lock().unwrap().clone();
-    let addrs: Vec<&str> = out
+    let heaps: Vec<&str> = out
         .iter()
-        .filter_map(|l| l.split("probe addr=").nth(1).map(str::trim))
+        .filter_map(|l| l.split("probe heap=").nth(1).map(str::trim))
         .collect();
 
     // Initial (fresh) load + N reloads = N+1 probe lines.
     assert!(
-        addrs.len() >= N + 1,
+        heaps.len() >= N + 1,
         "expected at least {} probe lines (fresh load + {N} reloads), got {}; player output:\n{:#?}",
         N + 1,
-        addrs.len(),
+        heaps.len(),
         out
     );
 
-    let baseline = addrs[0];
-    for (i, a) in addrs.iter().enumerate() {
+    let baseline = heaps[0];
+    for (i, h) in heaps.iter().enumerate() {
         assert_eq!(
-            *a, baseline,
-            "arena allocation address drifted on reload {i}: {a:?} != fresh-load baseline \
-             {baseline:?} — libblytc arena allocator not reset on the hot swap (issue #133). \
-             All probes:\n{addrs:#?}"
+            *h, baseline,
+            "guest_heap_used drifted on reload {i}: {h:?} != fresh-load baseline {baseline:?} — \
+             the cart-heap accounting was not reset on the hot swap (issue #133). \
+             All probes:\n{heaps:#?}"
         );
     }
 }
@@ -470,12 +481,12 @@ end
 /// cart whose bundled resource content changed (RES_V1 → RES_V2), and assert the
 /// post-swap on_load_state read returns the NEW content (issue #246).
 ///
-/// `extra_args` selects the runner: `&[]` = the rv32 session path
-/// (`blyt_session_swap_cart` reloads ctx.resources — a regression guard);
-/// `&["--host-lua"]` = the host-Lua fast path (`blyt_hostlua_reload`, #244), whose
-/// resource reload was never exercised because `hello` has no resources.  Both
-/// must surface RES_V2; a stale RES_V1 would mean the resource table still aliases
-/// the freed old cart map (resource.c e->data = body).
+/// The pure-Lua cart runs host-Lua by default (ADR-0136), so the dev-ctrl reload
+/// drives `blyt_hostlua_reload` (#244), whose resource reload was never exercised
+/// because `hello` has no resources.  The reload must surface RES_V2; a stale
+/// RES_V1 would mean the resource table still aliases the freed old cart map
+/// (resource.c e->data = body).  `extra_args` is a general hook for extra player
+/// flags.
 fn native_reload_resource_leg(extra_args: &[&str], leg: &str) {
     let tmp = TempDir::new().unwrap();
     let save_dir = TempDir::new().unwrap();
@@ -561,28 +572,21 @@ fn native_reload_resource_leg(extra_args: &[&str], leg: &str) {
     );
 }
 
-/// rv32 session path (default player): `blyt_session_swap_cart` reloads
-/// ctx.resources on the swap.  Regression guard for the already-correct path.
-#[test]
-fn native_dev_control_reload_reloads_resource_session() {
-    require_sdk();
-    require_lua_sdk();
-    native_reload_resource_leg(&[], "native session");
-}
-
-/// Host-Lua fast path (`--host-lua`, #238): the dev-ctrl reload drives
-/// `blyt_hostlua_reload` (#244), which reloads its resource table from the new
-/// cart before the old cart is freed.  Pins that #244 handling — `hello` (its only
-/// prior reload cart) has zero resources, so this path was never exercised.
+/// Host-Lua path (ADR-0136): a pure-Lua cart runs host-Lua by default, so the
+/// dev-ctrl reload drives `blyt_hostlua_reload` (#244), which reloads its resource
+/// table from the new cart before the old cart is freed.  Pins that #244 handling —
+/// `hello` (its only prior reload cart) has zero resources, so this path was never
+/// exercised.
 #[test]
 fn native_dev_control_reload_reloads_resource_hostlua() {
     require_sdk();
     require_lua_sdk();
-    native_reload_resource_leg(&["--host-lua"], "native host-Lua");
+    native_reload_resource_leg(&[], "native host-Lua");
 }
 
-/// S7 (#232) — a HYBRID cart on the host-Lua path (`--host-lua`) refuses a
-/// hot-reload, leaving the live VM untouched (anti-#98).  Reloading only the Lua
+/// S7 (#232) — a HYBRID cart on the host-Lua path (`--host-lua`; a hybrid opts in,
+/// #236 keeps pure-Lua as the sole default host-Lua case) refuses a hot-reload,
+/// leaving the live VM untouched (anti-#98).  Reloading only the Lua
 /// half while the emulated native half keeps the old image would be a silent
 /// half-reload, so `blyt_hostlua_reload` returns false → the dev-ctrl `reload`
 /// errors, the new cart's markers never appear, and the ORIGINAL cart keeps
@@ -697,10 +701,9 @@ fn native_dev_control_reload_hybrid_refused_hostlua() {
 /// Drive a cart-swap `reload` through the embedded libretro core
 /// (test_libretro_core dlopens blyt_libretro.so with its OWN embedded guest
 /// libs — a distinct artifact from the sdk/lib blobs blytplay loads).  At frame
-/// `after` the harness calls blyt_libretro_reload_at(cart_v2); `extra_env` selects
-/// the runner (`BLYT_HOSTLUA=1` → the host-Lua fast path, else the rv32 session).
-/// Returns the captured stderr (cart debug output arrives via the libretro log
-/// callback).
+/// `after` the harness calls blyt_libretro_reload_at(cart_v2); `extra_env` is a
+/// general hook for extra core env.  Returns the captured stderr (cart debug
+/// output arrives via the libretro log callback).
 fn libretro_reload_capture(
     cart_v1: &std::path::Path,
     cart_v2: &std::path::Path,
@@ -727,10 +730,10 @@ fn libretro_reload_capture(
 
 /// libretro leg of #246: build a pure-Lua cart pair whose bundled resource
 /// content differs (RES_V1 → RES_V2), reload-swap v1→v2 mid-run, and assert the
-/// post-swap on_load_state read surfaces RES_V2.  `extra_env` picks the runner:
-/// the rv32 session (`reload_impl` → `blyt_session_swap_cart`) or the host-Lua
-/// fast path (`hostlua_reload_impl` → `blyt_hostlua_reload`, #244).  A stale
-/// RES_V1 would mean the resource table still aliases the freed old cart map.
+/// post-swap on_load_state read surfaces RES_V2.  A pure-Lua cart runs host-Lua by
+/// default (ADR-0136), so this drives the host-Lua reload path (`hostlua_reload_impl`
+/// → `blyt_hostlua_reload`, #244); `extra_env` is a general hook.  A stale RES_V1
+/// would mean the resource table still aliases the freed old cart map.
 fn libretro_reload_resource_leg(extra_env: &[(&str, &str)], leg: &str) {
     let tmp = TempDir::new().unwrap();
 
@@ -763,24 +766,14 @@ fn libretro_reload_resource_leg(extra_env: &[(&str, &str)], leg: &str) {
     );
 }
 
-/// libretro embedded core, rv32 session path.  Regression guard on the distinct
-/// .so artifact.
-#[test]
-fn libretro_dev_control_reload_reloads_resource_session() {
-    require_sdk();
-    require_lua_sdk();
-    require_libretro_core();
-    libretro_reload_resource_leg(&[], "libretro session");
-}
-
-/// libretro embedded core, host-Lua fast path (`BLYT_HOSTLUA=1`, #238): pins the
-/// #244 `blyt_hostlua_reload` resource handling on the embedded-guest-lib artifact.
+/// libretro embedded core, host-Lua path (the default, ADR-0136): pins the #244
+/// `blyt_hostlua_reload` resource handling on the embedded-guest-lib artifact.
 #[test]
 fn libretro_dev_control_reload_reloads_resource_hostlua() {
     require_sdk();
     require_lua_sdk();
     require_libretro_core();
-    libretro_reload_resource_leg(&[("BLYT_HOSTLUA", "1")], "libretro host-Lua");
+    libretro_reload_resource_leg(&[], "libretro host-Lua");
 }
 
 /* ── native player as an outbound dev-control client (issue #90, option 2) ──── */

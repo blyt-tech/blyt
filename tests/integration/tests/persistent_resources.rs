@@ -217,15 +217,10 @@ fn persistent_resident_from_frame0_lua_all_legs() {
 
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
-    // The single persistent resource is the only resident one, from frame 0.
+    // The single persistent resource is the only resident one, from frame 0. Host-Lua
+    // is the default for a pure-Lua cart on non-RISC-V hosts (ADR-0136), so all three
+    // legs preload persistent resources into the runner's resource table (no session).
     run_cart_all_legs(&cart, "PERSLUA resident=1 loaded=1");
-    // Native host-Lua fast path (#231): persistent resources preloaded into the
-    // runner's own resource table (no session), resident from frame 0.
-    run_cart_native_with_env(
-        &cart,
-        &[("BLYT_HOSTLUA", "1")],
-        "PERSLUA resident=1 loaded=1",
-    );
 }
 
 /// AC4 (build-time guard, the primary over-budget oracle): a persistent set whose

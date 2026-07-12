@@ -402,6 +402,22 @@ function draw() end
         None
     };
 
+    // ── Build the FP parity cart (gate 34, #223/#225, ADR-0136) ───────
+    // The RISC-V hardware-path leg of the FP determinism matrix: the same pure-Lua
+    // corpus cart `fp_parity.rs` runs on the host-Lua legs, run here through the
+    // native RV32 guest-lib softfloat — an independent softfloat implementation
+    // that must reproduce the pinned golden. Shared source / golden live in
+    // `common::fp`.
+    let fp_cart = if have_lua_gate {
+        let project = tmp.path().join("fp_parity");
+        CartProject::new()
+            .lua(common::fp::FP_PARITY_CART)
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     // ── Build the gfx carts (gates 16 & 17, #188 / Spike X) ───────────
     // Two probes drawing the SAME frames the emulated legs draw: the torture
     // frame via the gfx primitives (which rasterize natively on bare metal, no
@@ -848,6 +864,12 @@ function draw() end
         assert!(
             qemu.scp_to(cart, "/tmp/blyt_gate/"),
             "scp nonfp_gc.blyt failed"
+        );
+    }
+    if let Some(ref cart) = fp_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp fp_parity.blyt failed"
         );
     }
     assert!(
@@ -2725,6 +2747,39 @@ void blyt_cart_draw(void) {}
         println!("  PASS: {}", common::nonfp::GC_DIGEST);
     } else {
         println!("Gate 33b: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 34: FP determinism parity on metal (#223/#225, ADR-0136) ──
+    // The RISC-V hardware-path leg of the FP matrix. The same pure-Lua FP corpus
+    // cart `fp_parity.rs` runs on the host-Lua legs must reproduce the pinned
+    // golden through the native RV32 guest-lib softfloat — an INDEPENDENT softfloat
+    // implementation re-deriving the reference. This is the leg that replaces the
+    // retired emulated-RV32-Lua oracle (#236): without it, retiring the emulated
+    // legs would leave FP with strictly less cross-implementation coverage than the
+    // non-FP matrix (Gate 33). Closes the ADR-0136 FP model (host-Lua legs +
+    // golden + contraction-torture + this QEMU gate).
+    if fp_cart.is_some() {
+        println!("Gate 34: FP transcendental/number-format parity on metal...");
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/fp_parity.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "fp_parity.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        assert!(
+            output.contains(common::fp::FP_PARITY_DIGEST),
+            "native bare-metal FP digest must match the host-Lua legs' golden \
+             (expected {:?}; #223/#236)\noutput: {output}",
+            common::fp::FP_PARITY_DIGEST
+        );
+        println!("  PASS: {}", common::fp::FP_PARITY_DIGEST);
+    } else {
+        println!("Gate 34: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     println!("Gate tests passed.");

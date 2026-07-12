@@ -7,19 +7,19 @@
 //!   Q2 — one integer rasterizer source hashes bit-identically across every
 //!        compile target.
 //!
-//! These tests cover the three *emulated* legs (native blytplay / wasm /
-//! libretro), all running the same host runtime.  The fourth Q2 target — the
-//! bare-metal native leg, where the RV32-compiled rasterizer runs without an
-//! emulator — is asserted by the QEMU gate in `native_qemu.rs` against the same
-//! `common::gfx` golden.
+//! These tests cover the three host-runtime legs (native blytplay / wasm /
+//! libretro), all running the same host runtime — C carts under rv32emu, Lua
+//! carts on the host-Lua path (the default on non-RISC-V hosts after #236,
+//! ADR-0136).  The fourth Q2 target — the bare-metal native leg, where the
+//! RV32-compiled rasterizer runs without an emulator — is asserted by the QEMU
+//! gate in `native_qemu.rs` against the same `common::gfx` golden.
 
 mod common;
 
 use common::gfx;
 use common::{
     CartProject, build_cart, build_lua_cart, require_lua_sdk, require_sdk, require_wasm,
-    run_cart_libretro_hostlua_frame_hash, run_cart_libretro_with_env, run_cart_native_with_env,
-    run_cart_wasm_with_env, write_c_cart_project,
+    run_cart_all_legs_frame_hash, write_c_cart_project,
 };
 
 /// Build a C cart whose `blyt_cart_draw` runs `draw_body` once, then quits.
@@ -106,10 +106,7 @@ fn gfx_torture_frame_hashes_identically_across_legs() {
     let cart = build_draw_cart(&tmp.path().join("gfx-torture"), &gfx::c_draw_body(&ops));
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &expected);
-    run_cart_wasm_with_env(&cart, &env, &expected);
-    run_cart_libretro_with_env(&cart, &env, &expected);
+    run_cart_all_legs_frame_hash(&cart, &expected);
 }
 
 /// `blyt_gfx_palette_set` (issue #201): the new op must be serviced without
@@ -131,10 +128,7 @@ fn gfx_palette_set_does_not_perturb_index_hash_across_legs() {
     let cart = build_draw_cart(&tmp.path().join("gfx-palette-set"), &draw_body);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &expected);
-    run_cart_wasm_with_env(&cart, &env, &expected);
-    run_cart_libretro_with_env(&cart, &env, &expected);
+    run_cart_all_legs_frame_hash(&cart, &expected);
 }
 
 /// Q1 — the acquire/present raw-framebuffer contract.  `blyt_gfx_acquire()`
@@ -156,28 +150,17 @@ fn gfx_acquire_present_raw_framebuffer_hashes_identically_across_legs() {
     );
 
     let expected = gfx::expected_hash_line(&gfx::raw_pattern_frame());
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &expected);
-    run_cart_wasm_with_env(&cart, &env, &expected);
-    run_cart_libretro_with_env(&cart, &env, &expected);
+    run_cart_all_legs_frame_hash(&cart, &expected);
 }
 
-/// Q1 across execution models — the **host-Lua fast path** (the third model).  A
-/// pure-Lua cart draws the torture frame via `blyt32.gfx.*`; on wasm it runs on
-/// the host Lua VM with no emulator (the fast path's own `blyt32.gfx` binding +
-/// shared rasterizer), while blytplay and libretro run the same cart through the
-/// emulator (the guest `blyt32lua.c` binding → host primitives).  All three must
-/// emit the SAME `[blyt:fbhash]` golden the C carts produce — proving one gfx
-/// contract spans emulated-C, emulated-Lua, host-Lua (and, via the QEMU gate,
-/// native), and that the host-Lua fast path stays pixel-identical to the
-/// emulated path it shadows.
-///
-/// The **native** host-Lua fast path (#231, blytplay `--host-lua` /
-/// `BLYT_HOSTLUA=1`) is the fourth leg here: the same pure-Lua cart drawing via
-/// `blyt32.gfx.*`, but rasterizing into the native runner's own framebuffer with
-/// no emulator — it must emit the identical `[blyt:fbhash]` golden, proving the
-/// native host-Lua gfx bindings stay pixel-identical to the emulated path they
-/// shadow (the WASM host-Lua leg's native-player counterpart).
+/// Q1 across execution models — the **host-Lua path** (ADR-0136).  A pure-Lua
+/// cart draws the torture frame via `blyt32.gfx.*`.  After #236 retired the
+/// emulated RV32 Lua VM as a shipped path, all three host-runtime legs run this
+/// cart on the host Lua VM with no emulator: blytplay and the libretro core each
+/// rasterize into the native runner's own framebuffer, and wasm runs the host-Lua
+/// fast path.  All three must emit the SAME `[blyt:fbhash]` golden the C carts
+/// produce — proving the host-Lua gfx bindings stay pixel-identical to the
+/// reference rasterizer (and, via the QEMU native gate, to real RV32 hardware).
 #[test]
 fn gfx_torture_frame_lua_hashes_identically_across_legs() {
     require_sdk();
@@ -198,19 +181,7 @@ fn gfx_torture_frame_lua_hashes_identically_across_legs() {
     let cart = build_cart(&project);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &expected);
-    run_cart_wasm_with_env(&cart, &env, &expected);
-    run_cart_libretro_with_env(&cart, &env, &expected);
-    // Native host-Lua fast path (#231): same cart, no emulator, own framebuffer.
-    run_cart_native_with_env(
-        &cart,
-        &[("BLYT_FRAME_HASH", "1"), ("BLYT_HOSTLUA", "1")],
-        &expected,
-    );
-    // Same host-Lua fast path inside the libretro core (#233): the present path
-    // #231 added to blyt_libretro.so must emit the identical golden.
-    run_cart_libretro_hostlua_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash(&cart, &expected);
 }
 
 /// Build a Lua + native-C **hybrid** cart whose torture frame is split across
@@ -260,10 +231,7 @@ fn gfx_hybrid_both_halves_hash_identically_across_legs() {
     let cart = build_gfx_hybrid_cart(&tmp.path().join("gfx-hybrid"), &ops, 8);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &expected);
-    run_cart_wasm_with_env(&cart, &env, &expected);
-    run_cart_libretro_with_env(&cart, &env, &expected);
+    run_cart_all_legs_frame_hash(&cart, &expected);
 }
 
 /// Build a hybrid cart whose native half uses the raw `acquire`/`present` path
@@ -299,8 +267,5 @@ fn gfx_hybrid_native_acquire_present_hashes_identically_across_legs() {
     let cart = build_gfx_hybrid_raw_cart(&tmp.path().join("gfx-hybrid-raw"));
 
     let expected = gfx::expected_hash_line(&gfx::raw_pattern_frame());
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(&cart, &env, &expected);
-    run_cart_wasm_with_env(&cart, &env, &expected);
-    run_cart_libretro_with_env(&cart, &env, &expected);
+    run_cart_all_legs_frame_hash(&cart, &expected);
 }
