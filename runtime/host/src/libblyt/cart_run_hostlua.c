@@ -834,7 +834,7 @@ static const uint8_t *hl_resolve_palette(blyt_hostlua_t *hl, uint32_t handle);
  * shared integer rasterizer (blyt_raster.c) — the SAME core the emulated gfx
  * ECALL handlers (cart_run.c) and the WASM host-Lua bindings (wasm_main.c) run,
  * so the pixels are bit-identical to every other leg.  A pure-Lua cart on this
- * path has no session (blyt_hostlua_should_use rejects hybrids), so the draw
+ * path has no session (`hl->session` is non-NULL only for a hybrid), so the draw
  * target is always the runner's standalone fb — none of the WASM leg's
  * "session buffer when hybrid" routing is needed here. */
 
@@ -1242,10 +1242,15 @@ static hl_lock_t *hl_lock_live(lua_State *L, int idx) {
 }
 
 static int l_lock_get(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
     hl_lock_t *u = hl_lock_live(L, 1);
     int32_t x = (int32_t)luaL_checkinteger(L, 2);
     int32_t y = (int32_t)luaL_checkinteger(L, 3);
     if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h) {
+        /* Debug-cart bounds check, byte-identical to the guest binding
+         * (blyt32lua.c lua_lock_get); release reads as cleared. */
+        if (blyt_cart_is_debug(hl->cart))
+            return luaL_error(L, "lk:get out of bounds or on a released lock");
         lua_pushinteger(L, 0);
         return 1;
     }
@@ -1258,8 +1263,13 @@ static int l_lock_set(lua_State *L) {
     int32_t x = (int32_t)luaL_checkinteger(L, 2);
     int32_t y = (int32_t)luaL_checkinteger(L, 3);
     uint8_t c = (uint8_t)luaL_checkinteger(L, 4);
-    if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h)
+    if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h) {
+        /* Debug-cart bounds check, byte-identical to the guest binding
+         * (blyt32lua.c lua_lock_set); release is a silent no-op. */
+        if (blyt_cart_is_debug(hl->cart))
+            return luaL_error(L, "lk:set out of bounds or on a released lock");
         return 0;
+    }
     u->pixels[(uint32_t)y * (uint32_t)u->w + (uint32_t)x] = c;
     if (u->is_screen)
         hl->drawn = true;
@@ -2340,6 +2350,108 @@ bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
     return hl_rebuild_and_restore(hl, snap);
 }
 
+/* Dev-mode asset hot-swap (issue #118/#122) for the native host-Lua path — the
+ * session-less mirror of blyt_session_reload_resources + notify_assets_reloaded.
+ * Unlike a code reload it does NOT rebuild the VM: it re-reads the resource table
+ * (picking up edited bytes from the dev staging dir, BLYT_RESOURCE_DIR) and then
+ * fires the cart's optional Lua `on_assets_reloaded(ids)` global with the changed
+ * ids — exactly what the WASM host-Lua leg does (wasm_main.c).  Returns false if
+ * the resource reload fails. */
+bool blyt_hostlua_update_assets(blyt_hostlua_t *hl, blyt_cart_t *cart, const uint32_t *ids,
+                                size_t n) {
+    if (!hl || hl->done || !cart)
+        return false;
+
+    /* Re-read the resource table from the (edited) cart — the same clear+reload
+     * the hot reload uses, but the live VM is left running.  load_for_cart clears
+     * first, so this both drops superseded entries and re-reads the current ones. */
+    if (hl->resources_loaded) {
+        blyt_resource_table_clear(&hl->resources);
+        blyt_resource_table_load_for_cart(&hl->resources, cart);
+        blyt_resource_table_load_persistent_from_cart(&hl->resources, cart);
+        if (blyt_resource_table_preload_persistent(&hl->resources) != 0) {
+            if (hl->log_fn)
+                hl->log_fn("blyt-hostlua: update_assets persistent preload failed");
+            return false;
+        }
+        hl_publish_footprint(hl, &hl->resources);
+    }
+    /* A hybrid opted into host-Lua also keeps its native half's resources in the
+     * rv32 session; reload those too so a native re-read sees the new bytes. */
+    if (hl->session)
+        blyt_session_reload_resources(hl->session, cart);
+
+    /* Fire the cart's on_assets_reloaded(ids): a 1-based Lua array of the changed
+     * ids, the same shape the guest libblyt32lua builds for the emulated path. */
+    lua_State *L = hl->L;
+    if (L) {
+        lua_getglobal(L, "on_assets_reloaded");
+        if (lua_isfunction(L, -1)) {
+            lua_createtable(L, (int)n, 0);
+            for (size_t i = 0; i < n; i++) {
+                lua_pushinteger(L, (lua_Integer)ids[i]);
+                lua_seti(L, -2, (lua_Integer)(i + 1));
+            }
+            if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+                if (hl->log_fn)
+                    hl->log_fn(lua_tostring(L, -1));
+                lua_pop(L, 1);
+            }
+        } else {
+            lua_pop(L, 1);
+        }
+    }
+    return true;
+}
+
+/* Host-initiated save to a disk slot (dev-control `save_state`) — the session-less
+ * mirror of blyt_session_save_state.  Flushes transient state via on_save_state,
+ * then serialises the state buffers to disk (the same path the cart's
+ * blyt.save_write drives, l_save_write).  Returns 0 on success. */
+int blyt_hostlua_save_state(blyt_hostlua_t *hl, uint32_t slot) {
+    if (!hl || !hl->L)
+        return -1;
+    lua_getglobal(hl->L, "on_save_state");
+    if (lua_isfunction(hl->L, -1))
+        lua_pcall(hl->L, 0, 0, 0);
+    else
+        lua_pop(hl->L, 1);
+    blyt_state_ctx_t *ctx = hl_active_ctx(hl);
+    if (!ctx)
+        return -1;
+    return blyt_save_write(ctx, hl_active_save_dir(hl), hl_active_cart_name(hl), slot,
+                           blyt_cart_save_version(hl->cart));
+}
+
+/* Host-initiated load from a disk slot (dev-control `load_state`) — the
+ * session-less mirror of blyt_session_load_state.  Reads the slot, then notifies
+ * the cart's on_load_state(reason=SAVE_GAME, version) with the writer's version
+ * from the save header.  Returns 0 on success (BLYT_RUN_OK). */
+int blyt_hostlua_load_state(blyt_hostlua_t *hl, uint32_t slot) {
+    if (!hl || !hl->L)
+        return -1;
+    blyt_state_ctx_t *ctx = hl_active_ctx(hl);
+    if (!ctx)
+        return -1;
+    uint32_t saved_version = 0;
+    int r =
+        blyt_save_read(ctx, hl_active_save_dir(hl), hl_active_cart_name(hl), slot, &saved_version);
+    if (r != 0)
+        return r;
+    lua_getglobal(hl->L, "on_load_state");
+    if (lua_isfunction(hl->L, -1)) {
+        lua_newtable(hl->L);
+        lua_pushinteger(hl->L, 0); /* reason=BLYT_LOAD_SAVE_GAME */
+        lua_setfield(hl->L, -2, "reason");
+        lua_pushinteger(hl->L, (lua_Integer)saved_version);
+        lua_setfield(hl->L, -2, "saved_cart_version");
+        lua_pcall(hl->L, 1, 0, 0);
+    } else {
+        lua_pop(hl->L, 1);
+    }
+    return 0;
+}
+
 blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
     if (!hl)
         return BLYT_RUN_ERR_EMU;
@@ -2366,16 +2478,17 @@ blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
      * the phase off the session run-ctx to gate surface access to draw().  The
      * native counterpart of the WASM leg's __blyt_phase_* globals; a no-op for a
      * session-less pure-Lua runner (blyt_session_set_phase(NULL)). */
+    /* A Lua error in update()/draw() is PRINTED (by call_lifecycle) and
+     * NON-FATAL — the frame continues and the cart keeps running, byte-for-byte
+     * matching the emulated guest's per-frame `call_global` (blyt32lua.c), which
+     * `blyt_console_debug`s the error and returns.  A quit already requested in
+     * update() still takes effect on the next frame, so a cart that errors then
+     * quits exits cleanly (0).  Aborting here would diverge from the emulated
+     * path (which never aborts on a per-frame Lua error). */
     blyt_session_set_phase(hl->session, BLYT_PHASE_UPDATE);
-    if (call_lifecycle(hl, "update") != 0) {
-        hl->done = true;
-        return BLYT_RUN_ERR_ABORT;
-    }
+    call_lifecycle(hl, "update");
     blyt_session_set_phase(hl->session, BLYT_PHASE_DRAW);
-    if (call_lifecycle(hl, "draw") != 0) {
-        hl->done = true;
-        return BLYT_RUN_ERR_ABORT;
-    }
+    call_lifecycle(hl, "draw");
     blyt_session_set_phase(hl->session, BLYT_PHASE_NONE);
 
     /* A native lifecycle callback may have latched a quit through the trampoline
@@ -2425,20 +2538,40 @@ void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
     free(hl);
 }
 
-/* Opt-in dispatch predicate.  Routes to the native host-Lua path when the cart
- * has a .cart.lua section.  A hybrid cart IS supported here via the ADR-0130
- * ECALL bridge (#232): the Lua half runs on the host VM, the native half stays
- * emulated under rv32emu — for both `.lua_exports` (typed/bridged native exports
- * the Lua half calls) and native lifecycle callbacks (`blyt_cart_update` etc.,
- * injected as zero-arg Lua-global trampolines — #232 S4). */
+/* Dispatch predicate (ADR-0136, #236).  On a non-RISC-V host, host-Lua is the
+ * DEFAULT shipped execution path for a PURE-LUA cart — the emulated RV32 Lua VM is
+ * retired as a shipped path for that case.
+ *
+ * Host-Lua is opt-in (BLYT_HOSTLUA), NOT the default, in two transitional cases:
+ *
+ *  - a HYBRID cart (one carrying ANY cart-authored native code — `.lua_exports`
+ *    wrappers, a cart-native lifecycle, or even an unexported C/Rust helper, per
+ *    blyt_cart_has_native_code): debugging its native half needs a GDB/lldb stub on
+ *    the rv32 session, which the host-Lua path does not yet wire up (deferred to
+ *    #251), so it must keep the emulated session.  The opt-in also preserves #232's
+ *    hybrid host-Lua path (run/state/save parity) for testing.
+ *
+ *  - a DEBUG session (BLYT_DAP_PORT / BLYT_GDB_PORT set): the native host-Lua DAP
+ *    (#234) is not yet at full parity with the emulated DAP (e.g. `restart` is a
+ *    no-op — the run loop does not act on fc_dap_is_restart_pending), so `blyt debug`
+ *    on a pure-Lua cart keeps the complete emulated DAP by default.  Host-Lua
+ *    debugging stays reachable via the opt-in for its supported scenarios.
+ *
+ * A later issue makes these default host-Lua once #251 (native-half GDB) and the
+ * remaining native host-Lua DAP surface land.  A pure-Lua cart being RUN (no
+ * debugger) defaults to host-Lua.
+ *
+ * The compile gate BLYT_HOSTLUA_EXEC lives only in this TU: on real RISC-V hardware
+ * it is absent and the #else stub returns false, so carts run native RV32 with no
+ * host check needed here. */
 bool blyt_hostlua_should_use(const blyt_cart_t *cart) {
     if (!cart)
         return false;
-    if (!getenv("BLYT_HOSTLUA"))
-        return false;
     if (!blyt_cart_find_section(cart, ".cart.lua", NULL))
         return false;
-    return true;
+    if (blyt_cart_has_native_code(cart) || getenv("BLYT_DAP_PORT") || getenv("BLYT_GDB_PORT"))
+        return getenv("BLYT_HOSTLUA") != NULL; /* hybrid or debug: opt-in only (#251/#234) */
+    return true; /* pure-Lua, not debugging: host-Lua by default (#236) */
 }
 
 #else /* !BLYT_HOSTLUA_EXEC — seam VM absent; the frontend falls back to rv32. */
@@ -2498,6 +2631,27 @@ bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
     (void)hl;
     (void)new_cart;
     return false;
+}
+
+bool blyt_hostlua_update_assets(blyt_hostlua_t *hl, blyt_cart_t *cart, const uint32_t *ids,
+                                size_t n) {
+    (void)hl;
+    (void)cart;
+    (void)ids;
+    (void)n;
+    return false;
+}
+
+int blyt_hostlua_save_state(blyt_hostlua_t *hl, uint32_t slot) {
+    (void)hl;
+    (void)slot;
+    return -1;
+}
+
+int blyt_hostlua_load_state(blyt_hostlua_t *hl, uint32_t slot) {
+    (void)hl;
+    (void)slot;
+    return -1;
 }
 
 void blyt_hostlua_destroy(blyt_hostlua_t *hl) {

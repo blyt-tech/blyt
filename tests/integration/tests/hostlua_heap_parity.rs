@@ -125,10 +125,10 @@ fn lua_guest_heap_used_matches_wasm32_on_native_host_lua() {
     // the native path, so its 32-bit object sizes are the canonical target.
     let wasm = heap_used(&capture_cart_wasm(&cart, &[]));
 
-    // Native 64-bit host-Lua fast path (`BLYT_HOSTLUA=1`): identical runner, but
-    // 8-byte-pointer objects over-report unless the seam models the count down to
-    // rv32 sizes.
-    let hostlua = heap_used(&capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]));
+    // Native 64-bit host-Lua path (the default for a pure-Lua cart on non-RISC-V
+    // hosts, ADR-0136): identical runner, but 8-byte-pointer objects over-report
+    // unless the seam models the count down to rv32 sizes.
+    let hostlua = heap_used(&capture_cart_native(&cart, &[]));
     assert_eq!(
         hostlua, wasm,
         "native host-Lua guest_heap_used must equal its wasm32 sibling \

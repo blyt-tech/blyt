@@ -3,19 +3,24 @@
 /*
  * blyt_hostlua.h — native host-Lua fast path (#238, epic #230, ADR-0136).
  *
- * A SIBLING runner to blyt_session_*: it runs a PURE-LUA cart's bytecode in a
- * Lua VM compiled natively for the host (x86-64 / arm64) via the deterministic
- * seam VM (cmake/blyt_hostlua_vm.cmake, BLYT_HOSTLUA_FP_SEAM), instead of the
- * RV32 Lua VM under rv32emu.  This is the native port of the WASM host-Lua fast
- * path (frontends/wasm/wasm_main.c run_lua_cart); native cart code and the
- * native half of a hybrid cart keep using rv32emu (blyt_session_*).
+ * A SIBLING runner to blyt_session_*: it runs a cart's Lua bytecode in a Lua VM
+ * compiled natively for the host (x86-64 / arm64) via the deterministic seam VM
+ * (cmake/blyt_hostlua_vm.cmake, BLYT_HOSTLUA_FP_SEAM), instead of the RV32 Lua VM
+ * under rv32emu.  This is the native port of the WASM host-Lua fast path
+ * (frontends/wasm/wasm_main.c run_lua_cart); native cart code and the native half
+ * of a hybrid cart keep using rv32emu (blyt_session_*), bridged via the ADR-0130
+ * ECALL Lua C API for hybrids.
  *
- * Opt-in (issue #238): the frontend routes a cart here only when BLYT_HOSTLUA is
- * set in the environment AND the cart is pure Lua.  #236 flips the default and
- * removes the gate.  The whole path is compiled only when the deterministic seam
- * VM is available (BLYT_HOSTLUA_EXEC, set on libblyt by CMake); on a build
- * without it every entry point below degrades to a safe no-op / NULL so the
- * frontend transparently falls back to the rv32 session.
+ * Default path (ADR-0136, #236): the frontend routes a PURE-LUA cart here by
+ * default on every non-RISC-V host — the emulated RV32 Lua VM is retired as a
+ * shipped path for that case. A HYBRID cart (native .lua_exports and/or a
+ * cart-native lifecycle) stays emulated by default and reaches this path only via
+ * the BLYT_HOSTLUA opt-in, so `blyt debug` on a hybrid keeps native-half GDB/lldb
+ * on the rv32 session (host-Lua native-half debug is deferred to #251). The whole
+ * path is compiled only when the deterministic seam VM is available
+ * (BLYT_HOSTLUA_EXEC, set on libblyt by CMake); on a build without it (e.g. real
+ * RISC-V hardware, where carts run native RV32) every entry point below degrades to
+ * a safe no-op / NULL so the frontend transparently uses the rv32 session.
  *
  * Lifecycle mirrors the guest blyt_main loop (runtime/guest .../blyt_common.c):
  *   create  → init(); on_new_state()
@@ -43,11 +48,12 @@ typedef struct blyt_hostlua blyt_hostlua_t;
 bool blyt_hostlua_available(void);
 
 /*
- * The frontend's opt-in dispatch predicate: true iff the native host-Lua path
- * should run `cart` — the runner is compiled in (blyt_hostlua_available()), the
- * BLYT_HOSTLUA environment gate is set, and `cart` is PURE Lua (has a .cart.lua
- * section, defines no cart-native lifecycle symbol, and has no .lua_exports).
- * A native / hybrid cart returns false and keeps the rv32 session path.
+ * The frontend's dispatch predicate (ADR-0136): true iff the native host-Lua path
+ * should run `cart` — the runner is compiled in (BLYT_HOSTLUA_EXEC) and `cart` has
+ * a .cart.lua section (pure-Lua OR hybrid-Lua; a hybrid's native half runs
+ * emulated via the ADR-0130 bridge).  A pure-native cart (no .cart.lua) returns
+ * false and keeps the rv32 session path.  On a build without the seam VM the
+ * #else stub returns false, so real RISC-V hardware runs native RV32.
  */
 bool blyt_hostlua_should_use(const blyt_cart_t *cart);
 
@@ -144,6 +150,30 @@ void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl);
  * false for a NULL/finished runner or a build without the seam VM.
  */
 bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart);
+
+/*
+ * Dev-mode asset hot-swap (issue #118/#122): re-read the resource table from
+ * `cart` (picking up edited bytes from the dev staging dir) WITHOUT rebuilding the
+ * VM, then fire the cart's optional Lua `on_assets_reloaded(ids)` global with the
+ * `n` changed resource `ids`.  The session-less mirror of
+ * blyt_session_reload_resources + blyt_session_notify_assets_reloaded, used by the
+ * libretro core's `update_assets` command when a host-Lua runner is active.
+ * Returns false on reload failure or for a NULL/finished runner / seam-VM-less
+ * build.
+ */
+bool blyt_hostlua_update_assets(blyt_hostlua_t *hl, blyt_cart_t *cart, const uint32_t *ids,
+                                size_t n);
+
+/*
+ * Host-initiated state save/load to a disk slot (dev-control `save_state` /
+ * `load_state`) — the session-less mirrors of blyt_session_save_state /
+ * blyt_session_load_state.  save_state flushes transient state via on_save_state
+ * then serialises the state buffers; load_state reads the slot then notifies
+ * on_load_state(reason=SAVE_GAME).  Return 0 on success, non-zero on failure (incl.
+ * a NULL/seam-VM-less runner).
+ */
+int blyt_hostlua_save_state(blyt_hostlua_t *hl, uint32_t slot);
+int blyt_hostlua_load_state(blyt_hostlua_t *hl, uint32_t slot);
 
 /* Destroy a runner and free its VM.  NULL-safe. */
 void blyt_hostlua_destroy(blyt_hostlua_t *hl);

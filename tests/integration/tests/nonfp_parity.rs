@@ -10,18 +10,19 @@
 //! ## Reference model (ADR-0136 — NOT the emulated-RV32-Lua oracle)
 //!
 //! ADR-0136 drops the emulated-Lua-under-rv32emu leg as the determinism
-//! reference (#236 retires it). Parity is asserted against:
-//!   - **cross-host-Lua-leg agreement** — native blytplay (`BLYT_HOSTLUA=1`,
-//!     exercised on both x86-64 CI and arm64), wasm (auto host-Lua fast path),
-//!     and the libretro core's embedded host-Lua path produce byte-identical
-//!     observable output;
+//! reference (#236 retired it). Parity is asserted against:
+//!   - **cross-host-Lua-leg agreement** — native blytplay (host-Lua by default,
+//!     exercised on both x86-64 CI and arm64), wasm (host-Lua fast path), and the
+//!     libretro core's embedded host-Lua path produce byte-identical observable
+//!     output;
 //!   - a **pinned golden** digest (regenerate rarely, reviewed);
 //!   - **RISC-V hardware parity** via the QEMU native gate — the same non-FP
 //!     carts run through the native RV32 guest-lib path on real RISC-V in
 //!     `native_qemu.rs` (Gate 33: non-FP parity), asserting the same golden.
 //!
-//! The still-shipping emulated blytplay + libretro legs are also asserted here
-//! as a free cross-check while they ship; those two calls retire with #236.
+//! Before #236 the still-shipping emulated blytplay + libretro legs were asserted
+//! here too as a free cross-check; #236 retired the emulated RV32 Lua VM as a
+//! shipped path, so those legs now run host-Lua and are the reference above.
 //!
 //! ## Surface covered
 //!
@@ -55,24 +56,18 @@ use std::path::Path;
 use common::nonfp;
 use common::{
     CartProject, build_lua_cart, require_libretro_core, require_lua_sdk, require_sdk, require_wasm,
-    run_cart_libretro, run_cart_libretro_with_env, run_cart_native, run_cart_native_with_env,
-    run_cart_wasm,
+    run_cart_all_legs,
 };
 use tempfile::TempDir;
 
-/// Assert `expected` appears on every shipped leg that runs a pure-Lua cart: the
-/// three host-Lua reference legs (native blytplay `BLYT_HOSTLUA=1`, wasm auto
-/// host-Lua, libretro core `BLYT_HOSTLUA=1`) plus the still-shipping emulated
-/// blytplay + libretro legs as a cross-check. Mirrors the FP suite's
-/// `run_cart_all_legs` + explicit host-Lua legs, in one place.
+/// Assert `expected` appears on every shipped leg that runs a pure-Lua cart — the
+/// three host-Lua reference legs (native blytplay, wasm, libretro core), which are
+/// exactly `run_cart_all_legs` now that ADR-0136 makes host-Lua the default for a
+/// pure-Lua cart on non-RISC-V hosts (#236 retired the emulated RV32 Lua VM as a
+/// shipped path). RISC-V-Lua parity is the QEMU native gate (Gate 33); FP
+/// determinism is the FP suite + its QEMU gate.
 fn assert_all_hostlua_legs(cart: &Path, expected: &str) {
-    // Emulated cross-check (retires with #236).
-    run_cart_native(cart, expected);
-    run_cart_libretro(cart, expected);
-    // ADR-0136 reference: the three host-Lua legs.
-    run_cart_native_with_env(cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(cart, expected);
-    run_cart_libretro_with_env(cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_all_legs(cart, expected);
 }
 
 #[test]

@@ -54,10 +54,13 @@ static retro_log_printf_t g_log_cb = NULL;
 
 static blyt_cart_t *g_cart = NULL;
 static blyt_session_t *g_session = NULL;
-/* Native host-Lua fast path (#238): non-NULL when the cart runs in a host-Lua VM
- * instead of the rv32 session (opt-in BLYT_HOSTLUA + pure-Lua cart).  Exactly one
- * of g_session / g_hostlua is active per loaded cart; both dispatch through the
- * same retro_run / is_done / run_err seam so blytplay and the .so honor it. */
+/* Native host-Lua path (ADR-0136): non-NULL when the cart runs in a host-Lua VM
+ * instead of the rv32 session.  On a non-RISC-V host this is the DEFAULT for a
+ * PURE-LUA cart (#236 retired the emulated RV32 Lua VM as a shipped path there); a
+ * hybrid stays emulated by default and opts in via BLYT_HOSTLUA (see
+ * blyt_hostlua_should_use).  Exactly one of g_session / g_hostlua is active per
+ * loaded cart; both dispatch through the same retro_run / is_done / run_err seam so
+ * blytplay and the .so honor it. */
 static blyt_hostlua_t *g_hostlua = NULL;
 static bool g_cart_done = false;
 static blyt_cart_run_err_t g_run_err = BLYT_RUN_OK;
@@ -185,10 +188,11 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
     fprintf(stderr, "Blyt %s - %s (%s %s)\n", blyt_runtime_version(), blyt_cart_title(g_cart),
             blyt_cart_id(g_cart), blyt_cart_version(g_cart));
 
-    /* Native host-Lua fast path (#238): opt-in BLYT_HOSTLUA + pure-Lua cart runs
-     * in a host-Lua VM instead of the rv32 session.  Failing to build the runner
-     * for a cart it was selected for is a hard error (anti-#98) — do NOT silently
-     * fall back to rv32, which would mask a broken host-Lua path. */
+    /* Native host-Lua path (ADR-0136): a pure-Lua cart runs in a host-Lua VM by
+     * default instead of the rv32 session (#236 retired the emulated RV32 Lua VM as
+     * a shipped path there); a hybrid opts in via BLYT_HOSTLUA.  Failing to build
+     * the runner for a cart it was selected for is a hard error (anti-#98) — do NOT
+     * silently fall back to rv32, which would mask a broken host-Lua path. */
     if (blyt_hostlua_should_use(g_cart)) {
 #ifdef BLYT_DAP
         /* Source-level debugging on the native host-Lua path (#234): build the
@@ -517,10 +521,14 @@ void blyt_libretro_reset(void) {
 }
 
 bool blyt_libretro_save_state(uint32_t slot) {
+    if (g_hostlua)
+        return blyt_hostlua_save_state(g_hostlua, slot) == 0;
     return g_session && blyt_session_save_state(g_session, slot) == 0;
 }
 
 bool blyt_libretro_load_state(uint32_t slot) {
+    if (g_hostlua)
+        return blyt_hostlua_load_state(g_hostlua, slot) == 0;
     return g_session && blyt_session_load_state(g_session, slot) == 0;
 }
 
@@ -684,6 +692,10 @@ bool blyt_libretro_reload_for_debug(const char *reported_path) {
  * optional on_assets_reloaded hook is invoked with them (issue #122) so a cart
  * that cached/derived from a resource can re-derive only the affected ones. */
 bool blyt_libretro_update_assets(const uint32_t *ids, size_t n) {
+    /* Native host-Lua path (#236): a pure-Lua cart has no rv32 session — reload
+     * the runner's own resource table and fire its Lua on_assets_reloaded. */
+    if (g_hostlua)
+        return blyt_hostlua_update_assets(g_hostlua, g_cart, ids, n);
     if (!g_session)
         return false;
     if (!blyt_session_reload_resources(g_session, g_cart))

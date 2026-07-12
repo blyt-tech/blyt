@@ -1,23 +1,26 @@
-//! Host-Lua floating-point determinism parity gate (#223 AC1, ADR-0135).
+//! Host-Lua floating-point determinism parity gate (#223 AC1, ADR-0135/0136).
 //!
-//! Lua carts run two ways: the emulated/native-metal path (RV32 Lua VM under
-//! rv32emu, or native on RISC-V) and the host-Lua fast path (Lua VM compiled
-//! natively for the host — WASM today). The emulated path is a tight softfloat
-//! reference (blyt-tech musl generic-C `src/math` + Berkeley SoftFloat with the
-//! RISC-V NaN specialization + SOFTFLOAT_ROUND_ODD, `-ffp-contract=off`). The
-//! host-Lua fast path must reproduce that reference **bit-for-bit** — determinism
-//! is the core contract (ADR-0007); netplay/replay/rewind depend on it.
+//! After #236, a pure-Lua cart runs on the host-Lua path (the Lua VM compiled
+//! natively for the host) on every non-RISC-V host — the emulated RV32 Lua VM is
+//! retired as a shipped path AND as the determinism oracle (ADR-0136). The
+//! reference is now the softfloat-correct answer pinned as a **golden** digest:
+//! IEEE-754 correctly-rounded ops + `-ffp-contract=off` (no FMA) + RISC-V NaN
+//! canonicalization ⇒ native f64 == the softfloat reference by construction
+//! (ADR-0136). Determinism is the core contract (ADR-0007); netplay/replay/rewind
+//! depend on it.
 //!
-//! This gate is the oracle for that contract: a pure-Lua cart (no typed exports,
-//! no state layouts, so WASM routes it to the host-Lua fast path while
-//! native/libretro run the emulated VM) evaluates the cart-reachable
-//! transcendental + number-conversion surface over an adversarial corpus and
-//! folds the RAW f64 bit patterns of every result into an i32 FNV-1a digest.
-//! Integer hashing is bit-deterministic across every leg regardless of the FP
-//! result, so the ONLY thing that can move the digest is a divergent f64 bit
-//! pattern. `run_cart_all_legs` asserts the same `[blyt:fphash]` on all three
-//! legs — so a divergence between the host-Lua fast path and the softfloat
-//! reference fails here by construction.
+//! This gate pins that contract from four independent angles: (1) **cross-host-Lua-leg
+//! agreement** — `run_cart_all_legs` asserts the same `[blyt:fphash]` on blytplay,
+//! wasm, and the libretro core, all host-Lua; (2) the **pinned golden** below;
+//! (3) the **contraction-torture** control (`fp_native_hostlua_contraction_teeth`)
+//! which proves the gate would catch an FMA-induced divergence; and (4) an
+//! **independent softfloat implementation** — the RV32 guest-lib Lua running
+//! natively on real RISC-V via the QEMU native gate (`native_qemu.rs`), which
+//! reproduces the same golden. The cart (no typed exports, no state layouts)
+//! evaluates the cart-reachable transcendental + number-conversion surface over an
+//! adversarial corpus and folds the RAW f64 bit patterns of every result into an
+//! i32 FNV-1a digest. Integer hashing is bit-deterministic across every leg, so the
+//! ONLY thing that can move the digest is a divergent f64 bit pattern.
 //!
 //! To regenerate the expected digests after editing the corpus, run any leg
 //! (e.g. `blytplay --headless <cart>`) and copy the emitted `[blyt:fphash]`
@@ -31,6 +34,8 @@
 
 mod common;
 
+use common::fp::{FP_PARITY_CART, FP_PARITY_DIGEST};
+
 use common::{
     CartProject, build_dir, build_lua_cart, hostlua_native, hostlua_native_fma,
     require_hostlua_native, require_hostlua_native_fma, require_libretro_core, require_lua_sdk,
@@ -39,251 +44,6 @@ use common::{
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// The parity cart. Pure Lua, no exports/layouts → host-Lua fast path on WASM.
-/// See the module doc for what it proves. Kept in one place so the corpus and the
-/// pinned digest below stay in sync.
-const FP_PARITY_CART: &str = r#"
--- FP parity gate (#223 AC1). Folds the raw f64 bit patterns of the
--- cart-reachable Zone-2 (transcendental) + number-conversion surface over an
--- adversarial corpus into an i32 FNV-1a digest. Only a divergent f64 bit pattern
--- can move the digest (integer hashing is bit-deterministic across legs).
-
--- ---- i32 FNV-1a over bytes -------------------------------------------------
--- 0x811C9DC5 wraps into i32 as a negative value; the wrap is identical on every
--- leg. 0x01000193 (16777619) fits i32. Integer * wraps mod 2^32 (two's comp).
-local FNV_OFFSET = 0x811c9dc5
-local FNV_PRIME = 0x01000193
-
-local hash = FNV_OFFSET
--- Snapshot of `hash` taken after the transcendental + Zone-1 surface and before
--- the Phase-B number-format surface (see run_corpus): the #225 cross-arch gate
--- value. Defaults to the full hash so a leg that never calls run_corpus still
--- prints a well-defined line.
-local core_hash = FNV_OFFSET
-
-local function fold_byte(b)
-    hash = (hash ~ b) * FNV_PRIME
-end
-
--- Fold every byte of an arbitrary (binary-safe) string into the digest.
-local function fold_str(s)
-    for i = 1, #s do
-        fold_byte(s:byte(i))
-    end
-    -- length terminator so "ab".."" and "a".."b" boundaries can't collide
-    fold_byte(0)
-end
-
--- ADR-0010: a NaN's sign and payload are NOT part of the determinism contract —
--- they are canonicalized at the state-buffer boundary (blyt_canon_f64). WASM
--- makes an arithmetically-produced NaN's sign bit nondeterministic (x86-64
--- yields fff8..., arm64 / the softfloat reference yield the RISC-V canonical
--- 7ff8...), so hashing the raw transient NaN would test something the console
--- deliberately does not pin. Canonicalize every NaN to 0x7ff8000000000000 before
--- it enters the digest, exactly as the state-buffer boundary does; finite results
--- (where the seam's guarantee actually lives) fold through unchanged.
-local CANON_NAN = string.unpack("<d", "\0\0\0\0\0\0\248\127") -- 0x7ff8000000000000
-local function canon(x)
-    if x ~= x then -- x ~= x is true iff x is NaN, regardless of sign/payload
-        return CANON_NAN
-    end
-    return x
-end
-
--- Fold a double's raw little-endian IEEE-754 bits (NaN canonicalized per above).
--- string.pack("<d") writes the exact bit pattern the VM holds.
-local function fold_f64(x)
-    fold_str(string.pack("<d", canon(x)))
-end
-
--- ---- human-readable spot values (localize any divergence) ------------------
-local spot = {}
-local function packhex(x)
-    -- big-endian raw bytes -> 16 hex nibbles
-    local b = string.pack(">d", x)
-    local out = {}
-    for i = 1, 8 do
-        out[i] = string.format("%02x", b:byte(i))
-    end
-    return table.concat(out)
-end
-local function spotval(name, x)
-    spot[#spot + 1] = name .. "=" .. packhex(canon(x))
-end
-
--- ---- adversarial corpus ----------------------------------------------------
--- Compile-time literals: identical bytecode on every leg (luac runs once). The
--- divergence under test is the RUNTIME evaluation of math.*/^ on these inputs.
-local pi = math.pi
-local inf = math.huge
-local nan = inf - inf
-local inputs = {
-    0.0,
-    -0.0,
-    1.0,
-    -1.0,
-    0.5,
-    -0.5,
-    2.0,
-    -2.0,
-    3.0,
-    10.0,
-    100.0,
-    0.1,
-    0.2,
-    0.3,
-    0.75,
-    -0.75,
-    pi,
-    pi / 2,
-    pi / 4,
-    pi * 2,
-    pi * 1000000.0, -- near-multiple-of-pi argument reduction stress
-    355.0 / 113.0,
-    1e-1,
-    1e-300,
-    2.2250738585072014e-308, -- min normal
-    5e-324, -- min positive subnormal
-    1e-320, -- a subnormal
-    1e300,
-    1.7976931348623157e308, -- DBL_MAX
-    1e308,
-    inf,
-    -inf,
-    nan,
-}
-
--- Unary functions. asin/acos/log/sqrt applied to out-of-domain inputs yield NaN
--- / +-Inf on purpose: NaN-payload and infinity bit patterns are exactly what the
--- softfloat RISC-V specialization pins and where a foreign libm can diverge.
-local unary = {
-    { "sin", math.sin },
-    { "cos", math.cos },
-    { "tan", math.tan },
-    { "asin", math.asin },
-    { "acos", math.acos },
-    { "atan", math.atan },
-    { "exp", math.exp },
-    { "log", math.log },
-    { "sqrt", math.sqrt }, -- Zone-1 (IEEE sqrt) but included for completeness
-}
-
--- Binary. atan2 == math.atan(y, x); pow == y ^ x (Lua `^` -> luai_numpow, the
--- Zone-2 op ADR-0135 routes through the seam); fmod is Zone-1.
-local pairs_yx = {}
-do
-    local sample = { -3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 10.0, pi, 0.1, inf, -inf, nan }
-    for i = 1, #sample do
-        for j = 1, #sample do
-            pairs_yx[#pairs_yx + 1] = { sample[i], sample[j] }
-        end
-    end
-end
-
--- strtod corpus: parsed at RUNTIME via tonumber (exercises l_str2d per leg, not
--- the compile-time lexer).
-local strtod_inputs = {
-    "0",
-    "-0",
-    "0.1",
-    "0.2",
-    "3.141592653589793",
-    "2.718281828459045",
-    "1e308",
-    "1e-308",
-    "5e-324",
-    "2.2250738585072014e-308",
-    "1.7976931348623157e308",
-    "0.30000000000000004",
-    "123456789.123456789",
-    "1e-1",
-    "9007199254740993", -- 2^53+1, not exactly representable
-    "inf",
-    "-inf",
-    "nan",
-}
-
-local function run_corpus()
-    -- Zone-2 unary transcendentals
-    for u = 1, #unary do
-        local f = unary[u][2]
-        for i = 1, #inputs do
-            fold_f64(f(inputs[i]))
-        end
-    end
-    -- atan2 (binary atan), pow (^), fmod
-    for p = 1, #pairs_yx do
-        local y, x = pairs_yx[p][1], pairs_yx[p][2]
-        fold_f64(math.atan(y, x))
-        fold_f64(y ^ x)
-        fold_f64(math.fmod(y, x))
-    end
-    -- CORE digest snapshot (#225 / Spike Z): everything folded so far is the
-    -- Zone-2 transcendental + Zone-1 (sqrt/fmod) surface the ADR-0135 seam pins.
-    -- The native host-Lua leg must reproduce this bit-for-bit on FMA silicon
-    -- (x86-64/arm64) using ONLY the in-house musl kernels — no host libm, no
-    -- strtod/number-format (that surface is Phase B and stays out of the gate,
-    -- else a host-libc strtod difference would masquerade as a seam divergence).
-    core_hash = hash
-    -- number formatting: tostring(x) bytes AND tonumber(tostring(x)) round trip.
-    -- canon() first so tostring(NaN) is "nan" on every host (an x86-64 sign-set
-    -- NaN would otherwise stringify to "-nan"); finite values are unchanged.
-    for i = 1, #inputs do
-        local s = tostring(canon(inputs[i]))
-        fold_str(s)
-        -- Lua's tonumber deliberately rejects "inf"/"nan" (-> nil), identically
-        -- on every leg; guard so non-finite round-trips fold a constant.
-        fold_f64(tonumber(s) or 0.0)
-    end
-    -- strtod: tonumber(string)
-    for i = 1, #strtod_inputs do
-        fold_f64(tonumber(strtod_inputs[i]) or 0.0)
-    end
-
-    -- spot values for human divergence localization
-    spotval("sin1", math.sin(1.0))
-    spotval("cos1", math.cos(1.0))
-    spotval("tan1", math.tan(1.0))
-    spotval("exp1", math.exp(1.0))
-    spotval("log2", math.log(2.0))
-    spotval("pow_2_0.5", 2.0 ^ 0.5)
-    spotval("atan2_1_1", math.atan(1.0, 1.0))
-    spotval("sinbigpi", math.sin(pi * 1000000.0))
-    spotval("asin2_nan", math.asin(2.0))
-    spotval("sqrtneg_nan", math.sqrt(-1.0))
-    spotval("ts_0.1", tonumber(tostring(0.1)))
-end
-
-local function digest_hex(h)
-    local b0 = h & 0xff
-    local b1 = (h >> 8) & 0xff
-    local b2 = (h >> 16) & 0xff
-    local b3 = (h >> 24) & 0xff
-    return string.format("%02x%02x%02x%02x", b3, b2, b1, b0)
-end
-
-function init()
-    run_corpus()
-    -- Core (transcendental + Zone-1) — the #225 native cross-arch gate value.
-    blyt.debug.print("[blyt:fphash-core] " .. digest_hex(core_hash))
-    -- Full (adds Phase-B number-format) — the #223 Phase-A cross-leg gate value.
-    blyt.debug.print("[blyt:fphash] " .. digest_hex(hash))
-    for i = 1, #spot do
-        blyt.debug.print("[blyt:fpspot] " .. spot[i])
-    end
-end
-
-function update()
-    blyt.quit()
-end
-
-function draw() end
-"#;
-
-/// The pinned reference digest — the softfloat reference value every leg must
-/// reproduce. Regenerate (see module doc) if the corpus above changes.
-const FP_PARITY_DIGEST: &str = "[blyt:fphash] f7a69261";
-
 /// The CORE reference digest (#225 / Spike Z): the transcendental + Zone-1
 /// surface only, excluding the Phase-B number-format surface. This is the value
 /// the native host-Lua leg must reproduce bit-for-bit on FMA silicon — the
@@ -291,11 +51,12 @@ const FP_PARITY_DIGEST: &str = "[blyt:fphash] f7a69261";
 /// `FP_PARITY_DIGEST` if the corpus changes.
 const FP_PARITY_CORE_DIGEST: &str = "[blyt:fphash-core] 031a4987";
 
-/// The host-Lua fast path must compute `math.*`, `^`, and number↔string
-/// conversion bit-identically to the emulated softfloat reference across an
-/// adversarial FP corpus (ADR-0135 contract). Asserting the same digest on
-/// native (emulated), WASM (host-Lua fast path), and libretro (emulated) proves
-/// the fast path does not diverge.
+/// The host-Lua path must compute `math.*`, `^`, and number↔string conversion
+/// bit-identically to the softfloat-correct golden across an adversarial FP corpus
+/// (ADR-0135 contract). After #236 all three legs — blytplay, WASM, and the
+/// libretro core — run host-Lua, so asserting the same digest on every leg is the
+/// cross-host-Lua-leg agreement check; the golden pins the softfloat answer and the
+/// QEMU native gate re-derives it on an independent RISC-V softfloat.
 #[test]
 fn fp_transcendental_parity_across_legs() {
     require_sdk();

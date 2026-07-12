@@ -76,8 +76,9 @@ pub fn hostlua_native_fma() -> PathBuf {
 // is palette-independent (it operates on palette indices).  The reference
 // mirrors runtime/shared/blyt_raster.c primitive-for-primitive.
 //
-// Shared here (rather than per-suite) so the emulated trio (gfx.rs) and the
-// native QEMU gate (native_qemu.rs) hash against ONE golden and cannot drift.
+// Shared here (rather than per-suite) so the host-runtime legs (gfx.rs — C carts
+// emulated, Lua carts host-Lua) and the native QEMU gate (native_qemu.rs) hash
+// against ONE golden and cannot drift.
 // -------------------------------------------------------------------------
 /// Shared carts + pinned goldens for the non-FP determinism parity matrix
 /// (#235, Spike Z Q5). Referenced by both `nonfp_parity.rs` (the host-Lua-leg
@@ -249,6 +250,259 @@ function draw() end
     pub const GC_DIGEST: &str = "[blyt:gchash] 12522721";
 }
 
+pub mod fp {
+    //! Shared FP parity cart + pinned golden (#223/#225, ADR-0135/0136).
+    //! Referenced by both `fp_parity.rs` (the host-Lua-leg suite) and
+    //! `native_qemu.rs` (the RISC-V hardware-path gate) so the cart source and the
+    //! golden digest have a single source of truth. See `fp_parity.rs` for the full
+    //! reference model (ADR-0136).
+
+    /// The parity cart. Pure Lua, no exports/layouts → host-Lua fast path on WASM.
+    /// See the module doc for what it proves. Kept in one place so the corpus and the
+    /// pinned digest below stay in sync.
+    pub const FP_PARITY_CART: &str = r#"
+-- FP parity gate (#223 AC1). Folds the raw f64 bit patterns of the
+-- cart-reachable Zone-2 (transcendental) + number-conversion surface over an
+-- adversarial corpus into an i32 FNV-1a digest. Only a divergent f64 bit pattern
+-- can move the digest (integer hashing is bit-deterministic across legs).
+
+-- ---- i32 FNV-1a over bytes -------------------------------------------------
+-- 0x811C9DC5 wraps into i32 as a negative value; the wrap is identical on every
+-- leg. 0x01000193 (16777619) fits i32. Integer * wraps mod 2^32 (two's comp).
+local FNV_OFFSET = 0x811c9dc5
+local FNV_PRIME = 0x01000193
+
+local hash = FNV_OFFSET
+-- Snapshot of `hash` taken after the transcendental + Zone-1 surface and before
+-- the Phase-B number-format surface (see run_corpus): the #225 cross-arch gate
+-- value. Defaults to the full hash so a leg that never calls run_corpus still
+-- prints a well-defined line.
+local core_hash = FNV_OFFSET
+
+local function fold_byte(b)
+    hash = (hash ~ b) * FNV_PRIME
+end
+
+-- Fold every byte of an arbitrary (binary-safe) string into the digest.
+local function fold_str(s)
+    for i = 1, #s do
+        fold_byte(s:byte(i))
+    end
+    -- length terminator so "ab".."" and "a".."b" boundaries can't collide
+    fold_byte(0)
+end
+
+-- ADR-0010: a NaN's sign and payload are NOT part of the determinism contract —
+-- they are canonicalized at the state-buffer boundary (blyt_canon_f64). WASM
+-- makes an arithmetically-produced NaN's sign bit nondeterministic (x86-64
+-- yields fff8..., arm64 / the softfloat reference yield the RISC-V canonical
+-- 7ff8...), so hashing the raw transient NaN would test something the console
+-- deliberately does not pin. Canonicalize every NaN to 0x7ff8000000000000 before
+-- it enters the digest, exactly as the state-buffer boundary does; finite results
+-- (where the seam's guarantee actually lives) fold through unchanged.
+local CANON_NAN = string.unpack("<d", "\0\0\0\0\0\0\248\127") -- 0x7ff8000000000000
+local function canon(x)
+    if x ~= x then -- x ~= x is true iff x is NaN, regardless of sign/payload
+        return CANON_NAN
+    end
+    return x
+end
+
+-- Fold a double's raw little-endian IEEE-754 bits (NaN canonicalized per above).
+-- string.pack("<d") writes the exact bit pattern the VM holds.
+local function fold_f64(x)
+    fold_str(string.pack("<d", canon(x)))
+end
+
+-- ---- human-readable spot values (localize any divergence) ------------------
+local spot = {}
+local function packhex(x)
+    -- big-endian raw bytes -> 16 hex nibbles
+    local b = string.pack(">d", x)
+    local out = {}
+    for i = 1, 8 do
+        out[i] = string.format("%02x", b:byte(i))
+    end
+    return table.concat(out)
+end
+local function spotval(name, x)
+    spot[#spot + 1] = name .. "=" .. packhex(canon(x))
+end
+
+-- ---- adversarial corpus ----------------------------------------------------
+-- Compile-time literals: identical bytecode on every leg (luac runs once). The
+-- divergence under test is the RUNTIME evaluation of math.*/^ on these inputs.
+local pi = math.pi
+local inf = math.huge
+local nan = inf - inf
+local inputs = {
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    -0.5,
+    2.0,
+    -2.0,
+    3.0,
+    10.0,
+    100.0,
+    0.1,
+    0.2,
+    0.3,
+    0.75,
+    -0.75,
+    pi,
+    pi / 2,
+    pi / 4,
+    pi * 2,
+    pi * 1000000.0, -- near-multiple-of-pi argument reduction stress
+    355.0 / 113.0,
+    1e-1,
+    1e-300,
+    2.2250738585072014e-308, -- min normal
+    5e-324, -- min positive subnormal
+    1e-320, -- a subnormal
+    1e300,
+    1.7976931348623157e308, -- DBL_MAX
+    1e308,
+    inf,
+    -inf,
+    nan,
+}
+
+-- Unary functions. asin/acos/log/sqrt applied to out-of-domain inputs yield NaN
+-- / +-Inf on purpose: NaN-payload and infinity bit patterns are exactly what the
+-- softfloat RISC-V specialization pins and where a foreign libm can diverge.
+local unary = {
+    { "sin", math.sin },
+    { "cos", math.cos },
+    { "tan", math.tan },
+    { "asin", math.asin },
+    { "acos", math.acos },
+    { "atan", math.atan },
+    { "exp", math.exp },
+    { "log", math.log },
+    { "sqrt", math.sqrt }, -- Zone-1 (IEEE sqrt) but included for completeness
+}
+
+-- Binary. atan2 == math.atan(y, x); pow == y ^ x (Lua `^` -> luai_numpow, the
+-- Zone-2 op ADR-0135 routes through the seam); fmod is Zone-1.
+local pairs_yx = {}
+do
+    local sample = { -3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 10.0, pi, 0.1, inf, -inf, nan }
+    for i = 1, #sample do
+        for j = 1, #sample do
+            pairs_yx[#pairs_yx + 1] = { sample[i], sample[j] }
+        end
+    end
+end
+
+-- strtod corpus: parsed at RUNTIME via tonumber (exercises l_str2d per leg, not
+-- the compile-time lexer).
+local strtod_inputs = {
+    "0",
+    "-0",
+    "0.1",
+    "0.2",
+    "3.141592653589793",
+    "2.718281828459045",
+    "1e308",
+    "1e-308",
+    "5e-324",
+    "2.2250738585072014e-308",
+    "1.7976931348623157e308",
+    "0.30000000000000004",
+    "123456789.123456789",
+    "1e-1",
+    "9007199254740993", -- 2^53+1, not exactly representable
+    "inf",
+    "-inf",
+    "nan",
+}
+
+local function run_corpus()
+    -- Zone-2 unary transcendentals
+    for u = 1, #unary do
+        local f = unary[u][2]
+        for i = 1, #inputs do
+            fold_f64(f(inputs[i]))
+        end
+    end
+    -- atan2 (binary atan), pow (^), fmod
+    for p = 1, #pairs_yx do
+        local y, x = pairs_yx[p][1], pairs_yx[p][2]
+        fold_f64(math.atan(y, x))
+        fold_f64(y ^ x)
+        fold_f64(math.fmod(y, x))
+    end
+    -- CORE digest snapshot (#225 / Spike Z): everything folded so far is the
+    -- Zone-2 transcendental + Zone-1 (sqrt/fmod) surface the ADR-0135 seam pins.
+    -- The native host-Lua leg must reproduce this bit-for-bit on FMA silicon
+    -- (x86-64/arm64) using ONLY the in-house musl kernels — no host libm, no
+    -- strtod/number-format (that surface is Phase B and stays out of the gate,
+    -- else a host-libc strtod difference would masquerade as a seam divergence).
+    core_hash = hash
+    -- number formatting: tostring(x) bytes AND tonumber(tostring(x)) round trip.
+    -- canon() first so tostring(NaN) is "nan" on every host (an x86-64 sign-set
+    -- NaN would otherwise stringify to "-nan"); finite values are unchanged.
+    for i = 1, #inputs do
+        local s = tostring(canon(inputs[i]))
+        fold_str(s)
+        -- Lua's tonumber deliberately rejects "inf"/"nan" (-> nil), identically
+        -- on every leg; guard so non-finite round-trips fold a constant.
+        fold_f64(tonumber(s) or 0.0)
+    end
+    -- strtod: tonumber(string)
+    for i = 1, #strtod_inputs do
+        fold_f64(tonumber(strtod_inputs[i]) or 0.0)
+    end
+
+    -- spot values for human divergence localization
+    spotval("sin1", math.sin(1.0))
+    spotval("cos1", math.cos(1.0))
+    spotval("tan1", math.tan(1.0))
+    spotval("exp1", math.exp(1.0))
+    spotval("log2", math.log(2.0))
+    spotval("pow_2_0.5", 2.0 ^ 0.5)
+    spotval("atan2_1_1", math.atan(1.0, 1.0))
+    spotval("sinbigpi", math.sin(pi * 1000000.0))
+    spotval("asin2_nan", math.asin(2.0))
+    spotval("sqrtneg_nan", math.sqrt(-1.0))
+    spotval("ts_0.1", tonumber(tostring(0.1)))
+end
+
+local function digest_hex(h)
+    local b0 = h & 0xff
+    local b1 = (h >> 8) & 0xff
+    local b2 = (h >> 16) & 0xff
+    local b3 = (h >> 24) & 0xff
+    return string.format("%02x%02x%02x%02x", b3, b2, b1, b0)
+end
+
+function init()
+    run_corpus()
+    -- Core (transcendental + Zone-1) — the #225 native cross-arch gate value.
+    blyt.debug.print("[blyt:fphash-core] " .. digest_hex(core_hash))
+    -- Full (adds Phase-B number-format) — the #223 Phase-A cross-leg gate value.
+    blyt.debug.print("[blyt:fphash] " .. digest_hex(hash))
+    for i = 1, #spot do
+        blyt.debug.print("[blyt:fpspot] " .. spot[i])
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#;
+
+    /// The pinned reference digest — the softfloat reference value every leg must
+    /// reproduce. Regenerate (see module doc) if the corpus above changes.
+    pub const FP_PARITY_DIGEST: &str = "[blyt:fphash] f7a69261";
+}
+
 pub mod gfx {
     pub const FRAME_W: usize = 320;
     pub const FRAME_H: usize = 240;
@@ -265,8 +519,9 @@ pub mod gfx {
 
     /// Emit a Lua `draw()` body that issues `ops` via the `blyt32.gfx.*`
     /// primitives — the Lua-cart counterpart of [`c_draw_body`], drawing the
-    /// identical frame so a Lua cart hashes to the same golden across the
-    /// emulated-Lua legs (native/libretro) and the host-Lua fast path (wasm).
+    /// identical frame so a Lua cart hashes to the same golden across the three
+    /// host-Lua legs (blytplay/wasm/libretro — the default for a pure-Lua cart on
+    /// non-RISC-V hosts after #236).
     pub fn lua_draw_body(ops: &[Op]) -> String {
         let mut s = String::new();
         for op in ops {
@@ -1321,8 +1576,8 @@ pub fn run_cart_native_with_env(
 /// Run a cart on blytplay --headless with extra env and return its full stdout,
 /// for tests that parse a printed value (rather than assert a fixed line) and
 /// compare it across legs — e.g. the cross-leg `guest_heap_used` equality oracle
-/// (#231): capture the emulated-rv32 count and the native host-Lua (`BLYT_HOSTLUA=1`)
-/// count and require them identical.
+/// (#231): capture the native host-Lua count (the default for a pure-Lua cart on
+/// non-RISC-V hosts, ADR-0136) and require it identical to the wasm32 sibling.
 pub fn capture_cart_native(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
     use assert_cmd::Command;
     let mut cmd = Command::new(blytplay());
@@ -1362,42 +1617,6 @@ pub fn capture_cart_wasm(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> 
     }
     let output = cmd.assert().success().get_output().stdout.clone();
     String::from_utf8_lossy(&output).into_owned()
-}
-
-/// Run a pure-Lua gfx/surface cart on blytplay's native host-Lua fast path
-/// (#231, opt-in `BLYT_HOSTLUA=1`) with framebuffer hashing on, and assert
-/// `expected` (a `[blyt:fbhash]` line) appears in stdout — the fourth leg for
-/// gfx/surface parity carts, alongside emulated-native / wasm / libretro. Unlike
-/// [`run_cart_native_hostlua`] (the minimal Spike Z determinism binary), this
-/// drives the full runtime through blytplay, so the runner's own framebuffer +
-/// surface pool are exercised end to end.
-pub fn run_cart_native_hostlua_frame_hash(cart: &std::path::Path, expected: &str) {
-    run_cart_native_with_env(
-        cart,
-        &[("BLYT_FRAME_HASH", "1"), ("BLYT_HOSTLUA", "1")],
-        expected,
-    );
-}
-
-/// Run a pure-Lua gfx/surface cart through the embedded libretro core's native
-/// host-Lua fast path (#233, opt-in `BLYT_HOSTLUA=1`) with framebuffer hashing
-/// on, and assert `expected` (a `[blyt:fbhash]`/`[blyt:palhash]` line) appears
-/// in the core's output — the libretro-`.so` host-Lua leg of the gfx/surface
-/// frame-hash matrix, alongside libretro-rv32 / blytplay-host-Lua / wasm-host-Lua.
-///
-/// This exercises the framebuffer *present* path that #231 added to
-/// `blyt_libretro.so` (`blyt_hostlua_get_pixels`/`get_palette` → `g_xrgb`): the
-/// frame-hash lines emitted by the shared host-Lua runner (`hl_frame_done` in
-/// `cart_run_hostlua.c`) route through the runner's `log_fn`, which the core
-/// wires to `libretro_log` → the libretro `RETRO_LOG_INFO` callback — the same
-/// channel the rv32 leg's frame hashes flow through, captured by
-/// `test_libretro_core`.
-pub fn run_cart_libretro_hostlua_frame_hash(cart: &std::path::Path, expected: &str) {
-    run_cart_libretro_with_env(
-        cart,
-        &[("BLYT_FRAME_HASH", "1"), ("BLYT_HOSTLUA", "1")],
-        expected,
-    );
 }
 
 /// Run a cart on the native host-Lua determinism leg (Spike Z, #225); assert
@@ -1572,11 +1791,9 @@ pub fn run_cart_libretro_with_env(
 }
 
 /// Run a cart through the embedded libretro core with BOTH driver flags (e.g.
-/// `--run-frames N`, `--reset-every-frame`) AND extra process environment (e.g.
-/// `BLYT_HOSTLUA=1` to select the core's native host-Lua fast path); assert
-/// `expected` appears in the output. Used by the host-Lua hybrid legs (#232 S5),
-/// which need the frame cap for a never-quitting example cart and the env to
-/// opt into the host-Lua path in one invocation.
+/// `--run-frames N`, `--reset-every-frame`) AND extra process environment; assert
+/// `expected` appears in the output. For a leg that needs a frame cap (a
+/// never-quitting cart) plus custom env in one invocation.
 pub fn run_cart_libretro_with_env_and_flags(
     cart: &std::path::Path,
     extra_env: &[(&str, &str)],
@@ -1664,6 +1881,24 @@ pub fn run_cart_all_legs(cart: &std::path::Path, expected: &str) {
     run_cart_native(cart, expected);
     run_cart_wasm(cart, expected);
     run_cart_libretro(cart, expected);
+}
+
+/// The framebuffer-hash sibling of [`run_cart_all_legs`]: run `cart` with
+/// `BLYT_FRAME_HASH=1` on all three host-runtime legs — blytplay, wasm, and the
+/// embedded libretro core — asserting the same `expected` (`[blyt:fbhash]` /
+/// `[blyt:palhash]`) line on each.
+///
+/// Per ADR-0136 the frontend dispatches each leg by cart type: a **Lua** cart
+/// runs the three **host-Lua** legs — the determinism reference after #236
+/// retired the emulated RV32 Lua VM as a shipped path — while a **C/Rust/C++**
+/// cart runs the three **emulated rv32** legs (native cart code is kept on
+/// rv32emu). Either way the three legs must agree bit-for-bit, so this single
+/// helper serves both without the caller distinguishing them.
+pub fn run_cart_all_legs_frame_hash(cart: &std::path::Path, expected: &str) {
+    let env = [("BLYT_FRAME_HASH", "1")];
+    run_cart_native_with_env(cart, &env, expected);
+    run_cart_wasm_with_env(cart, &env, expected);
+    run_cart_libretro_with_env(cart, &env, expected);
 }
 
 /// Like [`run_cart_all_legs`], but drives each leg's `--reset-every-frame`

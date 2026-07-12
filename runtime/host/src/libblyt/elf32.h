@@ -145,6 +145,10 @@ typedef struct {
 #define STB_GLOBAL 1u
 #define STB_WEAK 2u
 
+/* Symbol type extracted from st_info */
+#define ELF32_ST_TYPE(i) ((i) & 0xfu)
+#define STT_FUNC 2u
+
 /* Special section indices */
 #define SHN_UNDEF 0u
 

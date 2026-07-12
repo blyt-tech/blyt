@@ -17,7 +17,6 @@ mod common;
 use common::{
     CartProject, blytplay, build_cart, build_lua_cart, require_libretro_core, require_lua_sdk,
     require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs,
-    run_cart_native_with_env,
 };
 use tempfile::TempDir;
 
@@ -237,9 +236,9 @@ fn mem_stats_lua_parity_all_legs() {
 
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
+    // Host-Lua is the default for a pure-Lua cart on non-RISC-V hosts (ADR-0136),
+    // so all three legs exercise mem.stats() + the resource table with no session.
     run_cart_all_legs(&cart, PARITY_EXPECT);
-    // Native host-Lua fast path (#231): mem.stats() + resource table, no session.
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], PARITY_EXPECT);
 }
 
 /// AC4 (Rust): the Rust SDK surface returns the same fields as C/Lua for the
