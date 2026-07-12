@@ -1686,6 +1686,16 @@ static int call_lifecycle(blyt_hostlua_t *hl, const char *name) {
     }
     if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
         const char *msg = lua_tostring(L, -1);
+#ifdef BLYT_DAP
+        /* Exception breakpoints (#257): when a client has set an exception filter
+         * that matches this uncaught Lua error, block here on the exception stop
+         * until the client resumes / disconnects — the native analog of the WASM
+         * leg's blyt_dap_report_exception park.  No filter set → returns 0 and the
+         * error falls through to the normal (non-fatal, printed) handling below,
+         * matching a plain run. */
+        if (hl->dap_enabled)
+            fc_hostlua_dap_report_exception(msg ? msg : "(error)", 1);
+#endif
         if (hl->log_fn) {
             char buf[512];
             snprintf(buf, sizeof(buf), "blyt-hostlua: error in %s(): %s", name,
@@ -2218,6 +2228,42 @@ int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
 #endif
 }
 
+int blyt_hostlua_dap_restart(blyt_hostlua_t *hl) {
+#ifdef BLYT_DAP
+    if (!hl || !hl->dap_enabled)
+        return -1;
+
+    /* DAP restart (#257): re-launch the cart from scratch — the host-Lua analog
+     * of retro_reset on the emulated restart path.  Tear the VM down and rebuild
+     * it fresh (no state preserved: a restart is a re-run, not a hot reload), then
+     * defer init() to the next wait_ready so a breakpoint in init() fires after
+     * the client re-sends configurationDone.  build_vm re-arms the master hook. */
+    lua_close(hl->L);
+    hl->L = NULL;
+    if (hl->arena.base)
+        blyt_arena_reset(&hl->arena);
+    if (build_vm(hl) != 0) {
+        hl->done = true;
+        return -1;
+    }
+    /* Fresh launch: zero the state buffers so the restarted cart sees them as it
+     * would on a first boot (the state ctx persists across VM rebuilds, so it
+     * must be explicitly re-zeroed here — unlike the reload/reset cycle, no
+     * snapshot is restored over them). */
+    blyt_state_ctx_t *sctx = hl_active_ctx(hl);
+    if (sctx)
+        blyt_state_ctx_zero_data(sctx);
+
+    hl->booted = false;
+    hl->done = false;
+    hl->quit = 0;
+    return 0;
+#else
+    (void)hl;
+    return -1;
+#endif
+}
+
 /* Shared tail of the reset-every-frame cycle and the hot reload (#244): tear the
  * VM down, rebuild it from hl->bytecode (re-arming the DAP master hook), re-run
  * init(), then restore `snap` over the fresh buffers and replay
@@ -2458,6 +2504,17 @@ blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
     if (hl->done)
         return BLYT_RUN_OK;
 
+#ifdef BLYT_DAP
+    /* DAP restart (#257): a `restart` request set the pending flag while paused;
+     * return BLYT_RUN_RESTART so the frontend rebuilds the VM and re-waits for
+     * configurationDone (the native analog of the emulated path's
+     * BLYT_RUN_RESTART → retro_reset + blyt_session_dap_reattach).  Checked before
+     * running the frame so no stale update()/draw() runs against the VM being
+     * torn down. */
+    if (hl->dap_enabled && fc_hostlua_dap_restart_pending())
+        return BLYT_RUN_RESTART;
+#endif
+
     /* Quit is tested at the top of the call, mirroring blyt_main's
      * `while (!g_quit_requested)`: a quit requested during a prior update() still
      * ran that frame's draw(); the exit runs on_quit() + cleanup() once. */
@@ -2539,10 +2596,15 @@ void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
 }
 
 /* Dispatch predicate (ADR-0136, #236).  On a non-RISC-V host, host-Lua is the
- * DEFAULT shipped execution path for a PURE-LUA cart — the emulated RV32 Lua VM is
- * retired as a shipped path for that case.
+ * DEFAULT shipped execution path for a PURE-LUA cart — RUN *and* DEBUG — the
+ * emulated RV32 Lua VM is retired as a shipped path for that case.  #257 brought
+ * the native host-Lua DAP (restart / exception breakpoints / loadedSources /
+ * source-map / multifile / evaluate-upvalue) to parity with the emulated + WASM
+ * legs, so the debug opt-in gate is gone: a debugger-attached pure-Lua cart now
+ * routes to host-Lua by default too.
  *
- * Host-Lua is opt-in (BLYT_HOSTLUA), NOT the default, in two transitional cases:
+ * Host-Lua remains opt-in (BLYT_HOSTLUA), NOT the default, in ONE transitional
+ * case:
  *
  *  - a HYBRID cart (one carrying ANY cart-authored native code — `.lua_exports`
  *    wrappers, a cart-native lifecycle, or even an unexported C/Rust helper, per
@@ -2551,15 +2613,8 @@ void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
  *    #251), so it must keep the emulated session.  The opt-in also preserves #232's
  *    hybrid host-Lua path (run/state/save parity) for testing.
  *
- *  - a DEBUG session (BLYT_DAP_PORT / BLYT_GDB_PORT set): the native host-Lua DAP
- *    (#234) is not yet at full parity with the emulated DAP (e.g. `restart` is a
- *    no-op — the run loop does not act on fc_dap_is_restart_pending), so `blyt debug`
- *    on a pure-Lua cart keeps the complete emulated DAP by default.  Host-Lua
- *    debugging stays reachable via the opt-in for its supported scenarios.
- *
- * A later issue makes these default host-Lua once #251 (native-half GDB) and the
- * remaining native host-Lua DAP surface land.  A pure-Lua cart being RUN (no
- * debugger) defaults to host-Lua.
+ * A later issue makes the hybrid case default host-Lua once #251 (native-half GDB
+ * + coordinated hybrid hot-reload) lands.
  *
  * The compile gate BLYT_HOSTLUA_EXEC lives only in this TU: on real RISC-V hardware
  * it is absent and the #else stub returns false, so carts run native RV32 with no
@@ -2569,9 +2624,9 @@ bool blyt_hostlua_should_use(const blyt_cart_t *cart) {
         return false;
     if (!blyt_cart_find_section(cart, ".cart.lua", NULL))
         return false;
-    if (blyt_cart_has_native_code(cart) || getenv("BLYT_DAP_PORT") || getenv("BLYT_GDB_PORT"))
-        return getenv("BLYT_HOSTLUA") != NULL; /* hybrid or debug: opt-in only (#251/#234) */
-    return true; /* pure-Lua, not debugging: host-Lua by default (#236) */
+    if (blyt_cart_has_native_code(cart))
+        return getenv("BLYT_HOSTLUA") != NULL; /* hybrid: opt-in only pending #251 */
+    return true; /* pure-Lua (run OR debug): host-Lua by default (#236, #257) */
 }
 
 #else /* !BLYT_HOSTLUA_EXEC — seam VM absent; the frontend falls back to rv32. */
@@ -2606,6 +2661,11 @@ int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port) {
 int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
     (void)hl;
     return 0;
+}
+
+int blyt_hostlua_dap_restart(blyt_hostlua_t *hl) {
+    (void)hl;
+    return -1;
 }
 
 blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {

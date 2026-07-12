@@ -97,6 +97,10 @@ lua_State *dap_lua_paused_state(void) {
     return g_core.paused_L;
 }
 
+int dap_lua_is_paused(void) {
+    return g_core.paused;
+}
+
 /* ── Source-path mapping (issue #51) ───────────────────────────────────────── */
 
 /* Map a local workspace path back to its canonical /blyt/... form for exact

@@ -342,6 +342,16 @@ RETRO_API void retro_run(void) {
             blyt_cart_run_err_t err = blyt_hostlua_run_frame(g_hostlua);
             if (err == BLYT_RUN_FRAME_DONE) {
                 /* normal frame */
+            } else if (err == BLYT_RUN_RESTART) {
+                /* DAP restart (#257): rebuild the host-Lua VM fresh, then re-wait
+                 * for the client's reconfiguration (setBreakpoints +
+                 * configurationDone) before booting init() under the re-armed hook
+                 * — the host-Lua analog of the emulated retro_reset +
+                 * blyt_session_dap_reattach + wait_ready below. */
+#ifdef BLYT_DAP
+                blyt_hostlua_dap_restart(g_hostlua);
+                blyt_hostlua_dap_wait_ready(g_hostlua);
+#endif
             } else {
                 g_cart_done = true;
                 g_run_err = (err == BLYT_RUN_OK) ? BLYT_RUN_OK : err;
