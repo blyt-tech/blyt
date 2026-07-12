@@ -100,8 +100,17 @@ void dap_lua_output(const char *msg);
 /* Dedupe + emit a "loadedSource" event the first time a source is seen. */
 void dap_lua_emit_loaded_source(const char *source_path);
 
-/* The lua_State the debugger is currently paused on (NULL when running). */
+/* The lua_State the debugger is currently paused on (NULL when running).  Note:
+ * NULL does NOT imply "running" — an exception stop (dap_lua_on_exception) parks
+ * with no live frame (paused_L == NULL) yet is still paused; use dap_lua_is_paused
+ * to gate on the paused state itself. */
 lua_State *dap_lua_paused_state(void);
+
+/* Non-zero while the debugger is stopped (breakpoint/step OR an exception stop),
+ * regardless of whether a live frame (paused_L) is available.  The native
+ * transport gates its reader thread on this so exception-stop inspection requests
+ * are queued to the blocked exec thread rather than dispatched inline. */
+int dap_lua_is_paused(void);
 
 #ifdef __cplusplus
 }

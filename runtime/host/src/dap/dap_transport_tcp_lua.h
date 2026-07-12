@@ -29,6 +29,16 @@ int fc_hostlua_dap_wait_ready(void);
 /* Stop the reader thread, drop the client, and release resources.  Idempotent. */
 void fc_hostlua_dap_shutdown(void);
 
+/* Test-and-clear the pending-restart flag (issue #257): non-zero once the client
+ * has sent a `restart` request.  The host-Lua run loop polls this at frame entry
+ * to trigger a VM rebuild (BLYT_RUN_RESTART). */
+int fc_hostlua_dap_restart_pending(void);
+
+/* Report a Lua error and block the exec thread on the exception stop if an
+ * exception breakpoint filter matches (issue #257).  Returns 1 if it paused
+ * (client resumed/disconnected), 0 if no filter matched. */
+int fc_hostlua_dap_report_exception(const char *msg, int is_uncaught);
+
 #ifdef __cplusplus
 }
 #endif

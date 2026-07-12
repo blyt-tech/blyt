@@ -97,6 +97,18 @@ int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port);
 int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl);
 
 /*
+ * Restart the debug session (issue #257): re-launch the cart from scratch by
+ * tearing the VM down and rebuilding it fresh (no state preserved — a DAP restart
+ * is a re-run, not a hot reload), with init() deferred so a breakpoint in init()
+ * fires after the client re-sends configurationDone.  Called by the frontend when
+ * blyt_hostlua_run_frame returns BLYT_RUN_RESTART; pair with a following
+ * blyt_hostlua_dap_wait_ready to gate + boot the fresh VM.  Returns 0 on success,
+ * -1 on failure or a runner not created for debug.  The host-Lua analog of
+ * retro_reset + blyt_session_dap_reattach on the emulated restart path.
+ */
+int blyt_hostlua_dap_restart(blyt_hostlua_t *hl);
+
+/*
  * Run one frame: update() then draw(), mirroring one iteration of the guest
  * blyt_main loop.  Returns BLYT_RUN_FRAME_DONE when a frame completed and the
  * cart is still running; BLYT_RUN_OK once the cart has requested quit (the final

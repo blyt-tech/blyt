@@ -199,9 +199,13 @@ static void *reader_thread(void *arg) {
                 break;
             blyt_tracef(BLYT_TRACE_DAP, "recv %s", buf);
             pthread_mutex_lock(&g_hl.mu);
-            if (dap_lua_paused_state()) {
-                /* Paused: the execution thread owns the VM, so it must run every
-                 * handler.  Enqueue for it to drain in-order. */
+            if (dap_lua_is_paused()) {
+                /* Paused (breakpoint/step OR an exception stop): the execution
+                 * thread owns the VM, so it must run every handler.  Enqueue for
+                 * it to drain in-order.  Gating on dap_lua_is_paused (not
+                 * dap_lua_paused_state) matters for an exception stop, which
+                 * parks with paused_L == NULL yet still needs its requests
+                 * serviced by the blocked exec thread. */
                 queue_push(buf);
             } else {
                 /* Running: no live VM to touch — dispatch inline and wake any
@@ -254,6 +258,49 @@ void fc_dap_pause_loop(lua_State *L, lua_Debug *ar) {
     dap_lua_apply_resume(); /* clears paused_L, applies step mode, emits "continued" */
     queue_clear(); /* drop any unserviced requests from this pause */
     pthread_mutex_unlock(&g_hl.mu);
+}
+
+/* Test-and-clear the pending-restart flag (issue #257).  The host-Lua run loop
+ * polls this at frame entry and, when set, returns BLYT_RUN_RESTART so the
+ * frontend rebuilds the VM and re-waits for configurationDone — the native
+ * analog of the emulated path's BLYT_RUN_RESTART + blyt_session_dap_reattach.
+ * Mutex-guarded because the flag lives in the shared core, which the reader
+ * thread may be mutating concurrently. */
+int fc_hostlua_dap_restart_pending(void) {
+    pthread_mutex_lock(&g_hl.mu);
+    int v = dap_lua_restart_pending();
+    pthread_mutex_unlock(&g_hl.mu);
+    return v;
+}
+
+/* Report a Lua error to the DAP client and, if an exception breakpoint filter
+ * matches, BLOCK the execution thread on the exception stop until the client
+ * resumes / disconnects (issue #257).  The native analog of the WASM leg's
+ * blyt_dap_report_exception → g_lua_dap_paused park: dap_lua_on_exception emits
+ * "stopped" (reason=exception, paused_L == NULL — the error unwound the frame),
+ * then this services inspection requests on THIS thread (the VM owner) exactly
+ * as fc_dap_pause_loop does for a breakpoint stop.  Returns 1 if it paused, 0 if
+ * no filter matched (the caller then handles the error as a plain, non-paused
+ * Lua error).  Called from the runner's call_lifecycle on a lua_pcall failure. */
+int fc_hostlua_dap_report_exception(const char *msg, int is_uncaught) {
+    pthread_mutex_lock(&g_hl.mu);
+    if (!dap_lua_on_exception(msg, is_uncaught)) {
+        pthread_mutex_unlock(&g_hl.mu);
+        return 0;
+    }
+    while (g_hl.running && !g_hl.client_gone && !dap_lua_continue_pending()) {
+        char *m = queue_pop();
+        if (m) {
+            dap_lua_dispatch(m);
+            free(m);
+        } else {
+            pthread_cond_wait(&g_hl.cond, &g_hl.mu);
+        }
+    }
+    dap_lua_apply_resume(); /* clears the paused state, emits "continued" */
+    queue_clear();
+    pthread_mutex_unlock(&g_hl.mu);
+    return 1;
 }
 
 /* ── Public API ────────────────────────────────────────────────────────────── */
