@@ -1584,6 +1584,11 @@ static int wasm_lua_save_read(lua_State *L) {
  * that the packer generates as native C in __blyt_lua_glue.c, but uses
  * blyt.buf.get_T/set_T instead of ECALL stubs so it runs without rv32emu. */
 static void wasm_register_s_proxy(lua_State *L) {
+    /* Indexed by type_tag; MUST cover every tag through f64=8 (state_buffer.c),
+     * kept byte-identical with cart_run_hostlua.c's register_s_proxy. The bound
+     * below is `< 9` to match. A tag past this table routes to the wrong
+     * accessor — the #235 bug (f64 fell through to i32) / the #253 class; any new
+     * field type must extend this array in lockstep. */
     static const char *type_names[] = {"i8",  "u8",  "i16",  "u16", "i32",
                                        "u32", "f32", "bool", "f64"};
 
