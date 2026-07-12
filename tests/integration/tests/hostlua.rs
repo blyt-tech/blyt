@@ -125,6 +125,21 @@ state_buffers:
     count: 1
 ";
 
+/// Sibling of [`SB_CONFIG`] whose single field is an **f64** (tag 8), for the
+/// #253 audit: the host-Lua state-buffer surface was only ever exercised with
+/// i32 fields, which is exactly why the #235 `type_names[]` bug (f64 routed to
+/// the i32 accessors) shipped unnoticed.
+const SB_F64_CONFIG: &str = "\
+records:
+  Game:
+    fields:
+      - { name: health, type: f64 }
+state_buffers:
+  game:
+    record: Game
+    count: 1
+";
+
 /// S3: state buffers + `S` proxy + `blyt.buf.*` + `save_write`/`save_read`. A cart
 /// allocates a slot, writes a field through the generated `S` proxy, persists via
 /// `save_write`, overwrites the field, then `save_read` restores it — the printed
@@ -247,6 +262,141 @@ function draw() end
     // opt-in dispatch too ("let it flip", #233 owns the .so parity wiring).
     run_cart_libretro(&cart, expected);
     run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+}
+
+/// #253: the f64 counterpart of [`hostlua_state_buffer_save_round_trip_parity`].
+/// The sibling only round-trips an i32 `score`, which is exactly the coverage
+/// gap that let the #235 bug (f64 fields routed to the i32 accessors) ship. This
+/// writes a **fractional** f64 (`42.5`) through the `S` proxy — a value that
+/// under the pre-#235 i32 path would have *errored* on write (`checkinteger` on
+/// a non-integer) rather than silently truncated — persists it via `save_write`,
+/// overwrites it, then `save_read` restores it. The printed value must be the
+/// saved `42.5` (exact, not i32-truncated to `42`), identically on the emulated,
+/// native host-Lua, and WASM legs. Proves save/restore serialization carries the
+/// full 8-byte f64 field (`field_sizeof(f64)=8`) end to end on host-Lua.
+#[test]
+fn hostlua_state_buffer_f64_save_round_trip_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_sb_f64");
+
+    CartProject::new()
+        .config(SB_F64_CONFIG)
+        .lua(
+            r#"
+local slot = -1
+
+function init()
+    slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].health = 42.5
+    blyt.save_write(0)
+    S.game[slot].health = 99.5
+end
+
+function update()
+    blyt.save_read(0)
+    blyt.debug.print("health=" .. tostring(S.game[slot].health))
+    blyt.quit()
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let expected = "health=42.5";
+
+    // native (emulated) + host-Lua share a real host save dir; WASM uses MEMFS /tmp.
+    let save_dir = TempDir::new().unwrap();
+    let sd = save_dir.path().to_str().unwrap();
+
+    run_cart_native_with_env(&cart, &[("BLYT_SAVE_DIR", sd)], expected);
+    run_cart_native_with_env(
+        &cart,
+        &[("BLYT_SAVE_DIR", sd), ("BLYT_HOSTLUA", "1")],
+        expected,
+    );
+    run_cart_wasm_with_env(&cart, &[("BLYT_SAVE_DIR", "/tmp")], expected);
+}
+
+/// #253: carries a single f64 state-buffer field through the reset-every-frame
+/// save/clear/restore snapshot cycle. The value lives entirely in the state
+/// buffer (the only state that survives the host-Lua VM-rebuild), so each frame
+/// does a read-modify-write of `S.game[0].health` by an exactly-representable
+/// fraction (`+0.25`) and quits once it crosses a fractional threshold — the
+/// final value is deterministic and identical across every leg AND invariant to
+/// `--reset-every-frame` (the VM-rebuild reset must round-trip the 8-byte f64
+/// field byte-identically, the same state the emulated BSS-zero + re-save/restore
+/// reaches). Guards the snapshot/restore path against the never-exercised-f64
+/// class; the fractional result would be impossible under the pre-#235 i32 route.
+#[test]
+fn hostlua_state_buffer_f64_reset_every_frame_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_sb_f64_ref");
+
+    CartProject::new()
+        .config(SB_F64_CONFIG)
+        .lua(
+            r#"
+function init() end
+
+function on_new_state()
+    local slot = blyt.buf.alloc_slot(S.GAME)
+    S.game[slot].health = 0.5
+end
+
+function update()
+    S.game[0].health = S.game[0].health + 0.25
+    if S.game[0].health >= 5.25 then
+        blyt.debug.print("health=" .. tostring(S.game[0].health))
+        blyt.quit()
+    end
+end
+
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    // 0.5 + 19 increments of 0.25 first reaches >= 5.25 at exactly 5.25; every
+    // step is exactly representable in f64 so tostring is stable across legs, and
+    // the fractional result proves the field was never coerced through i32.
+    let expected = "health=5.25";
+
+    // Plain run — every leg agrees (incl. the release libretro .so).
+    run_cart_native(&cart, expected);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+
+    // Reset-every-frame — the host-Lua VM-rebuild cycle must reach the SAME f64
+    // value as the emulated (BSS-zero) and WASM (VM-rebuild) legs.
+    run_native_env_flags(&cart, &[], &["--reset-every-frame"], expected);
+    run_native_env_flags(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        &["--reset-every-frame"],
+        expected,
+    );
+    run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
+    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], expected);
+    run_libretro_env_flags(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        &["--reset-every-frame"],
+        expected,
+    );
 }
 
 /// Run blytplay `--headless {flags} {cart}` with extra env; assert `expected` in

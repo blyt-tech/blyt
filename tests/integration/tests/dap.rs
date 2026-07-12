@@ -358,6 +358,69 @@ fn sdl_dap_hostlua_evaluate_expr() {
         .success();
 }
 
+/// Native host-Lua DAP (#253): inspection of an **f64 state-buffer field**. The
+/// shared inspection core reads the field through the `S` proxy on the parked
+/// host `lua_State`, so it exercises the same `get_f64` accessor the #235 bug
+/// misrouted to `get_i32`. The cart stores a fractional f64 (`42.5`) into a
+/// state-buffer field, breaks on the following line, and evaluates
+/// `S.game[slot].health` — which must render as the exact `42.5`, not an
+/// i32-misdecoded value. This closes the DAP-inspect leg of the never-exercised-
+/// f64 audit (the host-Lua state-buffer DAP tests otherwise only touch i32/plain
+/// locals). The inspection core is shared and value-generic, so its correctness
+/// here rides on the f64 accessor being correct on the host-Lua path.
+#[test]
+fn sdl_dap_hostlua_f64_state_buffer_inspect() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    const SB_F64_CONFIG: &str = "\
+records:
+  Game:
+    fields:
+      - { name: health, type: f64 }
+state_buffers:
+  game:
+    record: Game
+    count: 1
+";
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua_f64");
+    CartProject::new()
+        .config(SB_F64_CONFIG)
+        .lua(
+            "function init()\n\
+             \x20   local slot = blyt.buf.alloc_slot(S.GAME)\n\
+             \x20   S.game[slot].health = 42.5\n\
+             \x20   local marker = slot\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    // Break on line 4 (`local marker = slot`) — line 3 has already stored 42.5
+    // and `slot` is a live local in the paused frame, so the evaluate can index
+    // the state buffer through the `S` proxy's f64 accessor.
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "S.game[slot].health")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "42.5")
+        .env("BLYT_HOSTLUA", "1")
+        .assert()
+        .success();
+}
+
 /// Native host-Lua DAP for a HYBRID cart (#232 S6): a breakpoint in the Lua half,
 /// set on the line AFTER it calls a native export (`add_one`, driven through the
 /// ADR-0130 ECALL bridge), hits under blytdebug's host-Lua path, and the

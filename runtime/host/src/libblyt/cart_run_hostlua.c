@@ -700,6 +700,10 @@ static void register_state_api(lua_State *L) {
  * ECALL).  Byte-for-byte the WASM leg's wasm_register_s_proxy, reading the
  * runner's own ctx. */
 static void register_s_proxy(lua_State *L, blyt_state_ctx_t *ctx) {
+    /* Indexed by type_tag; MUST cover every tag through f64=8 (state_buffer.c).
+     * The bound below is `< 9` to match. A tag that falls past this table routes
+     * to the wrong accessor — the #235 bug (f64 fell through to i32) and the
+     * class #253 swept; any new field type must extend this array in lockstep. */
     static const char *type_names[] = {"i8",  "u8",  "i16",  "u16", "i32",
                                        "u32", "f32", "bool", "f64"};
 
