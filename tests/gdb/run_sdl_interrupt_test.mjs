@@ -135,9 +135,17 @@ function makeClient(port) {
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 async function main() {
-	const blytplay = spawn(BLYTRUN, ['--gdb', '0', '--headless', CART], {
-		stdio: ['ignore', 'pipe', 'pipe'],
-	});
+	// #251: BLYT_HOSTLUA + --host-lua opts a hybrid onto the native host-Lua path,
+	// so the interrupt lands in the native rv32 half (running inside a trampoline
+	// call) while the Lua half runs on the host VM.
+	const hostLuaArgs = process.env.BLYT_HOSTLUA ? ['--host-lua'] : [];
+	const blytplay = spawn(
+		BLYTRUN,
+		['--gdb', '0', '--headless', ...hostLuaArgs, CART],
+		{
+			stdio: ['ignore', 'pipe', 'pipe'],
+		},
+	);
 	blytplay.stderr.on('data', (d) => process.stderr.write(d));
 
 	const port = await findGdbPort(blytplay);

@@ -490,6 +490,59 @@ fn sdl_hybrid_gdb_only_hostlua() {
         .success();
 }
 
+/// SDL2 hybrid on the native host-Lua path: GDB async interrupt of a RUNNING
+/// native half (#251).  The native half does bounded work every frame; the GDB
+/// client continues, then sends the out-of-band interrupt (\x03) while the cart is
+/// running, and the stub answers T02 (SIGINT).  This reaches parity with the
+/// emulated leg (`sdl_c_cart_gdb_interrupt`): the interrupt is acknowledged and the
+/// native half is paused at the next frame's `run_frame` GDB gate (the same
+/// block-a-thread mechanism the emulated frame loop uses) — so a developer can
+/// break into a running/looping native function on host-Lua exactly as on the
+/// emulated path.  The idle-native case (interrupt while the cart sits purely in the
+/// Lua half, native not scheduled) intentionally has no effect — the Lua-half DAP
+/// pause covers that; see #251 discussion.
+///
+/// Requires: blytdebug with BLYT_GDB=ON, Lua SDK.
+#[test]
+fn sdl_hybrid_gdb_interrupt_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+    require_gdb();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hybrid_gdb_interrupt_hostlua");
+
+    // The native half owns the lifecycle and does a bounded busy-loop EVERY frame
+    // (volatile so it is not optimised away), never quitting.  Driving the native
+    // work per frame — rather than one infinite spin — keeps run_frame returning
+    // between frames so the GDB transport reader is serviced (an unbounded spin
+    // starves it); the cart is killed by the orchestrator after the interrupt.  The
+    // interrupt lands while the native `blyt_cart_update` is executing, so the stub
+    // answers T02.  The Lua half is a minimal stub (native owns the lifecycle).
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+             static volatile int g_sink = 0;\n\
+             void blyt_cart_init(void)   {}\n\
+             void blyt_cart_update(void) { for (volatile int i = 0; i < 2000000; i++) g_sink = i; }\n\
+             void blyt_cart_draw(void)   {}\n")
+        .lua("-- hybrid Lua half: native code owns the lifecycle\n")
+        .write(&project);
+
+    let cart = build_debug_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/gdb/run_sdl_interrupt_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_HOSTLUA", "1")
+        .assert()
+        .success();
+}
+
 /// WASM hybrid: Lua cart that calls a native C function debuggable via both
 /// DAP (Lua) and GDB (C).  Mirrors sdl_hybrid_gdb_and_dap on the WASM path.
 ///
