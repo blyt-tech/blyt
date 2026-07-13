@@ -584,41 +584,48 @@ fn native_dev_control_reload_reloads_resource_hostlua() {
     native_reload_resource_leg(&[], "native host-Lua");
 }
 
-/// S7 (#232) — a HYBRID cart on the host-Lua path (`--host-lua`; a hybrid opts in,
-/// #236 keeps pure-Lua as the sole default host-Lua case) refuses a hot-reload,
-/// leaving the live VM untouched (anti-#98).  Reloading only the Lua
-/// half while the emulated native half keeps the old image would be a silent
-/// half-reload, so `blyt_hostlua_reload` returns false → the dev-ctrl `reload`
-/// errors, the new cart's markers never appear, and the ORIGINAL cart keeps
-/// running (a second reload still gets a clean refusal; the process stays alive).
-/// A coordinated hybrid reload (`blyt_session_swap_cart` + Lua-VM rebuild) is a
-/// tracked follow-up.
+/// #251 (#232 S7 follow-up) — a HYBRID cart on the host-Lua path (`--host-lua`; a
+/// hybrid opts in, #236/#257 keep pure-Lua as the default host-Lua case) reloads
+/// *coordinated* across BOTH halves: the native rv32 half is `blyt_session_swap_cart`ed
+/// and the host Lua VM is rebuilt, together, so neither half is left on the old
+/// image (the silent half-reload #98 warns against).  The v1/v2 carts differ in the
+/// NATIVE half too — `compute(x)` returns `x+1` in v1 and `x+100` in v2 — so a
+/// Lua-only half-reload would surface the v2 Lua marker while `compute(41)` still
+/// returned 42; a coordinated reload returns 141.  Replaces the earlier
+/// refuse-outright guard (#232 deferred the coordinated swap to #251).
 #[test]
-fn native_dev_control_reload_hybrid_refused_hostlua() {
+fn native_dev_control_reload_hybrid_coordinated_hostlua() {
     require_sdk();
     require_lua_sdk();
 
     let tmp = TempDir::new().unwrap();
     let save_dir = TempDir::new().unwrap();
 
-    // A hybrid: Lua half + a native C export it calls at init.  v1 and v2 differ
-    // only in the strings they print, so a silent half-reload would surface a v2
-    // marker while the native half stayed v1.
-    let hybrid_c = "#include \"blyt.h\"\n\
-                    BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n";
+    // A hybrid: Lua half + a native C export it calls.  v1 and v2 differ in BOTH
+    // halves — the Lua marker string AND the native `compute` result — so the test
+    // can tell a coordinated reload (both new) from a silent half-reload (new Lua,
+    // stale native).
+    let hybrid_c = |ret: &str| {
+        format!(
+            "#include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(compute, int32_t x) {{ return {ret}; }}\n"
+        )
+    };
     let hybrid_lua = |tag: &str| {
         format!(
-            "function init() blyt.debug.print(\"hybrid {tag} init add_one=\" .. add_one(41)) end\n\
+            "function init() blyt.debug.print(\"hybrid {tag} init compute=\" .. compute(41)) end\n\
              function update() end\n\
              function draw() end\n\
-             function on_load_state(info) blyt.debug.print(\"hybrid {tag} RELOADED\") end\n"
+             function on_load_state(info)\n\
+                 blyt.debug.print(\"hybrid {tag} RELOADED compute=\" .. compute(41))\n\
+             end\n"
         )
     };
 
     let project_v1 = tmp.path().join("hybrid_reload_v1");
     CartProject::new()
         .config(DEV_CTRL_CONFIG)
-        .c(hybrid_c)
+        .c(&hybrid_c("x + 1"))
         .lua(&hybrid_lua("V1"))
         .write(&project_v1);
     let v1 = build_lua_cart(&project_v1);
@@ -626,7 +633,7 @@ fn native_dev_control_reload_hybrid_refused_hostlua() {
     let project_v2 = tmp.path().join("hybrid_reload_v2");
     CartProject::new()
         .config(DEV_CTRL_CONFIG)
-        .c(hybrid_c)
+        .c(&hybrid_c("x + 100"))
         .lua(&hybrid_lua("V2"))
         .write(&project_v2);
     let v2 = build_lua_cart(&project_v2);
@@ -659,42 +666,40 @@ fn native_dev_control_reload_hybrid_refused_hostlua() {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    wait_line("hybrid V1 init add_one=42");
+    wait_line("hybrid V1 init compute=42");
 
-    // Overwrite with v2 and attempt reload — the host-Lua hybrid path must refuse.
+    // Overwrite with v2 and reload — the host-Lua hybrid path must reload BOTH halves.
     std::fs::copy(&v2, &work).unwrap();
     let resp = dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":1,"cmd":"reload"}"#);
     assert!(
-        resp.contains("\"id\":1")
-            && resp.contains("\"status\":\"error\"")
-            && resp.contains("reload failed"),
-        "hybrid reload must be refused on the host-Lua path: {resp}"
+        resp.contains("\"id\":1") && resp.contains("\"status\":\"ok\""),
+        "coordinated hybrid reload must succeed on the host-Lua path: {resp}"
     );
 
-    // Still responsive: a second reload gets the same clean refusal — the VM (and
-    // dev-ctrl handler) is alive and the runner is not `done`.
-    let resp2 = dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":2,"cmd":"reload"}"#);
-    assert!(
-        resp2.contains("\"id\":2") && resp2.contains("\"status\":\"error\""),
-        "second hybrid reload should also be refused (live VM responsive): {resp2}"
-    );
+    // The rebuilt VM re-runs init() on the NEW cart, and on_load_state fires with the
+    // restored state — both call the NEW native `compute` (x+100 ⇒ 141).  Seeing 141
+    // (not 42) is the proof the native half swapped, not just the Lua half (anti-#98).
+    wait_line("hybrid V2 init compute=141");
+    wait_line("hybrid V2 RELOADED compute=141");
 
     // The process is still running (a corrupted half-reload could crash on the
     // next frame); give it a moment then confirm it has not exited.
     std::thread::sleep(Duration::from_millis(200));
     assert!(
         matches!(child.try_wait(), Ok(None)),
-        "player must still be running the original cart after a refused reload"
+        "player must still be running the reloaded cart after a coordinated reload"
     );
 
     let _ = child.kill();
     let _ = child.wait();
 
-    // No part of the new cart may have run — no silent half-reload (anti-#98).
+    // No silent half-reload: the v2 Lua half must never have run against the stale
+    // v1 native half (which would print compute=42 under a V2 marker).
     let out = lines.lock().unwrap().join("\n");
     assert!(
-        !out.contains("hybrid V2 init") && !out.contains("hybrid V2 RELOADED"),
-        "a refused hybrid reload must not have run any of the new cart:\n{out}"
+        !out.contains("hybrid V2 init compute=42")
+            && !out.contains("hybrid V2 RELOADED compute=42"),
+        "coordinated reload must not leave the native half on the old image:\n{out}"
     );
 }
 
@@ -774,6 +779,71 @@ fn libretro_dev_control_reload_reloads_resource_hostlua() {
     require_lua_sdk();
     require_libretro_core();
     libretro_reload_resource_leg(&[], "libretro host-Lua");
+}
+
+/// libretro embedded core, host-Lua HYBRID coordinated reload (#251): the .so
+/// counterpart of `native_dev_control_reload_hybrid_coordinated_hostlua`, run
+/// against blyt_libretro.so's OWN embedded guest libs (incl. libblyt32lua-bridge.so).
+/// The hybrid opts into host-Lua via BLYT_HOSTLUA; v1/v2 differ in BOTH halves
+/// (native `compute` returns x+1 vs x+100, plus the Lua marker), so seeing 141
+/// after the swap proves the native rv32 half was blyt_session_swap_cart'ed in
+/// lockstep with the Lua-VM rebuild — not left on the old image (anti-#98).
+#[test]
+fn libretro_dev_control_reload_hybrid_coordinated_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+
+    let hybrid_c = |ret: &str| {
+        format!(
+            "#include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(compute, int32_t x) {{ return {ret}; }}\n"
+        )
+    };
+    let hybrid_lua = |tag: &str| {
+        format!(
+            "function init() blyt.debug.print(\"hybrid {tag} init compute=\" .. compute(41)) end\n\
+             function update() end\n\
+             function draw() end\n\
+             function on_load_state(info)\n\
+                 blyt.debug.print(\"hybrid {tag} RELOADED compute=\" .. compute(41))\n\
+             end\n"
+        )
+    };
+
+    let project_v1 = tmp.path().join("libretro_hybrid_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(&hybrid_c("x + 1"))
+        .lua(&hybrid_lua("V1"))
+        .write(&project_v1);
+    let v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("libretro_hybrid_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(&hybrid_c("x + 100"))
+        .lua(&hybrid_lua("V2"))
+        .write(&project_v2);
+    let v2 = build_lua_cart(&project_v2);
+
+    let out = libretro_reload_capture(&v1, &v2, 2, 6, &[("BLYT_HOSTLUA", "1")]);
+    assert!(
+        out.contains("hybrid V1 init compute=42"),
+        "libretro host-Lua hybrid: v1 did not run its native compute at init; core output:\n{out}"
+    );
+    assert!(
+        out.contains("hybrid V2 RELOADED compute=141"),
+        "libretro host-Lua hybrid: coordinated reload did not swap the native half \
+         (expected compute=141 from the v2 native code); core output:\n{out}"
+    );
+    assert!(
+        !out.contains("hybrid V2 RELOADED compute=42")
+            && !out.contains("hybrid V2 init compute=42"),
+        "libretro host-Lua hybrid: silent half-reload — v2 Lua ran against stale v1 native:\n{out}"
+    );
 }
 
 /* ── native player as an outbound dev-control client (issue #90, option 2) ──── */

@@ -65,6 +65,11 @@ static blyt_hostlua_t *g_hostlua = NULL;
 static bool g_cart_done = false;
 static blyt_cart_run_err_t g_run_err = BLYT_RUN_OK;
 static bool g_dap_active = false;
+/* GDB stub attached (#251): true when a GDB listener was started on the active
+ * debug target — the rv32 session for an emulated cart, or the host-Lua runner's
+ * native-half session for a hybrid.  Drives the frontend's GDB readiness gate and
+ * shutdown for both paths. */
+static bool g_gdb_active = false;
 /* Path the current cart was loaded from — used by the dev control hot reload
  * (issue #87) to reopen the freshly rebuilt cart from disk. */
 static char *g_cart_path = NULL;
@@ -194,17 +199,22 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
      * the runner for a cart it was selected for is a hard error (anti-#98) — do NOT
      * silently fall back to rv32, which would mask a broken host-Lua path. */
     if (blyt_hostlua_should_use(g_cart)) {
+        /* Debugging on the native host-Lua path: the Lua half is source-debugged
+         * via DAP (#234); a HYBRID's native C/Rust half is additionally debugged
+         * via GDB on its rv32 session (#251).  A pure-Lua cart has no native
+         * machine code, so GDB does not apply there.  Either debugger defers the
+         * boot so the frontend can gate on both before init() runs. */
+        bool want_dap = false, want_gdb = false;
 #ifdef BLYT_DAP
-        /* Source-level debugging on the native host-Lua path (#234): build the
-         * runner with the DAP hook armed + init() deferred, then start the DAP
-         * server.  The wait_ready gate (main loop) boots the cart once the
-         * client sends configurationDone.  GDB does not apply here — a pure-Lua
-         * cart has no rv32 machine code to attach an RSP stub to (a future hybrid
-         * cart, #232, would run an rv32 session alongside for that). */
-        const char *dap_port_str = getenv("BLYT_DAP_PORT");
-        if (dap_port_str) {
-            g_hostlua = blyt_hostlua_create_debug(g_cart, libretro_log);
-            if (g_hostlua) {
+        want_dap = getenv("BLYT_DAP_PORT") != NULL;
+#endif
+#ifdef BLYT_GDB
+        want_gdb = getenv("BLYT_GDB_PORT") != NULL && blyt_cart_has_native_code(g_cart);
+#endif
+        if (want_dap || want_gdb) {
+            g_hostlua = blyt_hostlua_create_debug(g_cart, libretro_log, want_dap);
+#ifdef BLYT_DAP
+            if (g_hostlua && want_dap) {
                 int actual_port = 0;
                 if (blyt_hostlua_dap_listen(g_hostlua, &actual_port) >= 0) {
                     g_dap_active = true;
@@ -214,9 +224,25 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game) {
                         fprintf(stderr, "blyt: DAP listening on port %d\n", actual_port);
                 }
             }
-        } else
 #endif
+#ifdef BLYT_GDB
+            if (g_hostlua && want_gdb) {
+                /* Attach the rv32 GDB stub to the hybrid's native-half session — the
+                 * same session the runner drives through its export trampolines. */
+                blyt_session_t *ns = blyt_hostlua_session(g_hostlua);
+                int actual_port = atoi(getenv("BLYT_GDB_PORT"));
+                if (ns && blyt_session_gdb_listen(ns, &actual_port) >= 0) {
+                    g_gdb_active = true;
+                    if (g_log_cb)
+                        g_log_cb(RETRO_LOG_INFO, "blyt: GDB listening on port %d\n", actual_port);
+                    else
+                        fprintf(stderr, "blyt: GDB listening on port %d\n", actual_port);
+                }
+            }
+#endif
+        } else {
             g_hostlua = blyt_hostlua_create(g_cart, libretro_log);
+        }
         if (!g_hostlua) {
             if (g_log_cb)
                 g_log_cb(RETRO_LOG_ERROR, "blyt: failed to create host-Lua runner\n");
@@ -292,13 +318,19 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 
 RETRO_API void retro_unload_game(void) {
     g_dap_active = false;
+    g_gdb_active = false;
 #ifdef BLYT_DAP
     if (g_session)
         blyt_session_dap_shutdown(g_session);
 #endif
 #ifdef BLYT_GDB
+    /* Shut the GDB stub down on whichever session it was attached to — the emulated
+     * session, or the hybrid's native-half session on the host-Lua path (#251).
+     * Must precede blyt_hostlua_destroy, which frees that session. */
     if (g_session)
         blyt_session_gdb_shutdown(g_session);
+    else if (g_hostlua)
+        blyt_session_gdb_shutdown(blyt_hostlua_session(g_hostlua));
 #endif
     blyt_hostlua_destroy(g_hostlua);
     g_hostlua = NULL;
@@ -462,26 +494,48 @@ bool blyt_libretro_dap_wait_ready(void) {
 #endif
 
 #ifdef BLYT_GDB
+/* The session the GDB stub is attached to: the hybrid's native-half session on the
+ * host-Lua path (#251), else the emulated rv32 session.  NULL when neither. */
+static blyt_session_t *active_gdb_session(void) {
+    return g_hostlua ? blyt_hostlua_session(g_hostlua) : g_session;
+}
+
 /* Block until a GDB client connects.  Called by the SDL frontend before
  * starting the game loop so the cart does not run past any early breakpoints. */
 bool blyt_libretro_gdb_wait_attached(void) {
-    return g_session && blyt_session_gdb_wait_attached(g_session) != 0;
+    blyt_session_t *s = active_gdb_session();
+    return s && blyt_session_gdb_wait_attached(s) != 0;
 }
 
-/* In hybrid (DAP+GDB) mode, clear the initial GDB halt so the cart can run
- * without waiting for a vCont;c from lldb-dap.  The Lua DAP session has
- * already registered its breakpoints by the time this is called. */
+/* Clear the initial GDB halt so the cart can run without waiting for a vCont;c
+ * from lldb-dap (fallback when the native client never continues). */
 void blyt_libretro_gdb_continue_initial_halt(void) {
-    if (g_session)
-        blyt_session_gdb_continue_initial_halt(g_session);
+    blyt_session_t *s = active_gdb_session();
+    if (s)
+        blyt_session_gdb_continue_initial_halt(s);
 }
 
-/* In hybrid mode, wait for lldb-dap to finish its initial configuration (insert
- * breakpoints + first continue) before the cart runs, so a native breakpoint is
- * patched in before any cart code executes (issue #119).  Returns true once the
- * client has continued, false on timeout. */
+/* Wait for lldb-dap to finish its initial configuration (insert breakpoints +
+ * first continue) before the cart runs, so a native breakpoint is patched in
+ * before any cart code executes (issue #119; on host-Lua before the deferred boot
+ * runs the native half, #251).  Returns true once the client has continued. */
 bool blyt_libretro_gdb_wait_client_continue(void) {
-    return g_session && blyt_session_gdb_wait_client_continue(g_session) != 0;
+    blyt_session_t *s = active_gdb_session();
+    return s && blyt_session_gdb_wait_client_continue(s) != 0;
+}
+
+/* True when the current cart runs on the host-Lua path (#251) — the SDL frontend's
+ * debug gate uses this to sequence the GDB gate before the host-Lua boot. */
+bool blyt_libretro_is_hostlua(void) {
+    return g_hostlua != NULL;
+}
+
+/* Run the host-Lua deferred boot (#251) — used by the SDL frontend for a GDB-only
+ * hybrid, where no DAP wait_ready ran it.  Idempotent (the runner's booted latch);
+ * a no-op on the emulated path (which boots in the first retro_run frame). */
+void blyt_libretro_debug_boot(void) {
+    if (g_hostlua)
+        blyt_hostlua_dap_wait_ready(g_hostlua);
 }
 #endif
 
@@ -617,8 +671,12 @@ static bool reload_impl(const char *open_path, uint32_t load_base, const char *r
  * runner (which snapshots state, rebuilds the VM against the new bytecode and —
  * in a debug session — re-arms the persisted DAP breakpoints so an init()
  * breakpoint re-fires), then retire the old cart handle and adopt the new one.
- * There is no rv32 session, so no solib/base handling applies — the Lua
- * source-level DAP breakpoints re-bind host-side on the VM rebuild.
+ * For a pure-Lua runner there is no rv32 session, so load_base/reported_path/
+ * fire_solib are inert and the Lua source-level DAP breakpoints re-bind host-side
+ * on the VM rebuild.  For a HYBRID runner (#251) they steer the coordinated
+ * native-half blyt_session_swap_cart the runner performs: a debug reload passes a
+ * fresh ping-pong base + the unique DWARF path + fire_solib=true so an attached
+ * GDB/lldb rebinds native breakpoints before the reloaded init() runs.
  *
  * Failure contract: a rejected new image (open error, or a cart without a
  * .cart.lua section — blyt_hostlua_reload returns false without touching the live
@@ -626,7 +684,8 @@ static bool reload_impl(const char *open_path, uint32_t load_base, const char *r
  * can't-happen-in-practice (same bytecode format, only teardown+rebuild) and, as
  * with the reset-every-frame cycle, marks the runner done — the run ends; the
  * runner holds no live references to close new_cart against. */
-static bool hostlua_reload_impl(const char *open_path) {
+static bool hostlua_reload_impl(const char *open_path, uint32_t load_base,
+                                const char *reported_path, bool fire_solib) {
     if (!g_hostlua || !open_path)
         return false;
 
@@ -640,8 +699,10 @@ static bool hostlua_reload_impl(const char *open_path) {
     }
 
     /* The runner re-points its cart/bytecode/resources at new_cart; the old cart
-     * must stay valid until it returns, then we close it. */
-    if (!blyt_hostlua_reload(g_hostlua, new_cart)) {
+     * must stay valid until it returns, then we close it.  For a hybrid the runner
+     * additionally swaps the native rv32 half (blyt_session_swap_cart) using
+     * load_base/reported_path/fire_solib; for a pure-Lua runner those are inert. */
+    if (!blyt_hostlua_reload(g_hostlua, new_cart, load_base, reported_path, fire_solib)) {
         if (g_log_cb)
             g_log_cb(RETRO_LOG_ERROR, "blyt: host-Lua reload failed to rebuild the VM\n");
         blyt_cart_close(new_cart);
@@ -660,7 +721,7 @@ bool blyt_libretro_reload(void) {
     if (!g_cart_path)
         return false;
     if (g_hostlua)
-        return hostlua_reload_impl(g_cart_path);
+        return hostlua_reload_impl(g_cart_path, 0u, NULL, false);
     return reload_impl(g_cart_path, 0u, NULL, false);
 }
 
@@ -671,7 +732,7 @@ bool blyt_libretro_reload_at(const char *path) {
     if (!open_path)
         return false;
     if (g_hostlua)
-        return hostlua_reload_impl(open_path);
+        return hostlua_reload_impl(open_path, 0u, NULL, false);
     return reload_impl(open_path, 0u, NULL, false);
 }
 
@@ -684,13 +745,18 @@ bool blyt_libretro_reload_for_debug(const char *reported_path) {
     const char *path = (reported_path && reported_path[0]) ? reported_path : g_cart_path;
     if (!path)
         return false;
-    /* Pure-Lua carts have no rv32 session/lldb — the host-Lua runner re-binds its
-     * source-level DAP breakpoints host-side on the VM rebuild, so there is no
-     * solib event or fresh base to arrange (a pure-Lua debug session is DAP-only
-     * and reaches reload via blyt_libretro_reload_at, never here — this guard just
-     * keeps the two entry points behaviourally consistent). */
-    if (g_hostlua)
-        return hostlua_reload_impl(path);
+    /* Host-Lua runner: a HYBRID also has an rv32 native half (#251), so a debug
+     * reload re-maps THAT half at a fresh ping-pong base + unique DWARF path and
+     * fires a solib event so lldb rebinds native breakpoints — exactly like the
+     * emulated path below, but driven through the runner alongside the Lua-VM
+     * rebuild.  A pure-Lua runner has no session, so the base is 0 and no solib
+     * event is arranged (its source-level DAP breakpoints re-bind host-side on the
+     * VM rebuild). */
+    if (g_hostlua) {
+        blyt_session_t *ns = blyt_hostlua_session(g_hostlua);
+        uint32_t base = ns ? blyt_session_next_reload_base(ns) : 0u;
+        return hostlua_reload_impl(path, base, reported_path, ns != NULL);
+    }
     uint32_t base = blyt_session_next_reload_base(g_session);
     return reload_impl(path, base, reported_path, true);
 }
