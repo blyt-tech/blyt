@@ -132,9 +132,16 @@ struct blyt_hostlua {
     lua_State *lua_exch;
     int lua_exch_ref; /* LUA_NOREF when no exchange thread is anchored */
     /* Source-level debugging (#234): when set, build_vm arms the DAP master hook
-     * on hl->L (re-armed on every reset/reload rebuild), init() is deferred to
-     * blyt_hostlua_dap_wait_ready(), and destroy shuts the DAP server down. */
+     * on hl->L (re-armed on every reset/reload rebuild) and destroy shuts the DAP
+     * server down. */
     bool dap_enabled;
+    /* Deferred-boot debug session (#234/#251): when set, init()/on_new_state() are
+     * NOT run at create — the frontend gates on every active debugger (the Lua-half
+     * DAP configurationDone AND/OR the native-half GDB client attach+continue) and
+     * then runs the boot via blyt_hostlua_dap_wait_ready, so a breakpoint in init()
+     * (Lua or native) is armed before it fires.  Set for a GDB-only hybrid too,
+     * where dap_enabled is false but the boot must still wait for the GDB gate. */
+    bool debug;
     bool booted; /* init()/on_new_state() have run (the deferred debug boot) */
 };
 
@@ -2064,10 +2071,12 @@ static int build_vm(blyt_hostlua_t *hl) {
 
 /* Allocate a runner and build its VM (resources + palette + state ctx + VM),
  * but do NOT run the init() boot — the caller decides when (immediately for a
- * plain run, or after configurationDone for a debug session).  `debug` arms the
- * DAP master hook inside build_vm.  Returns the runner (VM live, uninitialised)
- * or NULL on failure. */
-static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool debug) {
+ * plain run, or after the debug gates for a debug session).  `dap_enabled` arms
+ * the DAP master hook inside build_vm (#234).  `debug` defers the boot so the
+ * frontend can gate on every active debugger before init() runs (#234/#251) — a
+ * GDB-only hybrid passes dap_enabled=false, debug=true.  Returns the runner (VM
+ * live, uninitialised) or NULL on failure. */
+static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_enabled, bool debug) {
     if (!cart)
         return NULL;
 
@@ -2083,7 +2092,8 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool debug)
     hl->cart = cart;
     hl->bytecode = (const unsigned char *)bytecode;
     hl->bytecode_size = lua_size;
-    hl->dap_enabled = debug; /* build_vm arms the master hook when set (#234) */
+    hl->dap_enabled = dap_enabled; /* build_vm arms the master hook when set (#234) */
+    hl->debug = debug; /* boot deferred to the frontend's debug gate (#234/#251) */
     hl->lua_exch_ref = LUA_NOREF;
 
     /* Resource table (#93/#158/#231): load the cart's bundled + persistent
@@ -2166,7 +2176,7 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool debug)
 }
 
 blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
-    blyt_hostlua_t *hl = hl_new(cart, log_fn, false);
+    blyt_hostlua_t *hl = hl_new(cart, log_fn, false, false);
     if (!hl)
         return NULL;
 
@@ -2179,17 +2189,24 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     return hl;
 }
 
-blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn) {
-#ifdef BLYT_DAP
-    /* Build + arm the hook, but DEFER init() to blyt_hostlua_dap_wait_ready() so
-     * a breakpoint set in init() fires (the native equivalent of the WASM leg
-     * gating init on configurationDone). */
-    return hl_new(cart, log_fn, true);
+blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap) {
+#if defined(BLYT_DAP) || defined(BLYT_GDB)
+    /* Build the VM (arming the DAP master hook iff `dap`) but DEFER init()/on_new_state()
+     * so the frontend can gate on every active debugger before it runs (#234/#251):
+     * the Lua-half DAP configurationDone and/or the native-half GDB attach+continue.
+     * A GDB-only hybrid passes dap=false — no DAP hook/server — and the boot is still
+     * withheld until blyt_hostlua_dap_wait_ready runs it after the GDB gate. */
+    return hl_new(cart, log_fn, dap, true);
 #else
     (void)cart;
     (void)log_fn;
+    (void)dap;
     return NULL;
 #endif
+}
+
+blyt_session_t *blyt_hostlua_session(blyt_hostlua_t *hl) {
+    return hl ? hl->session : NULL;
 }
 
 int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port) {
@@ -2210,22 +2227,24 @@ int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port) {
 }
 
 int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
+    if (!hl || !hl->debug)
+        return 0;
 #ifdef BLYT_DAP
-    if (!hl || !hl->dap_enabled)
-        return 0;
-    if (!fc_hostlua_dap_wait_ready()) /* blocks until configurationDone / shutdown */
-        return 0;
-    /* Run the deferred boot under the armed hook so an init() breakpoint pauses. */
+    /* DAP session: block until the client sends configurationDone (breakpoints set)
+     * before booting, so an init() breakpoint fires.  A GDB-only hybrid session
+     * (dap_enabled false) skips this — the frontend has already gated on the native
+     * GDB client's attach+continue, so its breakpoints are armed too. */
+    if (hl->dap_enabled && !fc_hostlua_dap_wait_ready())
+        return 0; /* server shut down before configurationDone */
+#endif
+    /* Run the deferred boot (under the armed hook, if any) so a breakpoint in init()
+     * — Lua-half (DAP) or native-half (GDB) — pauses before the cart proceeds. */
     if (!hl->booted) {
         call_lifecycle(hl, "init");
         call_lifecycle(hl, "on_new_state");
         hl->booted = true;
     }
     return 1;
-#else
-    (void)hl;
-    return 0;
-#endif
 }
 
 int blyt_hostlua_dap_restart(blyt_hostlua_t *hl) {
@@ -2338,22 +2357,10 @@ void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
     hl_rebuild_and_restore(hl, snap);
 }
 
-bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
+bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart, uint32_t load_base,
+                         const char *reported_path, bool fire_solib) {
     if (!hl || hl->done || !new_cart)
         return false;
-
-    /* Hybrid hot-reload is deferred to a #232 follow-up: rebuilding only the Lua
-     * half (this VM) while the emulated native half keeps the OLD image is a
-     * silent half-reload — the exact anti-pattern #98 warns against.  Refuse it
-     * outright, BEFORE any state snapshot or cart swap, so the live VM (and its
-     * session) is left completely untouched.  A real hybrid reload needs a
-     * coordinated Lua-VM rebuild + blyt_session_swap_cart of the native half. */
-    if (hl->session) {
-        if (hl->log_fn)
-            hl->log_fn("blyt-hostlua: hot-reload of a hybrid cart is not supported "
-                       "yet; keeping the current cart");
-        return false;
-    }
 
     /* Validate the new image BEFORE disturbing the live VM: a cart without a
      * .cart.lua section can't run on this path, so keep the old VM running and
@@ -2363,22 +2370,49 @@ bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
     if (!bytecode || !lua_size)
         return false;
 
-    /* Snapshot live state from the CURRENT VM first (on_save_state runs in the
-     * old VM, before the swap) — the same order as the reset cycle and the WASM
-     * pure-Lua reload. */
+    /* Snapshot live state from the CURRENT VM first.  on_save_state runs in the
+     * OLD Lua VM — and, for a hybrid, drives the OLD native half — BEFORE any
+     * swap, so it sees a coherent old image (the same order as the reset cycle and
+     * the WASM pure-Lua reload).  Must precede blyt_session_swap_cart below, which
+     * destroys+re-inits the (session-owned) state ctx. */
     call_lifecycle(hl, "on_save_state");
-    blyt_state_snapshot_t *snap = NULL;
     blyt_state_ctx_t *sctx = hl_active_ctx(hl);
-    if (sctx) {
-        snap = blyt_state_ctx_snapshot(sctx);
+    blyt_state_snapshot_t *snap = sctx ? blyt_state_ctx_snapshot(sctx) : NULL;
+
+    /* Hybrid (#251): swap the native rv32 half FIRST, so the Lua VM rebuild below
+     * re-wires the bridge + native-lifecycle trampolines (in build_vm) against the
+     * NEW native image.  blyt_session_swap_cart is atomic on failure — it fails
+     * before overwriting anything — so a bad native image leaves the old session
+     * (and this VM) running: restore the just-taken snapshot over the untouched
+     * buffers and refuse, no silent half-reload.  The swap also destroys+re-inits
+     * the session state ctx fresh from new_cart and reloads the session's own
+     * (native-facing) resource table, which is why the snapshot is taken above. */
+    if (hl->session) {
+        if (!blyt_session_swap_cart(hl->session, new_cart, load_base, reported_path)) {
+            if (hl->log_fn)
+                hl->log_fn("blyt-hostlua: hybrid reload failed to swap the native half; "
+                           "keeping the current cart");
+            if (snap) {
+                blyt_state_ctx_restore_snapshot(sctx, snap);
+                blyt_state_snapshot_free(snap);
+            }
+            return false;
+        }
+    } else if (sctx) {
+        /* Pure-Lua: no session to swap.  The standalone ctx persists across the
+         * rebuild, so zero it now for a fresh-load-identical restore target (a
+         * hybrid ctx was just re-init fresh by the swap, so this only applies
+         * here). */
         blyt_state_ctx_zero_data(sctx);
     }
 
-    /* Swap the cart image into the runner.  Resource-table entries alias the cart
-     * map zero-copy (resource.c), so the table must be re-pointed at new_cart now,
-     * while the old cart is still valid — the caller closes the old cart only
-     * after we return.  Re-seed the default palette from the new cart's assets
-     * too (the new init() may still override it). */
+    /* Re-point the runner's OWN (Lua-facing) resource table + cart/bytecode at
+     * new_cart.  Resource-table entries alias the cart map zero-copy (resource.c),
+     * so it must happen while the old cart is still valid — the caller closes it
+     * only after we return.  For a hybrid the session's NATIVE-facing resources
+     * were already reloaded inside swap_cart; this is the host-side Lua mirror.
+     * Re-seed the default palette from the new cart's assets too (the new init()
+     * may still override it). */
     if (hl->resources_loaded) {
         blyt_resource_table_clear(&hl->resources);
         blyt_resource_table_load_for_cart(&hl->resources, new_cart);
@@ -2392,7 +2426,23 @@ bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
     hl->bytecode_size = lua_size;
     hl_palette_ensure_default(hl);
 
-    /* Rebuild the VM from the NEW bytecode, restore, notify (HOT_RELOAD). */
+#ifdef BLYT_GDB
+    /* Debug reload (#251/#119): rebind the native GDB/lldb view to the swapped
+     * image's DWARF BEFORE the rebuilt init() runs — the reload-time equivalent of
+     * the startup native-breakpoint-armed-before-init() gate, so a breakpoint in a
+     * native lifecycle/export fires on the reloaded run.  No-op without an attached
+     * GDB client or for a pure-Lua runner (no session).  The Lua half's
+     * source-level DAP breakpoints persist host-side and re-arm on the VM rebuild
+     * inside build_vm. */
+    if (fire_solib && hl->session)
+        blyt_session_gdb_notify_cart_reloaded(hl->session, new_cart, load_base, reported_path);
+#else
+    (void)fire_solib;
+#endif
+
+    /* Rebuild the Lua VM from the NEW bytecode (re-wiring the bridge + native
+     * lifecycle against the swapped session for a hybrid), re-run init(), restore
+     * the snapshot, replay on_load_state(HOT_RELOAD). */
     return hl_rebuild_and_restore(hl, snap);
 }
 
@@ -2646,9 +2696,15 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     return NULL;
 }
 
-blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn) {
+blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap) {
     (void)cart;
     (void)log_fn;
+    (void)dap;
+    return NULL;
+}
+
+blyt_session_t *blyt_hostlua_session(blyt_hostlua_t *hl) {
+    (void)hl;
     return NULL;
 }
 
@@ -2687,9 +2743,13 @@ void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
     (void)hl;
 }
 
-bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart) {
+bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart, uint32_t load_base,
+                         const char *reported_path, bool fire_solib) {
     (void)hl;
     (void)new_cart;
+    (void)load_base;
+    (void)reported_path;
+    (void)fire_solib;
     return false;
 }
 

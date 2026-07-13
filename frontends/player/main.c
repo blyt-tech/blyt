@@ -62,6 +62,8 @@ bool blyt_libretro_dap_wait_ready(void);
 bool blyt_libretro_gdb_wait_attached(void);
 void blyt_libretro_gdb_continue_initial_halt(void);
 bool blyt_libretro_gdb_wait_client_continue(void);
+bool blyt_libretro_is_hostlua(void); /* #251 */
+void blyt_libretro_debug_boot(void); /* #251: host-Lua GDB-only deferred boot */
 #endif
 
 /* -------------------------------------------------------------------------
@@ -703,40 +705,47 @@ int main(int argc, char *argv[]) {
     else if (g_dev_ctrl_port >= 0)
         dev_ctrl_start(g_dev_ctrl_port);
 
+#if defined(BLYT_DAP) || defined(BLYT_GDB)
+    /* Debug readiness gate: arm every active debugger's breakpoints BEFORE the cart
+     * boots.  On the host-Lua path (#251) the boot — init()/on_new_state() — runs
+     * inside the DAP wait_ready / debug_boot call below and drives a HYBRID's native
+     * half immediately, so the native GDB gate must run FIRST; on the emulated path
+     * the boot happens in the first retro_run frame, after all gates.  Ordering the
+     * GDB gate before the DAP boot is safe on both — no cart code runs during the
+     * gates, and the two debuggers' transports are serviced on their own threads. */
+#ifdef BLYT_GDB
+    if (g_gdb_port >= 0) {
+        /* Wait for the GDB client to connect and set its breakpoints. */
+        blyt_libretro_gdb_wait_attached();
+        /* Wait for its first continue so native breakpoints are patched in before
+         * the boot — the #119 first-launch ordering gate (a breakpoint in
+         * blyt_cart_init stops on the very first launch, not only the next time its
+         * line runs).  Needed whenever the boot runs the native half right after
+         * this: on the host-Lua path always (the boot below drives it), on the
+         * emulated path only when the Lua half is also DAP-debugged (a pure-native
+         * emulated session waits for the client's continue implicitly).  Fall back
+         * to force-clearing the halt if the client never continues so boot cannot
+         * wedge — #146 makes a late insert fire on its next execution anyway. */
+        if (blyt_libretro_is_hostlua() || g_dap_port >= 0) {
+            if (!blyt_libretro_gdb_wait_client_continue())
+                blyt_libretro_gdb_continue_initial_halt();
+        }
+    }
+#endif
 #ifdef BLYT_DAP
-    /* Wait for the DAP client to finish configuration (setBreakpoints +
-     * configurationDone) before starting the game loop, so that breakpoints
-     * are registered before init() executes. */
+    /* Wait for the DAP client's configurationDone (Lua breakpoints registered); on
+     * the host-Lua path this also runs the deferred boot, now that any native GDB
+     * breakpoints are armed above. */
     if (g_dap_port >= 0)
         blyt_libretro_dap_wait_ready();
 #endif
 #ifdef BLYT_GDB
-    /* Wait for a GDB client to connect before running the cart, so that the
-     * client can set breakpoints before blyt_cart_init() executes. */
-    if (g_gdb_port >= 0)
-        blyt_libretro_gdb_wait_attached();
+    /* Host-Lua GDB-only hybrid: no DAP wait_ready ran the deferred boot, so run it
+     * now (native breakpoints already armed above).  No-op on the emulated path and
+     * whenever DAP is active (the boot already happened). */
+    if (g_gdb_port >= 0 && g_dap_port < 0)
+        blyt_libretro_debug_boot();
 #endif
-#if defined(BLYT_DAP) && defined(BLYT_GDB)
-    /* Hybrid mode (both DAP and GDB active): the Lua breakpoints are already
-     * registered (DAP configurationDone received above).  Wait for the native
-     * side (lldb-dap) to finish ITS initial configuration too — fetch the svr4
-     * library list, insert its breakpoints, and issue its first continue —
-     * before releasing the cart, so the native breakpoints are in place before
-     * any cart code runs (issue #119).  This preserves first-launch ORDERING: a
-     * breakpoint in blyt_cart_init() (the first place most authors set one) stops
-     * on the very first launch, not only the next time its line runs.  Without it
-     * the Lua-first gate would release the cart the instant lldb-dap connects,
-     * letting init() run past the breakpoint line before the insert lands.  This
-     * is no longer a correctness barrier — #146 made breakpoint inserts flush
-     * rv32emu's translated-block cache, so a late insert always fires on its next
-     * execution; the gate only buys the first-launch stop.  Fall back to
-     * force-clearing the halt if the native client never continues (e.g. no lldb
-     * on the native side) so boot cannot wedge — a lost race now costs at most one
-     * launch's ordering, never a silently missed breakpoint. */
-    if (g_dap_port >= 0 && g_gdb_port >= 0) {
-        if (!blyt_libretro_gdb_wait_client_continue())
-            blyt_libretro_gdb_continue_initial_halt();
-    }
 #endif
 
     SDL_Window *win = NULL;
