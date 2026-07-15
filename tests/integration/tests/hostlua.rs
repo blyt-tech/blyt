@@ -13,8 +13,9 @@
 mod common;
 
 use common::{
-    CartProject, build_lua_cart, require_libretro_core, require_lua_sdk, require_sdk, require_wasm,
-    run_cart_all_legs, run_cart_all_legs_reset_every_frame, run_cart_all_legs_with_save_dir,
+    CartProject, blytplay, build_lua_cart, libretro_so, require_libretro_core, require_lua_sdk,
+    require_sdk, require_wasm, run_cart_all_legs, run_cart_all_legs_reset_every_frame,
+    run_cart_all_legs_with_save_dir, test_libretro_core,
 };
 use tempfile::TempDir;
 
@@ -422,4 +423,159 @@ end
     // Reset-every-frame — the host-Lua VM-rebuild cycle must reach the SAME
     // trajectory on every leg.
     run_cart_all_legs_reset_every_frame(&cart, expected);
+}
+
+/// Capture a cart's blytplay `--headless` stdout (the runner's `log_fn` channel,
+/// where `blyt.debug.print` and reported Lua errors land). Self-quitting carts
+/// need no frame cap; `--quit-after` bounds the rest.
+fn capture_blytplay(cart: &std::path::Path) -> String {
+    use assert_cmd::Command;
+    let out = Command::new(blytplay())
+        .args(["--headless", "--quit-after", "5", cart.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Capture a cart's output through the embedded libretro core (the same host-Lua
+/// runner as blytplay, so its Lua errors flow through the identical
+/// `cart_run_hostlua.c` `call_lifecycle`). The core logs on stderr.
+fn capture_libretro(cart: &std::path::Path) -> String {
+    use assert_cmd::Command;
+    let out = Command::new(test_libretro_core())
+        .args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// #258 (AC#1/AC#3): a Lua runtime error in a cart callback prints the **bare**
+/// `lua_tostring` message — `main.lua:<line>: <msg>` — with **no**
+/// `blyt-hostlua: error in NAME()` wrapper, matching the guest's `call_global`
+/// (`blyt_console_debug(lua_tostring(...))` in `blyt32lua.c`) on both the emulated
+/// path and real RISC-V hardware. Before #258 the native host-Lua runner wrapped
+/// it, so the same cart showed different error text on desktop vs on hardware.
+///
+/// Asserted on the two legs that run the `cart_run_hostlua.c` `call_lifecycle`
+/// path — blytplay and the embedded libretro core — which are exactly the legs
+/// that carried the wrapper; both must now emit the bare message and never the
+/// wrapper. (The WASM host-Lua leg already prints the bare message via
+/// `blyt_js_error`, but treats the error as fatal teardown and exits non-zero —
+/// a pre-existing recovery divergence tracked separately, not a format one — so
+/// it is not driven here.)
+#[test]
+fn hostlua_callback_error_prints_bare_message() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_callback_error");
+
+    // draw() raises every frame (recoverable since #236); update() self-quits on
+    // the second frame, so ≥1 error line is printed before the cart exits.
+    CartProject::new()
+        .lua(
+            r#"
+local frames = 0
+function init() end
+function update()
+    frames = frames + 1
+    if frames >= 2 then
+        blyt.quit()
+    end
+end
+function draw()
+    error("kaboom-258")
+end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+
+    // The two legs that carried the wrapper: assert the BARE Lua error text
+    // (chunk name + position + message) and the ABSENCE of the removed wrapper.
+    for (leg, out) in [
+        ("blytplay", capture_blytplay(&cart)),
+        ("libretro", capture_libretro(&cart)),
+    ] {
+        assert!(
+            out.contains("main.lua:") && out.contains(": kaboom-258"),
+            "{leg}: expected bare 'main.lua:<line>: kaboom-258' Lua error, got: {out}"
+        );
+        assert!(
+            !out.contains("blyt-hostlua: error in"),
+            "{leg}: host-Lua-only error wrapper still present (should be bare per #258): {out}"
+        );
+    }
+}
+
+/// #258 (AC#2/AC#3): a Lua error in `init()` **reports-and-continues** on the
+/// native host-Lua path — the error is printed (bare) and the cart still boots and
+/// runs `update()`/`draw()` — matching the guest's `blyt_cart_init`, which calls
+/// `call_global("init")` and ignores its result, leaving `blyt_main` to run the
+/// frame loop. Before #258 `blyt_hostlua_create` aborted the cart (returned NULL)
+/// on an init error.
+///
+/// Asserted on the two `cart_run_hostlua.c` legs (blytplay + libretro). The WASM
+/// host-Lua leg is deliberately EXCLUDED: it treats init (and update/draw) Lua
+/// errors as fatal teardown (`g_lua_fatal`), a pre-existing cross-runtime gap
+/// tracked separately — not introduced or addressed by #258.
+#[test]
+fn hostlua_init_error_reports_and_continues() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_init_error");
+
+    CartProject::new()
+        .lua(
+            r#"
+function init()
+    blyt.debug.print("init-start")
+    error("init-boom-258")
+end
+function update()
+    blyt.debug.print("update-ran")
+    blyt.quit()
+end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+
+    for (leg, out) in [
+        ("blytplay", capture_blytplay(&cart)),
+        ("libretro", capture_libretro(&cart)),
+    ] {
+        assert!(
+            out.contains("init-start"),
+            "{leg}: init() body did not run: {out}"
+        );
+        assert!(
+            out.contains(": init-boom-258"),
+            "{leg}: init() error not reported (bare) per #258: {out}"
+        );
+        assert!(
+            !out.contains("blyt-hostlua: error in"),
+            "{leg}: host-Lua-only error wrapper still present (should be bare per #258): {out}"
+        );
+        // The report-and-continue proof: the cart booted despite the init error
+        // and reached the frame loop.
+        assert!(
+            out.contains("update-ran"),
+            "{leg}: cart aborted on init() error instead of continuing (regressed #258 AC#2): {out}"
+        );
+    }
 }
