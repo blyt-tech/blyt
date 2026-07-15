@@ -46,6 +46,7 @@
 #include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
 #include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
 #include "blyt_handle.h" /* runtime/shared: console-wide handle encoding (ADR-0134) */
+#include "blyt_hostlua_driver.h" /* runtime/shared: the ONE cart-driving model (#242) */
 #include "blyt_hostlua_heap.h" /* runtime/shared: rv32 heap-seam handoff (#231) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
@@ -143,6 +144,18 @@ struct blyt_hostlua {
      * where dap_enabled is false but the boot must still wait for the GDB gate. */
     bool debug;
     bool booted; /* init()/on_new_state() have run (the deferred debug boot) */
+    /* The shared coroutine driver (#242, blyt_hostlua_driver.h): the cart runs
+     * inside `co` — the boot chunk first, then the per-frame chunk resumed once
+     * per blyt_hostlua_run_frame — so this leg's allocation sequence is identical
+     * to the wasm leg's by construction (one chunk source, one coroutine shape),
+     * which is what makes guest_heap_used byte-exact across legs.  The coroutine
+     * is ONLY the execution container: native still pauses for a debugger by
+     * BLOCKING this thread (dap_transport_tcp_lua.c), never by yielding.
+     * Anchored in the registry via co_ref so it survives GC; both are rebuilt on
+     * every VM rebuild (reset/reload/restart). */
+    lua_State *co;
+    int co_ref; /* LUA_NOREF when no coroutine is anchored */
+    bool running_co; /* co holds the frame chunk (else the boot chunk) */
 };
 
 /* The runner is stashed in the lua_State's extra space so the C API callbacks
@@ -272,6 +285,69 @@ static int l_should_quit(lua_State *L) {
     return 1;
 }
 
+/* Forward decl: the shared driver's __blyt_call dispatches through this (defined
+ * with the rest of the lifecycle plumbing below). */
+static int call_lifecycle(blyt_hostlua_t *hl, lua_State *L, const char *name);
+
+/* `__blyt_call(name)` — the shared driver chunk's lifecycle dispatch (#242).
+ *
+ * Runs on the COROUTINE's lua_State (the incoming L), not on hl->L: the cart's
+ * callbacks must execute on the thread the driver chunk is running, so the DAP
+ * master hook armed on that thread sees them and the call frames sit where the
+ * shared execution model puts them.
+ *
+ * call_lifecycle pcalls, so a Lua error is caught HERE, inside the coroutine —
+ * the coroutine never unwinds and stays resumable, which is what gives every leg
+ * the guest's report-and-continue semantics (#236/#258/#264). */
+static void hl_report_lua_error(blyt_hostlua_t *hl, lua_State *L);
+
+static int l_blyt_call_k(lua_State *L, int status, lua_KContext ctx) {
+    (void)ctx;
+    if (status != LUA_OK && status != LUA_YIELD)
+        hl_report_lua_error(hl_from(L), L);
+    return 0;
+}
+
+static int l_blyt_call(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    lua_getglobal(L, name);
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    /* lua_pcallK with a continuation — the same call shape the wasm leg uses, so
+     * the two legs' allocation sequences stay identical by construction.  Native
+     * never actually yields here (it pauses for a debugger by BLOCKING the thread,
+     * dap_transport_tcp_lua.c), but the wasm leg MUST be able to yield out of a
+     * breakpoint through this frame, and the shared driver only stays shared if
+     * both legs call the cart the same way. */
+    int st = lua_pcallk(L, 0, 0, 0, 0, l_blyt_call_k);
+    return l_blyt_call_k(L, st, 0);
+}
+
+/* Phase brackets (#205, #232 S4) driven by the shared chunk; no-ops for a
+ * session-less pure-Lua cart (blyt_session_set_phase(NULL)). */
+static int l_phase_update(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl)
+        blyt_session_set_phase(hl->session, BLYT_PHASE_UPDATE);
+    return 0;
+}
+
+static int l_phase_draw(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl)
+        blyt_session_set_phase(hl->session, BLYT_PHASE_DRAW);
+    return 0;
+}
+
+static int l_phase_none(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl)
+        blyt_session_set_phase(hl->session, BLYT_PHASE_NONE);
+    return 0;
+}
+
 /* Sandboxed require(): the host-Lua fast path replaces the default searcher with
  * a hard error so a cart cannot reach the host filesystem — only modules already
  * registered in package.loaded (native exports) resolve.  Mirrors the WASM leg. */
@@ -389,6 +465,17 @@ static void register_blyt_api(lua_State *L) {
 
     lua_pushcfunction(L, l_require);
     lua_setglobal(L, "require");
+
+    /* The shared driver's dispatch + phase brackets (#242): the ONE chunk in
+     * blyt_hostlua_driver.h drives the cart through these on every host-Lua leg. */
+    lua_pushcfunction(L, l_blyt_call);
+    lua_setglobal(L, BLYT_HOSTLUA_CALL_FN);
+    lua_pushcfunction(L, l_phase_update);
+    lua_setglobal(L, BLYT_HOSTLUA_PHASE_UPDATE_FN);
+    lua_pushcfunction(L, l_phase_draw);
+    lua_setglobal(L, BLYT_HOSTLUA_PHASE_DRAW_FN);
+    lua_pushcfunction(L, l_phase_none);
+    lua_setglobal(L, BLYT_HOSTLUA_PHASE_NONE_FN);
 }
 
 /* Open the sandboxed standard-library subset the host-Lua fast path exposes
@@ -1681,39 +1768,51 @@ static void register_mem_api(lua_State *L) {
     lua_pop(L, 1); /* pop mem module */
 }
 
+/* Report an uncaught Lua error from a cart callback and POP it (#258).
+ *
+ * The one place this leg turns a caught error into output, shared by the driver's
+ * __blyt_call and the C-side lifecycle calls (on_save_state / on_load_state), so
+ * the reporting contract can't drift between them. */
+static void hl_report_lua_error(blyt_hostlua_t *hl, lua_State *L) {
+    const char *msg = lua_tostring(L, -1);
+    if (!hl) {
+        lua_pop(L, 1);
+        return;
+    }
+#ifdef BLYT_DAP
+    /* Exception breakpoints (#257): when a client has set an exception filter
+     * that matches this uncaught Lua error, block here on the exception stop
+     * until the client resumes / disconnects — the native analog of the WASM
+     * leg's blyt_dap_report_exception park.  No filter set → returns 0 and the
+     * error falls through to the normal (non-fatal, printed) handling below,
+     * matching a plain run. */
+    if (hl->dap_enabled)
+        fc_hostlua_dap_report_exception(msg ? msg : "(error)", 1);
+#endif
+    /* Byte-parity with the guest (#258): the BARE lua_tostring message, no
+     * host-Lua-only wrapper and no stderr fallback, so a cart author sees
+     * identical error text on desktop host-Lua and on hardware / emulated. */
+    if (hl->log_fn)
+        hl->log_fn(msg ? msg : "(no message)");
+    lua_pop(L, 1);
+}
+
 /* Call a global lifecycle function `name` if it is defined.  Returns 0 when the
  * callback ran cleanly (or is undefined) and -1 when it raised a Lua error (the
- * message is logged). */
-static int call_lifecycle(blyt_hostlua_t *hl, const char *name) {
-    lua_State *L = hl->L;
+ * message is logged).
+ *
+ * The C-side entry point, used for the callbacks the driver chunk does not own
+ * (on_save_state / on_load_state / on_assets_reloaded), which run on hl->L
+ * outside the coroutine.  The cart's init/update/draw/on_quit/cleanup instead go
+ * through the shared driver's __blyt_call (#242). */
+static int call_lifecycle(blyt_hostlua_t *hl, lua_State *L, const char *name) {
     lua_getglobal(L, name);
     if (!lua_isfunction(L, -1)) {
         lua_pop(L, 1);
         return 0;
     }
     if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-        const char *msg = lua_tostring(L, -1);
-#ifdef BLYT_DAP
-        /* Exception breakpoints (#257): when a client has set an exception filter
-         * that matches this uncaught Lua error, block here on the exception stop
-         * until the client resumes / disconnects — the native analog of the WASM
-         * leg's blyt_dap_report_exception park.  No filter set → returns 0 and the
-         * error falls through to the normal (non-fatal, printed) handling below,
-         * matching a plain run. */
-        if (hl->dap_enabled)
-            fc_hostlua_dap_report_exception(msg ? msg : "(error)", 1);
-#endif
-        /* Byte-parity with the guest (#258): the guest's call_global prints the
-         * BARE lua_tostring message via blyt_console_debug — which the emulated
-         * console_debug ECALL routes through this same log_fn and DISCARDS when it
-         * is NULL (BLYT_ECALL_CONSOLE_DEBUG in cart_run.c).  So emit the bare
-         * message here too — no "blyt-hostlua: error in NAME()" wrapper, and no
-         * stderr fallback — so a cart author sees identical error text on desktop
-         * host-Lua and on hardware / the emulated path.  `name` is unused now. */
-        (void)name;
-        if (hl->log_fn)
-            hl->log_fn(msg ? msg : "(no message)");
-        lua_pop(L, 1);
+        hl_report_lua_error(hl, L);
         return -1;
     }
     return 0;
@@ -1983,7 +2082,84 @@ static int hl_inject_native_lifecycle(blyt_hostlua_t *hl) {
     return 0;
 }
 
-static int build_vm(blyt_hostlua_t *hl) {
+/* Close the VM and drop the driver's coroutine handles with it (#242).
+ *
+ * lua_close frees the registry, so `co_ref` becomes a dangling index into a dead
+ * state: it MUST be reset here, or the next hl_make_co would luaL_unref a stale
+ * index in the rebuilt VM's registry and free an unrelated object. */
+static void hl_close_vm(blyt_hostlua_t *hl) {
+    if (hl->L)
+        lua_close(hl->L);
+    hl->L = NULL;
+    hl->co = NULL;
+    hl->co_ref = LUA_NOREF;
+    hl->running_co = false;
+    hl->lua_exch = NULL;
+    hl->lua_exch_ref = LUA_NOREF;
+}
+
+/* Replace the driver coroutine with a fresh thread running `chunk` (#242).
+ *
+ * The thread is anchored in the registry (luaL_ref) so it survives GC while the
+ * C side holds only a lua_State*, and any previously anchored thread is released
+ * first.  Mirrors — and now shares its chunk source with — the wasm leg.
+ * Returns 0, or -1 with the load error reported through the log channel. */
+static int hl_make_co(blyt_hostlua_t *hl, const char *chunk) {
+    if (hl->co_ref != LUA_NOREF) {
+        luaL_unref(hl->L, LUA_REGISTRYINDEX, hl->co_ref);
+        hl->co_ref = LUA_NOREF;
+    }
+    hl->co = lua_newthread(hl->L);
+    hl->co_ref = luaL_ref(hl->L, LUA_REGISTRYINDEX); /* pops the thread */
+    hl->running_co = false;
+    if (luaL_loadstring(hl->co, chunk) != LUA_OK) {
+        const char *msg = lua_tostring(hl->co, -1);
+        if (hl->log_fn)
+            hl->log_fn(msg ? msg : "(driver chunk load failed)");
+        lua_pop(hl->co, 1);
+        return -1;
+    }
+#ifdef BLYT_DAP
+    /* Arm the master hook on the coroutine too: the cart's callbacks execute on
+     * THIS thread, so a hook armed only on hl->L would never see them (the wasm
+     * leg installs per-coroutine for the same reason). */
+    if (hl->dap_enabled)
+        fc_consolelua_master_hook_install(hl->co);
+#endif
+    return 0;
+}
+
+/* Run the boot chunk to completion, then swap the driver over to the frame chunk
+ * (#242) — the shared driver's boot→running transition.
+ *
+ * A Lua error inside init()/on_new_state() is caught by the pcall in __blyt_call
+ * and reported there, so the resume returns LUA_OK and the cart still boots:
+ * report-and-continue, matching the guest's blyt_cart_init (#258).  Returns 0 on
+ * success, -1 if the frame chunk could not be built. */
+static int hl_boot(blyt_hostlua_t *hl) {
+    if (!hl->co || hl->running_co)
+        return 0;
+    int nres = 0;
+    int st = lua_resume(hl->co, NULL, 0, &nres);
+    while (st == LUA_YIELD) {
+        lua_settop(hl->co, 0); /* a boot-phase yield is not a frame boundary */
+        st = lua_resume(hl->co, NULL, 0, &nres);
+    }
+    if (st != LUA_OK) {
+        /* __blyt_call swallows callback errors, so reaching here means the driver
+         * chunk itself failed — report it rather than losing it silently. */
+        const char *msg = lua_tostring(hl->co, -1);
+        if (hl->log_fn)
+            hl->log_fn(msg ? msg : "(driver boot failed)");
+        lua_settop(hl->co, 0);
+    }
+    if (hl_make_co(hl, BLYT_HOSTLUA_CO_BODY_RUNNING) != 0)
+        return -1;
+    hl->running_co = true;
+    return 0;
+}
+
+static int build_vm(blyt_hostlua_t *hl, bool reload_boot) {
     /* lua_newstate with the arena-backed allocator (#158) + the seam VM's pinned
      * hash seed (luaL_makeseed(NULL) == luai_makeseed override 0x424C5954) — the
      * SAME seed luaL_newstate uses, kept for determinism (mirrors the WASM leg). */
@@ -2025,8 +2201,7 @@ static int build_vm(blyt_hostlua_t *hl) {
             fprintf(stderr, "blyt-hostlua: failed to load cart bytecode: %s\n",
                     msg ? msg : "(no message)");
         }
-        lua_close(hl->L);
-        hl->L = NULL;
+        hl_close_vm(hl);
         return -1;
     }
 
@@ -2036,38 +2211,56 @@ static int build_vm(blyt_hostlua_t *hl) {
      * defined in both halves is caught.  Before the baseline so these scaffolding
      * closures are excluded from the cart-attributable heap. */
     if (hl_inject_native_lifecycle(hl) != 0) {
-        lua_close(hl->L);
-        hl->L = NULL;
+        hl_close_vm(hl);
         return -1;
     }
 
-    /* Capture the runtime-scaffolding baseline (#231): everything allocated up to
-     * here — the VM, stdlibs, blyt/blyt32 API, S proxy, and the loaded cart
-     * bytecode — is runtime overhead, identical for a given cart but different in
-     * amount from the wasm leg (which additionally builds driver coroutines) and
-     * the emulated leg. Excluding it makes guest_heap_used / cart_allocations and
-     * the 16 MB fail-point count only the cart's own runtime allocations, so they
-     * are byte-identical across legs. Re-captured on every (re)build.
-     *
-     * Collect first (#231): the baseline must be the *settled* scaffolding
-     * footprint, not a snapshot that still holds this leg's build-time transient
-     * garbage — the amount of that garbage differs between legs (native builds the
-     * VM from C, wasm additionally builds driver coroutines), and any uncollected
-     * remainder biases the subtraction. A full collection here pins the baseline
-     * to the reachable scaffolding on every leg, so guest_heap_used − baseline is
-     * the byte-identical cart-attributable heap. */
-    lua_gc(hl->L, LUA_GCCOLLECT);
-    hl->mem_acct.guest_heap_baseline = hl->mem_acct.guest_heap_used;
-
 #ifdef BLYT_DAP
     /* Arm the DAP master hook on the fresh VM so breakpoints/steps fire in the
-     * lifecycle callbacks (#234).  Re-run on every rebuild (reset/reload), the
-     * native equivalent of the WASM leg re-installing the hook per coroutine. */
+     * lifecycle callbacks (#234).  Re-run on every rebuild (reset/reload).
+     *
+     * MUST precede hl_make_co: fc_consolelua_master_hook_install derives its hook
+     * mask from fc_master_hook_cfg.dap_enabled, so a coroutine created while that
+     * flag is still false would be installed with an EMPTY mask and the cart's
+     * callbacks — which run on that coroutine — would never trap.  lua_sethook
+     * does not allocate, so arming here is baseline-neutral. */
     if (hl->dap_enabled) {
         fc_master_hook_cfg.dap_enabled = true;
         fc_consolelua_master_hook_install(hl->L);
     }
 #endif
+
+    /* Build the driver's BOOT coroutine (#242) — before the baseline, so the
+     * coroutine thread and the boot chunk's interned strings are scaffolding, not
+     * cart-attributable.  The frame chunk is deliberately NOT compiled here: it is
+     * built at the boot→running transition (hl_boot), i.e. AFTER the baseline, so
+     * its strings ARE counted.  That split is not arbitrary — it is the shared
+     * driver's one definition of what counts, applied identically on every leg. */
+    if (hl_make_co(hl, reload_boot ? BLYT_HOSTLUA_CO_BODY_RELOAD_INIT
+                                   : BLYT_HOSTLUA_CO_BODY_INIT) != 0) {
+        hl_close_vm(hl);
+        return -1;
+    }
+
+    /* Capture the runtime-scaffolding baseline (#231): everything allocated up to
+     * here — the VM, stdlibs, blyt/blyt32 API, S proxy, the loaded cart bytecode
+     * and the driver's boot coroutine — is runtime overhead. Excluding it makes
+     * guest_heap_used / cart_allocations and the 16 MB fail-point count only the
+     * cart's own runtime allocations, so they are byte-identical across legs.
+     * Re-captured on every (re)build.
+     *
+     * Since #242 every host-Lua leg builds this scaffolding through the SAME
+     * shared driver (blyt_hostlua_driver.h), so what lands before the baseline is
+     * the same on all of them by construction — the old native-vs-wasm asymmetry
+     * ("wasm additionally builds driver coroutines") is gone.
+     *
+     * Collect first (#231): the baseline must be the *settled* scaffolding
+     * footprint, not a snapshot that still holds build-time transient garbage; any
+     * uncollected remainder biases the subtraction. A full collection here pins the
+     * baseline to the reachable scaffolding, so guest_heap_used − baseline is the
+     * byte-identical cart-attributable heap. */
+    lua_gc(hl->L, LUA_GCCOLLECT);
+    hl->mem_acct.guest_heap_baseline = hl->mem_acct.guest_heap_used;
     return 0;
 }
 
@@ -2097,6 +2290,7 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_en
     hl->dap_enabled = dap_enabled; /* build_vm arms the master hook when set (#234) */
     hl->debug = debug; /* boot deferred to the frontend's debug gate (#234/#251) */
     hl->lua_exch_ref = LUA_NOREF;
+    hl->co_ref = LUA_NOREF; /* calloc's 0 is a VALID registry ref, not "unset" */
 
     /* Resource table (#93/#158/#231): load the cart's bundled + persistent
      * resources so blyt.resource.*, mem.stats, and cart-asset palettes resolve
@@ -2161,7 +2355,7 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_en
         snprintf(hl->cart_name, sizeof(hl->cart_name), "%s", blyt_cart_id(cart));
     }
 
-    if (build_vm(hl) != 0) {
+    if (build_vm(hl, false) != 0) {
         if (hl->session)
             blyt_session_destroy(hl->session);
         if (hl->state_ctx) {
@@ -2182,13 +2376,16 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     if (!hl)
         return NULL;
 
-    /* Boot phase of the guest blyt_main loop: init() then on_new_state().  A Lua
-     * error in either is REPORTED (bare, by call_lifecycle) and the cart still
-     * boots — matching the guest's blyt_cart_init, which calls call_global("init")
-     * and ignores its result, leaving the main loop to run update()/draw() (#258).
-     * Both run unconditionally; neither aborts the cart. */
-    call_lifecycle(hl, "init");
-    call_lifecycle(hl, "on_new_state");
+    /* Boot phase of the guest blyt_main loop: init() then on_new_state(), run
+     * inside the shared driver's boot coroutine (#242).  A Lua error in either is
+     * REPORTED (bare, by the pcall in __blyt_call) and the cart still boots —
+     * matching the guest's blyt_cart_init, which calls call_global("init") and
+     * ignores its result, leaving the main loop to run update()/draw() (#258).
+     * Neither aborts the cart. */
+    if (hl_boot(hl) != 0) {
+        blyt_hostlua_destroy(hl);
+        return NULL;
+    }
     hl->booted = true;
     return hl;
 }
@@ -2244,8 +2441,8 @@ int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
     /* Run the deferred boot (under the armed hook, if any) so a breakpoint in init()
      * — Lua-half (DAP) or native-half (GDB) — pauses before the cart proceeds. */
     if (!hl->booted) {
-        call_lifecycle(hl, "init");
-        call_lifecycle(hl, "on_new_state");
+        if (hl_boot(hl) != 0)
+            return 0;
         hl->booted = true;
     }
     return 1;
@@ -2261,11 +2458,12 @@ int blyt_hostlua_dap_restart(blyt_hostlua_t *hl) {
      * it fresh (no state preserved: a restart is a re-run, not a hot reload), then
      * defer init() to the next wait_ready so a breakpoint in init() fires after
      * the client re-sends configurationDone.  build_vm re-arms the master hook. */
-    lua_close(hl->L);
-    hl->L = NULL;
+    hl_close_vm(hl);
     if (hl->arena.base)
         blyt_arena_reset(&hl->arena);
-    if (build_vm(hl) != 0) {
+    /* A restart is a fresh re-run, so the full boot chunk (init + on_new_state) —
+     * unlike the reload/reset rebuild, which preserves state and runs init() only. */
+    if (build_vm(hl, false) != 0) {
         hl->done = true;
         return -1;
     }
@@ -2295,15 +2493,18 @@ int blyt_hostlua_dap_restart(blyt_hostlua_t *hl) {
 static bool hl_rebuild_and_restore(blyt_hostlua_t *hl, blyt_state_snapshot_t *snap) {
     /* Tear down the VM and rebuild it (all Lua globals wiped — the host-Lua
      * equivalent of zeroing guest BSS; build_vm re-arms the DAP hook, #234). */
-    lua_close(hl->L);
-    hl->L = NULL;
+    hl_close_vm(hl);
     /* Empty the cart heap so the reloaded VM's allocations are bit-identical to a
      * first load (mirrors the WASM leg's wasm_lua_arena_reset).  lua_close already
      * frees the old VM's objects through the allocator; this zeroes any residual
      * accounting so guest_heap_used restarts from 0. */
     if (hl->arena.base)
         blyt_arena_reset(&hl->arena);
-    if (build_vm(hl) != 0) {
+    /* reload_boot: the rebuilt VM runs init() ONLY — a reload/reset PRESERVES
+     * state, so on_new_state() must not fire; the restore + on_load_state tail
+     * below is what re-seeds the cart (#242 routes this through the shared
+     * driver's reload boot chunk). */
+    if (build_vm(hl, true) != 0) {
         /* Rebuild failed: the runner is unusable; mark done so run_frame stops. */
         if (snap)
             blyt_state_snapshot_free(snap);
@@ -2311,9 +2512,15 @@ static bool hl_rebuild_and_restore(blyt_hostlua_t *hl, blyt_state_snapshot_t *sn
         return false;
     }
 
-    /* Re-run init() on the fresh VM (under the re-armed hook, an init()
-     * breakpoint pauses here — the reload-while-debug re-fire, #244). */
-    call_lifecycle(hl, "init");
+    /* Re-run init() on the fresh VM inside the driver's boot coroutine (under the
+     * re-armed hook, an init() breakpoint pauses here — the reload-while-debug
+     * re-fire, #244), then swap the driver to the frame chunk. */
+    if (hl_boot(hl) != 0) {
+        if (snap)
+            blyt_state_snapshot_free(snap);
+        hl->done = true;
+        return false;
+    }
 
     /* Restore state buffers + notify the cart (BLYT_LOAD_HOT_RELOAD = 3). */
     if (snap) {
@@ -2346,7 +2553,7 @@ void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
      * asserting the same output here as a plain run is the determinism stress. */
 
     /* 1. Ask the cart to flush any transient state into state buffers. */
-    call_lifecycle(hl, "on_save_state");
+    call_lifecycle(hl, hl->L, "on_save_state");
 
     /* 2. Snapshot + 3. zero state buffers (no-ops when the cart has no buffers,
      * where the cycle is just a VM rebuild). */
@@ -2379,7 +2586,7 @@ bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart, uint32_t loa
      * swap, so it sees a coherent old image (the same order as the reset cycle and
      * the WASM pure-Lua reload).  Must precede blyt_session_swap_cart below, which
      * destroys+re-inits the (session-owned) state ctx. */
-    call_lifecycle(hl, "on_save_state");
+    call_lifecycle(hl, hl->L, "on_save_state");
     blyt_state_ctx_t *sctx = hl_active_ctx(hl);
     blyt_state_snapshot_t *snap = sctx ? blyt_state_ctx_snapshot(sctx) : NULL;
 
@@ -2569,15 +2776,8 @@ blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
         return BLYT_RUN_RESTART;
 #endif
 
-    /* Quit is tested at the top of the call, mirroring blyt_main's
-     * `while (!g_quit_requested)`: a quit requested during a prior update() still
-     * ran that frame's draw(); the exit runs on_quit() + cleanup() once. */
-    if (hl->quit) {
-        call_lifecycle(hl, "on_quit");
-        call_lifecycle(hl, "cleanup");
-        hl->done = true;
-        return BLYT_RUN_OK;
-    }
+    if (!hl->co || !hl->running_co)
+        return BLYT_RUN_ERR_EMU; /* not booted — the frontend must boot first */
 
     /* Frame entry (mirrors blyt_session_run_frame): bump the tier-2 lock epoch so
      * any lock from the previous frame is now stale, and reap the previous
@@ -2585,22 +2785,39 @@ blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
     hl->lock_epoch++;
     hl_surf_reap(hl);
 
-    /* Phase brackets (#205, #232 S4): a hybrid cart's emulated native half reads
-     * the phase off the session run-ctx to gate surface access to draw().  The
-     * native counterpart of the WASM leg's __blyt_phase_* globals; a no-op for a
-     * session-less pure-Lua runner (blyt_session_set_phase(NULL)). */
-    /* A Lua error in update()/draw() is PRINTED (by call_lifecycle) and
-     * NON-FATAL — the frame continues and the cart keeps running, byte-for-byte
-     * matching the emulated guest's per-frame `call_global` (blyt32lua.c), which
-     * `blyt_console_debug`s the error and returns.  A quit already requested in
-     * update() still takes effect on the next frame, so a cart that errors then
-     * quits exits cleanly (0).  Aborting here would diverge from the emulated
-     * path (which never aborts on a per-frame Lua error). */
-    blyt_session_set_phase(hl->session, BLYT_PHASE_UPDATE);
-    call_lifecycle(hl, "update");
-    blyt_session_set_phase(hl->session, BLYT_PHASE_DRAW);
-    call_lifecycle(hl, "draw");
-    blyt_session_set_phase(hl->session, BLYT_PHASE_NONE);
+    /* Resume the shared driver's frame chunk (#242): ONE resume == ONE frame, the
+     * coroutine.yield() at the bottom of the loop being the frame boundary.  The
+     * chunk owns the phase brackets, the update/draw dispatch and the quit test,
+     * so this leg and the wasm leg execute the cart through the identical
+     * allocation sequence.
+     *
+     * Quit ordering is the chunk's `while not blyt.should_quit()`, tested only at
+     * the top — so a quit requested during update() still runs THIS frame's
+     * draw(), mirroring blyt_main's `while (!g_quit_requested)`.  on_quit() +
+     * cleanup() run in the chunk's tail, after which the resume returns LUA_OK.
+     *
+     * A Lua error in update()/draw() is PRINTED and NON-FATAL: __blyt_call pcalls
+     * each callback, so the error never unwinds this coroutine and the next frame
+     * still runs — byte-for-byte the emulated guest's per-frame `call_global`
+     * (blyt32lua.c), which blyt_console_debugs the error and returns.  A resume
+     * error here therefore means the DRIVER failed, not the cart. */
+    int nres = 0;
+    int st = lua_resume(hl->co, NULL, 0, &nres);
+
+    if (st == LUA_OK) {
+        /* The loop exited and on_quit()/cleanup() have run — the cart is done. */
+        hl->done = true;
+        return BLYT_RUN_OK;
+    }
+    if (st != LUA_YIELD) {
+        const char *msg = lua_tostring(hl->co, -1);
+        if (hl->log_fn)
+            hl->log_fn(msg ? msg : "(driver frame failed)");
+        lua_settop(hl->co, 0);
+        hl->done = true;
+        return BLYT_RUN_ERR_ABORT;
+    }
+    lua_settop(hl->co, 0); /* discard yielded values — the normal frame yield */
 
     /* A native lifecycle callback may have latched a quit through the trampoline
      * loop; also poll the session directly so a quit requested by the emulated

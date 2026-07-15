@@ -41,6 +41,7 @@
 #ifdef BLYT_LUA
 #include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
 #include "blyt_handle.h" /* runtime/shared: console-wide resource-constant encoding (ADR-0134) */
+#include "blyt_hostlua_driver.h" /* runtime/shared: the ONE cart-driving model (#242) */
 #include "blyt_hostlua_heap.h" /* runtime/shared: host-Lua stack-exclusion flag (#231) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
 #include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
@@ -264,32 +265,25 @@ static blyt_state_snapshot_t *g_reload_snap = NULL;
 #define WASM_LUA_TYPE_F32 3
 #define WASM_LUA_TYPE_BOOL 4
 
-/* Coroutine body: run init() + on_new_state(), then finish (LUA_OK). */
-static const char co_body_init[] = "init() "
-                                   "if type(on_new_state) == 'function' then on_new_state() end";
+/* The cart-driving chunks (#242).  These are NOT defined here: they come from
+ * runtime/shared/blyt_hostlua_driver.h, the single source of truth this leg now
+ * shares with the native runner (cart_run_hostlua.c).  Both legs compiling the
+ * same chunk source is what makes guest_heap_used byte-exact — the two used to
+ * intern different scaffolding strings and rehash g->strt at different counts,
+ * which was the whole execution-model residual (#231 → #242). */
+static const char co_body_init[] = BLYT_HOSTLUA_CO_BODY_INIT;
 
 #ifdef BLYT_GDB
-/* Coroutine body for a debug hot reload (issue #170): run ONLY init() under the
- * loop's INIT phase (so a Lua init() breakpoint fires under the master hook and
- * a Lua→native trampoline can yield for a native breakpoint).  No on_new_state()
- * — the reload preserves state: the loop runs the restore + on_load_state tail
- * once init() completes, not a fresh-boot reset. */
-static const char co_body_reload_init[] = "init()";
+/* Debug hot reload (issue #170): run ONLY init() under the loop's INIT phase (so
+ * a Lua init() breakpoint fires under the master hook and a Lua→native
+ * trampoline can yield for a native breakpoint).  No on_new_state() — the reload
+ * preserves state: the loop runs the restore + on_load_state tail once init()
+ * completes, not a fresh-boot reset. */
+static const char co_body_reload_init[] = BLYT_HOSTLUA_CO_BODY_RELOAD_INIT;
 #endif
 
-/* Coroutine body: per-frame update/draw loop with frame-boundary yield.  The
- * __blyt_phase_* brackets mirror the emulated blyt_main's BLYT_ECALL_PHASE
- * signal so a hybrid cart's native half stays draw()-only (#205); they no-op for
- * a session-less pure-Lua cart. */
-static const char co_body_running[] = "while not blyt.should_quit() do "
-                                      "  __blyt_phase_update() "
-                                      "  update() "
-                                      "  __blyt_phase_draw() "
-                                      "  if type(draw) == 'function' then draw() end "
-                                      "  coroutine.yield() "
-                                      "end "
-                                      "if type(on_quit) == 'function' then on_quit() end "
-                                      "if type(cleanup) == 'function' then cleanup() end";
+/* Per-frame update/draw loop with frame-boundary yield. */
+static const char co_body_running[] = BLYT_HOSTLUA_CO_BODY_RUNNING;
 #endif /* BLYT_LUA */
 
 /* -------------------------------------------------------------------------
@@ -443,6 +437,61 @@ static int lua_wasm_phase_draw(lua_State *L) {
     (void)L;
     blyt_session_set_phase(g_session, BLYT_PHASE_DRAW);
     return 0;
+}
+static int lua_wasm_phase_none(lua_State *L) {
+    (void)L;
+    blyt_session_set_phase(g_session, BLYT_PHASE_NONE);
+    return 0;
+}
+
+/* `__blyt_call(name)` — the shared driver's lifecycle dispatch (#242).
+ *
+ * The twin of the native runner's l_blyt_call/call_lifecycle
+ * (runtime/host/src/libblyt/cart_run_hostlua.c), driven by the SAME chunk from
+ * blyt_hostlua_driver.h so both legs execute the cart through the identical
+ * allocation sequence.
+ *
+ * Runs on the incoming L — the driver coroutine — so the cart's callbacks
+ * execute on the thread the master hook is armed for.  pcall'ing here is what
+ * makes an erroring callback RECOVERABLE on this leg (#264): the error is caught
+ * inside the coroutine, so the coroutine never unwinds, stays resumable, and the
+ * next frame still runs — matching the native/libretro legs and the guest's
+ * call_global rather than tearing the cart down. */
+static int lua_wasm_blyt_call_k(lua_State *L, int status, lua_KContext ctx) {
+    (void)ctx;
+    if (status != LUA_OK && status != LUA_YIELD) {
+        const char *msg = lua_tostring(L, -1);
+#ifdef BLYT_DAP
+        /* Exception breakpoints: the error is caught here now rather than
+         * surfacing out of lua_resume, so the DAP exception park must happen at
+         * this point (the native leg does the same inside call_lifecycle). */
+        blyt_dap_report_exception(L, 1);
+#endif
+        /* Bare lua_tostring message (#258) — identical text on every leg. */
+        blyt_js_error(msg ? msg : "(no message)");
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
+static int lua_wasm_blyt_call(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    lua_getglobal(L, name);
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    /* lua_pcallK, not lua_pcall — the K is load-bearing on THIS leg.
+     *
+     * A DAP breakpoint here pauses by lua_yield-ing out of the debug hook
+     * (dap_transport_wasm.c: the browser/Node event loop cannot block). A plain
+     * lua_pcall would put a NON-yieldable C-call boundary between the coroutine
+     * and the cart's callback, so that yield would fail with "attempt to yield
+     * across a C-call boundary" and the debugger would see an empty stack.
+     * Passing a continuation makes this frame yieldable, so the pause can unwind
+     * through it and resume back into lua_wasm_blyt_call_k. */
+    int st = lua_pcallk(L, 0, 0, 0, 0, lua_wasm_blyt_call_k);
+    return lua_wasm_blyt_call_k(L, st, 0);
 }
 
 /* -------------------------------------------------------------------------
@@ -2325,9 +2374,13 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     lua_pushcfunction(g_lua, wasm_lua_require);
     lua_setglobal(g_lua, "require");
     lua_pushcfunction(g_lua, lua_wasm_phase_update);
-    lua_setglobal(g_lua, "__blyt_phase_update");
+    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_UPDATE_FN);
     lua_pushcfunction(g_lua, lua_wasm_phase_draw);
-    lua_setglobal(g_lua, "__blyt_phase_draw");
+    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_DRAW_FN);
+    lua_pushcfunction(g_lua, lua_wasm_phase_none);
+    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_NONE_FN);
+    lua_pushcfunction(g_lua, lua_wasm_blyt_call);
+    lua_setglobal(g_lua, BLYT_HOSTLUA_CALL_FN);
 
     /* Step 8: re-register state + resource API */
     if (active_state_ctx())
@@ -3470,9 +3523,13 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
      * update()/draw() with these so a hybrid cart's native half stays
      * draw()-only through the gfx ECALL gate. */
     lua_pushcfunction(g_lua, lua_wasm_phase_update);
-    lua_setglobal(g_lua, "__blyt_phase_update");
+    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_UPDATE_FN);
     lua_pushcfunction(g_lua, lua_wasm_phase_draw);
-    lua_setglobal(g_lua, "__blyt_phase_draw");
+    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_DRAW_FN);
+    lua_pushcfunction(g_lua, lua_wasm_phase_none);
+    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_NONE_FN);
+    lua_pushcfunction(g_lua, lua_wasm_blyt_call);
+    lua_setglobal(g_lua, BLYT_HOSTLUA_CALL_FN);
 
     /* Create rv32emu session when the cart has native code.
      * For pure Lua carts with only .cart.layouts, use a lightweight state ctx
