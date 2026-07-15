@@ -241,7 +241,8 @@ fn lua_guest_heap_used_matches_wasm32_for_exec_model_constructs() {
     let hostlua = heap_used(&capture_cart_native(&cart, &[]));
 
     assert_eq!(
-        hostlua, wasm,
+        hostlua,
+        wasm,
         "native host-Lua guest_heap_used must equal its wasm32 sibling for the \
          execution-model-sensitive constructs (#242 TARGET): interning-heavy \
          tables, luaL_Buffer-boxed strings, open-upvalue closures and coroutine \
