@@ -1703,14 +1703,16 @@ static int call_lifecycle(blyt_hostlua_t *hl, const char *name) {
         if (hl->dap_enabled)
             fc_hostlua_dap_report_exception(msg ? msg : "(error)", 1);
 #endif
-        if (hl->log_fn) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "blyt-hostlua: error in %s(): %s", name,
-                     msg ? msg : "(no message)");
-            hl->log_fn(buf);
-        } else {
-            fprintf(stderr, "blyt-hostlua: error in %s(): %s\n", name, msg ? msg : "(no message)");
-        }
+        /* Byte-parity with the guest (#258): the guest's call_global prints the
+         * BARE lua_tostring message via blyt_console_debug — which the emulated
+         * console_debug ECALL routes through this same log_fn and DISCARDS when it
+         * is NULL (BLYT_ECALL_CONSOLE_DEBUG in cart_run.c).  So emit the bare
+         * message here too — no "blyt-hostlua: error in NAME()" wrapper, and no
+         * stderr fallback — so a cart author sees identical error text on desktop
+         * host-Lua and on hardware / the emulated path.  `name` is unused now. */
+        (void)name;
+        if (hl->log_fn)
+            hl->log_fn(msg ? msg : "(no message)");
         lua_pop(L, 1);
         return -1;
     }
@@ -2180,11 +2182,13 @@ blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
     if (!hl)
         return NULL;
 
-    /* Boot phase of the guest blyt_main loop: init() then on_new_state(). */
-    if (call_lifecycle(hl, "init") != 0 || call_lifecycle(hl, "on_new_state") != 0) {
-        blyt_hostlua_destroy(hl);
-        return NULL;
-    }
+    /* Boot phase of the guest blyt_main loop: init() then on_new_state().  A Lua
+     * error in either is REPORTED (bare, by call_lifecycle) and the cart still
+     * boots — matching the guest's blyt_cart_init, which calls call_global("init")
+     * and ignores its result, leaving the main loop to run update()/draw() (#258).
+     * Both run unconditionally; neither aborts the cart. */
+    call_lifecycle(hl, "init");
+    call_lifecycle(hl, "on_new_state");
     hl->booted = true;
     return hl;
 }
