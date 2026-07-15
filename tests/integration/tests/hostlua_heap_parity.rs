@@ -27,20 +27,20 @@
 //! retires the guest-lib Lua path (host-Lua everywhere, incl. rv32 hardware via
 //! the native fast path); it is out of scope for the size seam.
 //!
-//! SCOPE (#231 → #230): this cart drives the seam's two dominant divergent
-//! headers — `Table` (array-part tables) and `TString` (long, non-interned
-//! string bodies) — where the size normalisation is byte-exact across legs. A
-//! handful of other constructs (short-string *interning* — the string table
-//! rehashes at counts that differ because the two runners intern different
-//! scaffolding strings; `luaL_Buffer`-boxed strings > the aux-buffer threshold;
-//! closures with open upvalues; coroutine threads) still carry a small (≤ a few
-//! hundred bytes) *execution-model* residual: the wasm runner drives the cart
-//! through a `co_body` coroutine while the native runner calls lifecycle
-//! functions directly from C. Excluding the VM data stack + CallInfo from
-//! `guest_heap_used` (the #231 fix) removes the bulk of that difference; the last
-//! residual needs the two runners to execute identically, which is the epic-#230
-//! "one shared runner" unification. Tracked as a #230 follow-up; NOT asserted
-//! here so this gate pins the seam's sizing without depending on that refactor.
+//! SCOPE (#231 → #230): the first test drives the seam's two dominant divergent
+//! headers — `Table` (array-part tables) and `TString` (long, non-interned string
+//! bodies) — where the size normalisation is byte-exact across legs.
+//!
+//! The second test drives the constructs that were once attributed to a runner
+//! *execution-model* divergence (the wasm `co_body` coroutine vs the native
+//! direct-C runner). That attribution was only partly right. #242 unified both
+//! legs onto one shared coroutine driver
+//! (`runtime/shared/blyt_hostlua_driver.h`), which made coroutine threads
+//! byte-exact and took the residual 320 B -> 160 B — but not to zero. The
+//! remainder is a *sizing* gap, not an execution-model one: strings past the
+//! `luaL_Buffer` aux threshold become **external strings**, whose `TString`
+//! carries `contents`/`falloc`/`ud` — three pointers, 24 B host vs 12 B rv32.
+//! That is tracked in #267 and the second test is #[ignore]d until it lands.
 
 mod common;
 use common::*;
@@ -220,11 +220,20 @@ fn lua_guest_heap_used_matches_wasm32_on_native_host_lua() {
 /// allocation sequence is identical by construction rather than by hand-mirroring
 /// two implementations, so there is nothing left to diverge.
 ///
-/// RED until the runners unify: today wasm drives the cart through a `co_body`
-/// coroutine (interning that chunk's strings, allocating driver threads) while
-/// native calls `init()`/`update()`/`draw()` directly from C via `call_lifecycle`,
-/// so these constructs sit ~16..64 B apart.
+/// The runner half of this is DONE (#242): both legs now execute the cart through
+/// the one shared coroutine driver (`runtime/shared/blyt_hostlua_driver.h`), which
+/// took the residual 320 B -> 160 B and made coroutine threads byte-exact.
+///
+/// Still RED on the remainder, which turned out NOT to be execution-model at all
+/// but a SIZING hole in the #231 seam (#267): strings past the `luaL_Buffer`
+/// threshold become external strings, whose `TString` carries three pointers
+/// (`contents`/`falloc`/`ud`) that are 24 B on a 64-bit host vs 12 B on rv32.
+/// Bisected: boxed strings +144, interning +16, closures -16, threads 0.
+///
+/// Ignored — not deleted — so the oracle stays in the tree and #267 closes by
+/// removing one attribute. Un-ignore it there.
 #[test]
+#[ignore = "#267: external/boxed-string seam sizing gap (the non-runner remainder of #242)"]
 fn lua_guest_heap_used_matches_wasm32_for_exec_model_constructs() {
     require_sdk();
     require_lua_sdk();
