@@ -59,12 +59,17 @@
 #ifndef BLYT_SHARED_HOSTLUA_DRIVER_H
 #define BLYT_SHARED_HOSTLUA_DRIVER_H
 
+#include "lua.h" /* lua_State / lua_CFunction for the registration below */
+
 /*
- * The name the runner must register as a global C closure before loading any of
- * the chunks below: `__blyt_call(name)` looks up global `name`, returns quietly
- * if it is not a function, otherwise pcalls it with no args and — on error —
- * reports the bare lua_tostring message through the leg's log channel and
- * returns normally (report-and-continue, never rethrow).
+ * The name of the driver's dispatch global: `__blyt_call(name)` looks up global
+ * `name`, returns quietly if it is not a function, otherwise pcalls it with no
+ * args and — on error — reports the bare lua_tostring message through the leg's
+ * log channel and returns normally (report-and-continue, never rethrow).
+ *
+ * Registered by blyt_hostlua_driver_register_globals() below, NOT by the runner:
+ * see that function for why the driver owns this rather than documenting it as
+ * an obligation.
  */
 #define BLYT_HOSTLUA_CALL_FN "__blyt_call"
 
@@ -77,6 +82,42 @@
 #define BLYT_HOSTLUA_PHASE_UPDATE_FN "__blyt_phase_update"
 #define BLYT_HOSTLUA_PHASE_DRAW_FN "__blyt_phase_draw"
 #define BLYT_HOSTLUA_PHASE_NONE_FN "__blyt_phase_none"
+
+/*
+ * Register the driver's OWN four globals, in one canonical order, from one
+ * definition (#267). The leg supplies the four C functions — their bodies are
+ * necessarily leg-specific (each logs and reads its phase off its own run-ctx) —
+ * but the names, the count and above all the ORDER live here.
+ *
+ * Why the order is load-bearing rather than cosmetic. These names are interned
+ * short strings, so registering them allocates, and they land in the scaffolding
+ * that guest_heap_used subtracts as its baseline (see the baseline capture in
+ * each runner). Subtracting the baseline removes the scaffolding's BYTES but not
+ * its LAYOUT: the arena is first-fit and charges a recycled block whole when the
+ * remainder is too small to split (blyt_arena.c), so a different registration
+ * order leaves a different free list, and the cart's own later allocations get
+ * charged differently. That is not theoretical — native registered
+ * __blyt_call first and wasm registered it last, which refracted into a constant
+ * ±16 B cross-leg divergence in cart_allocations that survived #242's runner
+ * unification and blocked ADR-0029's determinism contract (#267).
+ *
+ * So: the driver defines these names, and the driver registers them. A leg that
+ * hand-rolls the sequence can silently drift out of order again; calling this
+ * cannot.
+ */
+static inline void blyt_hostlua_driver_register_globals(lua_State *L, lua_CFunction call_fn,
+                                                        lua_CFunction phase_update_fn,
+                                                        lua_CFunction phase_draw_fn,
+                                                        lua_CFunction phase_none_fn) {
+    lua_pushcfunction(L, call_fn);
+    lua_setglobal(L, BLYT_HOSTLUA_CALL_FN);
+    lua_pushcfunction(L, phase_update_fn);
+    lua_setglobal(L, BLYT_HOSTLUA_PHASE_UPDATE_FN);
+    lua_pushcfunction(L, phase_draw_fn);
+    lua_setglobal(L, BLYT_HOSTLUA_PHASE_DRAW_FN);
+    lua_pushcfunction(L, phase_none_fn);
+    lua_setglobal(L, BLYT_HOSTLUA_PHASE_NONE_FN);
+}
 
 /*
  * Boot chunk: the guest blyt_main's boot phase — init() then on_new_state().

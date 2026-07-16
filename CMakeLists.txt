@@ -106,14 +106,22 @@ FetchContent_Declare(
 # l_sprintf through blyt_fpm_strtod / blyt_fpm_snprintf under the same guard).
 # -heapseam adds the #231 rv32 heap-accounting seam (BLYT_HOSTLUA_HEAP_SEAM /
 # _ACCT: rv32 object sizing + LUAL_BUFFERSIZE pin + stack/CallInfo exclusion for
-# byte-identical guest_heap_used on the 64-bit host). PRE-RELEASE feature tag —
-# replace with a stable v5.5.0-blyt-v0-p4 at the #231 pre-merge gate.
-set(LUA_VERSION "v5.5.0-blyt-v0-p3-heapseam")
+# byte-identical guest_heap_used on the 64-bit host). -heapseamkind2 closes that
+# seam's two remaining host-width leaks (#267): long-string sizing is now
+# kind-aware (Lua 5.5 has three long-string layouts and the seam modelled all
+# three as LSTRREG, over-counting every luaL_Buffer-boxed external string by the
+# falloc/ud pointer pair), and the GC's pacing constants (LUAI_GCSTEPSIZE,
+# incstep's work-per-step divisor) are pinned to rv32 instead of the host's
+# sizeof(Table) / sizeof(void*) — pacing is observable through cart_allocations,
+# because sweep order drives which arena blocks get recycled. PRE-RELEASE
+# feature tag — replace with a stable v5.5.0-blyt-v0-p4 at the #231 pre-merge
+# gate.
+set(LUA_VERSION "v5.5.0-blyt-v0-p3-heapseamkind2")
 FetchContent_Declare(
   lua
   URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=a35b31eefa0249976234db2d3b71ce43501d3d0daca4c07cdf85f3e33b942f97)
+    SHA256=365bb34d1d68e0cbf0cb848be09ef308baeae90730a86d08587cd84b508079c9)
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)

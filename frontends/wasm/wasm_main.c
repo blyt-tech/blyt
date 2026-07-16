@@ -41,6 +41,7 @@
 #ifdef BLYT_LUA
 #include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
 #include "blyt_handle.h" /* runtime/shared: console-wide resource-constant encoding (ADR-0134) */
+#include "blyt_hostlua_api.h" /* runtime/shared: the ONE host-Lua API registration (#267) */
 #include "blyt_hostlua_driver.h" /* runtime/shared: the ONE cart-driving model (#242) */
 #include "blyt_hostlua_heap.h" /* runtime/shared: host-Lua stack-exclusion flag (#231) */
 #include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
@@ -1101,7 +1102,7 @@ static int lua_wasm_surface_blit(lua_State *L) {
  * rejected (#207); for a pure-Lua cart, the g_lua_surf pool.  Per-pixel get/set
  * then touch host memory with no crossing.  The per-frame epoch (g_lua_lock_
  * epoch, bumped in blyt_wasm_frame) is the staleness guard. */
-#define BLYT_WASM_LOCK_MT "blyt.surface.lock"
+#define BLYT_WASM_LOCK_MT BLYT_HOSTLUA_LOCK_MT /* shared key — see blyt_hostlua_api.h */
 
 static uint32_t g_lua_lock_epoch = 0;
 /* Chooses hard-error vs defined no-op on a bad get/set (mirrors the guest
@@ -1237,133 +1238,6 @@ static int lua_wasm_lock_release(lua_State *L) {
     }
     u->released = true;
     return 0;
-}
-
-static void wasm_register_surface_lock_mt(lua_State *L) {
-    luaL_newmetatable(L, BLYT_WASM_LOCK_MT);
-    lua_newtable(L); /* __index */
-    static const luaL_Reg lock_methods[] = {
-        {"get", lua_wasm_lock_get},
-        {"set", lua_wasm_lock_set},
-        {"clear", lua_wasm_lock_clear},
-        {"rect_fill", lua_wasm_lock_rect_fill},
-        {"line", lua_wasm_lock_line},
-        {"release", lua_wasm_lock_release},
-        {NULL, NULL},
-    };
-    luaL_setfuncs(L, lock_methods, 0);
-    lua_setfield(L, -2, "__index");
-    lua_pop(L, 1); /* pop mt */
-}
-
-/* Register blyt32.gfx.* onto the existing blyt32 global.  Called from both the
- * initial run_lua_cart setup and the reset/reload re-register, like the state
- * and resource API helpers. */
-static void wasm_register_gfx_api(lua_State *L) {
-    lua_gfx_palette_ensure_default();
-    lua_getglobal(L, "blyt32");
-    if (!lua_istable(L, -1)) {
-        lua_pop(L, 1);
-        return;
-    }
-    lua_newtable(L); /* blyt32.gfx */
-    static const struct {
-        const char *name;
-        lua_CFunction fn;
-    } gfx_fns[] = {
-        {"clear", lua_wasm_gfx_clear},
-        {"pixel", lua_wasm_gfx_pixel},
-        {"rect_fill", lua_wasm_gfx_rect_fill},
-        {"line", lua_wasm_gfx_line},
-        {"palette_set", lua_wasm_gfx_palette_set},
-        {NULL, NULL},
-    };
-    for (int i = 0; gfx_fns[i].name; i++) {
-        lua_pushcfunction(L, gfx_fns[i].fn);
-        lua_setfield(L, -2, gfx_fns[i].name);
-    }
-    /* Built-in palette constants (#201), mirroring blyt32lua.c's pure-Lua
-     * binding and BLYT_SCREEN's plain-constant-field precedent.  wasm_main.c
-     * is host-side (not cart code), so it encodes directly from the canonical
-     * runtime/shared source rather than including the cart-facing blyt.h. */
-    lua_pushinteger(
-        L, (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
-    lua_setfield(L, -2, "PALETTE_AURORA");
-    lua_pushinteger(L,
-                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_VGA, BLYT_RESOURCE_PROV_RUNTIME));
-    lua_setfield(L, -2, "PALETTE_VGA");
-    lua_pushinteger(L,
-                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_EGA, BLYT_RESOURCE_PROV_RUNTIME));
-    lua_setfield(L, -2, "PALETTE_EGA");
-    lua_pushinteger(L,
-                    (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_CGA, BLYT_RESOURCE_PROV_RUNTIME));
-    lua_setfield(L, -2, "PALETTE_CGA");
-    lua_pushinteger(
-        L, (lua_Integer)BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
-    lua_setfield(L, -2, "PALETTE_DEFAULT");
-    lua_setfield(L, -2, "gfx"); /* blyt32.gfx = gfx */
-
-    /* blyt32.surface.* — tier-1 surface API on the host-Lua fast path (#205). */
-    lua_newtable(L); /* blyt32.surface */
-    static const struct {
-        const char *name;
-        lua_CFunction fn;
-    } surface_fns[] = {
-        {"create", lua_wasm_surface_create},
-        {"destroy", lua_wasm_surface_destroy},
-        {"clear", lua_wasm_surface_clear},
-        {"pixel", lua_wasm_surface_pixel},
-        {"rect_fill", lua_wasm_surface_rect_fill},
-        {"line", lua_wasm_surface_line},
-        {"blit", lua_wasm_surface_blit},
-        {"acquire", lua_wasm_surface_acquire},
-        {NULL, NULL},
-    };
-    for (int i = 0; surface_fns[i].name; i++) {
-        lua_pushcfunction(L, surface_fns[i].fn);
-        lua_setfield(L, -2, surface_fns[i].name);
-    }
-    lua_pushinteger(L, (lua_Integer)BLYT_SCREEN); /* blyt32.surface.SCREEN */
-    lua_setfield(L, -2, "SCREEN");
-    lua_setfield(L, -2, "surface"); /* blyt32.surface = surface */
-
-    /* --- blyt32.color subtable: named color-index constants (#203) --- */
-    /* Mirrors blyt32lua.c's pure-Lua binding.  wasm_main.c is host-side (not
-     * cart code) so it cannot include the cart-facing blyt.h -- these raw
-     * indices MUST match blyt.h's BLYT_EGA_* / BLYT_AURORA_*.  The cross-leg
-     * parity test (identical frame hash on native/wasm/libretro) is the guard
-     * against drift here. */
-    static const char *const color_names[16] = {
-        "BLACK",  "BLUE",    "GREEN",    "CYAN",    "RED",    "MAGENTA",    "BROWN",     "LTGRAY",
-        "DKGRAY", "BR_BLUE", "BR_GREEN", "BR_CYAN", "BR_RED", "BR_MAGENTA", "BR_YELLOW", "WHITE",
-    };
-    static const uint8_t ega_idx[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-    static const uint8_t aurora_idx[16] = {0, 223, 185, 195, 155, 239, 165, 10,
-                                           5, 219, 189, 201, 160, 236, 175, 15};
-    lua_newtable(L); /* blyt32.color */
-    for (int pass = 0; pass < 2; pass++) { /* color.ega, color.vga (same set) */
-        lua_newtable(L);
-        for (int i = 0; i < 16; i++) {
-            lua_pushinteger(L, (lua_Integer)ega_idx[i]);
-            lua_setfield(L, -2, color_names[i]);
-        }
-        lua_setfield(L, -2, pass == 0 ? "ega" : "vga");
-    }
-    lua_newtable(L); /* color.aurora */
-    for (int i = 0; i < 16; i++) {
-        lua_pushinteger(L, (lua_Integer)aurora_idx[i]);
-        lua_setfield(L, -2, color_names[i]);
-    }
-    lua_setfield(L, -2, "aurora");
-    for (int i = 0; i < 16; i++) { /* default aliases on color root -> aurora */
-        lua_pushinteger(L, (lua_Integer)aurora_idx[i]);
-        lua_setfield(L, -2, color_names[i]);
-    }
-    lua_setfield(L, -2, "color"); /* blyt32.color = color */
-
-    wasm_register_surface_lock_mt(L); /* blyt.surface.lock metatable (tier-2, #208) */
-
-    lua_pop(L, 1); /* pop blyt32 */
 }
 
 /* Release all Lua and cart resources. */
@@ -1840,11 +1714,11 @@ static void wasm_register_state_api(lua_State *L, blyt_session_t *s) {
 /* Kind-specific constant metatables (ADR-0068/#166): typed-ness is the metatable,
  * so the wrong accessor raises "attempt to call a nil value".  ADR-0134/#196
  * collapsed accessors onto the constant — no separate loaded handle. */
-#define BLYT_RESOURCE_TEXT_CONST_MT "blyt.resource.text_const"
-#define BLYT_RESOURCE_BYTES_CONST_MT "blyt.resource.bytes_const"
+#define BLYT_RESOURCE_TEXT_CONST_MT BLYT_HOSTLUA_RESOURCE_TEXT_CONST_MT
+#define BLYT_RESOURCE_BYTES_CONST_MT BLYT_HOSTLUA_RESOURCE_BYTES_CONST_MT
 /* palette constant (#214): mirror of the guest binding — a cart palette asset's
  * R.<NAME>, consumed by gfx.palette_set (no bytes accessor). */
-#define BLYT_RESOURCE_PALETTE_CONST_MT "blyt.resource.palette_const"
+#define BLYT_RESOURCE_PALETTE_CONST_MT BLYT_HOSTLUA_RESOURCE_PALETTE_CONST_MT
 
 typedef struct {
     uint32_t id; /* the baked console-wide constant (ADR-0134) */
@@ -2067,68 +1941,6 @@ static int wasm_resource_unpin(lua_State *L) {
     return 0;
 }
 
-/* Build a kind-specific constant metatable carrying its accessor plus the shared
- * :id()/__eq/__tostring.  Mirrors the guest register_const_mt. */
-static void wasm_register_const_mt(lua_State *L, const char *mt_name, lua_CFunction accessor,
-                                   const char *accessor_name) {
-    luaL_newmetatable(L, mt_name);
-    lua_pushcfunction(L, wasm_const_eq);
-    lua_setfield(L, -2, "__eq");
-    lua_pushcfunction(L, wasm_const_tostring);
-    lua_setfield(L, -2, "__tostring");
-    lua_newtable(L);
-    lua_pushcfunction(L, accessor);
-    lua_setfield(L, -2, accessor_name);
-    lua_pushcfunction(L, wasm_const_id);
-    lua_setfield(L, -2, "id");
-    lua_setfield(L, -2, "__index");
-    lua_pop(L, 1); /* pop mt */
-}
-
-/* Register blyt.resource.* + blyt32.resource.* into g_lua, mirroring the guest
- * register_resource_module.  Call after the blyt/blyt32 globals exist. */
-static void wasm_register_resource_api(lua_State *L) {
-    wasm_register_const_mt(L, BLYT_RESOURCE_TEXT_CONST_MT, wasm_const_text, "text");
-    wasm_register_const_mt(L, BLYT_RESOURCE_BYTES_CONST_MT, wasm_const_bytes, "bytes");
-
-    /* Palette constant metatable (#214): :id()/__eq shared, palette-specific
-     * __tostring, no bytes accessor. */
-    luaL_newmetatable(L, BLYT_RESOURCE_PALETTE_CONST_MT);
-    lua_pushcfunction(L, wasm_const_eq);
-    lua_setfield(L, -2, "__eq");
-    lua_pushcfunction(L, wasm_palette_tostring);
-    lua_setfield(L, -2, "__tostring");
-    lua_newtable(L);
-    lua_pushcfunction(L, wasm_const_id);
-    lua_setfield(L, -2, "id");
-    lua_setfield(L, -2, "__index");
-    lua_pop(L, 1); /* pop mt */
-
-    lua_newtable(L); /* resource module */
-    lua_pushcfunction(L, wasm_text_resource);
-    lua_setfield(L, -2, "text_resource");
-    lua_pushcfunction(L, wasm_bytes_resource);
-    lua_setfield(L, -2, "bytes_resource");
-    lua_pushcfunction(L, wasm_palette_resource);
-    lua_setfield(L, -2, "palette");
-    lua_pushcfunction(L, wasm_resource_pin);
-    lua_setfield(L, -2, "pin");
-    lua_pushcfunction(L, wasm_resource_unpin);
-    lua_setfield(L, -2, "unpin");
-
-    lua_getglobal(L, "blyt");
-    lua_pushvalue(L, -2);
-    lua_setfield(L, -2, "resource");
-    lua_pop(L, 1);
-    lua_getglobal(L, "blyt32");
-    if (lua_istable(L, -1)) {
-        lua_pushvalue(L, -2);
-        lua_setfield(L, -2, "resource");
-    }
-    lua_pop(L, 1);
-    lua_pop(L, 1); /* pop resource module */
-}
-
 /* blyt32.mem.stats() for the WASM host-Lua fast path (ADR-0029, #159). Mirrors
  * the guest lua_mem_stats / host MEM_STATS ECALL byte-for-byte behaviourally,
  * reading the host accounting block + resource table directly (no ECALL). The
@@ -2173,26 +1985,6 @@ static int wasm_mem_stats(lua_State *L) {
     }
     lua_setfield(L, -2, "resources_loaded");
     return 1;
-}
-
-/* Register blyt.mem.* + blyt32.mem.* into g_lua, mirroring the guest
- * register_mem_module.  Call after the blyt/blyt32 globals exist. */
-static void wasm_register_mem_api(lua_State *L) {
-    lua_newtable(L); /* mem module */
-    lua_pushcfunction(L, wasm_mem_stats);
-    lua_setfield(L, -2, "stats");
-
-    lua_getglobal(L, "blyt");
-    lua_pushvalue(L, -2);
-    lua_setfield(L, -2, "mem");
-    lua_pop(L, 1);
-    lua_getglobal(L, "blyt32");
-    if (lua_istable(L, -1)) {
-        lua_pushvalue(L, -2);
-        lua_setfield(L, -2, "mem");
-    }
-    lua_pop(L, 1);
-    lua_pop(L, 1); /* pop mem module */
 }
 
 /* Derive a require()-able module name from a loaded chunk's embedded source
@@ -2284,6 +2076,89 @@ static int wasm_load_lua_bytecode(lua_State *L, const unsigned char *data, size_
  *   ext_snap       — when non-NULL, a snapshot captured by the caller before a
  *                    cart swap (reload); used instead of capturing internally.
  *                    Ownership transfers to this function (it is freed here). */
+/* This leg's half of the shared registration (blyt_hostlua_api.h, #267): the C
+ * bodies behind each name. The sequence — which registrations run, in what order
+ * — lives in that header, so this leg cannot drift out of step with the native
+ * one by editing a local copy. That drift is exactly what #267 fixed: the two
+ * legs had hand-rolled two different orders, which refracted through the arena's
+ * first-fit reuse into a cross-leg cart_allocations divergence. */
+static void wasm_hook_pre_gfx(void *ctx) {
+    (void)ctx;
+    lua_gfx_palette_ensure_default(); /* native has no default palette to build */
+}
+
+static void wasm_hook_state_api(lua_State *L, void *ctx) {
+    (void)ctx;
+    wasm_register_state_api(L, g_session);
+}
+
+static void wasm_hook_s_proxy(lua_State *L, void *ctx) {
+    (void)ctx; /* resolves active_state_ctx() itself, and no-ops without one */
+    wasm_register_s_proxy(L);
+}
+
+static const blyt_hostlua_api_t wasm_api_fns = {
+    .debug_print = lua_wasm_debug_print,
+    .quit = lua_wasm_quit,
+    .should_quit = lua_wasm_should_quit,
+    .require_fn = wasm_lua_require,
+
+    .blyt_call = lua_wasm_blyt_call,
+    .phase_update = lua_wasm_phase_update,
+    .phase_draw = lua_wasm_phase_draw,
+    .phase_none = lua_wasm_phase_none,
+
+    .gfx_clear = lua_wasm_gfx_clear,
+    .gfx_pixel = lua_wasm_gfx_pixel,
+    .gfx_rect_fill = lua_wasm_gfx_rect_fill,
+    .gfx_line = lua_wasm_gfx_line,
+    .gfx_palette_set = lua_wasm_gfx_palette_set,
+
+    .surface_create = lua_wasm_surface_create,
+    .surface_destroy = lua_wasm_surface_destroy,
+    .surface_clear = lua_wasm_surface_clear,
+    .surface_pixel = lua_wasm_surface_pixel,
+    .surface_rect_fill = lua_wasm_surface_rect_fill,
+    .surface_line = lua_wasm_surface_line,
+    .surface_blit = lua_wasm_surface_blit,
+    .surface_acquire = lua_wasm_surface_acquire,
+
+    .lock_get = lua_wasm_lock_get,
+    .lock_set = lua_wasm_lock_set,
+    .lock_clear = lua_wasm_lock_clear,
+    .lock_rect_fill = lua_wasm_lock_rect_fill,
+    .lock_line = lua_wasm_lock_line,
+    .lock_release = lua_wasm_lock_release,
+
+    .res_const_text = wasm_const_text,
+    .res_const_bytes = wasm_const_bytes,
+    .res_const_eq = wasm_const_eq,
+    .res_const_id = wasm_const_id,
+    .res_const_tostring = wasm_const_tostring,
+    .res_palette_tostring = wasm_palette_tostring,
+    .res_text_resource = wasm_text_resource,
+    .res_bytes_resource = wasm_bytes_resource,
+    .res_palette_resource = wasm_palette_resource,
+    .res_pin = wasm_resource_pin,
+    .res_unpin = wasm_resource_unpin,
+
+    .mem_stats = wasm_mem_stats,
+
+    .pre_gfx = wasm_hook_pre_gfx,
+};
+
+/* Arm the state hooks when this cart has a state context — mirrors the native
+ * leg's `if (sctx)`. Both hook bodies no-op without one anyway; the guard keeps
+ * the two legs' call sequences identical rather than merely equivalent. */
+static blyt_hostlua_api_t wasm_build_api(void) {
+    blyt_hostlua_api_t api = wasm_api_fns;
+    if (active_state_ctx()) {
+        api.register_state_api = wasm_hook_state_api;
+        api.register_s_proxy = wasm_hook_s_proxy;
+    }
+    return api;
+}
+
 static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_snap,
                              bool defer_init) {
     blyt_state_snapshot_t *snap = ext_snap;
@@ -2351,44 +2226,13 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     luaL_requiref(g_lua, LUA_UTF8LIBNAME, luaopen_utf8, 1);
     lua_pop(g_lua, 1);
 
-    /* Step 7: re-register core blyt API */
-    lua_newtable(g_lua);
-    lua_newtable(g_lua);
-    lua_pushcfunction(g_lua, lua_wasm_debug_print);
-    lua_setfield(g_lua, -2, "print");
-    lua_setfield(g_lua, -2, "debug");
-    lua_setglobal(g_lua, "blyt32");
-
-    lua_newtable(g_lua);
-    lua_newtable(g_lua);
-    lua_pushcfunction(g_lua, lua_wasm_debug_print);
-    lua_setfield(g_lua, -2, "print");
-    lua_setfield(g_lua, -2, "debug");
-    lua_pushcfunction(g_lua, lua_wasm_quit);
-    lua_setfield(g_lua, -2, "quit");
-    lua_pushcfunction(g_lua, lua_wasm_should_quit);
-    lua_setfield(g_lua, -2, "should_quit");
-    lua_setglobal(g_lua, "blyt");
-    lua_pushcfunction(g_lua, lua_wasm_quit);
-    lua_setglobal(g_lua, "blyt_quit");
-    lua_pushcfunction(g_lua, wasm_lua_require);
-    lua_setglobal(g_lua, "require");
-    lua_pushcfunction(g_lua, lua_wasm_phase_update);
-    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_UPDATE_FN);
-    lua_pushcfunction(g_lua, lua_wasm_phase_draw);
-    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_DRAW_FN);
-    lua_pushcfunction(g_lua, lua_wasm_phase_none);
-    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_NONE_FN);
-    lua_pushcfunction(g_lua, lua_wasm_blyt_call);
-    lua_setglobal(g_lua, BLYT_HOSTLUA_CALL_FN);
-
-    /* Step 8: re-register state + resource API */
-    if (active_state_ctx())
-        wasm_register_state_api(g_lua, g_session);
-    wasm_register_s_proxy(g_lua);
-    wasm_register_resource_api(g_lua);
-    wasm_register_gfx_api(g_lua); /* blyt32.gfx.* (#188) */
-    wasm_register_mem_api(g_lua);
+    /* Step 7: re-register the whole blyt/blyt32 surface, in the canonical
+     * cross-leg order (blyt_hostlua_api.h, #267). One call, one definition —
+     * the reload path cannot drift from the boot path either. */
+    {
+        blyt_hostlua_api_t api = wasm_build_api();
+        blyt_hostlua_register_api(g_lua, &api);
+    }
 
     /* Step 8b: for hybrid carts, recreate the Lua↔native exchange thread and
      * register the native export modules BEFORE the bytecode runs — the cart's
@@ -3493,44 +3337,6 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     luaL_requiref(g_lua, LUA_UTF8LIBNAME, luaopen_utf8, 1);
     lua_pop(g_lua, 1);
 
-    /* Register blyt32 API */
-    lua_newtable(g_lua);
-    lua_newtable(g_lua);
-    lua_pushcfunction(g_lua, lua_wasm_debug_print);
-    lua_setfield(g_lua, -2, "print");
-    lua_setfield(g_lua, -2, "debug");
-    lua_setglobal(g_lua, "blyt32");
-
-    /* Register blyt API: blyt.debug.print + blyt.quit + blyt.should_quit */
-    lua_newtable(g_lua);
-    lua_newtable(g_lua);
-    lua_pushcfunction(g_lua, lua_wasm_debug_print);
-    lua_setfield(g_lua, -2, "print");
-    lua_setfield(g_lua, -2, "debug");
-    lua_pushcfunction(g_lua, lua_wasm_quit);
-    lua_setfield(g_lua, -2, "quit");
-    lua_pushcfunction(g_lua, lua_wasm_should_quit);
-    lua_setfield(g_lua, -2, "should_quit");
-    lua_setglobal(g_lua, "blyt");
-    lua_pushcfunction(g_lua, lua_wasm_quit);
-    lua_setglobal(g_lua, "blyt_quit");
-
-    /* Register sandboxed require() */
-    lua_pushcfunction(g_lua, wasm_lua_require);
-    lua_setglobal(g_lua, "require");
-
-    /* Host-Lua lifecycle phase mirror (#205): the running coroutine brackets
-     * update()/draw() with these so a hybrid cart's native half stays
-     * draw()-only through the gfx ECALL gate. */
-    lua_pushcfunction(g_lua, lua_wasm_phase_update);
-    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_UPDATE_FN);
-    lua_pushcfunction(g_lua, lua_wasm_phase_draw);
-    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_DRAW_FN);
-    lua_pushcfunction(g_lua, lua_wasm_phase_none);
-    lua_setglobal(g_lua, BLYT_HOSTLUA_PHASE_NONE_FN);
-    lua_pushcfunction(g_lua, lua_wasm_blyt_call);
-    lua_setglobal(g_lua, BLYT_HOSTLUA_CALL_FN);
-
     /* Create rv32emu session when the cart has native code.
      * For pure Lua carts with only .cart.layouts, use a lightweight state ctx
      * to avoid allocating the full 256MB RV32 emulator. */
@@ -3614,13 +3420,16 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
              * it) — the fast-path mirror of cart_run.c's pre-init auto-load. */
             lua_gfx_seed_declared_default();
         }
-        /* Register state buffer + save/load + resource API. */
-        if (active_state_ctx())
-            wasm_register_state_api(g_lua, g_session);
-        wasm_register_s_proxy(g_lua);
-        wasm_register_resource_api(g_lua);
-        wasm_register_gfx_api(g_lua); /* blyt32.gfx.* (#188) */
-        wasm_register_mem_api(g_lua);
+        /* Register the whole blyt/blyt32 surface, in the canonical cross-leg
+         * order (blyt_hostlua_api.h, #267). This runs HERE, after the session /
+         * state ctx exists, rather than split across two points as it used to
+         * be: the order is observable through cart_allocations, so the sequence
+         * has to be one call driven from one definition, exactly as the native
+         * leg does it in build_vm. */
+        {
+            blyt_hostlua_api_t api = wasm_build_api();
+            blyt_hostlua_register_api(g_lua, &api);
+        }
     }
 
     /* Load and execute the bytecode (single chunk or BLMC; registers bundled
@@ -3690,15 +3499,18 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
 
     /* Runtime-scaffolding baseline (#231): everything allocated so far — VM,
      * stdlibs, blyt/blyt32 API, S proxy, the loaded cart bytecode, and the INIT +
-     * (later) RUNNING driver coroutines — is per-leg runtime overhead the native /
-     * emulated legs don't share (they drive frames from C, not a Lua coroutine).
+     * (later) RUNNING driver coroutines — is runtime overhead, not cart heap.
      * Excluding it makes cart_allocations + the 16 MB fail-point count only the
-     * cart's own runtime allocations, byte-identical across legs.
+     * cart's own runtime allocations. Since #242 the native leg builds the same
+     * driver coroutines here (it shares this runner), and since #267 it builds the
+     * same API scaffolding in the same order, so the pre-baseline footprint is
+     * identical across legs by construction.
      *
      * Collect first (#231): pin the baseline to the *settled* scaffolding, not a
      * snapshot still holding build-time transient garbage — the uncollected
-     * remainder differs between legs and would bias the subtraction. Mirrors the
-     * native runner (cart_run_hostlua.c). */
+     * remainder would bias the subtraction. Mirrors the native runner
+     * (cart_run_hostlua.c); see its baseline comment for why subtracting bytes is
+     * not on its own enough (layout survives the subtraction). */
     lua_gc(g_lua, LUA_GCCOLLECT);
     g_lua_mem_acct.guest_heap_baseline = g_lua_mem_acct.guest_heap_used;
 

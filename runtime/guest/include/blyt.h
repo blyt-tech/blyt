@@ -198,25 +198,28 @@ void *blyt_resource_bytes_get(blyt_bytes_resource_t id, size_t *len);
  *     - budget_cap (always 16 MB)
  *     - the fail *outcome*: a malloc / blyt_resource_load returning NULL /
  *       BLYT_RESOURCE_INVALID at the cap.
+ *     - cart_allocations (guest_heap_used) — the exact byte count.
  *
- *   Canonical diagnostic — cart_allocations (guest_heap_used).  The cart heap
- *   runs through one arena (ADR-0008 / #158) and is counted at the 32-bit
- *   canonical object sizes on every leg: on a 64-bit host (the native host-Lua
- *   fast path, ADR-0136) the accounting seam (#231) models Lua object sizes down
- *   to their rv32 widths, so wider host pointers do NOT inflate the count.  It is
- *   byte-identical across the native legs (64-bit desktop and rv32 hardware both
- *   run the direct-C runner) and equal to the wasm32 leg for the dominant
- *   pointer-bearing object types.  BUT it is a diagnostic to *size* a release
- *   decision, not a value to branch game state on: because the wasm runner drives
- *   the cart through a co_body coroutine while the native runner calls lifecycle
- *   functions directly from C, a few constructs — short-string interning,
- *   aux-buffer-boxed large strings, closures with open upvalues, coroutine
- *   threads — carry a small bounded execution-model residual (tens–hundreds of
- *   bytes, far below the 16 MB granularity, so it does not move the fail-point
- *   for realistic workloads).  Branch on the fail outcome above, never on the
- *   exact cart_allocations value.  The residual is closed when the two host-Lua
- *   runners unify into one (epic #230, tracked in #242), at which point the count
- *   is byte-exact everywhere.
+ *   cart_allocations is byte-identical on every leg.  The cart heap runs through
+ *   one arena (ADR-0008 / #158) counted at the 32-bit canonical on all of them:
+ *   on a 64-bit host (the native host-Lua fast path, ADR-0136) the accounting
+ *   seam (#231/#267) models Lua object sizes down to their rv32 widths and pins
+ *   the host-width constants that are observable through this API — the auxlib
+ *   buffer threshold and the GC's pacing constants — to the same canonical, so
+ *   neither wider host pointers nor a differently-paced collector can move the
+ *   count.  All the host-Lua legs additionally execute the cart through one
+ *   shared coroutine driver and build their scaffolding through one shared
+ *   registration (#242/#267), so the allocation sequence is identical by
+ *   construction rather than by agreement.
+ *
+ *   That makes the count safe to branch on, but think twice before you do: it is
+ *   a fact about this runtime's allocator, not about your game.  It is stable
+ *   across peers and replays at a given cart+runtime version, and it is NOT
+ *   stable across a runtime upgrade or a Lua bump — those legitimately move it.
+ *   Branching on the fail outcome expresses "am I out of memory"; branching on
+ *   the exact byte count pins your game's behaviour to an implementation detail
+ *   that is only promised to be *the same everywhere*, not to be *the same
+ *   forever*.
  *
  *   Advisory — history-dependent (LRU/eviction order differs across platforms),
  *   MUST NOT feed deterministic game state.  A *tuning* signal for "should I
