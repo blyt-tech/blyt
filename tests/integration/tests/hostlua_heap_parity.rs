@@ -33,14 +33,29 @@
 //!
 //! The second test drives the constructs that were once attributed to a runner
 //! *execution-model* divergence (the wasm `co_body` coroutine vs the native
-//! direct-C runner). That attribution was only partly right. #242 unified both
-//! legs onto one shared coroutine driver
-//! (`runtime/shared/blyt_hostlua_driver.h`), which made coroutine threads
-//! byte-exact and took the residual 320 B -> 160 B — but not to zero. The
-//! remainder is a *sizing* gap, not an execution-model one: strings past the
-//! `luaL_Buffer` aux threshold become **external strings**, whose `TString`
-//! carries `contents`/`falloc`/`ud` — three pointers, 24 B host vs 12 B rv32.
-//! That is tracked in #267 and the second test is #[ignore]d until it lands.
+//! direct-C runner). That attribution turned out to be one of three, and the
+//! chain is worth recording because each layer hid the next:
+//!
+//!   1. **Execution model (#242).** Real, but only part of it. Unifying both legs
+//!      onto one shared coroutine driver (`runtime/shared/blyt_hostlua_driver.h`)
+//!      made coroutine threads byte-exact and took the residual 320 B -> 160 B.
+//!   2. **Object sizing (#267).** Lua 5.5 gives long strings three layouts
+//!      (`luaS_sizelngstr`); the seam modelled all three with the `LSTRREG`
+//!      formula on the premise that pure Lua never makes an external string —
+//!      false, because `luaL_pushresult` converts a boxed buffer via
+//!      `lua_pushexternalstring`. Every boxed string was over-counted by the
+//!      host−rv32 width of `falloc`+`ud`.
+//!   3. **Order and pacing (#267).** With sizes exact, the count *still* moved:
+//!      `cart_allocations` comes off a first-fit arena, so it depends on
+//!      allocation and free ORDER too. Two things perturbed it — the legs
+//!      hand-registered their scaffolding in different orders (fixed by
+//!      `blyt_hostlua_api.h`), and the fork's GC pacing constants were on host
+//!      pointer widths, so the 64-bit VM swept at different points than the
+//!      32-bit legs (fixed by pinning them to rv32).
+//!
+//! The moral, for whoever debugs the next one: a divergence here is NOT
+//! necessarily a per-object size error. Sizes being byte-identical across legs
+//! does not imply the counts are — order and GC pacing reach the number too.
 
 mod common;
 use common::*;
@@ -165,6 +180,40 @@ end
 function draw() end
 "#;
 
+/// A cart that builds a fixed count of strings of a caller-chosen LENGTH, so a
+/// test can walk the `luaL_BUFFERSIZE` aux-buffer threshold. Below it,
+/// `string.rep` fills the buffer's on-stack `init.b` and `luaL_pushresult` copies
+/// the bytes into a plain long string (`LSTRREG`). At or above it, `prepbuffsize`
+/// spills to a heap box, and `luaL_pushresult` hands that box to
+/// `lua_pushexternalstring` — producing an EXTERNAL string (`LSTRMEM`), a
+/// different `TString` layout with `falloc`/`ud` live (see `LEN_PROBE_*` below).
+/// The threshold is pinned to the wasm32 value (512) on every leg by the seam's
+/// `LUAL_BUFFERSIZE` override, so both legs cross it at the same length.
+const LEN_PROBE_LUA: &str = r#"
+local KEEP = {}
+
+function init()
+    for _ = 1, 10 do
+        KEEP[#KEEP + 1] = string.rep("z", LEN)
+    end
+
+    collectgarbage("collect")
+    local m = blyt32.mem.stats()
+    blyt.debug.print(string.format("HEAP used=%d", m.cart_allocations))
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#;
+
+/// Lengths that keep `string.rep` inside the on-stack aux buffer (`LSTRREG`).
+const LEN_PROBE_INLINE: &[usize] = &[100, 500, 512];
+/// Lengths that spill to a heap box and become external strings (`LSTRMEM`).
+const LEN_PROBE_EXTERNAL: &[usize] = &[513, 600, 900];
+
 /// Parse the single `HEAP used=<n>` line the cart prints.
 fn heap_used(output: &str) -> u64 {
     let line = output
@@ -209,6 +258,65 @@ fn lua_guest_heap_used_matches_wasm32_on_native_host_lua() {
     );
 }
 
+/// The #267 target, stated at the level of the defect it closes: `guest_heap_used`
+/// is byte-exact across the host-Lua legs on BOTH sides of the `luaL_Buffer`
+/// aux-buffer threshold — for plain long strings AND for the external strings
+/// that crossing it produces.
+///
+/// Why this deserves its own test rather than riding the gate above: Lua 5.5
+/// gives long strings three layouts, sized separately by `luaS_sizelngstr`
+/// (`LSTRREG` inline content; `LSTRFIX` a bare header over borrowed bytes;
+/// `LSTRMEM` external bytes with `falloc`/`ud` live). The seam originally
+/// modelled all three with the `LSTRREG` formula on the premise that pure Lua
+/// never makes an external string — false, because `luaL_pushresult` converts a
+/// boxed buffer via `lua_pushexternalstring`. Every boxed string was therefore
+/// over-counted by the host−rv32 width of `falloc`+`ud`.
+///
+/// That defect was invisible to every existing test: `HEAP_LUA` stays under the
+/// threshold, so it only ever exercised `LSTRREG`, which was correct. Walking the
+/// boundary is what makes the omission fail loudly — the `>= 513` half of this
+/// test is red against a kind-blind model, and the `<= 512` half pins the
+/// `LSTRREG` path that must NOT regress while fixing it.
+///
+/// Deliberately asserts cross-leg EQUALITY, never a literal byte count: the
+/// contract is that the legs agree, not that they agree on a particular number.
+/// Pinning a magic value would turn every Lua bump into a false failure.
+#[test]
+fn lua_guest_heap_used_matches_wasm32_across_aux_buffer_threshold() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    for (kind, lengths) in [
+        ("inline/LSTRREG", LEN_PROBE_INLINE),
+        ("boxed-external/LSTRMEM", LEN_PROBE_EXTERNAL),
+    ] {
+        for &len in lengths {
+            let tmp = TempDir::new().unwrap();
+            let project = tmp.path().join(format!("hostlua_heap_len_{len}"));
+            CartProject::new()
+                .lua(&LEN_PROBE_LUA.replace("LEN", &len.to_string()))
+                .write(&project);
+
+            let cart = build_cart(&project);
+            let wasm = heap_used(&capture_cart_wasm(&cart, &[]));
+            let hostlua = heap_used(&capture_cart_native(&cart, &[]));
+
+            assert_eq!(
+                hostlua,
+                wasm,
+                "native host-Lua guest_heap_used must equal its wasm32 sibling for \
+                 {kind} strings of length {len} (#267): a mismatch on the >= 513 side \
+                 means the seam is modelling external strings (LSTRMEM, whose TString \
+                 keeps falloc/ud live) with the plain-long-string LSTRREG formula; a \
+                 mismatch on the <= 512 side means the LSTRREG path itself regressed \
+                 (native={hostlua}, wasm32={wasm}, delta={})",
+                hostlua as i64 - wasm as i64
+            );
+        }
+    }
+}
+
 /// The #242 target: `guest_heap_used` is byte-exact across the host-Lua legs for
 /// the **execution-model-sensitive** constructs too — short-string interning,
 /// `luaL_Buffer`-boxed strings, closures with open upvalues, and coroutine
@@ -230,10 +338,9 @@ fn lua_guest_heap_used_matches_wasm32_on_native_host_lua() {
 /// (`contents`/`falloc`/`ud`) that are 24 B on a 64-bit host vs 12 B on rv32.
 /// Bisected: boxed strings +144, interning +16, closures -16, threads 0.
 ///
-/// Ignored — not deleted — so the oracle stays in the tree and #267 closes by
-/// removing one attribute. Un-ignore it there.
+/// Closed by #267, which resolved the remainder into two distinct defects — see
+/// this module's header for the full account.
 #[test]
-#[ignore = "#267: external/boxed-string seam sizing gap (the non-runner remainder of #242)"]
 fn lua_guest_heap_used_matches_wasm32_for_exec_model_constructs() {
     require_sdk();
     require_lua_sdk();
