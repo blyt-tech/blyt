@@ -279,6 +279,133 @@ end
     );
 }
 
+/// #261 — the teeth for the native-half BSS reset gap. A hybrid whose NATIVE half
+/// parks mutable state in its OWN BSS (a plain module-level counter, deliberately
+/// NOT a state buffer) must reset in lockstep with the Lua half under
+/// `--reset-every-frame`, identically on every leg.
+///
+/// The emulated reference (`blyt_reset_every_frame_cycle`) zeroes ALL guest BSS —
+/// native half included — and re-runs init() each cycle, so the native counter is
+/// back to its post-init value (0) before every frame's update. The host-Lua legs
+/// (native runner `blyt_hostlua_reset_every_frame_cycle` and WASM `wasm_lua_rebuild`)
+/// rebuild only the Lua VM and round-trip the shared state buffers — the persisting
+/// rv32 session's native BSS is untouched — so before the fix the native counter
+/// DRIFTS (accumulates) on those legs while it stays reset on the emulated legs: a
+/// cross-leg determinism divergence (the #98 silent-half-operation class).
+///
+/// `frame` is persisted in a state buffer (so the loop advances across reset
+/// cycles, like the S3 cart), but the native tick counter is NOT — it is the
+/// drift-prone native-BSS state under test. `native_tick()` returns the counter
+/// AFTER incrementing, so:
+///   * plain run              — no reset, counter accumulates → frame 5 sees 5;
+///   * --reset-every-frame     — correct legs zero the native BSS each cycle, so
+///                               each frame's single tick returns 1 → frame 5 sees 1.
+/// Before the fix the host-Lua legs report 5 under reset-every-frame (accumulated);
+/// after it, 1 — matching the emulated legs.
+#[test]
+fn hostlua_hybrid_native_bss_reset_every_frame_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_native_bss");
+
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+/* Native-half state parked in the cart's OWN BSS, NOT a state buffer: a plain
+ * module-level counter. Under --reset-every-frame the emulated leg zeroes guest
+ * BSS each cycle, so the host-Lua legs must reset it in lockstep too (#261). */
+static int32_t g_native_ticks = 0;
+BLYT_LUA_EXPORT_I32(native_tick, int32_t unused) {
+    (void)unused;
+    g_native_ticks++;
+    return g_native_ticks;
+}
+"#)
+        .config(
+            "\
+records:
+  Globals:
+    fields:
+      - { name: frame, type: i32 }
+state_buffers:
+  globals:
+    record: Globals
+    count: 1
+",
+        )
+        .lua(
+            r#"
+local frame
+
+function init()
+    frame = 0
+end
+
+function on_new_state()
+    blyt.buf.alloc_slot(S.GLOBALS)
+end
+
+function update()
+    frame = frame + 1
+    -- Increment the native-BSS counter every frame; report it at frame 5. The
+    -- value distinguishes a leg that resets the native half each cycle (1) from
+    -- one that lets its BSS drift (5).
+    local ticks = native_tick(0)
+    if frame >= 5 then
+        blyt.debug.print("native ticks at frame 5 = " .. ticks)
+        blyt.quit()
+    end
+end
+
+function draw() end
+
+function on_save_state()
+    S.globals[0].frame = frame
+end
+
+function on_load_state(_info)
+    frame = S.globals[0].frame
+end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+
+    // Plain run — no reset, the native counter accumulates to the frame count on
+    // every leg (this is the same for emulated and host-Lua: nothing is reset).
+    let expected_plain = "native ticks at frame 5 = 5";
+    run_cart_native(&cart, expected_plain);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected_plain);
+    run_cart_wasm(&cart, expected_plain);
+    run_cart_libretro(&cart, expected_plain);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected_plain);
+
+    // Reset-every-frame — the native half's BSS must be zeroed each cycle in
+    // lockstep with the Lua VM rebuild, so the single per-frame tick returns 1 on
+    // EVERY leg. Before the #261 fix the host-Lua legs (native + WASM) would report
+    // 5 here (drift), diverging from the emulated legs.
+    let expected_reset = "native ticks at frame 5 = 1";
+    run_native_env_flags(&cart, &[], &["--reset-every-frame"], expected_reset);
+    run_native_env_flags(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        &["--reset-every-frame"],
+        expected_reset,
+    );
+    run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected_reset);
+    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], expected_reset);
+    run_cart_libretro_with_env_and_flags(
+        &cart,
+        &[("BLYT_HOSTLUA", "1")],
+        &["--reset-every-frame"],
+        expected_reset,
+    );
+}
+
 /// S4 — a native-lifecycle hybrid: the C half defines `blyt_cart_update`,
 /// overriding libblyt32lua's Lua-driver stub, so the runtime drives the native
 /// update each frame while `init`/`draw` stay in Lua. On the native host-Lua leg
