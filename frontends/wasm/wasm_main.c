@@ -2159,8 +2159,8 @@ static blyt_hostlua_api_t wasm_build_api(void) {
     return api;
 }
 
-static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_snap,
-                             bool defer_init) {
+static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_snap, bool defer_init,
+                             bool zero_native_bss) {
     blyt_state_snapshot_t *snap = ext_snap;
     blyt_state_ctx_t *sctx = active_state_ctx();
 
@@ -2183,6 +2183,21 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     /* Step 3: zero state buffers (fresh baseline; restored below if preserving) */
     if (sctx)
         blyt_state_ctx_zero_data(sctx);
+
+    /* Step 3b: for a hybrid reset-every-frame cycle (#261), zero the persisting
+     * rv32 session's guest BSS — the native half's static/global state — in
+     * lockstep with the Lua VM rebuild below.  The emulated leg zeroes ALL guest
+     * BSS at this step and re-runs init(); the VM tear-down/rebuild is the host-Lua
+     * equivalent for the Lua half, but the native half lives in g_session, which
+     * persists across the rebuild, so it must be zeroed explicitly.  Done AFTER the
+     * snapshot (so on_save_state saw a coherent image) and BEFORE the init() re-run
+     * (step 12), which drives the native init through the trampoline when it is the
+     * injected `init`, re-priming the just-zeroed BSS exactly as the emulated leg
+     * does.  Only the reset-every-frame path passes zero_native_bss: a cart-swap
+     * reload gets a fresh native image elsewhere, and a cold reset mirrors the
+     * native runner's restart (which does not zero the session either). */
+    if (zero_native_bss && g_session)
+        blyt_session_zero_guest_bss(g_session);
 
     /* Step 4: destroy entire Lua VM (all coroutines, globals gone) */
     if (g_lua_co_ref != LUA_NOREF && g_lua) {
@@ -2417,7 +2432,9 @@ static void wasm_lua_reload_restore_tail(void) {
 /* --reset-every-frame stress cycle: rebuild the VM preserving state and replay
  * on_load_state(HOT_RELOAD).  Thin wrapper over the shared rebuild path. */
 static void wasm_lua_reset_cycle(void) {
-    wasm_lua_rebuild(true, NULL, false);
+    /* zero_native_bss=true: reset a hybrid's native rv32 half in lockstep with the
+     * Lua VM rebuild, matching the emulated leg's guest-BSS zero (#261). */
+    wasm_lua_rebuild(true, NULL, false, true);
 }
 
 /* -------------------------------------------------------------------------
@@ -2586,7 +2603,7 @@ void blyt_dev_ctrl_command(const char *json) {
             dev_ctrl_respond_err(id, cmd, "reset not supported for carts with native code yet");
             return;
         }
-        if (wasm_lua_rebuild(false, NULL, false))
+        if (wasm_lua_rebuild(false, NULL, false, false))
             dev_ctrl_respond_ok(id, cmd);
         else
             dev_ctrl_respond_err(id, cmd, "reset failed");
@@ -2861,7 +2878,7 @@ static void wasm_session_reload(long id) {
              * re-arm, then INIT runs the reloaded init().  On failure rebuild
              * has already freed snap; on the deferred-success path it leaves
              * snap untouched, so the restore tail takes ownership below. */
-            if (!wasm_lua_rebuild(true, snap, true /* defer_init */)) {
+            if (!wasm_lua_rebuild(true, snap, true /* defer_init */, false)) {
                 dev_ctrl_respond_err(id, "reload", "rebuild failed");
                 return;
             }
@@ -2877,7 +2894,7 @@ static void wasm_session_reload(long id) {
          * pre-swap snapshot and replaying on_load_state(HOT_RELOAD).  rebuild()
          * takes ownership of snap and re-binds the native lifecycle trampolines
          * to the new module. */
-        if (wasm_lua_rebuild(true, snap, false))
+        if (wasm_lua_rebuild(true, snap, false, false))
             dev_ctrl_respond_ok(id, "reload");
         else
             dev_ctrl_respond_err(id, "reload", "rebuild failed");
@@ -3022,7 +3039,7 @@ void blyt_dev_ctrl_reload_fetched(int ok) {
      * Pure-Lua carts have no native (rv32) GDB breakpoints to re-arm, so the
      * synchronous rebuild is fine here — the debug-reload deferral (issue #170)
      * is only needed for hybrid carts (handled in wasm_session_reload). */
-    if (wasm_lua_rebuild(true, snap, false))
+    if (wasm_lua_rebuild(true, snap, false, false))
         dev_ctrl_respond_ok(id, "reload");
     else
         dev_ctrl_respond_err(id, "reload", "rebuild failed");

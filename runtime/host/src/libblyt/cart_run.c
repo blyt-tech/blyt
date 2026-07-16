@@ -4886,7 +4886,11 @@ int blyt_session_gdb_wait_client_continue(blyt_session_t *s) {
  * --reset-every-frame cycle helpers
  * ------------------------------------------------------------------------- */
 
-static void blyt_session_zero_guest_bss(blyt_session_t *s) {
+/* Zero every recorded cart BSS region (the guest's static/global vars, native
+ * half included).  Public so the host-Lua reset-every-frame path (native runner
+ * cart_run_hostlua.c + WASM wasm_main.c) can reset a hybrid's persisting rv32
+ * session in lockstep with its Lua VM rebuild — matching this leg (#261). */
+void blyt_session_zero_guest_bss(blyt_session_t *s) {
     vm_attr_t *attr = PRIV(s->rv);
     for (int i = 0; i < s->n_cart_bss; i++)
         memory_fill(attr->mem, s->cart_bss[i].start, s->cart_bss[i].size, 0);

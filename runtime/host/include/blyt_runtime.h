@@ -586,6 +586,15 @@ int blyt_session_gdb_wait_client_continue(blyt_session_t *s);
  */
 void blyt_reset_every_frame_cycle(blyt_session_t *s);
 
+/* Zero every recorded cart BSS region of the session (guest static/global vars,
+ * the native half of a hybrid included) — the standalone half of step 3 of the
+ * reset-every-frame cycle.  The host-Lua reset paths (native cart_run_hostlua.c
+ * and WASM wasm_main.c) call this to reset a hybrid's persisting rv32 session in
+ * lockstep with their Lua VM rebuild, so a native half that parks mutable state
+ * in its own BSS (not a state buffer) resets identically to the emulated leg
+ * under --reset-every-frame (#261). */
+void blyt_session_zero_guest_bss(blyt_session_t *s);
+
 /* Force-evict every eviction-eligible resource in the session's table (ADR-0027
  * v2, #137): the "evict all evictable now" forcing primitive behind the
  * per-leg --evict-every-frame / BLYT_RESOURCE_EVICT_EVERY_FRAME test hook. Frees

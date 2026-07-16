@@ -2399,6 +2399,21 @@ void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
         blyt_state_ctx_zero_data(sctx);
     }
 
+    /* 3b. Hybrid (#261): zero the persisting rv32 session's guest BSS — the native
+     * half's static/global state — in lockstep with the Lua VM rebuild below.  The
+     * emulated leg zeroes ALL guest BSS at this step (blyt_session_zero_guest_bss)
+     * and re-runs init(); the Lua VM tear-down/rebuild is the host-Lua equivalent
+     * for the Lua half, but the native half lives in the session, which persists
+     * across the rebuild, so it must be zeroed explicitly here.  Done AFTER the
+     * snapshot (so on_save_state saw a coherent image) and BEFORE hl_rebuild_and_
+     * restore, whose hl_boot re-runs init() — which drives the native init through
+     * the trampoline when it is the injected `init`, re-priming the just-zeroed BSS
+     * exactly as the emulated leg does.  No session PC/reg save-restore is needed:
+     * unlike the emulated game loop, the native half is only ever driven call-by-
+     * call via trampolines and is always at rest between frames. */
+    if (hl->session)
+        blyt_session_zero_guest_bss(hl->session);
+
     /* 4–6. Rebuild from the SAME bytecode, restore, notify. */
     hl_rebuild_and_restore(hl, snap);
 }
