@@ -376,6 +376,52 @@ function draw() end
         None
     };
 
+    // ── Build the reverse-trampoline re-entrant hybrid cart (#262) ────
+    // Bare-metal is the parity anchor for reverse-trampoline re-entrancy: the
+    // native half links the real in-machine libblyt32lua, so native->Lua->native
+    // runs on the natural call stack (no exchange-thread pool).  Its `re:211`
+    // must match what the host-Lua legs produce via the pool + CPU save/restore.
+    let reentrant_cart = if have_lua_gate {
+        let project = tmp.path().join("reentrant_metal");
+        CartProject::new()
+            .lib_file(
+                "host",
+                "host.c",
+                r#"#include "blyt.h"
+BLYT_LUA_MODULE_EXPORT_RAW(host, inner) {
+    lua_Integer x = lua_tointeger(L, 1);
+    lua_pushinteger(L, x + 100);
+    return 1;
+}
+BLYT_LUA_MODULE_EXPORT_RAW(host, outer) {
+    lua_getglobal(L, "middle");
+    lua_pushinteger(L, 5);
+    lua_pcall(L, 1, 1, 0); /* middle -> host.inner: native->Lua->native */
+    lua_Integer r = lua_tointeger(L, -1);
+    lua_pushinteger(L, r + 1); /* proves the outer call resumed cleanly */
+    return 1;
+}
+"#,
+            )
+            .lua(
+                r#"
+local host = require("host")
+function middle(n)
+    return host.inner(n) * 2
+end
+function init()
+    blyt32.debug.print("re:" .. host.outer())
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+            )
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     // ── Build the non-FP parity carts (gate 33, #235 / Spike Z Q5) ────
     // The RISC-V hardware-path leg of the non-FP determinism matrix: the same
     // carts `nonfp_parity.rs` runs on the host-Lua legs, run here through the
@@ -854,6 +900,12 @@ function draw() end
             "scp hybrid_metal.blyt failed"
         );
     }
+    if let Some(ref cart) = reentrant_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp reentrant_metal.blyt failed"
+        );
+    }
     if let Some(ref cart) = nonfp_nan_cart {
         assert!(
             qemu.scp_to(cart, "/tmp/blyt_gate/"),
@@ -1133,6 +1185,32 @@ function draw() end
         println!("  PASS: output = {:?}", output.trim());
     } else {
         println!("Gate 8: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 8b: reverse-trampoline re-entrant hybrid on metal (#262) ─
+    if let Some(ref _cart) = reentrant_cart {
+        println!("Gate 8b: reverse-trampoline native->Lua->native on metal...");
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/reentrant_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "reentrant_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        // inner(5)=105, *2=210 in middle, +1 in outer after it resumes = 211 —
+        // the SAME cart + value as hostlua_hybrid's re-entrant test, so bare-metal
+        // is a true parity anchor for the host-Lua legs' pool + CPU save/restore.
+        assert!(
+            output.contains("re:211"),
+            "expected 're:211' in output\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    } else {
+        println!("Gate 8b: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 9: state buffer save/load round-trip on metal ───────────

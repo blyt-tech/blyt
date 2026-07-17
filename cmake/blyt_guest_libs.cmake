@@ -744,6 +744,7 @@ else()
       ${SF_MWORD}
       "${LUA32_DIR}/softfloat_builtins.c"
       "${LUA32_DIR}/lua_runtime_stubs.c"
+      "${LUA32_DIR}/lua_reverse_tramp.c"
       "${LUA32_DIR}/blyt32lua.c"
       ${_VLUA_DAP_SRCS}
       CFLAGS
@@ -1162,6 +1163,7 @@ if(BLYT_BUILD_NATIVE)
       "${_LIBBLYTC_NATIVE_OBJ}"
       "${LUA32_DIR}/lua_native_malloc.c"
       "${LUA32_DIR}/lua_native_stubs.c"
+      "${LUA32_DIR}/lua_reverse_tramp.c"
       "${LUA32_DIR}/blyt32lua.c"
       CFLAGS
       ${LUA_MUSL_INCLUDES}

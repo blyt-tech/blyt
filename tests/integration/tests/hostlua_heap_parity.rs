@@ -369,3 +369,75 @@ fn lua_guest_heap_used_matches_wasm32_for_exec_model_constructs() {
         hostlua as i64 - wasm as i64
     );
 }
+
+/// #262: the reverse-trampoline exchange-thread pool must not perturb
+/// `cart_allocations` across the host-Lua legs.  A hybrid whose native half
+/// re-enters Lua (which allocates, then re-enters native) exercises the pool and
+/// the nested-call path; the count must stay byte-identical native-host-Lua vs
+/// wasm32.  The #267 lesson applies directly: allocation ORDER through the
+/// first-fit arena is in the ADR-0029 contract, so a divergence here — e.g. the
+/// two legs creating the pool differently, or the reentry allocating out of
+/// order — would be a real determinism break, not a cosmetic one.
+#[test]
+fn reentrant_reverse_trampoline_heap_parity_across_host_lua_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_heap_reentrant");
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+BLYT_LUA_MODULE_EXPORT_RAW(host, inner) {
+    lua_Integer x = lua_tointeger(L, 1);
+    lua_pushinteger(L, x + 1);
+    return 1;
+}
+BLYT_LUA_MODULE_EXPORT_RAW(host, outer) {
+    lua_getglobal(L, "middle");
+    lua_pushinteger(L, 1);
+    lua_pcall(L, 1, 1, 0); /* middle -> host.inner: native->Lua->native */
+    return 1;
+}
+"#)
+        .lua(
+            r#"
+local host = require("host")
+local KEEP = {}
+function middle(n)
+    -- allocate INSIDE the nested Lua frame so the reentry path touches the arena
+    local t = {}
+    for j = 1, 24 do
+        t[j] = j
+    end
+    KEEP[#KEEP + 1] = t
+    return host.inner(n) + n
+end
+function init()
+    for _ = 1, 40 do
+        host.outer()
+        KEEP[#KEEP + 1] = string.rep("z", 120 + #KEEP)
+    end
+    collectgarbage("collect")
+    local m = blyt32.mem.stats()
+    blyt.debug.print(string.format("HEAP used=%d", m.cart_allocations))
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let wasm = heap_used(&capture_cart_wasm(&cart, &[]));
+    let hostlua = heap_used(&capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]));
+    assert_eq!(
+        hostlua,
+        wasm,
+        "reverse-trampoline hybrid cart_allocations must be byte-identical across \
+         the host-Lua legs (#262/#267): the exchange-thread pool and the nested \
+         native->Lua->native allocation ORDER must not diverge native-host-Lua vs \
+         wasm32 (native={hostlua}, wasm32={wasm}, delta={})",
+        hostlua as i64 - wasm as i64
+    );
+}
