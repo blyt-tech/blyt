@@ -243,6 +243,11 @@ enum {
     BLYT_LUA_OP_SETGLOBAL = 22, /* (name_ptr, name_len) */
     BLYT_LUA_OP_ERROR = 23, /* () — never returns to the guest */
     BLYT_LUA_OP_ERRMSG = 24, /* (msg_ptr, msg_len) — never returns */
+    /* Reverse-trampoline (#262, ADR-0130 amend): call a Lua value the native
+     * half has pushed (func + nargs already on the exchange stack).
+     * a2=nargs, a3=nresults (LUA_MULTRET=-1), a4=is_protected (1=pcall→returns
+     * the Lua status in a0; 0=call→re-raises into the guest on error). */
+    BLYT_LUA_OP_PCALL = 25,
 };
 
 /* Bridge op status (returned in a0).  Lua errors never return: the host

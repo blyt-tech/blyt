@@ -522,6 +522,45 @@ void blyt_session_lua_bridge_attach(blyt_session_t *s, struct lua_State *exch);
 int blyt_session_begin_bridged_call(blyt_session_t *s, uint32_t wrap_addr);
 
 /*
+ * Reverse-trampoline exchange-thread pool depth (#262).  A native→Lua callback
+ * runs on an exchange thread; each further native call it makes needs a distinct
+ * clean one, so native→Lua→native nesting of depth N needs N+1 threads.  The
+ * frontends (native cart_run_hostlua.c + wasm_main.c) pre-create a pool this deep;
+ * deeper nesting is a clean Lua error, not corruption.  8 is far beyond any
+ * realistic reverse-trampoline chain.
+ */
+#define BLYT_HOSTLUA_EXCH_POOL_DEPTH 8
+
+/*
+ * Re-entrant call frame (#262): the full mutable rv32 CPU + bridge state that
+ * blyt_session_begin_fn_call / begin_bridged_call overwrite.  A native→Lua
+ * callback (the reverse-trampoline PCALL op) can re-enter native — the Lua
+ * callback calls another export — while the OUTER guest call is parked mid-ECALL
+ * on the single rv32 CPU.  A trampoline that drives a call while one may already
+ * be in flight must save this frame first and restore it after its drive, so the
+ * nested call does not clobber the suspended outer one.  The C recursion of the
+ * trampolines is the save stack; the fields are plain copies so no rv32 internals
+ * leak into this header.
+ */
+typedef struct {
+    uint32_t regs[32];
+    uint32_t pc;
+    uint32_t fcsr;
+    uint64_t fregs[32];
+    uint32_t bridge_saved_regs[32];
+    uint32_t bridge_saved_fcsr;
+    uint64_t bridge_saved_fregs[32];
+    uint32_t trace_fn_addr;
+    uint32_t lua_bridge_token;
+    bool lua_bridge_active;
+    bool lua_bridge_error;
+    bool fn_return_done;
+} blyt_session_call_frame_t;
+
+void blyt_session_save_call_frame(blyt_session_t *s, blyt_session_call_frame_t *frame);
+void blyt_session_restore_call_frame(blyt_session_t *s, const blyt_session_call_frame_t *frame);
+
+/*
  * Visitor callback for blyt_session_visit_lua_exports.
  * Called once per exported function with its Lua name, guest function address,
  * wrapper address (nonzero only for bridged exports), flags

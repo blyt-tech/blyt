@@ -123,8 +123,15 @@ static bool g_lua_quit = false; /* blyt.quit() called */
 static bool g_lua_fatal = false; /* hard stop: error or DAP exception */
 static bool g_lua_error = false;
 static bool g_lua_active = false;
-static lua_State *g_lua_exch = NULL; /* exchange thread for ECALL bridge */
-static int g_lua_exch_ref = LUA_NOREF;
+/* ECALL-bridge exchange-thread pool (#232, #262).  A reverse-trampoline callback
+ * runs ON an exchange thread, so a nested native→Lua→native call needs a DISTINCT
+ * clean one: the trampoline uses g_lua_exch_pool[g_lua_exch_depth] at each nesting
+ * level (pool[0] is the base the bridge attaches to). */
+static lua_State *g_lua_exch_pool[BLYT_HOSTLUA_EXCH_POOL_DEPTH];
+static int g_lua_exch_pool_ref[BLYT_HOSTLUA_EXCH_POOL_DEPTH] = {
+    LUA_NOREF, LUA_NOREF, LUA_NOREF, LUA_NOREF, LUA_NOREF, LUA_NOREF, LUA_NOREF, LUA_NOREF};
+static int g_lua_exch_depth = 0;
+static lua_State *g_lua_exch = NULL; /* == g_lua_exch_pool[0]; base exchange thread */
 static bool g_trampoline_failed = false; /* FN_ERROR from a bridged call */
 /* Saved at startup for wasm_lua_reset_cycle */
 static const void *g_lua_bytecode = NULL;
@@ -620,44 +627,93 @@ static int wasm_make_trampoline(lua_State *L) {
  * same way.  The call is driven synchronously within the Lua C function.
  * ------------------------------------------------------------------------- */
 
+/* Create the ADR-0130 exchange-thread pool (#232, #262) off g_lua, anchored in
+ * the registry, and attach the base to the session's bridge.  Recreated on every
+ * (re)load/reset; wasm_teardown_exch_pool drops the old refs first. */
+static void wasm_create_exch_pool(void) {
+    for (int i = 0; i < BLYT_HOSTLUA_EXCH_POOL_DEPTH; i++) {
+        g_lua_exch_pool[i] = lua_newthread(g_lua);
+        g_lua_exch_pool_ref[i] = luaL_ref(g_lua, LUA_REGISTRYINDEX);
+    }
+    g_lua_exch_depth = 0;
+    g_lua_exch = g_lua_exch_pool[0];
+    blyt_session_lua_bridge_attach(g_session, g_lua_exch);
+}
+
+/* Drop the exchange-thread pool's registry anchors and clear it. */
+static void wasm_teardown_exch_pool(void) {
+    for (int i = 0; i < BLYT_HOSTLUA_EXCH_POOL_DEPTH; i++) {
+        if (g_lua_exch_pool_ref[i] != LUA_NOREF && g_lua)
+            luaL_unref(g_lua, LUA_REGISTRYINDEX, g_lua_exch_pool_ref[i]);
+        g_lua_exch_pool_ref[i] = LUA_NOREF;
+        g_lua_exch_pool[i] = NULL;
+    }
+    g_lua_exch_depth = 0;
+    g_lua_exch = NULL;
+}
+
 /* Upvalues: [1]=wrap_guest_addr */
 static int wasm_make_bridged_trampoline(lua_State *L) {
     uint32_t wrap_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
     int n = lua_gettop(L);
-    if (!lua_checkstack(g_lua_exch, n + 2))
+
+    /* Reverse-trampoline re-entrancy (#262): the callback that reached this export
+     * may be running ON an exchange thread, so a nested native call needs a
+     * DISTINCT clean one.  g_lua_exch_pool[g_lua_exch_depth] is guaranteed != L. */
+    if (g_lua_exch_depth >= BLYT_HOSTLUA_EXCH_POOL_DEPTH)
+        return luaL_error(L, "blyt bridge: reverse-trampoline nesting too deep");
+    lua_State *ex = g_lua_exch_pool[g_lua_exch_depth];
+    if (!lua_checkstack(ex, n + 2))
         return luaL_error(L, "blyt bridge: exchange stack overflow");
-    lua_settop(g_lua_exch, 0); /* defensive: previous call always cleans up */
-    lua_xmove(L, g_lua_exch, n); /* wrapper sees args at exch indices 1..n */
-    if (blyt_session_begin_bridged_call(g_session, wrap_addr) != 0)
+    lua_settop(ex, 0); /* defensive: previous call always cleans up */
+    lua_xmove(L, ex, n); /* wrapper sees args at exch indices 1..n */
+
+    lua_State *prev_exch = g_lua_exch;
+    g_lua_exch = ex;
+    blyt_session_lua_bridge_attach(g_session, ex);
+    g_lua_exch_depth++;
+
+    if (blyt_session_begin_bridged_call(g_session, wrap_addr) != 0) {
+        g_lua_exch_depth--;
+        g_lua_exch = prev_exch;
+        blyt_session_lua_bridge_attach(g_session, prev_exch);
         return luaL_error(L, "blyt bridge: call setup failed");
+    }
     blyt_cart_run_err_t ferr;
     do {
         ferr = blyt_session_run_frame(g_session);
     } while (ferr != BLYT_RUN_FN_DONE && ferr != BLYT_RUN_FN_ERROR &&
              ferr != BLYT_RUN_ERR_ECALL_TRAP && ferr != BLYT_RUN_ERR_ABORT);
+
+    /* Pop the nesting NOW — before any marshalling that could raise — so the pool
+     * state stays consistent even on a longjmp.  `ex` still holds the results. */
+    g_lua_exch_depth--;
+    g_lua_exch = prev_exch;
+    blyt_session_lua_bridge_attach(g_session, prev_exch);
+
     if (ferr == BLYT_RUN_FN_ERROR) {
         /* ADR-0130: bridged wrapper raised; guest registers were restored.
          * Re-raise inside the Lua call so a script-level pcall catches it. */
-        if (lua_gettop(g_lua_exch) < 1)
-            lua_pushstring(g_lua_exch, "blyt bridge: unknown error");
-        lua_xmove(g_lua_exch, L, 1);
-        lua_settop(g_lua_exch, 0);
+        if (lua_gettop(ex) < 1)
+            lua_pushstring(ex, "blyt bridge: unknown error");
+        lua_xmove(ex, L, 1);
+        lua_settop(ex, 0);
         return lua_error(L);
     }
     if (ferr != BLYT_RUN_FN_DONE) {
-        lua_settop(g_lua_exch, 0);
+        lua_settop(ex, 0);
         return luaL_error(L, "blyt bridge: call failed");
     }
     /* a0 = the wrapper's lua_CFunction-style return count. */
     int m = (int)blyt_session_fn_return_value(g_session);
     if (!g_lua_quit && blyt_session_check_guest_quit(g_session))
         g_lua_quit = true;
-    int avail = lua_gettop(g_lua_exch);
+    int avail = lua_gettop(ex);
     if (m < 0 || m > avail)
         m = 0;
     luaL_checkstack(L, m + 1, "bridged results");
-    lua_xmove(g_lua_exch, L, m);
-    lua_settop(g_lua_exch, 0);
+    lua_xmove(ex, L, m);
+    lua_settop(ex, 0);
     return m;
 }
 
@@ -1247,11 +1303,7 @@ static void lua_cleanup(void) {
         g_lua_co_ref = LUA_NOREF;
     }
     g_lua_co = NULL;
-    if (g_lua_exch_ref != LUA_NOREF && g_lua) {
-        luaL_unref(g_lua, LUA_REGISTRYINDEX, g_lua_exch_ref);
-        g_lua_exch_ref = LUA_NOREF;
-    }
-    g_lua_exch = NULL;
+    wasm_teardown_exch_pool();
     if (g_lua) {
         lua_close(g_lua);
         g_lua = NULL;
@@ -2205,11 +2257,7 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
         g_lua_co_ref = LUA_NOREF;
     }
     g_lua_co = NULL;
-    if (g_lua_exch_ref != LUA_NOREF && g_lua) {
-        luaL_unref(g_lua, LUA_REGISTRYINDEX, g_lua_exch_ref);
-        g_lua_exch_ref = LUA_NOREF;
-    }
-    g_lua_exch = NULL;
+    wasm_teardown_exch_pool();
     lua_close(g_lua);
     g_lua = NULL;
 
@@ -2257,9 +2305,7 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
      * after, as before, broke a hybrid reload of any cart that require()s a
      * native module at chunk top level (issue #124). */
     if (g_session && g_has_lua_exports) {
-        g_lua_exch = lua_newthread(g_lua);
-        g_lua_exch_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
-        blyt_session_lua_bridge_attach(g_session, g_lua_exch);
+        wasm_create_exch_pool();
         wasm_register_lua_trampolines(g_lua, g_session);
     }
 
@@ -3390,9 +3436,7 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
             }
 #endif
             if (g_has_lua_exports) {
-                g_lua_exch = lua_newthread(g_lua);
-                g_lua_exch_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
-                blyt_session_lua_bridge_attach(g_session, g_lua_exch);
+                wasm_create_exch_pool();
                 wasm_register_lua_trampolines(g_lua, g_session);
             }
         } else if (has_layouts) {

@@ -469,6 +469,107 @@ fn sdl_dap_hostlua_hybrid_breakpoint_evaluate() {
         .success();
 }
 
+/// Native host-Lua DAP (#262): a breakpoint in a Lua function reached via a
+/// native→Lua CALLBACK (the reverse-trampoline — the native half does
+/// `lua_getglobal`+`lua_pcall`) fires.  Such a callback runs on an ADR-0130
+/// exchange thread, not on hl->L or the driver coroutine, so this pins that the
+/// master hook is armed on the exchange-thread pool too — without it the
+/// breakpoint silently never stops (the original #262 gap).  Evaluates a local in
+/// the paused callback frame (`a == 41`).
+#[test]
+fn sdl_dap_hostlua_hybrid_native_to_lua_callback_breakpoint() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua_reverse");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+            \x20   lua_getglobal(L, \"on_native\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n")
+        .lua(
+            "local host = require(\"host\")\n\
+             function on_native()\n\
+             \x20   local a = 41\n\
+             \x20   local b = a + 1\n\
+             end\n\
+             function init() host.run_cb() end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "a")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "41")
+        .env("BLYT_HOSTLUA", "1")
+        .assert()
+        .success();
+}
+
+/// Emulated-leg parity control for the above (#262): the SAME cart, but WITHOUT
+/// BLYT_HOSTLUA, so blytdebug runs it fully emulated (one rv32 machine, the guest
+/// master hook applies uniformly).  A breakpoint in the native→Lua callback fires
+/// here too — the host-Lua leg must match this, which the exchange-thread-pool
+/// hook makes true.
+#[test]
+fn sdl_dap_hybrid_native_to_lua_callback_breakpoint() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_reverse_emulated");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+            \x20   lua_getglobal(L, \"on_native\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n")
+        .lua(
+            "local host = require(\"host\")\n\
+             function on_native()\n\
+             \x20   local a = 41\n\
+             \x20   local b = a + 1\n\
+             end\n\
+             function init() host.run_cb() end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "a")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "41")
+        .assert()
+        .success();
+}
+
 /// Native host-Lua DAP (#257): restart parity — after the first breakpoint stop,
 /// the client restarts the cart (twice) and it stops at the same breakpoint each
 /// time with locals re-inspectable, then continues to a clean exit.  Mirrors

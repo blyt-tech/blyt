@@ -853,6 +853,8 @@ static const char *bridge_op_name(uint32_t op) {
         return "ERROR";
     case BLYT_LUA_OP_ERRMSG:
         return "ERRMSG";
+    case BLYT_LUA_OP_PCALL:
+        return "PCALL";
     default:
         return "?";
     }
@@ -915,6 +917,9 @@ static void bridge_trace_op(uint32_t opcode, uint32_t a2, uint32_t a3, uint32_t 
     case BLYT_LUA_OP_ERRMSG:
         snprintf(args, sizeof args, "len=%u", a3);
         break;
+    case BLYT_LUA_OP_PCALL:
+        snprintf(args, sizeof args, "nargs=%d, nresults=%d, prot=%u", (int32_t)a2, (int32_t)a3, a4);
+        break;
     default:
         snprintf(args, sizeof args, "a2=0x%x, a3=0x%x, a4=0x%x", a2, a3, a4);
         break;
@@ -955,6 +960,13 @@ static bool bridge_pcall(riscv_t *rv, lua_State *EX, const int *argidx, int narg
         return false;
     }
     return true;
+}
+
+/* Recover the owning session from g_run_ctx (== &session->ctx).  Used by the
+ * reverse-trampoline PCALL op to save/restore the parked outer call across a
+ * re-entrant native→Lua→native chain (#262). */
+static blyt_session_t *session_from_run_ctx(blyt_run_ctx_t *c) {
+    return (blyt_session_t *)((char *)c - offsetof(blyt_session_t, ctx));
 }
 
 /* Dispatch one BLYT_ECALL_LUA_OP.  Register conventions per ecall.h. */
@@ -1303,6 +1315,50 @@ static void bridge_lua_op(riscv_t *rv) {
         }
         free(hstr);
         hstr = NULL;
+        break;
+    }
+
+    case BLYT_LUA_OP_PCALL: {
+        /* Reverse-trampoline (#262): the native half calls a Lua value it has
+         * pushed (function + nargs on the exchange stack) back through the
+         * bridge — the "reverse-trampoline" ADR-0130 deferred.  a2=nargs,
+         * a3=nresults (LUA_MULTRET=-1), a4=is_protected.  The host ALWAYS runs
+         * lua_pcall internally: an unprotected error would longjmp past these C
+         * frames.  is_protected decides the guest-visible behaviour — pcall
+         * returns the Lua status; call re-raises the error into the guest. */
+        int32_t nargs = (int32_t)a2;
+        int32_t nresults = (int32_t)a3;
+        int is_protected = (int)a4;
+        int top = lua_gettop(EX);
+        if (nargs < 0 || nargs > top - 1) {
+            bridge_fail_msg(rv, EX, "blyt bridge: pcall bad argument count");
+            return;
+        }
+        if (nresults != LUA_MULTRET && (nresults < 0 || nresults > 200)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: pcall bad result count");
+            return;
+        }
+        if (nresults != LUA_MULTRET && !lua_checkstack(EX, nresults)) {
+            bridge_fail_msg(rv, EX, "blyt bridge: pcall result stack overflow");
+            return;
+        }
+        /* Re-entrancy (#262): the callback may call another native export, whose
+         * trampoline clobbers THIS parked call's CPU + bridge state on the single
+         * rv32.  Save it and restore after lua_pcall — which is protected, so it
+         * never longjmps out and the restore always runs (even if the callback
+         * errored).  The C recursion of nested PCALL ops is the save stack. */
+        blyt_session_t *sess = session_from_run_ctx(g_run_ctx);
+        blyt_session_call_frame_t frame;
+        blyt_session_save_call_frame(sess, &frame);
+        int rc = lua_pcall(EX, nargs, nresults, 0);
+        blyt_session_restore_call_frame(sess, &frame);
+        if (rc != LUA_OK && !is_protected) {
+            /* lua_call semantics: the error object is on EX top; re-raise it
+             * into the guest's calling Lua context (halt, do not advance PC). */
+            bridge_fail(rv);
+            return;
+        }
+        st = (uint32_t)rc; /* pcall: guest reads the Lua status; call: LUA_OK */
         break;
     }
 
@@ -3947,7 +4003,7 @@ static void blyt_emit_frame_hash(blyt_session_t *session) {
     g_run_ctx->log_fn(buf);
 }
 
-blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
+static blyt_cart_run_err_t run_frame_impl(blyt_session_t *session) {
     g_run_ctx = &session->ctx;
     session->ctx.frame_done = false;
     session->ctx.fn_return_done = false;
@@ -4271,6 +4327,20 @@ blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
     return BLYT_RUN_OK;
 }
 
+/* Public entry point.  run_frame_impl clears g_run_ctx to NULL on every exit;
+ * that is correct at the top level but wrong for a RE-ENTRANT drive (#262): a
+ * native→Lua→native chain calls run_frame while an outer call is still parked on
+ * the C stack, and the outer's remaining bridge ops need g_run_ctx restored to
+ * ITS session (not NULL). Save/restore the caller's g_run_ctx around the inner
+ * drive so nesting is transparent; at the top level the saved value is NULL, so
+ * behaviour is unchanged. */
+blyt_cart_run_err_t blyt_session_run_frame(blyt_session_t *session) {
+    blyt_run_ctx_t *prev_run_ctx = g_run_ctx;
+    blyt_cart_run_err_t r = run_frame_impl(session);
+    g_run_ctx = prev_run_ctx;
+    return r;
+}
+
 void blyt_session_destroy(blyt_session_t *session) {
     if (!session)
         return;
@@ -4352,6 +4422,57 @@ int blyt_session_begin_bridged_call(blyt_session_t *s, uint32_t wrap_addr) {
     return -1;
 #endif
 }
+
+/* Save/restore the full mutable CPU + bridge state around a nested guest call
+ * (#262 reverse-trampoline re-entrancy).  The single rv32 CPU drives every native
+ * call, so a native→Lua→native chain must stash the suspended outer call's state
+ * before driving the inner one and restore it after — otherwise the inner
+ * begin_*_call clobbers the outer's PC/regs/token and the outer resumes on
+ * garbage.  Captures exactly what begin_fn_call + begin_bridged_call mutate. */
+#ifdef BLYT_LUA_BRIDGE
+void blyt_session_save_call_frame(blyt_session_t *s, blyt_session_call_frame_t *frame) {
+    for (uint32_t i = 0; i < 32; i++)
+        frame->regs[i] = rv_get_reg(s->rv, i);
+    frame->pc = s->rv->PC;
+    frame->fcsr = s->rv->csr_fcsr;
+    for (uint32_t i = 0; i < 32; i++)
+        frame->fregs[i] = s->rv->F[i].v;
+    memcpy(frame->bridge_saved_regs, s->bridge_saved_regs, sizeof frame->bridge_saved_regs);
+    frame->bridge_saved_fcsr = s->bridge_saved_fcsr;
+    memcpy(frame->bridge_saved_fregs, s->bridge_saved_fregs, sizeof frame->bridge_saved_fregs);
+    frame->trace_fn_addr = s->trace_fn_addr;
+    frame->lua_bridge_token = s->ctx.lua_bridge_token;
+    frame->lua_bridge_active = s->ctx.lua_bridge_active;
+    frame->lua_bridge_error = s->ctx.lua_bridge_error;
+    frame->fn_return_done = s->ctx.fn_return_done;
+}
+
+void blyt_session_restore_call_frame(blyt_session_t *s, const blyt_session_call_frame_t *frame) {
+    for (uint32_t i = 1; i < 32; i++) /* x0 is hardwired zero */
+        rv_set_reg(s->rv, i, frame->regs[i]);
+    s->rv->PC = frame->pc;
+    s->rv->csr_fcsr = frame->fcsr;
+    for (uint32_t i = 0; i < 32; i++)
+        s->rv->F[i].v = frame->fregs[i];
+    memcpy(s->bridge_saved_regs, frame->bridge_saved_regs, sizeof s->bridge_saved_regs);
+    s->bridge_saved_fcsr = frame->bridge_saved_fcsr;
+    memcpy(s->bridge_saved_fregs, frame->bridge_saved_fregs, sizeof s->bridge_saved_fregs);
+    s->trace_fn_addr = frame->trace_fn_addr;
+    s->ctx.lua_bridge_token = frame->lua_bridge_token;
+    s->ctx.lua_bridge_active = frame->lua_bridge_active;
+    s->ctx.lua_bridge_error = frame->lua_bridge_error;
+    s->ctx.fn_return_done = frame->fn_return_done;
+}
+#else
+void blyt_session_save_call_frame(blyt_session_t *s, blyt_session_call_frame_t *frame) {
+    (void)s;
+    (void)frame;
+}
+void blyt_session_restore_call_frame(blyt_session_t *s, const blyt_session_call_frame_t *frame) {
+    (void)s;
+    (void)frame;
+}
+#endif
 
 void blyt_session_visit_lua_exports(blyt_session_t *s, blyt_lua_export_visitor_t cb,
                                     void *userdata) {

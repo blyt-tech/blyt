@@ -59,6 +59,11 @@
 #include "state_buffer.h" /* blyt_state_ctx_t + typed accessors */
 #include "testcard.h" /* PM5544 testcard (drawn until the cart draws, #204) */
 
+/* Reverse-trampoline exchange-thread pool depth (#262): shared with the wasm
+ * frontend via blyt_runtime.h so both legs bound native→Lua→native nesting
+ * identically. */
+#define HL_EXCH_POOL_DEPTH BLYT_HOSTLUA_EXCH_POOL_DEPTH
+
 /* Host-Lua surface pool (blyt32.surface.*, #205/#208, #231).  A pure-Lua cart on
  * this path has no session, so its surfaces live in the runner (the session-less
  * mirror of the WASM leg's g_lua_surf pool — none of that leg's hybrid/session
@@ -131,8 +136,16 @@ struct blyt_hostlua {
      * session itself persists across rebuilds.  The native counterpart of the
      * WASM leg's g_session / g_lua_exch. */
     blyt_session_t *session;
-    lua_State *lua_exch;
-    int lua_exch_ref; /* LUA_NOREF when no exchange thread is anchored */
+    /* ADR-0130 exchange-thread pool (#232, #262).  A reverse-trampoline callback
+     * runs ON an exchange thread, so a nested native→Lua→native call needs a
+     * DISTINCT clean one: the trampoline uses exch_pool[exch_depth] at each
+     * nesting level (pool[0] is the base the bridge attaches to).  All are
+     * anchored off hl->L (registry) and recreated on every VM rebuild; lua_close
+     * frees the registry, so no explicit unref is needed at teardown. */
+    lua_State *exch_pool[HL_EXCH_POOL_DEPTH];
+    int exch_pool_ref[HL_EXCH_POOL_DEPTH];
+    int exch_depth; /* active reverse-trampoline nesting level */
+    lua_State *lua_exch; /* == exch_pool[0]; NULL when no exchange thread anchored */
     /* Source-level debugging (#234): when set, build_vm arms the DAP master hook
      * on hl->L (re-armed on every reset/reload rebuild) and destroy shuts the DAP
      * server down. */
@@ -1690,39 +1703,67 @@ static int hl_bridged_trampoline(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
     uint32_t wrap_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
     int n = lua_gettop(L);
-    if (!lua_checkstack(hl->lua_exch, n + 2))
+
+    /* Reverse-trampoline re-entrancy (#262): the callback that reached this export
+     * may itself be running ON an exchange thread (a native→Lua callback via the
+     * PCALL op), so a nested native call needs a DISTINCT clean thread.
+     * exch_pool[exch_depth] is guaranteed != L — the caller runs on
+     * exch_pool[depth-1] (or hl->co at depth 0).  Point the bridge at it for the
+     * call and pop back to the caller's thread on the way out. */
+    if (hl->exch_depth >= HL_EXCH_POOL_DEPTH)
+        return luaL_error(L, "blyt hybrid: reverse-trampoline nesting too deep");
+    lua_State *ex = hl->exch_pool[hl->exch_depth];
+    if (!lua_checkstack(ex, n + 2))
         return luaL_error(L, "blyt hybrid: exchange stack overflow");
-    lua_settop(hl->lua_exch, 0); /* defensive: previous call always cleans up */
-    lua_xmove(L, hl->lua_exch, n); /* wrapper sees args at exch indices 1..n */
-    if (blyt_session_begin_bridged_call(hl->session, wrap_addr) != 0)
+    lua_settop(ex, 0); /* defensive: previous call always cleans up */
+    lua_xmove(L, ex, n); /* wrapper sees args at exch indices 1..n */
+
+    lua_State *prev_exch = hl->lua_exch;
+    hl->lua_exch = ex;
+    blyt_session_lua_bridge_attach(hl->session, ex);
+    hl->exch_depth++;
+
+    if (blyt_session_begin_bridged_call(hl->session, wrap_addr) != 0) {
+        hl->exch_depth--;
+        hl->lua_exch = prev_exch;
+        blyt_session_lua_bridge_attach(hl->session, prev_exch);
         return luaL_error(L, "blyt hybrid: bridged call setup failed");
+    }
     blyt_cart_run_err_t ferr;
     do {
         ferr = blyt_session_run_frame(hl->session);
     } while (ferr != BLYT_RUN_FN_DONE && ferr != BLYT_RUN_FN_ERROR &&
              ferr != BLYT_RUN_ERR_ECALL_TRAP && ferr != BLYT_RUN_ERR_ABORT);
+
+    /* Pop the nesting NOW — before any result marshalling that could raise — so
+     * hl->lua_exch / exch_depth stay consistent even on a longjmp.  `ex` (local)
+     * still holds the wrapper's results/error. */
+    hl->exch_depth--;
+    hl->lua_exch = prev_exch;
+    blyt_session_lua_bridge_attach(hl->session, prev_exch);
+
     if (ferr == BLYT_RUN_FN_ERROR) {
         /* The wrapper raised a Lua error; guest registers were restored.  Re-raise
          * inside this Lua call so a script-level pcall catches it (ADR-0130). */
-        if (lua_gettop(hl->lua_exch) < 1)
-            lua_pushstring(hl->lua_exch, "blyt hybrid: unknown error");
-        lua_xmove(hl->lua_exch, L, 1);
-        lua_settop(hl->lua_exch, 0);
+        if (lua_gettop(ex) < 1)
+            lua_pushstring(ex, "blyt hybrid: unknown error");
+        lua_xmove(ex, L, 1);
+        lua_settop(ex, 0);
         return lua_error(L);
     }
     if (ferr != BLYT_RUN_FN_DONE) {
-        lua_settop(hl->lua_exch, 0);
+        lua_settop(ex, 0);
         return luaL_error(L, "blyt hybrid: bridged call failed");
     }
     int m = (int)blyt_session_fn_return_value(hl->session); /* a0 = wrapper result count */
     if (!hl->quit && blyt_session_check_guest_quit(hl->session))
         hl->quit = 1;
-    int avail = lua_gettop(hl->lua_exch);
+    int avail = lua_gettop(ex);
     if (m < 0 || m > avail)
         m = 0;
     luaL_checkstack(L, m + 1, "bridged results");
-    lua_xmove(hl->lua_exch, L, m);
-    lua_settop(hl->lua_exch, 0);
+    lua_xmove(ex, L, m);
+    lua_settop(ex, 0);
     return m;
 }
 
@@ -1781,8 +1822,12 @@ static void hl_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr,
 static void hl_wire_hybrid(blyt_hostlua_t *hl) {
     if (!hl->session)
         return;
-    hl->lua_exch = lua_newthread(hl->L);
-    hl->lua_exch_ref = luaL_ref(hl->L, LUA_REGISTRYINDEX);
+    for (int i = 0; i < HL_EXCH_POOL_DEPTH; i++) {
+        hl->exch_pool[i] = lua_newthread(hl->L);
+        hl->exch_pool_ref[i] = luaL_ref(hl->L, LUA_REGISTRYINDEX);
+    }
+    hl->exch_depth = 0;
+    hl->lua_exch = hl->exch_pool[0];
     blyt_session_lua_bridge_attach(hl->session, hl->lua_exch);
     blyt_session_visit_lua_exports(hl->session, hl_visit_export_cb, hl->L);
 }
@@ -1857,7 +1902,11 @@ static void hl_close_vm(blyt_hostlua_t *hl) {
     hl->co_ref = LUA_NOREF;
     hl->running_co = false;
     hl->lua_exch = NULL;
-    hl->lua_exch_ref = LUA_NOREF;
+    for (int i = 0; i < HL_EXCH_POOL_DEPTH; i++) {
+        hl->exch_pool[i] = NULL;
+        hl->exch_pool_ref[i] = LUA_NOREF; /* lua_close freed the registry */
+    }
+    hl->exch_depth = 0;
 }
 
 /* Replace the driver coroutine with a fresh thread running `chunk` (#242).
@@ -2053,6 +2102,15 @@ static int build_vm(blyt_hostlua_t *hl, bool reload_boot) {
     if (hl->dap_enabled) {
         fc_master_hook_cfg.dap_enabled = true;
         fc_consolelua_master_hook_install(hl->L);
+        /* Reverse-trampoline callbacks (#262) run on the exchange threads, NOT on
+         * hl->L or the driver coroutine, so a breakpoint in a Lua function reached
+         * via a native->Lua call fires only if the pool carries the hook too.
+         * Hooks are per-thread in Lua 5.4 and not inherited by lua_newthread, so
+         * arm every pool thread here — after dap_enabled is set (so the mask is
+         * non-empty) and on every rebuild (hl_wire_hybrid recreates the pool). */
+        for (int i = 0; i < HL_EXCH_POOL_DEPTH; i++)
+            if (hl->exch_pool[i])
+                fc_consolelua_master_hook_install(hl->exch_pool[i]);
     }
 #endif
 
@@ -2124,7 +2182,8 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_en
     hl->bytecode_size = lua_size;
     hl->dap_enabled = dap_enabled; /* build_vm arms the master hook when set (#234) */
     hl->debug = debug; /* boot deferred to the frontend's debug gate (#234/#251) */
-    hl->lua_exch_ref = LUA_NOREF;
+    for (int i = 0; i < HL_EXCH_POOL_DEPTH; i++)
+        hl->exch_pool_ref[i] = LUA_NOREF; /* calloc's 0 is a VALID ref, not "unset" */
     hl->co_ref = LUA_NOREF; /* calloc's 0 is a VALID registry ref, not "unset" */
 
     /* Resource table (#93/#158/#231): load the cart's bundled + persistent

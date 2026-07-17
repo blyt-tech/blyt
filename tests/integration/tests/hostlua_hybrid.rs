@@ -656,3 +656,175 @@ fn hostlua_hybrid_example_hello_lua_rust_parity() {
     run_cart_libretro(&cart, expected);
     run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
 }
+
+/// S6 — reverse-trampoline (#262): the native half calls a Lua function BACK
+/// through the ADR-0130 bridge (`lua_getglobal` + `lua_pcall`), the deferred
+/// "reverse-trampoline" ADR-0130 anticipated. A raw export `host.tick()` invokes
+/// the Lua global `on_tick(7)` and returns its result, so the observable line
+/// (`cb:14`) proves the native→Lua call round-tripped through the exchange
+/// thread. Fails on every host-Lua leg until the CALL opcode exists (today the
+/// bridge stub has no `lua_pcall`); the emulated + libretro legs link the real
+/// in-machine `libblyt32lua`.
+#[test]
+fn hostlua_hybrid_native_to_lua_callback_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_reverse_tramp");
+
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+/* Reverse-trampoline (#262): call a Lua global back through the bridge and
+ * return its result. */
+BLYT_LUA_MODULE_EXPORT_RAW(host, tick) {
+    lua_getglobal(L, "on_tick"); /* push the Lua callback */
+    lua_pushinteger(L, 7);       /* arg */
+    lua_pcall(L, 1, 1, 0);       /* on_tick(7) -> single result on the stack */
+    return 1;                    /* hand that result back to the Lua caller */
+}
+"#)
+        .lua(
+            r#"
+local host = require("host")
+function on_tick(n)
+    return n * 2
+end
+function init()
+    blyt.debug.print("cb:" .. host.tick())
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let expected = "cb:14";
+
+    run_cart_native(&cart, expected);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+}
+
+/// S6 — reverse-trampoline error semantics (#262): `lua_pcall` returns a status
+/// the native half reads (a callee error is CAUGHT, status non-OK), and
+/// `lua_call` RE-RAISES the callee's error into the calling Lua context (caught
+/// by a script-level `pcall`).  `err:true:false` proves both: `true` = pcall
+/// reported the error, `false` = the unprotected call's error propagated and the
+/// Lua `pcall` returned not-ok.  Identical on all five legs.
+#[test]
+fn hostlua_hybrid_native_to_lua_callback_errors_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_reverse_err");
+
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+/* pcall: catch the callee's error, report whether it errored. */
+BLYT_LUA_MODULE_EXPORT_RAW(host, protected_call) {
+    lua_getglobal(L, "boom");
+    int rc = lua_pcall(L, 0, 0, 0);
+    lua_pushboolean(L, rc != LUA_OK);
+    return 1;
+}
+/* call: propagate the callee's error into the Lua caller (never returns here). */
+BLYT_LUA_MODULE_EXPORT_RAW(host, unprotected_call) {
+    lua_getglobal(L, "boom");
+    lua_call(L, 0, 0);
+    return 0;
+}
+"#)
+        .lua(
+            r#"
+local host = require("host")
+function boom()
+    error("kaboom")
+end
+function init()
+    local pc = host.protected_call()        -- true: pcall caught boom's error
+    local ok = pcall(host.unprotected_call) -- false: lua_call re-raised, caught here
+    blyt.debug.print("err:" .. tostring(pc) .. ":" .. tostring(ok))
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let expected = "err:true:false";
+
+    run_cart_native(&cart, expected);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+}
+
+/// S6 — RE-ENTRANT reverse-trampoline (#262): native `host.outer()` calls Lua
+/// `middle()`, which calls native `host.inner()` back — native→Lua→native.  On
+/// the host-Lua legs the single rv32 CPU drives both native calls, so the nested
+/// call must save/restore the outer call's CPU state or the outer's post-call
+/// arithmetic reads garbage (anti-#98 teeth).  `re:211` = inner(5)=105, *2=210
+/// in middle, +1 in outer after it resumes.  On bare-metal / emulated it is the
+/// natural in-machine stack; the host-Lua legs must match it exactly.
+#[test]
+fn hostlua_hybrid_reentrant_native_to_lua_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_reentrant");
+
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+BLYT_LUA_MODULE_EXPORT_RAW(host, inner) {
+    lua_Integer x = lua_tointeger(L, 1);
+    lua_pushinteger(L, x + 100);
+    return 1;
+}
+/* Reverse-trampoline that RE-ENTERS native: outer -> middle (Lua) -> inner. */
+BLYT_LUA_MODULE_EXPORT_RAW(host, outer) {
+    lua_getglobal(L, "middle");
+    lua_pushinteger(L, 5);
+    lua_pcall(L, 1, 1, 0);            /* middle(5) calls host.inner internally */
+    lua_Integer r = lua_tointeger(L, -1);
+    lua_pushinteger(L, r + 1);        /* proves the outer call resumed cleanly */
+    return 1;
+}
+"#)
+        .lua(
+            r#"
+local host = require("host")
+function middle(n)
+    return host.inner(n) * 2
+end
+function init()
+    blyt.debug.print("re:" .. host.outer())
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let expected = "re:211";
+
+    run_cart_native(&cart, expected);
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
+    run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+}
