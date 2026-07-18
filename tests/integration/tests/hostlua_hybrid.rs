@@ -1011,3 +1011,135 @@ function draw() end
     run_cart_wasm(&cart, expected);
     run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
 }
+
+// ── #276: hybrid legs must resolve ONE cart-facing resource table ─────────────
+//
+// A hybrid's Lua half runs on the host-Lua VM; its native C/Rust half is emulated
+// in the rv32 bridge session (ADR-0130). Resource ops from the native half go
+// through the resource ECALL handlers into the SESSION's ctx.resources. The
+// cart-facing `blyt.resource.*` + `blyt32.mem.stats()` bindings the Lua half reads
+// must therefore resolve that SAME session table — otherwise the native half's
+// residency/pin work is invisible to the Lua half on one leg but not another.
+//
+// The bug (#276): the native host-Lua leg (cart_run_hostlua.c) read the RUNNER's
+// own `hl->resources` for a hybrid, while WASM (wasm_main.c) read the session's
+// `ctx.resources`. So a hybrid whose native half pins a resource reported divergent
+// `mem.stats().resource_cache_used` / `resources_loaded` and diverging residency
+// across the native vs WASM (and libretro) host-Lua legs — a latent anti-#98
+// cross-leg divergence (determinism contract, ADR-0007/0029). The fix unifies the
+// native leg onto the session's table (matching WASM), single-sourcing the hybrid's
+// one cart-facing resource table.
+
+/// #276 teeth — a hybrid whose EMULATED NATIVE half pins a cart resource (into the
+/// session's resource table). The Lua half then reads `blyt32.mem.stats()`, which
+/// must resolve that SAME session table on every host-Lua leg, so the native-half
+/// pin is visible as `resource_cache_used` / a `resources_loaded` entry identically
+/// across native / WASM / libretro host-Lua (anti-#98).
+///
+/// Before the fix the native (and libretro) host-Lua leg read the runner-owned
+/// `hl->resources` — untouched by the native-half pin — so it reported the resource
+/// as NOT resident (cache_used=0, listed=0), diverging from WASM which read the
+/// session table (resident). The cross-leg equality asserts catch that divergence;
+/// the positive `listed==1` assert prevents a trivially-equal all-zero green.
+#[test]
+fn hostlua_hybrid_native_half_pins_resource_table_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_restable");
+
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+#include "cart_resources.h" /* generated R_<NAME> constants */
+/* The emulated native half pins the cart resource and HOLDS it for the cart's
+ * lifetime, so it stays resident in the rv32 session's resource table — the ONE
+ * table the Lua half's mem.stats() must read on every host-Lua leg (#276). */
+static const void *g_p;
+static size_t g_sz;
+BLYT_LUA_MODULE_EXPORT_RAW(host, pin_big) {
+    int ok = (blyt_resource_pin((blyt_resource_id_t)R_BIG, &g_p, &g_sz) == BLYT_OK);
+    lua_pushboolean(L, ok);
+    return 1;
+}
+"#)
+        .lua(
+            r#"
+local host = require("host")
+local R = require("cart_resources")
+function init()
+    local ok = host.pin_big() -- native half pins R.BIG into the session table
+    local m = blyt32.mem.stats()
+    local listed = 0
+    for _, r in ipairs(m.resources_loaded) do
+        if r.id == R.BIG:id() then listed = 1 end
+    end
+    blyt.debug.print(string.format("RESTABLE pin=%s cache_used=%d listed=%d loaded=%d",
+        tostring(ok), m.resource_cache_used, listed, #m.resources_loaded))
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        // 64 KiB of zeros: the packer compresses it (#157), so the native-half pin
+        // decompresses it into an owned buffer -> it counts in resident_decompressed
+        // (resource_cache_used) and appears in resources_loaded.
+        .asset_bytes("big.bin", &[0u8; 64 * 1024])
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+
+    let native = capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]);
+    let wasm = capture_cart_wasm(&cart, &[]);
+    let libretro = capture_cart_libretro(&cart, &[("BLYT_HOSTLUA", "1")]);
+
+    let (n_cache, n_listed, n_loaded) = (
+        probe_u64(&native, "cache_used"),
+        probe_u64(&native, "listed"),
+        probe_u64(&native, "loaded"),
+    );
+    let (w_cache, w_listed, w_loaded) = (
+        probe_u64(&wasm, "cache_used"),
+        probe_u64(&wasm, "listed"),
+        probe_u64(&wasm, "loaded"),
+    );
+    let (l_cache, l_listed, l_loaded) = (
+        probe_u64(&libretro, "cache_used"),
+        probe_u64(&libretro, "listed"),
+        probe_u64(&libretro, "loaded"),
+    );
+
+    // The native-half pin must be visible to the Lua half's mem.stats() — a
+    // meaningful (non-trivial) green: the resource is resident and listed, not the
+    // all-zero case that would satisfy equality without proving anything (anti-#98).
+    assert_eq!(
+        w_listed, 1,
+        "the native half pinned R.BIG into the session table; the Lua half's \
+         mem.stats().resources_loaded must list it on WASM (the reference leg): {wasm}"
+    );
+    assert!(
+        w_cache >= 64 * 1024,
+        "WASM resource_cache_used ({w_cache}) must include the pinned 64 KiB resource: {wasm}"
+    );
+
+    // Byte-identical resource residency across all three host-Lua legs (anti-#98):
+    // native and libretro must read the SAME session table WASM does, so the
+    // native-half pin is equally visible. Before the #276 fix the native/libretro
+    // legs read the runner-owned table (pin invisible) and diverge here.
+    assert_eq!(
+        (n_cache, n_listed, n_loaded),
+        (w_cache, w_listed, w_loaded),
+        "hybrid mem.stats resource figures must be identical native-host-Lua vs \
+         wasm32 (#276): native=(cache={n_cache},listed={n_listed},loaded={n_loaded}) \
+         wasm=(cache={w_cache},listed={w_listed},loaded={w_loaded})\nnative:\n{native}\nwasm:\n{wasm}"
+    );
+    assert_eq!(
+        (n_cache, n_listed, n_loaded),
+        (l_cache, l_listed, l_loaded),
+        "hybrid mem.stats resource figures must be identical native-host-Lua vs \
+         libretro-host-Lua (#276): native=(cache={n_cache},listed={n_listed},loaded={n_loaded}) \
+         libretro=(cache={l_cache},listed={l_listed},loaded={l_loaded})\nnative:\n{native}\nlibretro:\n{libretro}"
+    );
+}

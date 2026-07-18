@@ -1328,6 +1328,14 @@ static int l_lock_release(lua_State *L) {
  * heap uses. */
 
 static blyt_resource_table_t *hl_active_resources(blyt_hostlua_t *hl) {
+    /* A hybrid resolves its ONE cart-facing table from the session (#276),
+     * matching the WASM leg's active_resource_table(): the native C/Rust half's
+     * resource ECALLs land in the session's ctx.resources, so the Lua half's
+     * blyt.resource.* + mem.stats bindings must read that SAME table or the two
+     * host-Lua legs disagree on residency/pin state (anti-#98, ADR-0007/0029).
+     * Only a session-less pure-Lua cart owns a runner table. */
+    if (hl->session)
+        return blyt_session_resources(hl->session);
     return hl->resources_loaded ? &hl->resources : NULL;
 }
 
@@ -2221,25 +2229,6 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_en
         hl->exch_pool_ref[i] = LUA_NOREF; /* calloc's 0 is a VALID ref, not "unset" */
     hl->co_ref = LUA_NOREF; /* calloc's 0 is a VALID registry ref, not "unset" */
 
-    /* Resource table (#93/#158/#231): load the cart's bundled + persistent
-     * resources so blyt.resource.*, mem.stats, and cart-asset palettes resolve
-     * (session-less mirror of the WASM leg).  Must precede the palette seed below,
-     * which may resolve a cart-provenance declared default (#214). */
-    blyt_resource_table_init(&hl->resources);
-    blyt_resource_table_load_for_cart(&hl->resources, cart);
-    blyt_resource_table_load_persistent_from_cart(&hl->resources, cart);
-    if (blyt_resource_table_preload_persistent(&hl->resources) != 0) {
-        if (log_fn)
-            log_fn("blyt-hostlua: persistent resource preload failed");
-        blyt_resource_table_clear(&hl->resources);
-        free(hl);
-        return NULL;
-    }
-    hl->resources_loaded = true;
-    hl_publish_footprint(hl, &hl->resources);
-
-    hl_palette_ensure_default(hl); /* built-in or cart-asset declared default (#214) */
-
     /* Hybrid (#232): a cart has a native C/Rust half if it exports Lua-callable
      * functions (.lua_exports) OR defines native lifecycle callbacks
      * (blyt_cart_update etc. in its own code — #232 S4).  Create the rv32 session
@@ -2247,19 +2236,44 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_en
      * (libblyt32lua-bridge.so) and its Lua C API calls trap to this host VM.  The
      * session persists across VM rebuilds; build_vm re-attaches the exchange
      * thread, re-installs the export trampolines, and re-injects the native
-     * lifecycle globals each rebuild. */
+     * lifecycle globals each rebuild.  Created BEFORE the resource table (#276):
+     * a hybrid's ONE cart-facing table is the session's ctx.resources (which
+     * blyt_session_create_lua_bridge already loads + persistent-preloads), so the
+     * runner never mirrors it — hl_active_resources resolves it from the session. */
     if (blyt_cart_find_section(cart, ".lua_exports", NULL) ||
         blyt_cart_has_native_lifecycle(cart)) {
         hl->session = blyt_session_create_lua_bridge(cart, log_fn);
         if (!hl->session) {
             if (log_fn)
                 log_fn("blyt-hostlua: hybrid session create failed");
-            if (hl->resources_loaded)
-                blyt_resource_table_clear(&hl->resources);
             free(hl);
             return NULL;
         }
     }
+
+    /* Resource table (#93/#158/#231/#276): only a session-less pure-Lua cart owns
+     * a runner table (the session-less mirror of the WASM leg's g_lua_resources).
+     * A hybrid uses the session's ctx.resources, loaded once by the session above
+     * — never double-loaded here, which would also double-count the resource
+     * footprint against the unified 16 MB budget (#250).  Must precede the palette
+     * seed below, which may resolve a cart-provenance declared default (#214)
+     * against whichever table hl_active_resources returns. */
+    if (!hl->session) {
+        blyt_resource_table_init(&hl->resources);
+        blyt_resource_table_load_for_cart(&hl->resources, cart);
+        blyt_resource_table_load_persistent_from_cart(&hl->resources, cart);
+        if (blyt_resource_table_preload_persistent(&hl->resources) != 0) {
+            if (log_fn)
+                log_fn("blyt-hostlua: persistent resource preload failed");
+            blyt_resource_table_clear(&hl->resources);
+            free(hl);
+            return NULL;
+        }
+        hl->resources_loaded = true;
+        hl_publish_footprint(hl, &hl->resources);
+    }
+
+    hl_palette_ensure_default(hl); /* built-in or cart-asset declared default (#214) */
 
     /* State buffers: a pure-Lua cart with .cart.layouts gets a standalone ctx
      * (no session/emulator).  Initialised once here; the VM built below registers
