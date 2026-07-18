@@ -24,10 +24,11 @@
 mod common;
 
 use common::{
-    CartProject, build_lua_cart, require_cpp_sdk, require_libretro_core, require_lua_sdk,
-    require_rust_riscv_target, require_sdk, require_wasm, run_cart_libretro,
-    run_cart_libretro_with_env, run_cart_libretro_with_env_and_flags, run_cart_libretro_with_flags,
-    run_cart_native, run_cart_native_with_env, run_cart_wasm, run_cart_wasm_with_env,
+    CartProject, build_lua_cart, capture_cart_libretro, capture_cart_native, capture_cart_wasm,
+    require_cpp_sdk, require_libretro_core, require_lua_sdk, require_rust_riscv_target,
+    require_sdk, require_wasm, run_cart_libretro, run_cart_libretro_with_env,
+    run_cart_libretro_with_env_and_flags, run_cart_libretro_with_flags, run_cart_native,
+    run_cart_native_with_env, run_cart_wasm, run_cart_wasm_with_env,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -826,5 +827,187 @@ function draw() end
     run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
     run_cart_wasm(&cart, expected);
     run_cart_libretro(&cart, expected);
+    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+}
+
+// ── #250: hybrid heap accounting + unified 16 MB budget across both halves ────
+//
+// A hybrid's Lua half runs on the host-Lua VM (its rv32-shadow arena) while the
+// native C/Rust half stays EMULATED in an rv32 bridge session with its OWN
+// libblytc arena (ADR-0130). #232 v1 left the two arenas independent, so:
+//   * mem.stats().cart_allocations reported only the Lua-shadow figure — the
+//     emulated native half's allocations were invisible; and
+//   * the 16 MB unified budget (ADR-0008 / #158) was enforced per-arena, so a
+//     hybrid's COMBINED footprint could exceed 16 MB undetected.
+//
+// #250 folds the native half's arena into the reported figure and makes the
+// fail-point account for both halves together — modelling the SINGLE logical
+// 16 MB pool bare-metal rv32 already shares natively. The emulated leg runs the
+// whole cart in one arena (unified for free) and is being retired (ADR-0136), so
+// it is NOT the byte-exact anchor here; the bar is the THREE host-Lua legs
+// identical to each other (native host-Lua / WASM / libretro host-Lua), which
+// all separate the two arenas identically and drive the same emulated native
+// half through the same shared runner (#242). Anti-#98: assert the SAME observed
+// value across all three, not per-leg smoke.
+
+/// Parse the integer after `key=` on the line containing `key=` (e.g. the
+/// `cart_allocations` figure a probe cart prints).
+fn probe_u64(output: &str, key: &str) -> u64 {
+    let needle = format!("{key}=");
+    let line = output
+        .lines()
+        .find(|l| l.contains(&needle))
+        .unwrap_or_else(|| panic!("no {needle:?} line in output:\n{output}"));
+    let rest = &line[line.find(&needle).unwrap() + needle.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("bad {needle:?} value in line {line:?}"))
+}
+
+/// #250 (1) — the emulated native half's heap is FOLDED into
+/// `mem.stats().cart_allocations`. The native half grabs a large, known block
+/// (1 MiB) in its rv32 libblytc arena and holds it; the Lua half then reads
+/// `cart_allocations`. Before the fold that figure reflected only the Lua-shadow
+/// arena (a few KB), so it MUST now be >= the native block — and byte-identical
+/// across the three host-Lua legs, which run the identical emulated native half
+/// through the identical shared runner (#242/#267: the first-fit count is in the
+/// ADR-0029 contract, so the fold's ORDER — not just its total — must match).
+#[test]
+fn hostlua_hybrid_native_heap_folded_into_mem_stats() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_fold");
+
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+#include <stdlib.h>
+/* The emulated native half allocates a known block in its rv32 libblytc arena
+ * and holds it live for the cart's lifetime, so it stays counted in the
+ * session's guest_heap_used. */
+static void *g_block;
+BLYT_LUA_MODULE_EXPORT_RAW(host, grab) {
+    lua_Integer n = lua_tointeger(L, 1);
+    g_block = malloc((size_t)n);
+    if (g_block)
+        ((volatile char *)g_block)[0] = 1; /* touch: not dead-stripped */
+    lua_pushboolean(L, g_block != NULL);
+    return 1;
+}
+"#)
+        .lua(
+            r#"
+local host = require("host")
+local MIB = 1024 * 1024
+function init()
+    local ok = host.grab(MIB) -- 1 MiB in the emulated native half's arena
+    collectgarbage("collect")
+    local m = blyt32.mem.stats()
+    blyt.debug.print(string.format("FOLD cart_allocations=%d grab=%s", m.cart_allocations,
+        tostring(ok)))
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+
+    let native = probe_u64(
+        &capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]),
+        "cart_allocations",
+    );
+    let wasm = probe_u64(&capture_cart_wasm(&cart, &[]), "cart_allocations");
+    let libretro = probe_u64(
+        &capture_cart_libretro(&cart, &[("BLYT_HOSTLUA", "1")]),
+        "cart_allocations",
+    );
+
+    // The native half's 1 MiB block must now be visible in cart_allocations
+    // (before the fold it reflected only the Lua-shadow arena, << 1 MiB).
+    assert!(
+        native >= 1024 * 1024,
+        "native host-Lua cart_allocations ({native}) must include the emulated \
+         native half's 1 MiB block (#250 fold); a value < 1 MiB means the native \
+         arena is not folded into mem.stats()"
+    );
+    // Byte-identical across the three host-Lua legs (anti-#98).
+    assert_eq!(
+        native, wasm,
+        "hybrid cart_allocations must be byte-identical native-host-Lua vs wasm32 \
+         (#250/#267): native={native}, wasm32={wasm}"
+    );
+    assert_eq!(
+        native, libretro,
+        "hybrid cart_allocations must be byte-identical native-host-Lua vs \
+         libretro-host-Lua (#250): native={native}, libretro={libretro}"
+    );
+}
+
+/// #250 (2) — the unified 16 MB budget (ADR-0008 / #158) fail-point accounts for
+/// BOTH halves together. The Lua half holds ~8 MiB live; the native half then
+/// tries to grab 9 MiB. Each fits its OWN arena (< 16 MiB), but the COMBINED
+/// 17 MiB exceeds the single logical 16 MiB pool, so the native grab MUST fail —
+/// deterministically and identically on every host-Lua leg. Before the shared
+/// fail-point the native arena would allow it (9 < 16) and the cart would report
+/// success, silently over-budget.
+#[test]
+fn hostlua_hybrid_unified_budget_fail_point_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_budget");
+
+    CartProject::new()
+        .c(r#"#include "blyt.h"
+#include <stdlib.h>
+static void *g_block;
+BLYT_LUA_MODULE_EXPORT_RAW(host, grab) {
+    lua_Integer n = lua_tointeger(L, 1);
+    g_block = malloc((size_t)n);
+    if (g_block)
+        ((volatile char *)g_block)[0] = 1;
+    lua_pushboolean(L, g_block != NULL);
+    return 1;
+}
+"#)
+        .lua(
+            r#"
+local host = require("host")
+local MIB = 1024 * 1024
+local KEEP = {}
+function init()
+    -- Lua half: ~8 MiB of live, non-interned string bodies held in KEEP.
+    for i = 1, 8 do
+        KEEP[i] = string.rep("x", MIB)
+    end
+    collectgarbage("collect")
+    -- Native half: 9 MiB. Alone it fits the 16 MiB arena; combined with the
+    -- Lua half's ~8 MiB it exceeds the unified 16 MiB pool and MUST fail.
+    local ok = host.grab(9 * MIB)
+    blyt.debug.print("BUDGET grab_ok=" .. tostring(ok))
+end
+function update() blyt.quit() end
+function draw() end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let expected = "BUDGET grab_ok=false";
+
+    // Deterministic, leg-identical over-budget rejection across the three
+    // host-Lua legs (anti-#98). A green here without the shared fail-point would
+    // print grab_ok=true (native arena allows 9 MiB on its own).
+    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_wasm(&cart, expected);
     run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
 }

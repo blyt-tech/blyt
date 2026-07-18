@@ -1619,6 +1619,22 @@ pub fn capture_cart_wasm(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> 
     String::from_utf8_lossy(&output).into_owned()
 }
 
+/// Run a cart through the embedded libretro core with extra env and return its
+/// full output — the libretro companion to [`capture_cart_native`] /
+/// [`capture_cart_wasm`] for cross-leg value comparison (e.g. the host-Lua leg
+/// via `BLYT_HOSTLUA=1`). The embedded core logs to stderr, so that is what is
+/// captured.
+pub fn capture_cart_libretro(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.assert().success().get_output().stderr.clone();
+    String::from_utf8_lossy(&output).into_owned()
+}
+
 /// Run a cart on the native host-Lua determinism leg (Spike Z, #225); assert
 /// `expected` appears in stdout. The cart must be pure Lua (the leg reads its
 /// `.cart.lua` bytecode section) and must terminate itself via `blyt.quit()`.

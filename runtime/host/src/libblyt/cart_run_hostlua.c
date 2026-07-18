@@ -1335,12 +1335,20 @@ static blyt_resource_table_t *hl_active_resources(blyt_hostlua_t *hl) {
  * evictable cache to the room it leaves — the host-Lua mirror of the host
  * mem_acct_publish_footprint (#158).  Call after any pin/unpin. */
 static void hl_publish_footprint(blyt_hostlua_t *hl, blyt_resource_table_t *t) {
-    if (!t)
-        return;
-    uint32_t footprint = blyt_resource_table_footprint(t);
+    uint32_t footprint = t ? blyt_resource_table_footprint(t) : 0u;
+    /* Unified budget (#250): a hybrid's emulated native half runs in a SEPARATE
+     * rv32 session arena; its live cart heap counts against the SAME logical
+     * 16 MB pool, so fold it into this (host-VM) arena's non-evictable footprint
+     * term.  The native arena symmetrically folds this arena's heap
+     * (blyt_session_set_peer_heap), so an allocation from either half fails once
+     * the combined footprint would exceed 16 MB — the single shared pool bare
+     * metal uses natively.  0 for a pure-Lua cart (no session). */
+    if (hl->session)
+        footprint += blyt_session_cart_heap(hl->session);
     hl->mem_acct.non_evictable_footprint = footprint;
-    blyt_resource_table_evict_to_fit(
-        t, blyt_mem_cache_room(blyt_mem_cart_heap(&hl->mem_acct), footprint));
+    if (t)
+        blyt_resource_table_evict_to_fit(
+            t, blyt_mem_cache_room(blyt_mem_cart_heap(&hl->mem_acct), footprint));
 }
 
 /* Would newly pinning `e` (adding e->len to the footprint when it is so far
@@ -1511,7 +1519,14 @@ static int l_mem_stats(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
     blyt_resource_table_t *t = hl_active_resources(hl);
     uint32_t cache_used = t ? blyt_resource_table_resident_decompressed(t) : 0u;
+    /* cart_allocations spans the WHOLE cart (#250): the Lua half's host-VM arena
+     * PLUS a hybrid's emulated native half, whose libblytc allocations live in the
+     * rv32 session's separate arena.  Folding the two here makes the figure the
+     * combined cart-attributable heap the unified 16 MB pool tracks — byte-identical
+     * across the host-Lua legs, which drive the identical emulated native half. */
     uint32_t heap_used = blyt_mem_cart_heap(&hl->mem_acct);
+    if (hl->session)
+        heap_used += blyt_session_cart_heap(hl->session);
 
     lua_createtable(L, 0, 5);
     lua_pushinteger(L, (lua_Integer)cache_used);
@@ -1667,6 +1682,22 @@ static void hl_rv32_to_lua(lua_State *L, uint32_t val, int type) {
     }
 }
 
+/* Unified 16 MB budget coupling across the two hybrid arenas (#250).  Before
+ * driving the emulated native half, publish this (host-VM) arena's live cart heap
+ * into the session so the native arena's malloc/pin predicate charges the combined
+ * footprint; after it returns, fold the native half's now-updated cart heap back
+ * into this arena's predicate.  Both host-Lua legs do this at the SAME trampoline
+ * points, so the fail-point is deterministic and leg-identical.  hl_publish_footprint
+ * already adds the session heap, so `leave` is just a republish. */
+static void hl_budget_enter_native(blyt_hostlua_t *hl) {
+    if (hl->session)
+        blyt_session_set_peer_heap(hl->session, blyt_mem_cart_heap(&hl->mem_acct));
+}
+static void hl_budget_leave_native(blyt_hostlua_t *hl) {
+    if (hl->session)
+        hl_publish_footprint(hl, hl_active_resources(hl));
+}
+
 /* Drive the emulated native half until the in-flight call completes, then push
  * its scalar return.  A native blyt_quit() during the call latches hl->quit
  * (the host-Lua mirror of the WASM leg's g_lua_quit propagation). */
@@ -1681,6 +1712,7 @@ static int hl_run_trampoline_loop(lua_State *L, blyt_hostlua_t *hl, int ret_type
     uint32_t ret_val = blyt_session_fn_return_value(hl->session);
     if (!hl->quit && blyt_session_check_guest_quit(hl->session))
         hl->quit = 1;
+    hl_budget_leave_native(hl); /* native heap settled — refold into the budget (#250) */
     hl_rv32_to_lua(L, ret_val, ret_type);
     return (ret_type == HL_LUA_TYPE_VOID) ? 0 : 1;
 }
@@ -1693,6 +1725,7 @@ static int hl_typed_trampoline(lua_State *L) {
     uint32_t args[4] = {0};
     for (int i = 0; i < nargs && i < 4; i++)
         args[i] = hl_lua_to_rv32(L, i + 1, (int)lua_tointeger(L, lua_upvalueindex(3 + i)));
+    hl_budget_enter_native(hl); /* publish the Lua-half heap into the budget (#250) */
     blyt_session_begin_fn_call(hl->session, fn_addr, nargs, args);
     int ret_type = (int)lua_tointeger(L, lua_upvalueindex(7));
     return hl_run_trampoline_loop(L, hl, ret_type);
@@ -1723,6 +1756,7 @@ static int hl_bridged_trampoline(lua_State *L) {
     blyt_session_lua_bridge_attach(hl->session, ex);
     hl->exch_depth++;
 
+    hl_budget_enter_native(hl); /* publish the Lua-half heap into the budget (#250) */
     if (blyt_session_begin_bridged_call(hl->session, wrap_addr) != 0) {
         hl->exch_depth--;
         hl->lua_exch = prev_exch;
@@ -1758,6 +1792,7 @@ static int hl_bridged_trampoline(lua_State *L) {
     int m = (int)blyt_session_fn_return_value(hl->session); /* a0 = wrapper result count */
     if (!hl->quit && blyt_session_check_guest_quit(hl->session))
         hl->quit = 1;
+    hl_budget_leave_native(hl); /* native heap settled — refold into the budget (#250) */
     int avail = lua_gettop(ex);
     if (m < 0 || m > avail)
         m = 0;
