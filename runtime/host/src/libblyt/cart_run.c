@@ -292,6 +292,14 @@ typedef struct {
      * host-read); field 4 = non_evictable_footprint (host-written, guest-read).
      * 0 if the cart has no libblytc (then the budget is unenforced host-side). */
     uint32_t mem_acct_vaddr;
+    /* Peer-half cart heap for the unified 16 MB budget on the host-Lua hybrid
+     * path (#250): when this rv32 session runs a hybrid's EMULATED native half,
+     * the Lua half runs in a SEPARATE host-VM arena whose live cart heap counts
+     * against the SAME logical pool.  The runner publishes that peer figure here
+     * (blyt_session_set_peer_heap) so this arena's malloc/pin predicate charges
+     * the combined footprint.  Stays 0 on a pure-emulated cart, where the whole
+     * cart already shares one arena and there is no separate peer. */
+    uint32_t peer_heap;
 } blyt_run_ctx_t;
 
 static blyt_run_ctx_t *g_run_ctx = NULL;
@@ -637,7 +645,11 @@ static uint32_t mem_acct_guest_heap_used(const blyt_run_ctx_t *ctx, memory_t *me
  * (#205).  Both are irreclaimable within a frame, so both sit in the predicate's
  * footprint term alongside the guest heap. */
 static uint32_t ctx_non_evictable_footprint(const blyt_run_ctx_t *ctx) {
-    return blyt_resource_table_footprint(&ctx->resources) + ctx->surfaces.surface_bytes;
+    /* peer_heap (#250): the host-Lua hybrid's OTHER-half live cart heap, folded in
+     * so this arena's budget predicate charges the combined 16 MB pool.  0 on
+     * every pure-emulated path (no peer), so a no-op there. */
+    return blyt_resource_table_footprint(&ctx->resources) + ctx->surfaces.surface_bytes +
+           ctx->peer_heap;
 }
 
 static void mem_acct_publish_footprint(blyt_run_ctx_t *ctx, memory_t *mem) {
@@ -3462,6 +3474,32 @@ static void load_session_resources(blyt_run_ctx_t *ctx, const blyt_cart_t *cart)
 
 blyt_resource_table_t *blyt_session_resources(blyt_session_t *s) {
     return &s->ctx.resources;
+}
+
+/* #250: the session's live cart-attributable heap (guest_heap_used minus the
+ * runtime-scaffolding baseline, clamped at 0) — the emulated native half's
+ * contribution to a host-Lua hybrid's unified 16 MB pool.  The host-Lua runner
+ * folds this into mem.stats().cart_allocations and into the host-VM arena's
+ * budget predicate.  0 when the session has no libblytc accounting block. */
+uint32_t blyt_session_cart_heap(blyt_session_t *s) {
+    if (!s || !s->ctx.mem_acct_vaddr)
+        return 0;
+    memory_t *mem = s->attr.mem;
+    uint32_t used = mem_acct_read_u32(mem, s->ctx.mem_acct_vaddr);
+    uint32_t baseline = mem_acct_read_u32(mem, s->ctx.mem_acct_vaddr + 12u);
+    return used > baseline ? used - baseline : 0u;
+}
+
+/* #250: publish the peer (Lua-half) live cart heap into this session's budget
+ * accounting so the emulated native half's malloc/pin predicate charges the
+ * COMBINED host-VM + native footprint against the one 16 MB pool.  Re-publishes
+ * the footprint immediately so the guest arena sees it on its next allocation.
+ * Called by the host-Lua runner just before it drives a native call. */
+void blyt_session_set_peer_heap(blyt_session_t *s, uint32_t bytes) {
+    if (!s)
+        return;
+    s->ctx.peer_heap = bytes;
+    mem_acct_publish_footprint(&s->ctx, s->attr.mem);
 }
 
 size_t blyt_session_resource_evict_all(blyt_session_t *s) {

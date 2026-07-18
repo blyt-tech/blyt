@@ -227,12 +227,19 @@ static void wasm_lua_arena_reset(void) {
  * evictable cache to the room it leaves — the host-Lua mirror of the host
  * mem_acct_publish_footprint (#158). Call after any load/release. */
 static void wasm_lua_publish_footprint(blyt_resource_table_t *t) {
-    if (!t)
-        return;
-    uint32_t footprint = blyt_resource_table_footprint(t);
+    uint32_t footprint = t ? blyt_resource_table_footprint(t) : 0u;
+    /* Unified budget (#250): a hybrid's emulated native half runs in a SEPARATE
+     * rv32 session arena; its live cart heap counts against the SAME logical
+     * 16 MB pool, so fold it into this (host-VM) arena's non-evictable footprint.
+     * The native arena symmetrically folds this arena's heap
+     * (blyt_session_set_peer_heap).  0 for a pure-Lua cart (no session).  Mirrors
+     * the native runner's hl_publish_footprint. */
+    if (g_session)
+        footprint += blyt_session_cart_heap(g_session);
     g_lua_mem_acct.non_evictable_footprint = footprint;
-    blyt_resource_table_evict_to_fit(
-        t, blyt_mem_cache_room(blyt_mem_cart_heap(&g_lua_mem_acct), footprint));
+    if (t)
+        blyt_resource_table_evict_to_fit(
+            t, blyt_mem_cache_room(blyt_mem_cart_heap(&g_lua_mem_acct), footprint));
 }
 
 /* Would newly loading/pinning `e` (adding e->len to the footprint when it is so
@@ -561,6 +568,23 @@ static void wasm_rv32_to_lua(lua_State *L, uint32_t val, int type) {
 static int trampoline_gdb_resume_k(lua_State *L, int status, lua_KContext ctx);
 #endif
 
+/* Unified 16 MB budget coupling across the two hybrid arenas (#250) — the WASM
+ * mirror of the native runner's hl_budget_enter_native / hl_budget_leave_native.
+ * Before driving the emulated native half, publish the Lua-half (host-VM) heap
+ * into the session so the native arena's malloc/pin predicate charges the combined
+ * footprint; after it returns, refold the native half's now-updated heap into the
+ * host-VM predicate.  Both host-Lua legs do this at the SAME trampoline points, so
+ * the fail-point is deterministic and leg-identical. */
+static blyt_resource_table_t *active_resource_table(void);
+static void wasm_budget_enter_native(void) {
+    if (g_session)
+        blyt_session_set_peer_heap(g_session, blyt_mem_cart_heap(&g_lua_mem_acct));
+}
+static void wasm_budget_leave_native(void) {
+    if (g_session)
+        wasm_lua_publish_footprint(active_resource_table());
+}
+
 /* Run blyt_session_run_frame() in a loop until the native call completes.
  * When a GDB breakpoint fires (BLYT_RUN_GDB_PAUSED) the coroutine yields via
  * lua_yieldk so the Node.js event loop can relay the T05 packet and receive
@@ -592,6 +616,7 @@ static int run_trampoline_loop(lua_State *L, int ret_type) {
     uint32_t ret_val = blyt_session_fn_return_value(g_session);
     if (!g_lua_quit && blyt_session_check_guest_quit(g_session))
         g_lua_quit = true;
+    wasm_budget_leave_native(); /* native heap settled — refold into the budget (#250) */
     wasm_rv32_to_lua(L, ret_val, ret_type);
     return (ret_type == WASM_LUA_TYPE_VOID) ? 0 : 1;
 }
@@ -611,6 +636,7 @@ static int wasm_make_trampoline(lua_State *L) {
     uint32_t args[4] = {0};
     for (int i = 0; i < nargs && i < 4; i++)
         args[i] = wasm_lua_to_rv32(L, i + 1, (int)lua_tointeger(L, lua_upvalueindex(3 + i)));
+    wasm_budget_enter_native(); /* publish the Lua-half heap into the budget (#250) */
     blyt_session_begin_fn_call(g_session, fn_addr, nargs, args);
     int ret_type = (int)lua_tointeger(L, lua_upvalueindex(7));
     return run_trampoline_loop(L, ret_type);
@@ -673,6 +699,7 @@ static int wasm_make_bridged_trampoline(lua_State *L) {
     blyt_session_lua_bridge_attach(g_session, ex);
     g_lua_exch_depth++;
 
+    wasm_budget_enter_native(); /* publish the Lua-half heap into the budget (#250) */
     if (blyt_session_begin_bridged_call(g_session, wrap_addr) != 0) {
         g_lua_exch_depth--;
         g_lua_exch = prev_exch;
@@ -708,6 +735,7 @@ static int wasm_make_bridged_trampoline(lua_State *L) {
     int m = (int)blyt_session_fn_return_value(g_session);
     if (!g_lua_quit && blyt_session_check_guest_quit(g_session))
         g_lua_quit = true;
+    wasm_budget_leave_native(); /* native heap settled — refold into the budget (#250) */
     int avail = lua_gettop(ex);
     if (m < 0 || m > avail)
         m = 0;
@@ -2003,7 +2031,14 @@ static int wasm_resource_unpin(lua_State *L) {
 static int wasm_mem_stats(lua_State *L) {
     blyt_resource_table_t *t = active_resource_table();
     uint32_t cache_used = t ? blyt_resource_table_resident_decompressed(t) : 0u;
+    /* cart_allocations spans the WHOLE cart (#250): the Lua half's host-VM arena
+     * PLUS a hybrid's emulated native half in the rv32 session's separate arena.
+     * Folding the two makes the figure the combined cart-attributable heap the
+     * unified 16 MB pool tracks — byte-identical across the host-Lua legs. Mirrors
+     * the native runner's l_mem_stats. */
     uint32_t heap_used = blyt_mem_cart_heap(&g_lua_mem_acct);
+    if (g_session)
+        heap_used += blyt_session_cart_heap(g_session);
 
     lua_createtable(L, 0, 5);
     lua_pushinteger(L, (lua_Integer)cache_used);

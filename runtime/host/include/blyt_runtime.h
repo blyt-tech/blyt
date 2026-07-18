@@ -496,6 +496,16 @@ blyt_state_ctx_t *blyt_session_state_ctx(blyt_session_t *s);
 const char *blyt_session_save_dir(blyt_session_t *s);
 const char *blyt_session_cart_name(blyt_session_t *s);
 
+/* Unified 16 MB budget across a host-Lua hybrid's two arenas (#250, ADR-0008).
+ * The hybrid's Lua half runs in a host-VM arena; its native half runs EMULATED
+ * in this rv32 session's own arena.  blyt_session_cart_heap reads the native
+ * half's live cart heap (folded into mem.stats + the host-VM predicate);
+ * blyt_session_set_peer_heap pushes the Lua half's heap the other way so the
+ * native arena's malloc/pin fails once the COMBINED footprint exceeds 16 MB —
+ * matching the single shared pool bare-metal rv32 uses natively. */
+uint32_t blyt_session_cart_heap(blyt_session_t *s);
+void blyt_session_set_peer_heap(blyt_session_t *s, uint32_t bytes);
+
 /* --- ECALL-bridged Lua C API (ADR-0130, WASM hybrid carts) ----------------- */
 
 /* .lua_exports entry flags (byte after ret_type; 0 in pre-ADR-0130 carts). */
