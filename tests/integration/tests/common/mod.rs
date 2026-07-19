@@ -1518,6 +1518,58 @@ pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     ))
 }
 
+// ── #278: shared hybrid init-budget probe ────────────────────────────────────
+//
+// A hybrid whose Lua init() fills the cart heap in fixed 64 KiB blocks BEFORE any
+// native call, with an 8 MiB persistent resource reserved from frame 0. The
+// surviving block count measures the budget headroom the init() allocations see.
+// Shared here so the host-Lua leg parity test (hostlua_hybrid.rs) and the
+// bare-metal QEMU anchor (native_qemu.rs) run the byte-identical cart and pin to
+// the SAME count — see hostlua_hybrid.rs for the full rationale.
+
+/// Trivial native half; its `.lua_exports` makes the cart a hybrid (a SEPARATE
+/// rv32 session arena). Never called during init(), so no trampoline couples the
+/// two arenas before the budget probe.
+pub const INIT_BUDGET_HYBRID_C: &str = r#"#include "blyt.h"
+BLYT_LUA_MODULE_EXPORT_RAW(host, noop) {
+    (void)L;
+    return 0;
+}
+"#;
+
+/// Lua half: fill in 64 KiB blocks, hold each distinct long-string body live,
+/// print the surviving count, then release so the cart exits cleanly on every leg
+/// (the count, not an ENOMEM crash, is the observable).
+pub const INIT_BUDGET_HYBRID_LUA: &str = r#"
+require("host") -- hybrid marker; calls NO native fn before the fill below
+local CHUNK = 64 * 1024
+local KEEP = {}
+function init()
+    local n = 0
+    while n < 4096 do
+        local ok, s = pcall(string.rep, "x", CHUNK)
+        if not ok or not s then break end
+        n = n + 1
+        KEEP[n] = s
+    end
+    blyt.debug.print("INITBUDGET filled=" .. n)
+    KEEP = {}
+    collectgarbage("collect")
+end
+function update() blyt.quit() end
+function draw() end
+"#;
+
+/// Persistent-resource size the probe reserves from frame 0 (8 MiB).
+pub const INIT_BUDGET_PERSIST_BYTES: usize = 8 * 1024 * 1024;
+
+/// Deterministic surviving 64 KiB-block count once the 8 MiB persistent
+/// reservation is honoured (16 - 8 MiB headroom, minus runtime scaffolding). The
+/// emulated rv32 oracle, bare metal, and all three host-Lua legs must agree on
+/// this exact figure (#278); before the fix the host-Lua legs fill ~255 (the full
+/// 16 MiB). A scaffolding shift moves it — update here and both callers follow.
+pub const INIT_BUDGET_FILLED: u64 = 127;
+
 /// Run a cart with blytplay --headless; assert `expected` appears in stdout.
 pub fn run_cart_native(cart: &std::path::Path, expected: &str) {
     run_cart_native_with_env(cart, &[], expected)

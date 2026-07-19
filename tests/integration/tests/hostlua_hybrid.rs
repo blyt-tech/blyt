@@ -1012,6 +1012,85 @@ function draw() end
     run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
 }
 
+// ── #278: hybrid must reserve its persistent footprint during init() ─────────
+//
+// #250 coupled the two hybrid arenas (host-VM Lua half + emulated rv32 native
+// half) ONLY at trampoline points: hl_budget_enter/leave_native + pin/unpin
+// publish the peer heap and fold the session's cart heap + persistent-resource
+// footprint into the host-VM arena's non_evictable_footprint. Nothing published
+// at VM-build time, so a hybrid's host-VM arena started with footprint = 0 and
+// ignored the session's persistent reservation until the FIRST native call.
+//
+// A Lua init() that fills the heap BEFORE touching native therefore ran against
+// the full 16 MiB on the host-Lua legs, but against only (16 - persistent) MiB on
+// bare metal / the emulated oracle, which reserves persistent from frame 0
+// (ADR-0028) — the single-arena model bare metal runs natively. That is a
+// bare-metal determinism divergence (ADR-0136 anchor), not merely an
+// emulated-vs-host-Lua one, so the teeth pin the host-Lua legs to the emulated
+// rv32 oracle here and to real RISC-V hardware in the QEMU gate (native_qemu.rs).
+
+#[test]
+fn hostlua_hybrid_init_budget_reserves_persistent_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_init_budget");
+    CartProject::new()
+        .c(common::INIT_BUDGET_HYBRID_C)
+        .lua(common::INIT_BUDGET_HYBRID_LUA)
+        .asset_bytes("pers8.bin", &vec![0u8; common::INIT_BUDGET_PERSIST_BYTES])
+        .persistent(&["pers8"])
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let golden = common::INIT_BUDGET_FILLED;
+
+    // The emulated rv32 leg (no BLYT_HOSTLUA): a hybrid defaults to emulated
+    // (ADR-0136), which reserves the 8 MiB persistent set from frame 0 (ADR-0028)
+    // — the same one-arena model bare metal runs. This cross-checks the pinned
+    // golden against the oracle, so a scaffolding shift is caught here (not only
+    // in the QEMU gate, native_qemu.rs, which pins the same figure on hardware).
+    let oracle = probe_u64(&capture_cart_native(&cart, &[]), "filled");
+    assert_eq!(
+        oracle, golden,
+        "emulated rv32 oracle filled={oracle} != pinned INIT_BUDGET_FILLED={golden}: \
+         the 8 MiB persistent reservation moved — update the shared const and the \
+         QEMU gate together (#278)"
+    );
+
+    // Every host-Lua leg must reserve the SAME persistent footprint from frame 0.
+    // RED before the #278 fix: footprint = 0 until the first trampoline, so the
+    // fill runs against the full 16 MiB and `filled` is ~255 (2x the golden).
+    let native = probe_u64(
+        &capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]),
+        "filled",
+    );
+    let wasm = probe_u64(&capture_cart_wasm(&cart, &[]), "filled");
+    let libretro = probe_u64(
+        &capture_cart_libretro(&cart, &[("BLYT_HOSTLUA", "1")]),
+        "filled",
+    );
+
+    assert_eq!(
+        native, golden,
+        "native host-Lua hybrid must reserve its persistent footprint during init() \
+         from frame 0 like bare metal (#278): native filled={native}, expected={golden}"
+    );
+    assert_eq!(
+        wasm, golden,
+        "WASM host-Lua hybrid must reserve its persistent footprint during init() \
+         from frame 0 like bare metal (#278): wasm filled={wasm}, expected={golden}"
+    );
+    assert_eq!(
+        libretro, golden,
+        "libretro host-Lua hybrid must reserve its persistent footprint during init() \
+         from frame 0 like bare metal (#278): libretro filled={libretro}, expected={golden}"
+    );
+}
+
 // ── #276: hybrid legs must resolve ONE cart-facing resource table ─────────────
 //
 // A hybrid's Lua half runs on the host-Lua VM; its native C/Rust half is emulated
