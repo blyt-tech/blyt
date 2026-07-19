@@ -3610,6 +3610,18 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
     lua_gc(g_lua, LUA_GCCOLLECT);
     g_lua_mem_acct.guest_heap_baseline = g_lua_mem_acct.guest_heap_used;
 
+    /* Seed the unified-budget coupling at frame 0 — BEFORE init() runs (#278).
+     * A pure-Lua cart already published its footprint above (the !g_session
+     * block); a hybrid did not, so its host-VM arena would start with
+     * non_evictable_footprint = 0 and its Lua init() could allocate against the
+     * full 16 MB, ignoring the session's persistent reservation until the first
+     * native trampoline — a bare-metal divergence (ADR-0028), not just an
+     * emulated-vs-host-Lua one.  Publish both directions once here, reusing the
+     * #250/#267 coupling verbatim (guarded on g_session).  Mirrors the native
+     * runner's hl_new seed (cart_run_hostlua.c, #278). */
+    wasm_budget_enter_native();
+    wasm_budget_leave_native();
+
 #ifdef BLYT_DAP
     {
         int dap_port = blyt_js_dap_port();

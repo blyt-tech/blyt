@@ -376,6 +376,25 @@ function draw() end
         None
     };
 
+    // ── Build the init-budget hybrid cart (#278) ─────────────────────
+    // A hybrid whose Lua init() fills the heap BEFORE any native call, with an
+    // 8 MiB persistent resource reserved from frame 0 (ADR-0028). Bare metal is
+    // the parity anchor: it reserves persistent in its ONE arena from frame 0, so
+    // the init() fill sees only (16 - 8) MiB — the exact block count the host-Lua
+    // legs must match. Same cart + figure as hostlua_hybrid's parity test (#278).
+    let init_budget_cart = if have_lua_gate {
+        let project = tmp.path().join("init_budget_metal");
+        CartProject::new()
+            .c(common::INIT_BUDGET_HYBRID_C)
+            .lua(common::INIT_BUDGET_HYBRID_LUA)
+            .asset_bytes("pers8.bin", &vec![0u8; common::INIT_BUDGET_PERSIST_BYTES])
+            .persistent(&["pers8"])
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     // ── Build the reverse-trampoline re-entrant hybrid cart (#262) ────
     // Bare-metal is the parity anchor for reverse-trampoline re-entrancy: the
     // native half links the real in-machine libblyt32lua, so native->Lua->native
@@ -900,6 +919,12 @@ function draw() end
             "scp hybrid_metal.blyt failed"
         );
     }
+    if let Some(ref cart) = init_budget_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp init_budget_metal.blyt failed"
+        );
+    }
     if let Some(ref cart) = reentrant_cart {
         assert!(
             qemu.scp_to(cart, "/tmp/blyt_gate/"),
@@ -1211,6 +1236,36 @@ function draw() end
         println!("  PASS: output = {:?}", output.trim());
     } else {
         println!("Gate 8b: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 8c: hybrid reserves persistent budget during init() (#278) ─
+    if let Some(ref _cart) = init_budget_cart {
+        println!("Gate 8c: hybrid init() budget reservation on metal...");
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/init_budget_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "init_budget_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        // Bare metal reserves the 8 MiB persistent set from frame 0 (ADR-0028) in
+        // its ONE arena, so the Lua init() fill sees only (16 - 8) MiB of headroom
+        // — the SAME deterministic block count the emulated oracle and all three
+        // host-Lua legs report (hostlua_hybrid.rs). A host-Lua leg that ignored
+        // the reservation until its first trampoline would fill ~255; this anchors
+        // the golden figure to real RISC-V hardware (#278).
+        let expected = format!("INITBUDGET filled={}", common::INIT_BUDGET_FILLED);
+        assert!(
+            output.contains(&expected),
+            "expected {expected:?} in output\noutput: {output}"
+        );
+        println!("  PASS: output = {:?}", output.trim());
+    } else {
+        println!("Gate 8c: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 9: state buffer save/load round-trip on metal ───────────
