@@ -242,6 +242,13 @@ typedef struct {
     bool ecall_trapped; /* cart issued a non-permitted ecall */
     bool ecall_aborted; /* cart called abort() — ECALL_EXIT with a0 != 0 */
     bool frame_done; /* set by BLYT_ECALL_FRAME_DONE; cleared by run_frame */
+    /* The cart called blyt_exit — it has run cleanup() and will never run again
+     * (#283).  Distinct from the rv halt, which BLYT_ECALL_FRAME_DONE also
+     * raises once per frame and run_frame clears on entry, so `halted` cannot
+     * tell "frame boundary" from "cart is gone".  Sticky for the session's
+     * remaining life; the emulated counterpart of the host-Lua runner's
+     * `hl->done`. */
+    bool cart_exited;
     bool fn_return_done; /* set by BLYT_ECALL_HOST_FN_RETURN; cleared by run_frame */
     bool dap_enabled; /* set by blyt_session_dap_listen(); enables ECALL_DAP_HOOK */
     blyt_debug_state_t debug_state;
@@ -1805,6 +1812,8 @@ static void blyt_ecall_handler(riscv_t *rv) {
         uint32_t code = rv_get_reg(rv, rv_reg_a0);
         blyt_tracef(BLYT_TRACE_API, "exit(code=%u)", code);
         rv_halt(rv);
+        if (g_run_ctx)
+            g_run_ctx->cart_exited = true;
         if (code != 0 && g_run_ctx)
             g_run_ctx->ecall_aborted = true;
         return;
@@ -2652,6 +2661,8 @@ static void blyt_ecall_handler(riscv_t *rv) {
         blyt_tracef(BLYT_TRACE_API, "sys_exit%s(code=%u)", num == 94 ? "_group" : "",
                     rv_get_reg(rv, rv_reg_a0));
         rv_halt(rv);
+        if (g_run_ctx)
+            g_run_ctx->cart_exited = true;
         if (rv_get_reg(rv, rv_reg_a0) != 0 && g_run_ctx)
             g_run_ctx->ecall_aborted = true;
         return;
@@ -5087,6 +5098,20 @@ void blyt_reset_every_frame_cycle(blyt_session_t *s) {
     uint32_t i;
 
     if (!s || s->fn_init == 0)
+        return;
+
+    /* A finished cart is never stressed again (#283).  Without this, a frontend
+     * that drives the cycle after the run in which the cart exited re-runs
+     * init() on a cart that has already run cleanup() — an extra, cart-observable
+     * init() and an ADR-0087 lifecycle inversion.  Mirrors
+     * blyt_hostlua_reset_every_frame_cycle's `hl->done` early-out, so neither
+     * exec model can be resurrected by a caller; the blytplay loop that actually
+     * did so is fixed at its call site too.
+     *
+     * Note this tests cart_exited, NOT the rv halt: BLYT_ECALL_FRAME_DONE halts
+     * the emulator once per frame to hand control back, so `halted` is true at
+     * every frame boundary and would disable the cycle entirely. */
+    if (s->ctx.cart_exited)
         return;
 
     /* Preserve emulator state so the normal game loop continues after the cycle. */

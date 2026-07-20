@@ -2106,6 +2106,99 @@ pub fn run_cart_all_legs_reset_every_frame(cart: &std::path::Path, expected: &st
     run_cart_libretro_with_flags(cart, &["--reset-every-frame"], expected);
 }
 
+/// Extract a cart's own markers from one leg's captured output, in order. A
+/// marker is `<{tag}:PAYLOAD>`; each PAYLOAD is returned.
+///
+/// Raw leg outputs are not directly comparable: the libretro driver prints a
+/// version banner and a debug guest lib emits ungated trace lines, so isolating
+/// what the *cart* emitted is what lets the comparison be EXACT without first
+/// normalising every leg's own noise.
+///
+/// Markers are self-delimiting rather than line-based on purpose. Bare metal's
+/// `blyt_console_debug` goes straight to `write(2)` with no trailing newline, so
+/// a whole run arrives as a single line with the guest's own trace output run
+/// together with the cart's — a line-based extractor yields NOTHING there and the
+/// assertion fails (or worse, an `is_empty()`-tolerant one passes) for a reason
+/// that has nothing to do with the cart. That is the same shape as the coverage
+/// gap these helpers exist to close (#284).
+pub fn cart_markers(output: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}:");
+    let mut out = Vec::new();
+    let mut rest = output;
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + open.len()..];
+        match rest.find('>') {
+            Some(end) => {
+                out.push(rest[..end].to_owned());
+                rest = &rest[end + 1..];
+            }
+            None => break, /* truncated output — stop rather than invent a marker */
+        }
+    }
+    out
+}
+
+/// Assert one leg's markers are EXACTLY `expected` — same payloads, same order,
+/// same count.
+fn assert_markers_exact(leg: &str, output: &str, tag: &str, expected: &[&str]) {
+    let got = cart_markers(output, tag);
+    assert_eq!(
+        got,
+        expected,
+        "\n{leg} leg emitted a different marker sequence.\n  expected ({} lines): {:#?}\n  got      ({} lines): {:#?}\nfull {leg} output:\n{output}",
+        expected.len(),
+        expected,
+        got.len(),
+        got,
+    );
+}
+
+/// The exact-match counterpart to [`run_cart_all_legs`] (#284): run `cart` on all
+/// three host-runtime legs and require each leg's marker lines (see
+/// [`cart_marker_lines`]) to equal `expected` exactly.
+///
+/// [`run_cart_all_legs`] and friends assert only that a substring *appears* in
+/// each leg's output, so a leg that runs an extra frame, or repeats a lifecycle
+/// callback, still passes. That is how #283 stayed invisible: blytplay drove one
+/// `--reset-every-frame` cycle too many and re-entered `init()` on an
+/// already-finished cart, and every substring assertion was still satisfied.
+/// Reach for this helper whenever the *number* of times something happens is
+/// part of the contract — frame counts above all, since a cart's frame count is
+/// cart-observable and determinism is the core contract.
+pub fn run_cart_all_legs_exact(cart: &std::path::Path, tag: &str, expected: &[&str]) {
+    assert_markers_exact("native", &capture_cart_native(cart, &[]), tag, expected);
+    assert_markers_exact("wasm", &capture_cart_wasm(cart, &[]), tag, expected);
+    assert_markers_exact("libretro", &capture_cart_libretro(cart, &[]), tag, expected);
+}
+
+/// [`run_cart_all_legs_exact`] under each leg's `--reset-every-frame` save/restore
+/// stress cycle, translating the per-leg knob exactly as
+/// [`run_cart_all_legs_reset_every_frame`] does. The cart must terminate itself.
+pub fn run_cart_all_legs_exact_reset_every_frame(
+    cart: &std::path::Path,
+    tag: &str,
+    expected: &[&str],
+) {
+    assert_markers_exact(
+        "native",
+        &capture_cart_native_with_flags(cart, &["--reset-every-frame"], &[]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "wasm",
+        &capture_cart_wasm(cart, &[("BLYT_RESET_EVERY_FRAME", "1")]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "libretro",
+        &capture_cart_libretro_with_flags(cart, &["--reset-every-frame"], &[]),
+        tag,
+        expected,
+    );
+}
+
 /// Like [`run_cart_all_legs`], but force-evicts every evictable resource after
 /// each frame (ADR-0027 v2, #137), translating the per-leg knob (blytplay
 /// `--evict-every-frame` flag / `BLYT_RESOURCE_EVICT_EVERY_FRAME` env / driver

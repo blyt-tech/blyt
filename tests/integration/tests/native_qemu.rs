@@ -347,6 +347,31 @@ function draw() end
         None
     };
 
+    // Gate 35 (#283): a Lua cart whose full ADR-0087 lifecycle is observable, so
+    // bare metal can be checked against the host-Lua legs callback for callback.
+    let lifecycle_cart = if have_lua_gate {
+        let project = tmp.path().join("lifecycle_metal");
+        CartProject::new()
+            .lua(
+                r#"
+local frame = 0
+function init() blyt32.debug.print("<lc:init>") end
+function update()
+    frame = frame + 1
+    blyt32.debug.print("<lc:update " .. frame .. ">")
+    if frame >= 2 then blyt.quit() end
+end
+function draw() end
+function on_quit() blyt32.debug.print("<lc:on_quit>") end
+function cleanup() blyt32.debug.print("<lc:cleanup>") end
+"#,
+            )
+            .write(&project);
+        Some(build_cart(&project))
+    } else {
+        None
+    };
+
     let hybrid_cart = if have_lua_gate {
         let project = tmp.path().join("hybrid_metal");
         CartProject::new()
@@ -911,6 +936,12 @@ function draw() end
         assert!(
             qemu.scp_to(cart, "/tmp/blyt_gate/"),
             "scp lua_metal.blyt failed"
+        );
+    }
+    if let Some(ref cart) = lifecycle_cart {
+        assert!(
+            qemu.scp_to(cart, "/tmp/blyt_gate/"),
+            "scp lifecycle_metal.blyt failed"
         );
     }
     if let Some(ref cart) = hybrid_cart {
@@ -2913,6 +2944,47 @@ void blyt_cart_draw(void) {}
         println!("  PASS: {}", common::fp::FP_PARITY_DIGEST);
     } else {
         println!("Gate 34: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 35: Lua cart lifecycle tail on metal (#283) ──────────────
+    // ADR-0087 fixes the lifecycle as init → on_new_state → [update → draw] →
+    // on_quit → cleanup, and its Lua entry-point table maps the last two to the
+    // `on_quit` and `cleanup` globals. The emulated Lua shim
+    // (runtime/guest/src/libblyt32lua/blyt32lua.c) defined every other entry point
+    // and silently omitted these two, so libblytcommon's weak no-ops won and a Lua
+    // cart's on_quit()/cleanup() had NEVER run on the RV32 guest-lib path — bare
+    // metal included, since it links the same shim — while the host-Lua driver
+    // chunk called them. Latent since the Lua runtime was introduced.
+    //
+    // Bare metal is the parity anchor (ADR-0136), and here it agreed with the
+    // *broken* emulated leg rather than the correct host-Lua ones: the written
+    // design, not the anchor's current behaviour, is what settles it. This gate is
+    // the anchor-side half of the fix, asserting the exact marker sequence so a
+    // regression that drops or repeats a callback fails rather than passing on a
+    // substring.
+    if lifecycle_cart.is_some() {
+        println!("Gate 35: Lua lifecycle on_quit/cleanup on metal...");
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/lifecycle_metal.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "lifecycle_metal.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        let markers = common::cart_markers(&output, "lc");
+        assert_eq!(
+            markers,
+            ["init", "update 1", "update 2", "on_quit", "cleanup"],
+            "bare-metal lifecycle must match the host-Lua legs exactly \
+             (ADR-0087 order, #283)\noutput: {output}"
+        );
+        println!("  PASS: {markers:?}");
+    } else {
+        println!("Gate 35: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     println!("Gate tests passed.");

@@ -53,6 +53,8 @@
     blyt_cart_on_new_state;
     blyt_cart_on_save_state;
     blyt_cart_on_load_state;
+    blyt_cart_on_quit;
+    blyt_cart_cleanup;
     blyt_cart_on_assets_reloaded;
   local: *;
 };
