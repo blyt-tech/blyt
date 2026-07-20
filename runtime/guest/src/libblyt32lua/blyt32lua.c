@@ -1134,6 +1134,24 @@ void blyt_cart_on_new_state(void) {
 void blyt_cart_on_save_state(void) {
     call_global("on_save_state");
 }
+/* The loop-exit tail of blyt_main, per ADR-0087's Lua entry-point table (#283).
+ * These two were missing here since the Lua runtime was introduced, so the weak
+ * libblytcommon no-ops won and a Lua cart's on_quit()/cleanup() had NEVER run on
+ * the emulated path — nor on bare metal, which links this same shim — while the
+ * host-Lua driver chunk (BLYT_HOSTLUA_CO_BODY_RUNNING) called them faithfully.
+ * A cart-observable cross-leg divergence that stayed invisible because every
+ * assertion covering it was a substring match on output the cart emitted earlier
+ * in its life (#284).
+ *
+ * No blyt_quit() here, unlike libblytcommon's weak on_quit default: that default
+ * exists to end the loop when nothing else would, and by the time this runs the
+ * loop has already exited on the cart's own blyt_quit(). */
+void blyt_cart_on_quit(void) {
+    call_global("on_quit");
+}
+void blyt_cart_cleanup(void) {
+    call_global("cleanup");
+}
 void blyt_cart_on_load_state(blyt_load_info_t info) {
     if (!g_L)
         return;

@@ -427,6 +427,10 @@ void blyt_cart_on_save_state(void) {
 void blyt_cart_on_load_state(blyt_load_info_t info) {
     (void)info;
 }
+void blyt_cart_on_quit(void) {
+}
+void blyt_cart_cleanup(void) {
+}
 void blyt_cart_on_assets_reloaded(const uint32_t *ids, size_t n) {
     (void)ids;
     (void)n;

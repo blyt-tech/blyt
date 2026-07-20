@@ -781,7 +781,24 @@ int main(int argc, char *argv[]) {
         retro_run();
         if (g_quit_after >= 0 && ++frame_count >= g_quit_after)
             g_quit = true;
-        if (g_reset_every_frame && !g_quit)
+        /* Only stress a cart that is still running (#283).  This retro_run may
+         * have been the one where the cart exited — the guest ran on_quit() and
+         * cleanup() and halted — and the loop condition above does not re-test
+         * until the next iteration.  Driving the cycle into a finished session
+         * re-runs init() on a cart that has already run cleanup(), inverting
+         * ADR-0087's lifecycle and adding a cart-observable extra init(): the
+         * emulated leg reported 5 where the host-Lua legs reported 4, purely
+         * because blyt_hostlua_reset_every_frame_cycle happens to early-out on
+         * hl->done while the emulated cycle had no such guard.  The libretro
+         * driver (tests/unit/test_libretro_core.c) already breaks on is_done()
+         * before its cycle and the WASM tick gates on BLYT_RUN_FRAME_DONE, so
+         * blytplay was the sole outlier.  Frame counts are cart-observable and
+         * determinism is the core contract, so this has to agree everywhere.
+         *
+         * --evict-every-frame is deliberately left alone: eviction runs no cart
+         * callback, so it is not cart-observable, and the libretro driver
+         * likewise evicts before its is_done() check. */
+        if (g_reset_every_frame && !g_quit && !blyt_libretro_is_done())
             retro_reset_every_frame_cycle();
         if (g_evict_every_frame && !g_quit)
             retro_resource_evict_all();
