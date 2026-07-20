@@ -131,6 +131,18 @@ async function main() {
 		const userDataDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), 'blyt-vscode-ud-'),
 		);
+		/* Both of VS Code's writable state dirs must be redirected out of the
+		 * package. @vscode/test-electron defaults --extensions-dir (and
+		 * --user-data-dir) to <package>/.vscode-test/*, which BLYT_VSCODE_TEST_CACHE
+		 * does NOT cover — cachePath only redirects the VS Code *download*. Under
+		 * test-linux-docker the repo is mounted read-only, so that default made the
+		 * leg depend on host state: a checkout that had never run this suite
+		 * natively had no .vscode-test/, and VS Code died at startup with ENOENT
+		 * (mkdir), while one that had ran but logged EROFS on every extensions.json
+		 * write. A tmp dir per window is both hermetic and writable. */
+		const extensionsDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), 'blyt-vscode-ext-'),
+		);
 		console.log(`[runTests] running ${spec} in a ${key} window …`);
 		try {
 			await runTests({
@@ -142,6 +154,8 @@ async function main() {
 					workspace,
 					'--user-data-dir',
 					userDataDir,
+					'--extensions-dir',
+					extensionsDir,
 					'--disable-workspace-trust',
 					'--disable-gpu',
 					'--no-cached-data',
