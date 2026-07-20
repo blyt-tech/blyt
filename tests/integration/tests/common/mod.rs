@@ -1570,6 +1570,88 @@ pub const INIT_BUDGET_PERSIST_BYTES: usize = 8 * 1024 * 1024;
 /// 16 MiB). A scaffolding shift moves it — update here and both callers follow.
 pub const INIT_BUDGET_FILLED: u64 = 127;
 
+// ── #280: the same probe, driven across the --reset-every-frame cycle ────────
+//
+// #278 seeded the #250 arena coupling at frame 0 only on each leg's INITIAL-LOAD
+// path, leaving the shared VM-rebuild path unseeded. The rebuild empties the
+// arena (zeroing non_evictable_footprint) and re-runs init(), so the reset
+// cycle's init() sees the full 16 MiB again until the first native trampoline —
+// the #278 divergence a second time, on a different code path.
+//
+// This probe is the #278 cart plus a state-buffer frame counter, which is the
+// only state that survives a reset cycle (Lua globals are wiped with the VM and
+// the native half's BSS is zeroed in lockstep, #261) and so is what lets the cart
+// run far enough to be reset at all. It prints its surviving block count from
+// EVERY init() — frame 0 and each rebuild — and all of them must agree.
+//
+// Bare metal has no reset cycle to anchor against directly (the native launcher
+// has no --reset-every-frame; it is a host-driven VM-rebuild stress). The anchor
+// is transitive instead: the invariant is that a rebuild's init() sees the SAME
+// headroom as frame 0, and frame 0's headroom is pinned to real RISC-V hardware
+// by native_qemu.rs Gate 8c on the sibling #278 cart. Asserting every cycle here
+// reproduces that same figure carries the hardware anchor onto the reset path.
+
+/// Native half for the reset-path probe — identical in role to
+/// [`INIT_BUDGET_HYBRID_C`]: a `.lua_exports` hybrid marker never called before
+/// the fill, so no trampoline couples the two arenas ahead of the measurement.
+pub const RESET_BUDGET_HYBRID_C: &str = INIT_BUDGET_HYBRID_C;
+
+/// State-buffer declaration carrying the frame counter across the reset cycle.
+pub const RESET_BUDGET_HYBRID_CONFIG: &str = "\
+records:
+  Globals:
+    fields:
+      - { name: frame, type: i32 }
+state_buffers:
+  globals:
+    record: Globals
+    count: 1
+";
+
+/// Lua half: the [`INIT_BUDGET_HYBRID_LUA`] fill, reported from every init() —
+/// frame 0 and each `--reset-every-frame` rebuild — with the frame counter
+/// round-tripped through a state buffer so the cart survives to be reset.
+pub const RESET_BUDGET_HYBRID_LUA: &str = r#"
+require("host") -- hybrid marker; calls NO native fn before the fill below
+local CHUNK = 64 * 1024
+local KEEP = {}
+local frame = 0
+
+function init()
+    local n = 0
+    while n < 4096 do
+        local ok, s = pcall(string.rep, "x", CHUNK)
+        if not ok or not s then break end
+        n = n + 1
+        KEEP[n] = s
+    end
+    blyt.debug.print("RESETBUDGET filled=" .. n)
+    KEEP = {}
+    collectgarbage("collect")
+end
+
+function on_new_state()
+    blyt.buf.alloc_slot(S.GLOBALS)
+end
+
+function update()
+    frame = frame + 1
+    if frame >= 3 then
+        blyt.quit()
+    end
+end
+
+function draw() end
+
+function on_save_state()
+    S.globals[0].frame = frame
+end
+
+function on_load_state(_info)
+    frame = S.globals[0].frame
+end
+"#;
+
 /// Run a cart with blytplay --headless; assert `expected` appears in stdout.
 pub fn run_cart_native(cart: &std::path::Path, expected: &str) {
     run_cart_native_with_env(cart, &[], expected)
@@ -1679,6 +1761,50 @@ pub fn capture_cart_wasm(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> 
 pub fn capture_cart_libretro(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
     use assert_cmd::Command;
     let mut cmd = Command::new(test_libretro_core());
+    cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.assert().success().get_output().stderr.clone();
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+/// Like [`capture_cart_native`], but also passes blytplay flags — for probes that
+/// need a run-mode knob (`--reset-every-frame`) *and* an env selector
+/// (`BLYT_HOSTLUA=1`) at once, and parse a printed value rather than assert a
+/// fixed line (#280).
+pub fn capture_cart_native_with_flags(
+    cart: &std::path::Path,
+    extra_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(blytplay());
+    cmd.arg("--headless");
+    for f in extra_flags {
+        cmd.arg(f);
+    }
+    cmd.arg(cart.to_str().unwrap());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.assert().success().get_output().stdout.clone();
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+/// Like [`capture_cart_libretro`], but also passes `test_libretro_core` flags —
+/// the libretro companion to [`capture_cart_native_with_flags`] (#280). Flags
+/// precede the core/cart operands, matching [`run_cart_libretro_with_flags`].
+pub fn capture_cart_libretro_with_flags(
+    cart: &std::path::Path,
+    extra_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    for f in extra_flags {
+        cmd.arg(f);
+    }
     cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
     for (k, v) in extra_env {
         cmd.env(k, v);

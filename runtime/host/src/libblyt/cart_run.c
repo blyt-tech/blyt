@@ -416,6 +416,11 @@ struct blyt_session {
     } cart_bss[MAX_BSS_REGIONS];
     int n_cart_bss;
 
+    /* Guest address of libblytc's `blytc_arena_ready` reset lever (#133), kept so
+     * blyt_reset_every_frame_cycle can empty the cart heap the same way the hot
+     * swap does.  0 for a cart that does not link libblytc's arena. */
+    uint32_t arena_ready_vaddr;
+
     /* Cart image placement (issue #127).  cart_base is the guest load base of
      * the cart image (0 for the native bias today); cart_span is the highest
      * mapped offset (max p_vaddr + p_memsz) so [cart_base, cart_base + cart_span)
@@ -3399,6 +3404,9 @@ static blyt_cart_run_err_t dynlink(blyt_session_t *s, const blyt_cart_t *cart) {
             write_u32_le(v, BLYT_ARENA_SIZE);
             memory_write(mem, sym_size, v, 4);
         }
+        /* Retain the arena's reset lever (#133) so the reset-every-frame cycle
+         * can empty the cart heap between cycles, as the hot swap does (#280). */
+        s->arena_ready_vaddr = symtab_lookup(all_syms, "blytc_arena_ready");
         /* Resolve the unified-budget accounting block (ADR-0008 #158) so the
          * resource ECALLs can publish the footprint + read the heap total. Its
          * .data is zero-initialised in the freshly mapped lib (footprint 0,
@@ -3629,6 +3637,7 @@ bool blyt_session_swap_cart(blyt_session_t *s, const blyt_cart_t *new_cart, uint
         memory_write(mem, sym_size, v, 4);
     }
     uint32_t sym_ready = symtab_lookup(all, "blytc_arena_ready");
+    s->arena_ready_vaddr = sym_ready; /* keep the reset-cycle lever current (#280) */
     if (sym_ready != 0) {
         uint8_t v[4];
         write_u32_le(v, 0);
@@ -5102,6 +5111,25 @@ void blyt_reset_every_frame_cycle(blyt_session_t *s) {
     /* 3. Zero state buffers and guest BSS (static vars). */
     blyt_state_ctx_zero_data(&s->state_ctx);
     blyt_session_zero_guest_bss(s);
+
+    /* 3b. Empty the cart heap (#280).  Zeroing BSS drops every guest pointer INTO
+     *     the arena but leaves the arena itself full, and step 4 re-runs init() —
+     *     which for a Lua cart builds a whole new Lua state.  Without this the
+     *     abandoned one is never reclaimed, so each cycle leaks it (~34 KB for the
+     *     stock Lua runtime): the cart's heap headroom shrinks cycle by cycle, and
+     *     a cart that measures its own budget sees a DIFFERENT answer on every
+     *     one.  That is cart-observable and defeats the point of the cycle, which
+     *     is to prove a save/restore round trip is behaviourally identical to a
+     *     plain run.  Re-zeroing the ready lever makes the next malloc re-init the
+     *     bump pointer + free list (also re-zeroing guest_heap_used) — the same
+     *     #133 mechanism the hot swap uses for the same accumulation hazard, and
+     *     the emulated-leg counterpart of the host-Lua legs' arena reset in their
+     *     VM rebuild.  The non-evictable footprint is deliberately untouched: the
+     *     persistent resources stay resident and stay reserved (ADR-0028). */
+    if (s->arena_ready_vaddr) {
+        uint8_t z[4] = {0};
+        memory_write(PRIV(s->rv)->mem, s->arena_ready_vaddr, z, 4);
+    }
 
     /* 4. Re-run init. */
     blyt_session_begin_fn_call(s, s->fn_init, 0, NULL);
