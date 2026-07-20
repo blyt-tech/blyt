@@ -63,10 +63,10 @@ pub fn run(cart_path: &Path, output: Option<&Path>) -> Result<(), ExportError> {
  * HTML generation
  *
  * Produces a single self-contained HTML file.  The WASM binary and cart are
- * embedded as base64 strings and decoded at runtime via atob().  Setting
- * Module.wasmBinary to the decoded ArrayBuffer makes Emscripten skip its
- * normal fetch; the cart is written into MEMFS via a preRun hook so the
- * runtime finds it at /cart.blyt as usual.
+ * embedded as base64 strings and decoded at runtime via atob().  An
+ * instantiateWasm hook compiles the decoded bytes directly so Emscripten never
+ * fetches blytplay.wasm; the cart is written into MEMFS via a preRun hook so
+ * the runtime finds it at /cart.blyt as usual.
  * ------------------------------------------------------------------------- */
 
 fn generate_html(cart_name: &str, cart_bytes: &[u8], wasm_bytes: &[u8], js: &str) -> String {
@@ -99,8 +99,17 @@ fn generate_html(cart_name: &str, cart_bytes: &[u8], wasm_bytes: &[u8], js: &str
 
     // Inline script: decode embedded data and configure the Emscripten Module.
     //
-    // Module.wasmBinary — ArrayBuffer of the WASM module.  When set,
-    // Emscripten uses it directly and skips any fetch of blytplay.wasm.
+    // Module.instantiateWasm — compiles the embedded bytes ourselves, so
+    // Emscripten never fetches blytplay.wasm.  Returning {} tells it the
+    // instantiation is async and to wait for the callback.
+    //
+    // This deliberately does NOT use Module.wasmBinary, which would be the
+    // more obvious way to hand over the bytes: emcc 6.0.x dropped wasmBinary
+    // from the default INCOMING_MODULE_JS_API allowlist, so supplying it makes
+    // the loader abort with "`Module.wasmBinary` was supplied but `wasmBinary`
+    // not included in INCOMING_MODULE_JS_API" before the canvas ever renders
+    // (#285).  instantiateWasm is on that allowlist, so this needs no
+    // -sINCOMING_MODULE_JS_API override to keep in sync with emcc's defaults.
     //
     // preRun — writes the cart into the virtual filesystem before main()
     // runs, exactly as the dev shell does via a fetch.
@@ -119,7 +128,11 @@ fn generate_html(cart_name: &str, cart_bytes: &[u8], wasm_bytes: &[u8], js: &str
     html.push_str("\");\n");
     html.push_str("window.Module={\n");
     html.push_str("  canvas:document.getElementById(\"canvas\"),\n");
-    html.push_str("  wasmBinary:wasmBytes.buffer,\n");
+    html.push_str(
+        "  instantiateWasm:function(imports,cb){\
+         WebAssembly.instantiate(wasmBytes,imports).then(function(r){\
+         cb(r.instance,r.module);});return{};},\n",
+    );
     html.push_str("  preRun:[function(){FS.writeFile(\"/cart.blyt\",cartBytes);}],\n");
     html.push_str("  print:function(s){console.log(s);},\n");
     html.push_str("  printErr:function(s){console.error(s);},\n");

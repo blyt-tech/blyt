@@ -122,7 +122,10 @@ void blyt_cart_draw(void)   {}
         html.contains("<canvas id=\"canvas\""),
         "HTML missing canvas element"
     );
-    assert!(html.contains("wasmBinary"), "HTML missing wasmBinary setup");
+    assert!(
+        html.contains("instantiateWasm"),
+        "HTML missing instantiateWasm setup"
+    );
     assert!(
         html.contains("FS.writeFile(\"/cart.blyt\""),
         "HTML missing cart preRun hook"
@@ -190,7 +193,10 @@ void blyt_cart_draw(void)   {}
         html.contains("<canvas id=\"canvas\""),
         "HTML missing canvas element"
     );
-    assert!(html.contains("wasmBinary"), "HTML missing wasmBinary setup");
+    assert!(
+        html.contains("instantiateWasm"),
+        "HTML missing instantiateWasm setup"
+    );
     assert!(
         html.len() > 512 * 1024,
         "HTML is suspiciously small ({} bytes) — WASM may not be embedded",

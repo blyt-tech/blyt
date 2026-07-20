@@ -682,6 +682,30 @@ if(EMCC)
     endif()
 
     message(STATUS "Building ${_WNAME} WASM runtime (${_w})…")
+    # An emcc upgrade moves the toolchain out from under an existing tree and
+    # CMake cannot recover on its own: CMakeSystem.cmake include()s the platform
+    # file by absolute path, so once that version-stamped directory is gone
+    # (Homebrew Cellar/<ver>, an emsdk re-install, …) every configure fails at
+    # project(). emcmake passing the new toolchain file does not rescue it — the
+    # cache is only consulted, never re-derived.
+    #
+    # Detect it via the recorded platform file rather than the cached compiler:
+    # CMAKE_C_COMPILER is typically a stable symlink (/opt/homebrew/bin/emcc)
+    # that survives the upgrade and so proves nothing. Drop the tree instead of
+    # failing every build after a toolchain bump (#285).
+    file(GLOB _wasm_sysfiles "${_WDIR}/CMakeFiles/*/CMakeSystem.cmake")
+    foreach(_sf IN LISTS _wasm_sysfiles)
+      file(STRINGS "${_sf}" _plat REGEX "^include\\(\".*\"\\)")
+      string(REGEX REPLACE "^include\\(\"(.*)\"\\)$" "\\1" _plat "${_plat}")
+      if(_plat AND NOT EXISTS "${_plat}")
+        message(
+          STATUS
+            "${_WNAME} WASM: toolchain moved (${_plat} is gone) — reconfiguring from scratch"
+        )
+        file(REMOVE_RECURSE "${_WDIR}")
+        break()
+      endif()
+    endforeach()
     # BLYT_WASM_OUT_DIR makes the emcmake tree emit .html/.js/.wasm directly
     # into the SDK share dir, so later incremental `cmake --build ${_WDIR}`
     # invocations update the SDK in place (no copy step to go stale).
@@ -701,17 +725,21 @@ if(EMCC)
         ${CCACHE_LAUNCHER_ARGS} -G Ninja
       RESULT_VARIABLE R
       OUTPUT_QUIET)
+    # Hard-fail rather than warn. Reaching here means emcc was found (see the
+    # enclosing check), so a failure is a real breakage, not a machine without
+    # Emscripten. Warning instead left the previously-built .wasm sitting in
+    # ${_WDEST} and still exited 0, so the SDK silently shipped — and the whole
+    # test suite silently exercised — a runtime built by the *old* compiler.
+    # That is the stale-.wasm trap in the worst form: green, and wrong (#285).
     if(NOT R EQUAL 0)
-      message(WARNING "${_WNAME} WASM: configure failed — skipping")
-    else()
-      execute_process(COMMAND ${CMAKE_COMMAND} --build "${_WDIR}"
-                      RESULT_VARIABLE R)
-      if(NOT R EQUAL 0)
-        message(WARNING "${_WNAME} WASM: build failed — skipping")
-      else()
-        message(STATUS "${_WNAME} WASM assembled at ${_WDEST}")
-      endif()
+      message(FATAL_ERROR "${_WNAME} WASM: configure failed")
     endif()
+    execute_process(COMMAND ${CMAKE_COMMAND} --build "${_WDIR}"
+                    RESULT_VARIABLE R)
+    if(NOT R EQUAL 0)
+      message(FATAL_ERROR "${_WNAME} WASM: build failed")
+    endif()
+    message(STATUS "${_WNAME} WASM assembled at ${_WDEST}")
   endforeach()
 
   # Write the embedding README alongside the release runtime files.

@@ -47,10 +47,12 @@ jobs:
           # Keep in sync with CART_RUST_TOOLCHAIN in devtool/src/build.rs.
           rustup toolchain install nightly-2026-06-01 --profile minimal --component rust-src
 
+      # Keep in sync with the other two emsdk pins: ci.yml and
+      # Dockerfile.testing (#285).
       - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v16
         with:
-          version: 6.0.0
+          version: 6.0.3
           actions-cache-folder: emsdk-cache
 
       - name: ccache
