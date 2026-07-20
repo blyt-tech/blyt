@@ -69,10 +69,14 @@ jobs:
       # compiler cache on every run (~650 misses). A working emsdk cache
       # installs into the stable emsdk-cache/ folder. Version pinned so
       # emsdk bumps are deliberate (an upgrade invalidates the WASM cache).
+      # Keep this version in sync with the other two emsdk pins:
+      # Dockerfile.testing and external-examples.yml. The test-linux-docker
+      # container mirrors this job, so a drift between them compiles the WASM
+      # legs with a different emcc there (#285).
       - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v16
         with:
-          version: 6.0.0
+          version: 6.0.3
           actions-cache-folder: emsdk-cache
 
       # Compiler caches, persisted in the GitHub Actions cache. ccache is
