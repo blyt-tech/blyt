@@ -75,9 +75,18 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustup toolchain install nightly-2026-06-01 --profile minimal --component rust-src
 
 # ── Emscripten SDK ─────────────────────────────────────────────────────────────
+# Pinned, and must stay in sync with the setup-emsdk `version:` in ci.yml — this
+# image exists to mirror CI, and a floating `latest` silently compiles the WASM
+# legs with a different emcc than CI does. That is not hypothetical: `latest`
+# reached 6.0.2 while CI was pinned to 6.0.0, and 6.0.x dropped `wasmBinary`
+# from the default INCOMING_MODULE_JS_API allowlist, so the single-file HTML
+# export (devtool/src/export.rs) aborted on load and
+# wasm_canvas_renders_in_browser failed here but not in CI (#285). Bump this and
+# ci.yml together, as a deliberate change (an upgrade also invalidates the WASM
+# compiler cache).
 RUN git clone --depth 1 https://github.com/emscripten-core/emsdk.git /opt/emsdk \
-    && /opt/emsdk/emsdk install latest \
-    && /opt/emsdk/emsdk activate latest
+    && /opt/emsdk/emsdk install 6.0.0 \
+    && /opt/emsdk/emsdk activate 6.0.0
 ENV EMSDK=/opt/emsdk \
     EM_CONFIG=/opt/emsdk/.emscripten
 
