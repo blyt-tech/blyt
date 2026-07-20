@@ -288,14 +288,14 @@ static blyt_state_snapshot_t *g_reload_snap = NULL;
  * which was the whole execution-model residual (#231 → #242). */
 static const char co_body_init[] = BLYT_HOSTLUA_CO_BODY_INIT;
 
-#ifdef BLYT_GDB
-/* Debug hot reload (issue #170): run ONLY init() under the loop's INIT phase (so
- * a Lua init() breakpoint fires under the master hook and a Lua→native
- * trampoline can yield for a native breakpoint).  No on_new_state() — the reload
- * preserves state: the loop runs the restore + on_load_state tail once init()
- * completes, not a fresh-boot reset. */
+/* State-preserving rebuild (reset-every-frame cycle, hot reload): run ONLY
+ * init().  No on_new_state() — the rebuild preserves state, so the restore +
+ * on_load_state(HOT_RELOAD) tail is what re-seeds the cart, not a fresh boot.
+ * Used by every state-preserving rebuild, debug or not: the debug hot reload
+ * (issue #170) drives it under the loop's INIT phase so a Lua init() breakpoint
+ * fires under the master hook and a Lua→native trampoline can yield for a native
+ * breakpoint; the plain rebuild resumes it inline (#280). */
 static const char co_body_reload_init[] = BLYT_HOSTLUA_CO_BODY_RELOAD_INIT;
-#endif
 
 /* Per-frame update/draw loop with frame-boundary yield. */
 static const char co_body_running[] = BLYT_HOSTLUA_CO_BODY_RUNNING;
@@ -576,6 +576,29 @@ static int trampoline_gdb_resume_k(lua_State *L, int status, lua_KContext ctx);
  * host-VM predicate.  Both host-Lua legs do this at the SAME trampoline points, so
  * the fail-point is deterministic and leg-identical. */
 static blyt_resource_table_t *active_resource_table(void);
+/* Re-establish the two cart-heap invariants a VM rebuild destroys, immediately
+ * before the rebuilt VM's init() runs — the WASM counterpart of what the native
+ * runner's build_vm does on every (re)build (#280).
+ *
+ * 1. The scaffolding baseline (#231).  wasm_lua_arena_reset zeroes
+ *    guest_heap_baseline on the promise that it is "re-captured after the
+ *    rebuild" — nothing ever did.  Left at 0, cart_allocations counts the whole
+ *    rebuilt VM + stdlibs + API + bytecode as cart heap, so it disagrees with the
+ *    native host-Lua leg (which recaptures) after ANY reset or reload — a
+ *    #267-class cross-leg divergence on its own.  Collect first, so the baseline
+ *    pins the SETTLED scaffolding rather than build-time transient garbage.
+ *
+ * 2. The unified-budget coupling (#250/#278).  The rebuild empties the arena and
+ *    wasm_lua_arena_reset clears non_evictable_footprint, so the rebuilt VM's
+ *    init() would run against the full 16 MB — ignoring the hybrid's persistent
+ *    reservation until its first native trampoline, exactly the #278 bug on the
+ *    reset path instead of the boot path.  Re-seeding both directions here is the
+ *    rebuild-path analogue of the frame-0 seed in run_lua_cart.  Order matters:
+ *    the footprint publish bounds the evictable cache against cart_heap, so the
+ *    baseline must be correct FIRST or evict_to_fit computes its room against a
+ *    scaffolding-inflated heap. */
+static void wasm_lua_rebaseline_and_seed_budget(void);
+
 static void wasm_budget_enter_native(void) {
     if (g_session)
         blyt_session_set_peer_heap(g_session, blyt_mem_cart_heap(&g_lua_mem_acct));
@@ -583,6 +606,13 @@ static void wasm_budget_enter_native(void) {
 static void wasm_budget_leave_native(void) {
     if (g_session)
         wasm_lua_publish_footprint(active_resource_table());
+}
+
+static void wasm_lua_rebaseline_and_seed_budget(void) {
+    lua_gc(g_lua, LUA_GCCOLLECT);
+    g_lua_mem_acct.guest_heap_baseline = g_lua_mem_acct.guest_heap_used;
+    wasm_budget_enter_native();
+    wasm_budget_leave_native();
 }
 
 /* Run blyt_session_run_frame() in a loop until the native call completes.
@@ -2413,6 +2443,9 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
         if (fc_master_hook_cfg.dap_enabled)
             fc_consolelua_master_hook_install(g_lua_co);
 #endif
+        /* After the reload-init coroutine (it is scaffolding, as on the native
+         * leg), before wasm_lua_loop drives the deferred init() (#280). */
+        wasm_lua_rebaseline_and_seed_budget();
         g_lua_phase = LUA_PHASE_INIT;
         return true;
     }
@@ -2420,15 +2453,83 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
     (void)defer_init;
 #endif
 
-    /* Step 12: call init() from C (no coroutine needed for this reset call) */
-    lua_getglobal(g_lua, "init");
-    if (lua_isfunction(g_lua, -1)) {
-        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call init");
-        lua_pcall(g_lua, 0, 0, 0);
-        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret init");
-    } else {
-        lua_pop(g_lua, 1);
+    /* Steps 12-15: boot the rebuilt VM through the SHARED driver (#242), in the
+     * same shape and the same order as the native runner's build_vm + hl_boot
+     * (cart_run_hostlua.c) — see below for why that is a correctness requirement
+     * and not tidiness (#280).
+     *
+     * Step 12: the boot chunk, in a coroutine.  This path used to call init()
+     * straight from C and then build the running coroutine at the END, after the
+     * state restore.  Native builds the boot coroutine BEFORE its heap baseline,
+     * resumes it, then builds the running coroutine BEFORE restoring — so the two
+     * legs rebuilt with different allocation ORDERS.  Per #267 that is enough on
+     * its own: the arena is first-fit and charges a recycled block whole when the
+     * remainder cannot be split, so a different order leaves a different free
+     * list and the cart's own later allocations are charged differently.  It
+     * showed up as a cart-visible ~48-64 B cart_allocations split between the
+     * legs after any reset/reload, scaling with cart activity — the residual
+     * #242's runner unification left behind, because it unified only the
+     * INITIAL-LOAD path and this rebuild path kept hand-rolling its own shape.
+     *
+     * Routing through the driver's chunks also folds on_new_state() back into the
+     * cold-reset boot (BLYT_HOSTLUA_CO_BODY_INIT is "init + on_new_state"), so
+     * the separate hand-called on_new_state below is gone: one definition of what
+     * a boot runs, on every leg and every path. */
+    g_lua_co = lua_newthread(g_lua);
+    g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
+    if (luaL_loadstring(g_lua_co, preserve_state ? co_body_reload_init : co_body_init) != LUA_OK) {
+        blyt_js_error(lua_tostring(g_lua_co, -1));
+        lua_close(g_lua);
+        g_lua = NULL;
+        if (snap)
+            blyt_state_snapshot_free(snap);
+        g_lua_fatal = true;
+        return false;
     }
+#ifdef BLYT_DAP
+    if (fc_master_hook_cfg.dap_enabled)
+        fc_consolelua_master_hook_install(g_lua_co);
+#endif
+
+    /* Re-baseline the cart heap and re-seed the unified-budget coupling — after
+     * the boot coroutine (scaffolding, as on native), before init() allocates. */
+    wasm_lua_rebaseline_and_seed_budget();
+
+    /* Resume the boot chunk to completion, mirroring native's hl_boot.  A yield
+     * here is not a frame boundary, so discard any yielded values and resume
+     * again; a debugger-driven boot takes the defer_init path above instead. */
+    {
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "call init");
+        int nres = 0;
+        int st = lua_resume(g_lua_co, g_lua, 0, &nres);
+        while (st == LUA_YIELD) {
+            lua_settop(g_lua_co, 0);
+            st = lua_resume(g_lua_co, g_lua, 0, &nres);
+        }
+        if (st != LUA_OK) {
+            /* __blyt_call pcalls each callback and swallows its error, so getting
+             * here means the driver chunk itself failed — report rather than lose
+             * it (matches the native runner's hl_boot). */
+            const char *msg = lua_tostring(g_lua_co, -1);
+            blyt_js_error(msg ? msg : "(driver boot failed)");
+            lua_settop(g_lua_co, 0);
+        }
+        blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret init");
+    }
+
+    /* Step 15 (before the restore, as on native): the running coroutine for the
+     * next frame.  Re-arming the DAP master hook on it keeps breakpoints firing
+     * after a hot reload (issue #90) — the debug session is uninterrupted
+     * (ADR-0045 DAP continuity) but the hook lived on the coroutine just
+     * replaced. */
+    luaL_unref(g_lua, LUA_REGISTRYINDEX, g_lua_co_ref);
+    g_lua_co = lua_newthread(g_lua);
+    g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
+    luaL_loadstring(g_lua_co, co_body_running);
+#ifdef BLYT_DAP
+    if (fc_master_hook_cfg.dap_enabled)
+        fc_consolelua_master_hook_install(g_lua_co);
+#endif
 
     if (preserve_state) {
         /* Step 13: restore state buffers from snapshot */
@@ -2451,32 +2552,8 @@ static bool wasm_lua_rebuild(bool preserve_state, blyt_state_snapshot_t *ext_sna
         } else {
             lua_pop(g_lua, 1);
         }
-    } else {
-        /* Fresh reset (no state preserved): run on_new_state() like a cold boot. */
-        lua_getglobal(g_lua, "on_new_state");
-        if (lua_isfunction(g_lua, -1)) {
-            blyt_tracef(BLYT_TRACE_LIFECYCLE, "call on_new_state");
-            lua_pcall(g_lua, 0, 0, 0);
-            blyt_tracef(BLYT_TRACE_LIFECYCLE, "ret on_new_state");
-        } else {
-            lua_pop(g_lua, 1);
-        }
     }
 
-    /* Step 15: create running coroutine for next frame */
-    g_lua_co = lua_newthread(g_lua);
-    g_lua_co_ref = luaL_ref(g_lua, LUA_REGISTRYINDEX);
-    luaL_loadstring(g_lua_co, co_body_running);
-#ifdef BLYT_DAP
-    /* Re-arm the DAP master hook on the freshly built running coroutine so
-     * breakpoints keep firing after a hot reload (issue #90): the debug session
-     * is uninterrupted (ADR-0045 DAP continuity), but the hook lives on the
-     * coroutine we just replaced — without reinstalling it, the reloaded cart
-     * would run with debugging silently dead.  Mirrors the INIT→RUNNING
-     * transition and initial-start paths. */
-    if (fc_master_hook_cfg.dap_enabled)
-        fc_consolelua_master_hook_install(g_lua_co);
-#endif
     /* g_lua_phase stays LUA_PHASE_RUNNING — next frame calls update() directly */
     return true;
 }
@@ -3606,21 +3683,15 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
      * snapshot still holding build-time transient garbage — the uncollected
      * remainder would bias the subtraction. Mirrors the native runner
      * (cart_run_hostlua.c); see its baseline comment for why subtracting bytes is
-     * not on its own enough (layout survives the subtraction). */
-    lua_gc(g_lua, LUA_GCCOLLECT);
-    g_lua_mem_acct.guest_heap_baseline = g_lua_mem_acct.guest_heap_used;
-
-    /* Seed the unified-budget coupling at frame 0 — BEFORE init() runs (#278).
-     * A pure-Lua cart already published its footprint above (the !g_session
-     * block); a hybrid did not, so its host-VM arena would start with
-     * non_evictable_footprint = 0 and its Lua init() could allocate against the
-     * full 16 MB, ignoring the session's persistent reservation until the first
-     * native trampoline — a bare-metal divergence (ADR-0028), not just an
-     * emulated-vs-host-Lua one.  Publish both directions once here, reusing the
-     * #250/#267 coupling verbatim (guarded on g_session).  Mirrors the native
-     * runner's hl_new seed (cart_run_hostlua.c, #278). */
-    wasm_budget_enter_native();
-    wasm_budget_leave_native();
+     * not on its own enough (layout survives the subtraction).
+     *
+     * The baseline capture and the frame-0 budget seed (#278: a hybrid whose
+     * host-VM arena started at non_evictable_footprint = 0 could let its Lua
+     * init() allocate against the full 16 MB, ignoring the session's persistent
+     * reservation until the first native trampoline — a bare-metal divergence,
+     * ADR-0028) are the SAME pair the rebuild path needs, so both come from one
+     * definition rather than two copies that can drift (#267). */
+    wasm_lua_rebaseline_and_seed_budget();
 
 #ifdef BLYT_DAP
     {

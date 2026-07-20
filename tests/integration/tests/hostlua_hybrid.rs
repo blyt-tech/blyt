@@ -1091,6 +1091,220 @@ fn hostlua_hybrid_init_budget_reserves_persistent_parity() {
     );
 }
 
+// ── #280: the reservation must survive the --reset-every-frame rebuild ───────
+//
+// #278 fixed the INITIAL-LOAD path only (hl_new / run_lua_cart). The shared
+// VM-rebuild path was left unseeded on purpose, so on a reset cycle the rebuilt
+// VM re-runs init() against a zeroed non_evictable_footprint until its first
+// native trampoline — a hybrid that reallocates in the re-run init() before
+// touching native ignores its own persistent reservation all over again.
+//
+// Bare metal keeps persistent reserved across the reset (ADR-0028); the emulated
+// rv32 legs model that one-arena behaviour and are the oracle here. Bare metal
+// itself has no --reset-every-frame to gate on directly, so the hardware anchor
+// is transitive: every cycle must reproduce the frame-0 figure, and frame 0 is
+// pinned to real RISC-V hardware by Gate 8c (native_qemu.rs) on the sibling #278
+// cart. That is why this asserts against INIT_BUDGET_FILLED rather than a fresh
+// golden — the two probes must agree, because "the reset cycle sees the same
+// headroom as frame 0" IS the invariant under test.
+//
+// RED before the fix: the first line is the (already-fixed) frame-0 figure and
+// every later line is ~2x it, the full 16 MiB the unseeded rebuild hands back.
+
+/// Every `filled=` value the probe printed — one per init(), i.e. frame 0 plus
+/// one per reset cycle.
+fn probe_all_u64(output: &str, key: &str) -> Vec<u64> {
+    let needle = format!("{key}=");
+    output
+        .lines()
+        .filter_map(|l| l.find(&needle).map(|i| &l[i + needle.len()..]))
+        .map(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("bad {needle:?} value in {rest:?}"))
+        })
+        .collect()
+}
+
+/// Assert the probe was actually reset (more than one init()) and that every
+/// cycle saw the same budget headroom as frame 0.
+fn assert_reset_budget(leg: &str, output: &str, golden: u64) {
+    let filled = probe_all_u64(output, "filled");
+    assert!(
+        filled.len() >= 2,
+        "{leg}: expected >=2 RESETBUDGET lines (frame 0 + at least one reset cycle), \
+         got {filled:?}\noutput:\n{output}"
+    );
+    for (cycle, n) in filled.iter().enumerate() {
+        assert_eq!(
+            *n, golden,
+            "{leg}: init() on cycle {cycle} saw filled={n}, expected {golden} — the \
+             rebuilt VM must re-reserve the hybrid's persistent footprint before \
+             init() runs, like frame 0 and bare metal (#280/#278). All cycles: {filled:?}"
+        );
+    }
+}
+
+#[test]
+fn hostlua_hybrid_reset_cycle_budget_reserves_persistent_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_reset_budget");
+    CartProject::new()
+        .c(common::RESET_BUDGET_HYBRID_C)
+        .config(common::RESET_BUDGET_HYBRID_CONFIG)
+        .lua(common::RESET_BUDGET_HYBRID_LUA)
+        .asset_bytes("pers8.bin", &vec![0u8; common::INIT_BUDGET_PERSIST_BYTES])
+        .persistent(&["pers8"])
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    let golden = common::INIT_BUDGET_FILLED;
+
+    // The emulated rv32 oracle (no BLYT_HOSTLUA): one arena, persistent reserved
+    // from frame 0 and kept across the reset (ADR-0028) — the model bare metal
+    // runs. It must hold that reservation on EVERY cycle, which before #280 it
+    // did not: re-running init() built a fresh guest Lua state without reclaiming
+    // the abandoned one, so the leak ate ~34 KB of headroom per cycle and the
+    // count decayed 127 → 126 → 125.
+    assert_reset_budget(
+        "emulated rv32 oracle",
+        &common::capture_cart_native_with_flags(&cart, &["--reset-every-frame"], &[]),
+        golden,
+    );
+
+    // The three host-Lua legs must hold the same reservation across the rebuild.
+    assert_reset_budget(
+        "native host-Lua",
+        &common::capture_cart_native_with_flags(
+            &cart,
+            &["--reset-every-frame"],
+            &[("BLYT_HOSTLUA", "1")],
+        ),
+        golden,
+    );
+    assert_reset_budget(
+        "wasm host-Lua",
+        &common::capture_cart_wasm(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")]),
+        golden,
+    );
+    assert_reset_budget(
+        "libretro host-Lua",
+        &common::capture_cart_libretro_with_flags(
+            &cart,
+            &["--reset-every-frame"],
+            &[("BLYT_HOSTLUA", "1")],
+        ),
+        golden,
+    );
+}
+
+/// #280 (2) — the WASM leg's rebuild never recaptured its scaffolding baseline,
+/// so after ANY reset/reload `cart_allocations` still counted the whole rebuilt
+/// VM + stdlibs + API + bytecode as cart heap while the native leg (whose
+/// `build_vm` recaptures) counted 0. A #267-class cross-leg divergence in a
+/// cart-visible figure (ADR-0029), independent of the budget reservation above:
+/// it is wrong even for a cart that never gets near the 16 MB cap.
+///
+/// The cart holds a known 256 KiB live across the reset cycle and reports
+/// `cart_allocations` once the cycle has run, so the figure covers a rebuilt VM
+/// rather than the initial load. RED on WASM before the fix (scaffolding-inflated
+/// by tens of KB); the three host-Lua legs must agree byte-for-byte.
+#[test]
+fn hostlua_hybrid_reset_cycle_cart_allocations_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_reset_alloc");
+    CartProject::new()
+        .c(common::RESET_BUDGET_HYBRID_C)
+        .config(common::RESET_BUDGET_HYBRID_CONFIG)
+        .lua(
+            r#"
+require("host") -- hybrid marker
+local KEEP = {}
+local frame = 0
+
+function init()
+    -- A known, deterministic live set: 4 x 64 KiB distinct long strings.
+    KEEP = {}
+    for i = 1, 4 do
+        KEEP[i] = string.rep(tostring(i), 64 * 1024)
+    end
+    collectgarbage("collect")
+end
+
+function on_new_state()
+    blyt.buf.alloc_slot(S.GLOBALS)
+end
+
+function update()
+    frame = frame + 1
+    -- Report from frame 2, i.e. after at least one reset cycle has rebuilt the
+    -- VM — the initial load already agreed across legs before #280.
+    if frame >= 2 then
+        blyt.debug.print("RESETALLOC alloc=" .. blyt32.mem.stats().cart_allocations)
+        blyt.quit()
+    end
+end
+
+function draw() end
+function on_save_state() S.globals[0].frame = frame end
+function on_load_state(_info) frame = S.globals[0].frame end
+"#,
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+
+    let native = probe_u64(
+        &common::capture_cart_native_with_flags(
+            &cart,
+            &["--reset-every-frame"],
+            &[("BLYT_HOSTLUA", "1")],
+        ),
+        "alloc",
+    );
+    let wasm = probe_u64(
+        &common::capture_cart_wasm(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")]),
+        "alloc",
+    );
+    let libretro = probe_u64(
+        &common::capture_cart_libretro_with_flags(
+            &cart,
+            &["--reset-every-frame"],
+            &[("BLYT_HOSTLUA", "1")],
+        ),
+        "alloc",
+    );
+
+    assert!(
+        native >= 256 * 1024,
+        "native host-Lua cart_allocations ({native}) must include the cart's own \
+         256 KiB live set after the reset cycle"
+    );
+    assert_eq!(
+        native, wasm,
+        "cart_allocations after a reset cycle must be byte-identical native-host-Lua \
+         vs wasm32 (#280/#267): native={native}, wasm32={wasm} — a wasm value inflated \
+         by tens of KB means wasm_lua_rebuild did not recapture its scaffolding baseline"
+    );
+    assert_eq!(
+        native, libretro,
+        "cart_allocations after a reset cycle must be byte-identical native-host-Lua \
+         vs libretro-host-Lua (#280): native={native}, libretro={libretro}"
+    );
+}
+
 // ── #276: hybrid legs must resolve ONE cart-facing resource table ─────────────
 //
 // A hybrid's Lua half runs on the host-Lua VM; its native C/Rust half is emulated

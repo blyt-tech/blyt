@@ -2197,6 +2197,25 @@ static int build_vm(blyt_hostlua_t *hl, bool reload_boot) {
      * byte-identical cart-attributable heap. */
     lua_gc(hl->L, LUA_GCCOLLECT);
     hl->mem_acct.guest_heap_baseline = hl->mem_acct.guest_heap_used;
+
+    /* Seed the unified-budget coupling before the freshly built VM's init() runs
+     * (#278 at frame 0; #280 on every rebuild).  The #250 coupling otherwise
+     * fires only at trampoline points, so a hybrid's init() would allocate
+     * against the full 16 MB and ignore its own persistent reservation until the
+     * first native call — diverging from bare metal, which reserves persistent
+     * from frame 0 (ADR-0028).
+     *
+     * Doing it HERE rather than in hl_new covers every path that rebuilds a VM —
+     * the reset-every-frame cycle and hot reload (hl_rebuild_and_restore) and the
+     * DAP restart — not just the initial load.  The rebuild paths reset the arena
+     * beforehand, which zeroes guest_heap_used but NOT non_evictable_footprint,
+     * so this leg happened to retain a stale-but-plausible reservation across a
+     * rebuild; that was luck, not design (the WASM leg clears the footprint on
+     * arena reset and so lost it outright, #280).  Re-publishing both directions
+     * here makes the reservation explicit and current on every leg and path.
+     * Guarded on hl->session inside, so a no-op for a pure-Lua cart. */
+    hl_budget_enter_native(hl);
+    hl_budget_leave_native(hl);
     return 0;
 }
 
@@ -2312,20 +2331,8 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_en
         return NULL;
     }
 
-    /* Seed the unified-budget coupling at frame 0 — BEFORE init() runs (#278).
-     * The #250 coupling fires only at trampoline points (hl_budget_enter/
-     * leave_native) + pins; build_vm just captured the heap baseline but never
-     * published the session's persistent-resource footprint / native heap into
-     * this host-VM arena.  So a hybrid started with non_evictable_footprint = 0
-     * and its Lua init() could allocate against the full 16 MB, ignoring its own
-     * persistent reservation until the first native call — diverging from bare
-     * metal, which reserves persistent from frame 0 (ADR-0028).  Publish both
-     * directions once here (peer heap = 0 at frame 0, footprint = resources +
-     * native heap), reusing the byte-identical #250/#267 coupling verbatim.
-     * Guarded on hl->session, so a no-op for a pure-Lua cart (already published
-     * above).  The WASM leg does the equivalent in run_lua_cart (wasm_main.c). */
-    hl_budget_enter_native(hl);
-    hl_budget_leave_native(hl);
+    /* The frame-0 budget seed (#278) now lives at the tail of build_vm, which
+     * runs it on the initial load AND on every rebuild (#280). */
     return hl;
 }
 
