@@ -457,14 +457,13 @@ void blyt_cart_draw(void) {}
 
     // Send update_assets for resource id 1 and wait for the ack.
     let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect dev-ctrl");
-    sock.set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    sock.write_all(b"{\"id\":1,\"cmd\":\"update_assets\",\"assets\":[1]}\n")
-        .unwrap();
-    let ack = read_line(&mut sock, Duration::from_secs(10));
-    assert!(
-        ack.contains("\"status\":\"ok\"") && ack.contains("update_assets"),
-        "expected ok ack for update_assets, got: {ack}"
+    dev_ctrl_command(
+        &mut sock,
+        "{\"id\":1,\"cmd\":\"update_assets\",\"assets\":[1]}\n",
+        "update_assets",
+        &mut child,
+        &buf,
+        Duration::from_secs(10),
     );
 
     // Give the cart several frames to print the new content, then stop it.
@@ -509,23 +508,198 @@ fn wait_for_dev_ctrl_port(
     }
 }
 
-fn read_line(sock: &mut TcpStream, timeout: Duration) -> String {
+/// Why a dev-control line read stopped.  The outcomes are kept distinct because
+/// the flake in issue #288 surfaced only as `expected ok ack for update_assets,
+/// got: ` — an empty string — and the reader it came from collapsed *timeout*,
+/// *peer closed* and *I/O error* into that same empty string, so the panic could
+/// not say which had happened.
+#[derive(Debug)]
+enum DevCtrlRead {
+    /// A complete newline-terminated line (newline stripped).
+    Line(String),
+    /// The deadline expired before a newline arrived.
+    TimedOut { partial: String, waited: Duration },
+    /// The player closed the connection before sending a newline.
+    Closed { partial: String, waited: Duration },
+    /// A real I/O error — not a timeout, not EOF.
+    Failed {
+        partial: String,
+        error: std::io::Error,
+        waited: Duration,
+    },
+}
+
+impl DevCtrlRead {
+    /// One-line description for a panic message.
+    fn describe(&self) -> String {
+        match self {
+            DevCtrlRead::Line(l) => format!("got line {l:?}"),
+            DevCtrlRead::TimedOut { partial, waited } => {
+                format!("TIMED OUT after {waited:?} with no newline (partial: {partial:?})")
+            }
+            DevCtrlRead::Closed { partial, waited } => format!(
+                "connection CLOSED by the player after {waited:?} before a newline \
+                 (partial: {partial:?})"
+            ),
+            DevCtrlRead::Failed {
+                partial,
+                error,
+                waited,
+            } => format!("I/O ERROR after {waited:?}: {error} (partial: {partial:?})"),
+        }
+    }
+}
+
+/// Read one newline-terminated line from a dev-control socket, giving up after
+/// `timeout` and reporting *why* it stopped.
+///
+/// Deliberately deadline-driven rather than leaning on `SO_RCVTIMEO`: the socket
+/// is polled in short slices so that
+///   - `WouldBlock`/`TimedOut` means "nothing yet", not "give up", and
+///   - `Interrupted` (EINTR) is retried — `Read::read` does *not* retry it for us
+///     (unlike `read_exact`/`read_to_end`), so under load a single stray signal
+///     used to abort the whole read and yield an empty ack (issue #288).
+fn read_dev_ctrl_line(sock: &mut TcpStream, timeout: Duration) -> DevCtrlRead {
+    use std::io::ErrorKind;
+
     let start = std::time::Instant::now();
+    // Short slices so the deadline below — not the socket option — decides when
+    // to stop waiting.
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
+
     let mut acc = String::new();
     let mut byte = [0u8; 1];
-    while start.elapsed() < timeout {
+    loop {
         match sock.read(&mut byte) {
-            Ok(0) => break,
+            Ok(0) => {
+                return DevCtrlRead::Closed {
+                    partial: acc,
+                    waited: start.elapsed(),
+                };
+            }
             Ok(_) => {
                 if byte[0] == b'\n' {
-                    break;
+                    return DevCtrlRead::Line(acc);
                 }
                 acc.push(byte[0] as char);
             }
-            Err(_) => break,
+            Err(e) => match e.kind() {
+                ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut => {}
+                _ => {
+                    return DevCtrlRead::Failed {
+                        partial: acc,
+                        error: e,
+                        waited: start.elapsed(),
+                    };
+                }
+            },
+        }
+        if start.elapsed() >= timeout {
+            return DevCtrlRead::TimedOut {
+                partial: acc,
+                waited: start.elapsed(),
+            };
         }
     }
-    acc
+}
+
+/// Send one dev-control command and require an `ok` ack naming `cmd`.
+///
+/// The command is sent exactly once: `update_assets` mutates player state, so a
+/// retry would paper over the very race issue #288 is about.  What this *does*
+/// add is evidence — on failure it reports which of timeout / peer-close / I/O
+/// error ended the read, how long it waited, any partial bytes, whether the
+/// player process is still alive, and everything the player printed.  The
+/// original assertion threw all of that away.
+fn dev_ctrl_command(
+    sock: &mut TcpStream,
+    request: &str,
+    cmd: &str,
+    child: &mut std::process::Child,
+    player_out: &std::sync::Arc<std::sync::Mutex<String>>,
+    timeout: Duration,
+) {
+    sock.write_all(request.as_bytes())
+        .unwrap_or_else(|e| panic!("write {cmd} to dev-ctrl: {e}"));
+
+    let outcome = read_dev_ctrl_line(sock, timeout);
+    if let DevCtrlRead::Line(ref line) = outcome {
+        if line.contains("\"status\":\"ok\"") && line.contains(cmd) {
+            return;
+        }
+    }
+
+    let child_state = match child.try_wait() {
+        Ok(Some(status)) => format!("player EXITED with {status}"),
+        Ok(None) => "player still running".to_string(),
+        Err(e) => format!("could not query player: {e}"),
+    };
+    let printed = player_out.lock().unwrap().clone();
+    panic!(
+        "expected ok ack for {cmd}, but {}\n  request: {}\n  {child_state}\n  \
+         player output so far ({} bytes):\n{printed}",
+        outcome.describe(),
+        request.trim_end(),
+        printed.len(),
+    );
+}
+
+/// The dev-control line reader must distinguish *why* it returned no line
+/// (issue #288).  A reader that reports "" for a timeout, a peer close and an
+/// I/O error alike makes a flaky ack impossible to diagnose from the panic —
+/// which is exactly how #288 presented.  Needs no SDK: it drives a local
+/// listener directly.
+#[test]
+fn dev_ctrl_read_distinguishes_timeout_from_close() {
+    use std::net::TcpListener;
+
+    // Serve one connection, run `serve` on the accepted socket, and return the
+    // client end for the reader under test.
+    fn with_server(serve: impl FnOnce(TcpStream) + Send + 'static) -> TcpStream {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            serve(sock);
+        });
+        TcpStream::connect(("127.0.0.1", port)).unwrap()
+    }
+
+    // A complete line reads back as a line, newline stripped.
+    let mut sock = with_server(|mut s| {
+        s.write_all(b"{\"status\":\"ok\"}\n").unwrap();
+        // Hold the connection so this cannot be mistaken for a close.
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    match read_dev_ctrl_line(&mut sock, Duration::from_secs(5)) {
+        DevCtrlRead::Line(l) => assert_eq!(l, "{\"status\":\"ok\"}"),
+        other => panic!("expected a line, got {}", other.describe()),
+    }
+
+    // Silence to the deadline is a timeout, NOT a close — the distinction the
+    // old reader erased.
+    let mut sock = with_server(|_s| std::thread::sleep(Duration::from_secs(3)));
+    match read_dev_ctrl_line(&mut sock, Duration::from_millis(300)) {
+        DevCtrlRead::TimedOut { partial, .. } => assert_eq!(partial, ""),
+        other => panic!("expected a timeout, got {}", other.describe()),
+    }
+
+    // A peer that closes mid-line is reported as closed, and the partial bytes
+    // it did send survive into the diagnosis.
+    let mut sock = with_server(|mut s| {
+        s.write_all(b"{\"status\":\"e").unwrap();
+    });
+    match read_dev_ctrl_line(&mut sock, Duration::from_secs(5)) {
+        DevCtrlRead::Closed { partial, .. } => assert_eq!(partial, "{\"status\":\"e"),
+        other => panic!("expected a close, got {}", other.describe()),
+    }
+
+    // A peer that closes without sending anything is still a close, not a timeout.
+    let mut sock = with_server(|s| drop(s));
+    match read_dev_ctrl_line(&mut sock, Duration::from_secs(5)) {
+        DevCtrlRead::Closed { partial, .. } => assert_eq!(partial, ""),
+        other => panic!("expected a close, got {}", other.describe()),
+    }
 }
 
 /// WASM dev-mode hot-swap (issue #118): the full browser path.  `blyt run` serves
@@ -951,14 +1125,14 @@ fn native_update_assets_capture(
     }
 
     let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect dev-ctrl");
-    sock.set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
     let cmd = format!("{{\"id\":1,\"cmd\":\"update_assets\",\"assets\":{assets_json}}}\n");
-    sock.write_all(cmd.as_bytes()).unwrap();
-    let ack = read_line(&mut sock, Duration::from_secs(10));
-    assert!(
-        ack.contains("\"status\":\"ok\"") && ack.contains("update_assets"),
-        "expected ok ack for update_assets, got: {ack}"
+    dev_ctrl_command(
+        &mut sock,
+        &cmd,
+        "update_assets",
+        &mut child,
+        &buf,
+        Duration::from_secs(10),
     );
 
     std::thread::sleep(Duration::from_millis(500));
