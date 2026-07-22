@@ -11,6 +11,9 @@ use crate::engine::TaskInput;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FileState {
     pub size: u64,
+    /// Modification time in **nanoseconds** since the Unix epoch (see
+    /// `file_meta`).  Whole-second resolution here would let a same-size edit
+    /// within one second slip through the fast path unrebuilt (issue #290).
     pub mtime: u64,
     pub hash: u64,
 }
@@ -37,12 +40,24 @@ pub fn save_task_state(state_file: &Path, state: &TaskState) -> std::io::Result<
 
 fn file_meta(path: &Path) -> Option<(u64, u64)> {
     let meta = fs::metadata(path).ok()?;
+    // Nanosecond mtime, not whole seconds.  The size+mtime fast path below waves
+    // a file through as "unchanged" when both match the recorded state — so a
+    // byte-length-identical edit (e.g. a hot-reload source save changing `1` to
+    // `2`) that lands in the *same wall-clock second* as the previous build
+    // collides on a seconds-resolution mtime and is silently skipped, never
+    // rebuilt or reloaded (issue #290).  Sub-second precision distinguishes
+    // those writes on every filesystem we target (ext4/APFS/overlayfs all keep
+    // nanosecond mtimes); on the rare 1 s-resolution filesystem the sub-second
+    // part is 0 and we degrade to exactly the old behaviour — never worse.  A
+    // wider mtime only ever steers more edits onto the hash slow path, which is
+    // always the safe direction.  (u128 ns since the epoch fits u64 for ~500
+    // years.)
     let mtime = meta
         .modified()
         .ok()?
         .duration_since(UNIX_EPOCH)
         .ok()?
-        .as_secs();
+        .as_nanos() as u64;
     Some((meta.len(), mtime))
 }
 
@@ -305,6 +320,44 @@ mod tests {
 
         let (_, needs_run) = check_inputs(&[TaskInput::File(path)], Some(&prev));
         assert!(needs_run, "hash mismatch should trigger rerun");
+    }
+
+    #[test]
+    fn same_second_same_size_edit_is_detected() {
+        // Regression for #290.  A byte-length-identical edit that lands in the
+        // SAME wall-clock second as the previous build must still rerun the
+        // task.  We pin the edited file's mtime to exactly one nanosecond after
+        // the baseline's — same whole second — so a seconds-resolution mtime
+        // would collide and the size+mtime fast path would wave the edit through
+        // as "unchanged", silently skipping the rebuild (and the hot reload).
+        // Sub-second mtime instead sends it to the hash slow path, which sees the
+        // content change.  Forcing the mtime keeps this deterministic regardless
+        // of how fast the test ran or the filesystem's mtime granularity.
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "src.lua", b"local _ = 1");
+
+        let (map, _) = check_inputs(&[TaskInput::File(path.clone())], None);
+        let key = path.to_string_lossy().into_owned();
+        let baseline_mtime = map[&key].mtime; // nanoseconds since the epoch
+        let prev = TaskState {
+            inputs: map,
+            outputs: vec![],
+        };
+
+        // Same size, different content, pinned to baseline + 1 ns (same second).
+        fs::write(&path, b"local _ = 2").unwrap();
+        let forced = UNIX_EPOCH + Duration::from_nanos(baseline_mtime + 1);
+        let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_modified(forced).unwrap();
+        drop(f);
+
+        let (_, needs_run) = check_inputs(&[TaskInput::File(path)], Some(&prev));
+        assert!(
+            needs_run,
+            "same-second, same-size content edit must be detected and rerun (#290)"
+        );
     }
 
     #[test]
