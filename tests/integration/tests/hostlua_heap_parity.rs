@@ -214,6 +214,110 @@ const LEN_PROBE_INLINE: &[usize] = &[100, 500, 512];
 /// Lengths that spill to a heap box and become external strings (`LSTRMEM`).
 const LEN_PROBE_EXTERNAL: &[usize] = &[513, 600, 900];
 
+/// State layout for the registration-path gate (#270). Declaring ANY state
+/// buffer is what makes `hl_active_ctx()` / `active_state_ctx()` non-NULL, which
+/// is the sole condition under which `build_vm` arms `api.register_state_api` +
+/// `api.register_s_proxy` (`cart_run_hostlua.c:2100`, `wasm_main.c:2273`) and the
+/// shared canonical sequence fires the two hooks at `blyt_hostlua_api.h:358-361`.
+/// Every other gate cart in this file declares NO layout, so those two hooks —
+/// the ONE registration pair #267 left hand-mirrored per leg rather than folding
+/// into the shared header — never run, and their allocation order/sizing has zero
+/// cross-leg coverage.
+///
+/// The layout is deliberately rich: `Types` covers all nine field type tags in
+/// declaration order (i8=0 … f64=8), so the per-leg `type_names[]` table that
+/// must be extended in lockstep (`cart_run_hostlua.c:777`, `wasm_main.c:1625` —
+/// the #235 f64-misroute / #253-audit class) is exercised end to end, including
+/// the f64=8 boundary; and a second multi-slot `Entity` buffer (`count: 4`) makes
+/// `register_s_proxy` emit several row tables and a second metatable pair. The
+/// more machinery the generated proxy chunk allocates, the more surface a
+/// registration reorder has to refract through the first-fit arena into a
+/// `cart_allocations` divergence — which is exactly what this gate must catch.
+const STATE_CONFIG: &str = "\
+records:
+  Types:
+    fields:
+      - { name: v_i8,   type: i8   }
+      - { name: v_u8,   type: u8   }
+      - { name: v_i16,  type: i16  }
+      - { name: v_u16,  type: u16  }
+      - { name: v_i32,  type: i32  }
+      - { name: v_u32,  type: u32  }
+      - { name: v_f32,  type: f32  }
+      - { name: v_bool, type: bool }
+      - { name: v_f64,  type: f64  }
+  Entity:
+    fields:
+      - { name: hp, type: i32 }
+      - { name: x,  type: f64 }
+state_buffers:
+  types:
+    record: Types
+    count: 2
+  entity:
+    record: Entity
+    count: 4
+";
+
+/// The #270 gate cart: pairs `STATE_CONFIG` with a cart that actually drives the
+/// `S` proxy the registration builds. It allocs slots in both declared buffers
+/// and writes/reads a spread of fields across every type tag, so the metatable
+/// `__index`/`__newindex` closures and per-slot row tables that
+/// `register_s_proxy` emits are all live and touched (not merely constructed).
+/// Then, as every other cart here, it allocates a deterministic `KEEP` string
+/// spread for arena churn, forces a full collection, and reads `cart_allocations`
+/// (`guest_heap_used`). The registration allocations are anchored live in `S`
+/// and `blyt.buf`, so they survive the collection and land in the count — meaning
+/// any divergence in the state/S-proxy registration ORDER or SIZING between the
+/// two legs moves this number. The strings stay under the `luaL_Buffer` threshold
+/// (see `HEAP_LUA`) so the count is free of the boxed-external-string residual.
+const STATE_LUA: &str = r#"
+local KEEP = {}
+
+function init()
+    -- Types buffer: touch every declared field once so every accessor closure
+    -- the S proxy generated is exercised, across all nine type tags.
+    for _ = 1, 2 do
+        blyt.buf.alloc_slot(S.TYPES)
+    end
+    S.types[0].v_i8 = -3
+    S.types[0].v_u8 = 200
+    S.types[0].v_i16 = -1000
+    S.types[0].v_u16 = 60000
+    S.types[0].v_i32 = 123456
+    S.types[0].v_u32 = 2000000000
+    S.types[0].v_f32 = 1.5
+    S.types[0].v_bool = true
+    S.types[0].v_f64 = 3.25
+    S.types[1].v_i32 = S.types[0].v_i32 + 1
+
+    -- Entity buffer: multiple slots, so register_s_proxy emitted several row
+    -- tables and a second metatable pair.
+    for i = 0, 3 do
+        blyt.buf.alloc_slot(S.ENTITY)
+        S.entity[i].hp = (i + 1) * 10
+        S.entity[i].x = i + 0.5
+    end
+
+    -- Deterministic heap spread (under the luaL_Buffer threshold) so the arena
+    -- has real churn to refract a registration reorder through, kept live so a
+    -- full collection cannot reclaim it.
+    for i = 1, 40 do
+        KEEP[#KEEP + 1] = string.rep("s", 100 + i)
+    end
+
+    collectgarbage("collect")
+    local m = blyt32.mem.stats()
+    blyt.debug.print(string.format("HEAP used=%d", m.cart_allocations))
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#;
+
 /// Parse the single `HEAP used=<n>` line the cart prints.
 fn heap_used(output: &str) -> u64 {
     let line = output
@@ -438,6 +542,63 @@ function draw() end
          the host-Lua legs (#262/#267): the exchange-thread pool and the nested \
          native->Lua->native allocation ORDER must not diverge native-host-Lua vs \
          wasm32 (native={hostlua}, wasm32={wasm}, delta={})",
+        hostlua as i64 - wasm as i64
+    );
+}
+
+/// The #270 target: `guest_heap_used` is byte-exact across the host-Lua legs for
+/// a cart that declares state layouts — the one path the other gate carts here
+/// leave entirely uncovered.
+///
+/// Every other cart in this file is built with no `config_yaml`, so it declares
+/// no state buffers; with no layout `hl_active_ctx()` / `active_state_ctx()` is
+/// NULL, `build_vm` never arms `api.register_state_api` / `api.register_s_proxy`,
+/// and the two hooks in the shared canonical sequence
+/// (`blyt_hostlua_api.h:358-361`) never fire. That pair is the ONE registration
+/// #267 deliberately left hand-mirrored per leg (native drives a
+/// `blyt_state_ctx_t`, wasm a `blyt_session_t`) rather than folding into the
+/// shared header — so it is exactly the shape of the original #267 defect (two
+/// hand-written sequences that agreed by accident until a differing order
+/// refracted through the first-fit arena into a ±16 B `cart_allocations`
+/// divergence), and nothing gated it.
+///
+/// This cart declares layouts (so both hooks arm) and drives the resulting `S`
+/// proxy across all nine field type tags and multiple slots, then asserts the
+/// two legs' `cart_allocations` are byte-identical. It is NOT expected to be red
+/// today — the issue confirms a state-buffer cart is already byte-exact; this is
+/// the guard that keeps the state/S-proxy registration order and sizing from
+/// silently drifting apart in future. Teeth confirmed by locally reordering one
+/// leg's registration (swap `register_state_api`/`register_s_proxy` in
+/// `build_vm`, or reorder the buffers inside `register_s_proxy`) and watching it
+/// go red.
+#[test]
+fn lua_guest_heap_used_matches_wasm32_with_state_buffers() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_heap_state");
+    CartProject::new()
+        .config(STATE_CONFIG)
+        .lua(STATE_LUA)
+        .write(&project);
+
+    let cart = build_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm = heap_used(&capture_cart_wasm(&cart, &[]));
+    let hostlua = heap_used(&capture_cart_native(&cart, &[]));
+
+    assert_eq!(
+        hostlua,
+        wasm,
+        "native host-Lua guest_heap_used must equal its wasm32 sibling for a cart \
+         that declares state layouts (#270): a mismatch means the two legs' \
+         hand-mirrored state_api / S-proxy registration sequences have drifted in \
+         order or sizing — the registration allocations refract through the \
+         first-fit arena, so a differing order moves cart_allocations and breaks \
+         the ADR-0029 determinism tier (native={hostlua}, wasm32={wasm}, delta={})",
         hostlua as i64 - wasm as i64
     );
 }
