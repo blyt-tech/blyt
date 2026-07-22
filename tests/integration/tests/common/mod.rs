@@ -1723,6 +1723,49 @@ pub fn capture_cart_native(cart: &std::path::Path, extra_env: &[(&str, &str)]) -
     String::from_utf8_lossy(&output).into_owned()
 }
 
+/// Run a cart through a WASM runtime dir and return its **combined stdout+stderr**,
+/// asserting a clean exit (status 0). The dir selects the runtime: `find_wasm_dir()`
+/// for release (`blytplay.js`), `find_wasm_debug_dir()` for debug (`blytdebug.js`) —
+/// the driver loads whichever the dir ships.
+///
+/// Unlike [`capture_cart_wasm`] (stdout only) this also folds in stderr, where the
+/// host-Lua leg's reported Lua errors land (`blyt_js_error` → `console.error`), so an
+/// erroring cart's bare message is visible alongside its `blyt.debug.print` markers
+/// for cross-leg recovery assertions (#264). Asserting `.success()` is itself the
+/// AC#3 check: a cart that errors in a callback then calls `blyt.quit()` must still
+/// exit 0.
+fn capture_cart_wasm_dir(wasm_dir: &std::path::Path, cart: &std::path::Path) -> String {
+    use assert_cmd::Command;
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+    let output = Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let mut s = String::from_utf8_lossy(&output.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&output.stderr));
+    s
+}
+
+/// [`capture_cart_wasm_dir`] against the **release** WASM runtime (`blyt run`).
+pub fn capture_cart_wasm_combined(cart: &std::path::Path) -> String {
+    capture_cart_wasm_dir(&find_wasm_dir(), cart)
+}
+
+/// [`capture_cart_wasm_dir`] against the **debug** WASM runtime (`blyt debug`,
+/// `blytdebug.js` with BLYT_DAP/BLYT_GDB compiled in). Driven headlessly with no DAP
+/// client (`blyt_js_dap_port() == 0`), so the cart runs standalone — this is the
+/// leg that would trip the `runtimeKeepalivePop` assertion if the error-teardown
+/// keepalive accounting regressed (#102/#264 AC#5).
+pub fn capture_cart_wasm_debug_combined(cart: &std::path::Path) -> String {
+    capture_cart_wasm_dir(&find_wasm_debug_dir(), cart)
+}
+
 /// Run a cart on the WASM runner with extra env and return its full stdout — the
 /// wasm32 companion to [`capture_cart_native`] for cross-leg value comparison.
 pub fn capture_cart_wasm(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {

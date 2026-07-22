@@ -41,9 +41,16 @@ if (!wasmDir || !cartPath) {
 	process.exit(1);
 }
 
-var wasmJsPath = path.join(wasmDir, 'blytplay.js');
-if (!nodefs.existsSync(wasmJsPath)) {
-	process.stderr.write(`blytplay.js not found at: ${wasmJsPath}\n`);
+/* Release dirs ship blytplay.js, debug dirs ship blytdebug.js (ADR-0129); a dir
+ * holds exactly one, so pick whichever is present.  This lets the same driver
+ * exercise both the release and the debug WASM runtime (issue #264 AC#5). */
+var wasmJsPath = ['blytplay.js', 'blytdebug.js']
+	.map((f) => path.join(wasmDir, f))
+	.find((p) => nodefs.existsSync(p));
+if (!wasmJsPath) {
+	process.stderr.write(
+		`neither blytplay.js nor blytdebug.js found in: ${wasmDir}\n`,
+	);
 	process.exit(1);
 }
 

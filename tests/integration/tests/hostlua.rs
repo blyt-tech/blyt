@@ -13,9 +13,10 @@
 mod common;
 
 use common::{
-    CartProject, blytplay, build_lua_cart, libretro_so, require_libretro_core, require_lua_sdk,
-    require_sdk, require_wasm, run_cart_all_legs, run_cart_all_legs_reset_every_frame,
-    run_cart_all_legs_with_save_dir, test_libretro_core,
+    CartProject, blytplay, build_lua_cart, capture_cart_wasm_combined,
+    capture_cart_wasm_debug_combined, libretro_so, require_libretro_core, require_lua_sdk,
+    require_sdk, require_wasm, require_wasm_debug, run_cart_all_legs,
+    run_cart_all_legs_reset_every_frame, run_cart_all_legs_with_save_dir, test_libretro_core,
 };
 use tempfile::TempDir;
 
@@ -462,24 +463,33 @@ fn capture_libretro(cart: &std::path::Path) -> String {
 /// path and real RISC-V hardware. Before #258 the native host-Lua runner wrapped
 /// it, so the same cart showed different error text on desktop vs on hardware.
 ///
-/// Asserted on the two legs that run the `cart_run_hostlua.c` `call_lifecycle`
-/// path — blytplay and the embedded libretro core — which are exactly the legs
-/// that carried the wrapper; both must now emit the bare message and never the
-/// wrapper. (The WASM host-Lua leg already prints the bare message via
-/// `blyt_js_error`, but treats the error as fatal teardown and exits non-zero —
-/// a pre-existing recovery divergence tracked separately, not a format one — so
-/// it is not driven here.)
+/// Asserted on **all four** host-Lua legs: the two `cart_run_hostlua.c`
+/// `call_lifecycle` legs (blytplay + libretro), which carried the removed wrapper,
+/// plus both WASM runtimes (release `blyt run` + debug `blyt debug`). Since #242's
+/// runner unification (PR #266) the WASM leg drives the cart through the same
+/// `blyt_hostlua_driver.h` coroutine, whose `__blyt_call` pcalls each callback and
+/// reports the bare message — so it now RECOVERS per frame and exits 0 like the
+/// others, and is folded back in here (#264 AC#1/#4) rather than excluded. The
+/// WASM leg prints the error via `blyt_js_error` (`console.error`, a `[blyt] `
+/// channel prefix on stderr — not the removed wrapper), which the combined-stream
+/// capture and the `.contains()` assertions match through.
 #[test]
 fn hostlua_callback_error_prints_bare_message() {
     require_sdk();
     require_lua_sdk();
     require_libretro_core();
+    require_wasm();
+    require_wasm_debug();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hostlua_callback_error");
 
-    // draw() raises every frame (recoverable since #236); update() self-quits on
-    // the second frame, so ≥1 error line is printed before the cart exits.
+    // draw() raises every frame (recoverable since #236). update() prints a marker
+    // per frame and self-quits on the THIRD frame — so reaching "frame 3" proves the
+    // cart survived the draw errors on frames 1 and 2 and kept running (recovery),
+    // not merely that one error was printed before it died. A leg that treated the
+    // first error as fatal teardown (the pre-#266 WASM behaviour) would stop at
+    // "frame 1" and never reach "frame 3", failing this test.
     CartProject::new()
         .lua(
             r#"
@@ -487,7 +497,8 @@ local frames = 0
 function init() end
 function update()
     frames = frames + 1
-    if frames >= 2 then
+    blyt.debug.print("frame " .. frames)
+    if frames >= 3 then
         blyt.quit()
     end
 end
@@ -500,12 +511,21 @@ end
 
     let cart = build_lua_cart(&project);
 
-    // The two legs that carried the wrapper: assert the BARE Lua error text
-    // (chunk name + position + message) and the ABSENCE of the removed wrapper.
+    // Every host-Lua leg: assert (a) the cart RECOVERED and ran to frame 3 despite
+    // draw() erroring every frame, (b) the BARE Lua error text (chunk name +
+    // position + message), and (c) the ABSENCE of the removed wrapper. The two WASM
+    // legs' capture asserts a clean exit (status 0) internally — the AC#3
+    // report-then-quit check.
     for (leg, out) in [
         ("blytplay", capture_blytplay(&cart)),
         ("libretro", capture_libretro(&cart)),
+        ("wasm", capture_cart_wasm_combined(&cart)),
+        ("wasm-debug", capture_cart_wasm_debug_combined(&cart)),
     ] {
+        assert!(
+            out.contains("frame 3"),
+            "{leg}: cart did not recover from draw() error and run to frame 3 (AC#1): {out}"
+        );
         assert!(
             out.contains("main.lua:") && out.contains(": kaboom-258"),
             "{leg}: expected bare 'main.lua:<line>: kaboom-258' Lua error, got: {out}"
@@ -524,15 +544,21 @@ end
 /// frame loop. Before #258 `blyt_hostlua_create` aborted the cart (returned NULL)
 /// on an init error.
 ///
-/// Asserted on the two `cart_run_hostlua.c` legs (blytplay + libretro). The WASM
-/// host-Lua leg is deliberately EXCLUDED: it treats init (and update/draw) Lua
-/// errors as fatal teardown (`g_lua_fatal`), a pre-existing cross-runtime gap
-/// tracked separately — not introduced or addressed by #258.
+/// Asserted on **all four** host-Lua legs: the two `cart_run_hostlua.c` legs
+/// (blytplay + libretro) and both WASM runtimes (release + debug). Since #242's
+/// runner unification (PR #266) the WASM boot chunk dispatches `init()` /
+/// `on_new_state()` through the same `__blyt_call` pcall, so an init error is
+/// caught inside the coroutine, the boot resume still returns LUA_OK, and the cart
+/// boots into the frame loop — report-and-continue, matching the guest and the
+/// native/libretro legs. The WASM leg is therefore folded back in here (#264
+/// AC#2/#4) rather than excluded as it was in #258.
 #[test]
 fn hostlua_init_error_reports_and_continues() {
     require_sdk();
     require_lua_sdk();
     require_libretro_core();
+    require_wasm();
+    require_wasm_debug();
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hostlua_init_error");
@@ -558,6 +584,8 @@ function draw() end
     for (leg, out) in [
         ("blytplay", capture_blytplay(&cart)),
         ("libretro", capture_libretro(&cart)),
+        ("wasm", capture_cart_wasm_combined(&cart)),
+        ("wasm-debug", capture_cart_wasm_debug_combined(&cart)),
     ] {
         assert!(
             out.contains("init-start"),
