@@ -982,6 +982,57 @@ fn native_dev_control_connect_lifecycle() {
     );
 }
 
+/// Drain a child's stdout into a shared line buffer on a background thread,
+/// returning the buffer.  The thread ends at EOF (process exit / stdout close).
+/// Keeping the pipe drained also prevents the child from blocking on a full
+/// stdout buffer during a long-running session.
+fn drain_stdout_lines(stdout: impl std::io::Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let w = Arc::clone(&lines);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => w.lock().unwrap().push(line.trim_end().to_string()),
+            }
+        }
+    });
+    lines
+}
+
+/// Poll a shared line buffer until some line satisfies `pred`, up to `timeout`.
+/// Returns true if a matching line appeared in time.  This is the readiness
+/// primitive that replaces fixed sleeps: the caller waits on an observable
+/// signal (a banner, the watcher-armed line) rather than guessing a delay.
+fn wait_for_line(
+    lines: &Arc<Mutex<Vec<String>>>,
+    timeout: Duration,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if lines.lock().unwrap().iter().any(|l| pred(l)) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Parse the TCP port out of a `Dev control:  127.0.0.1:<port> …` banner line.
+fn parse_dev_ctrl_port(line: &str) -> Option<u16> {
+    let idx = line.find("127.0.0.1:")?;
+    let after = &line[idx + "127.0.0.1:".len()..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    (end > 0).then(|| after[..end].parse().ok()).flatten()
+}
+
 /// End-to-end "option 2": the real devtool owns the hub and file watcher; the
 /// player dials in and a watcher-driven rebuild reloads the *native* player the
 /// same way it reloads the browser page.  Starts `blyt run ./project`, dials its
@@ -989,6 +1040,16 @@ fn native_dev_control_connect_lifecycle() {
 /// project dir (so the player loads the devtool-rebuilt `build/.elf`), edits a
 /// source file, and asserts the player's `on_load_state` fires with
 /// reason=HOT_RELOAD(3) — i.e. the broadcast reached the dialed player.
+///
+/// Synchronisation (issue #290): the edit must not race the devtool's file
+/// watcher.  notify does not deliver events that predate its `watch()` calls, so
+/// an edit landing before the watcher is armed is lost — no rebuild, no reload,
+/// and the generous *read* poll below can never see a reload that never fired.
+/// A fixed `sleep(1s)` here under-waits under a saturated run (the hub-dial
+/// sibling of #288 / PR #289).  Instead we drain the devtool's stdout and wait
+/// for its `[watch] ready` armed-signal (and the player's dial-in banner) before
+/// editing, and on failure attribute the miss to the exact stage that dropped it
+/// using the watcher's own progress lines.
 #[test]
 fn player_dials_devtool_hub_and_reloads() {
     require_sdk();
@@ -1017,18 +1078,58 @@ fn player_dials_devtool_hub_and_reloads() {
         .write(&project);
 
     // Start the devtool (release project-dir mode → hub + watcher + initial
-    // build of build/.elf).  Reuse the banner reader to get the dev ctrl port;
-    // by the time it prints, build/.elf exists for the player to load.
+    // build of build/.elf).  Drain its stdout so we can both read the dev ctrl
+    // port and, later, attribute a missed reload to the stage that dropped it.
     let mut serve = spawn_blyt_run(&project);
-    let (port, _stdout) = read_dev_ctrl_port(&mut serve);
+    let dev_out = drain_stdout_lines(serve.stdout.take().unwrap());
+
+    // Wait for the dev control port banner; fail fast (with stderr) if the
+    // devtool exits before announcing it (e.g. the initial build failed).
+    let port = loop {
+        if let Some(p) = dev_out.lock().unwrap().iter().find_map(|l| {
+            l.contains("Dev control:")
+                .then(|| parse_dev_ctrl_port(l))
+                .flatten()
+        }) {
+            break p;
+        }
+        if let Ok(Some(status)) = serve.try_wait() {
+            let mut errout = String::new();
+            if let Some(mut e) = serve.stderr.take() {
+                e.read_to_string(&mut errout).ok();
+            }
+            panic!(
+                "blyt run exited ({status}) before announcing the dev control port;\n\
+                 devtool stdout:\n{}\nstderr:\n{errout}",
+                dev_out.lock().unwrap().join("\n")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(port != 0, "devtool dev control port must be a real port");
 
     // The player dials the hub and runs on the same project dir (loads build/.elf).
     let save_dir = TempDir::new().unwrap();
     let (mut child, lines) = spawn_player_dialing(&project, port, save_dir.path());
 
-    // Give the player time to dial in, load build/.elf, and run a few frames.
-    std::thread::sleep(Duration::from_secs(1));
+    // Synchronise on real readiness signals instead of a fixed sleep (#290):
+    //  1. the devtool's file watcher is armed (`[watch] ready`) — else the edit
+    //     predates the inotify watch and is silently dropped; and
+    //  2. the player has dialed the hub (`Dev control: connected`) — else the
+    //     reload broadcast reaches zero clients.
+    assert!(
+        wait_for_line(&dev_out, Duration::from_secs(20), |l| l == "[watch] ready"),
+        "devtool file watcher never armed ([watch] ready) — the edit would race \
+         the inotify watch; devtool output:\n{}",
+        dev_out.lock().unwrap().join("\n")
+    );
+    assert!(
+        wait_for_line(&lines, Duration::from_secs(10), |l| l
+            .contains("Dev control: connected")),
+        "player never dialed the devtool hub (no 'Dev control: connected' \
+         banner); player output:\n{}",
+        lines.lock().unwrap().join("\n")
+    );
 
     // Edit a watched source file → devtool rebuilds → broadcasts reload → the
     // dialed player reopens build/.elf and runs on_load_state(HOT_RELOAD).
@@ -1069,9 +1170,38 @@ fn player_dials_devtool_hub_and_reloads() {
     let _ = serve.wait(); /* reap the devtool so it doesn't linger as a zombie */
 
     let out = lines.lock().unwrap().join("\n");
+    let dev = dev_out.lock().unwrap().join("\n");
+
+    // Attribute a miss to the exact stage that dropped it (AC #290): the panic
+    // must distinguish "the watcher never fired a rebuild" from "the rebuild
+    // fired but the broadcast never reached the player", not just dump stdout.
+    let watcher_saw_edit = dev
+        .lines()
+        .any(|l| l.starts_with("[watch] ") && l.ends_with("changed"));
+    let rebuild_ran = dev.contains("[build] rebuilding");
+    let reload_broadcast = dev.lines().find(|l| l.starts_with("[reload] signalled"));
+    let diagnosis = if !watcher_saw_edit {
+        "the watcher never observed the edit (no '[watch] … changed') — the \
+         inotify watch was not armed for the change despite [watch] ready"
+    } else if let Some(rl) = reload_broadcast {
+        if rl.contains("signalled 0 ") {
+            "the rebuild fired but the reload reached 0 runtimes — the player was \
+             not a registered hub client when the broadcast went out"
+        } else {
+            "the rebuild fired and the reload was broadcast to ≥1 runtime, but the \
+             player never applied it (on_load_state did not run) — loss is player-side"
+        }
+    } else if rebuild_ran {
+        "the watcher observed the edit and started a rebuild, but no reload was \
+         broadcast (build failed or the cart was deemed unchanged) — see [build]/[reload]"
+    } else {
+        "the watcher observed the edit but no rebuild started"
+    };
+
     assert!(
         seen,
         "watcher-driven reload did not reach the dialed player (expected \
-         on_load_state reason=HOT_RELOAD(3)); player output:\n{out}"
+         on_load_state reason=HOT_RELOAD(3)).\nDiagnosis: {diagnosis}.\n\
+         --- devtool output ---\n{dev}\n--- player output ---\n{out}"
     );
 }
