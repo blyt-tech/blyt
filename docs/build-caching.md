@@ -70,6 +70,29 @@ requires teaching the gdb stub, DAP, and lldb-dap tests (and VS Code
 debugging) about source-path substitution. Revisit only if debug-build
 worktree time is still a problem.
 
+## Generated headers that shadow one on a later `-I` path
+
+ccache's direct mode records the exact set of headers a translation unit
+resolved during its **first** compile. If you later introduce a *generated*
+header that shadows an existing one further down the `-I` search path, ccache
+does not notice: it re-hashes only the headers already in its manifest (still
+the old, shadowed one), so a rebuild returns a **stale object** compiled as if
+the shadow did not exist. It never re-preprocesses to discover the new file.
+Clean builds and CI are unaffected — the shadow exists before the first
+compile there — so this bites only incremental dev trees that already cached
+the pre-shadow objects (blyt#229; blyt#225 Phase B lost hours to a stale
+`frexpl.c.o` that self-recursed into a stack overflow).
+
+The fix is to name the shadow header on the compile command line with
+`-include <generated-header>` (see `cmake/blyt_hostlua_vm.cmake`, which does
+this for the generated `bits/float.h`). Adding the flag changes direct mode's
+primary hash — busting any stale entry — and the header is then recorded and
+re-hashed as a real dependency on every build. Give the header an include
+guard so the later `#include` is a no-op and the behaviour is identical to the
+`-I` shadow alone. The last-resort manual recovery, if you hit a stale object
+before wiring this up, is `rm -rf` the affected object dir and rebuild with
+`CCACHE_RECACHE=1` (or `ccache -C` to clear the whole cache).
+
 ## Inspecting
 
 ```sh
