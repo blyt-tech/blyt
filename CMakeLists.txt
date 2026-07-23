@@ -46,7 +46,10 @@ set(FETCHCONTENT_BASE_DIR
 # (e.g. uninitialised submodule directories in a new worktree) are ignored.
 macro(_blyt_fc_local dep dir sentinel)
   if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/${dir}/${sentinel}")
-    set("FETCHCONTENT_SOURCE_DIR_${dep}"
+    # FetchContent reads FETCHCONTENT_SOURCE_DIR_<UPPERCASE-name>; the lowercase
+    # spelling is a distinct, ignored cache variable (blyt#228).
+    string(TOUPPER "${dep}" _dep_upper)
+    set("FETCHCONTENT_SOURCE_DIR_${_dep_upper}"
         "${CMAKE_SOURCE_DIR}/third_party/${dir}"
         CACHE PATH "" FORCE)
     message(STATUS "FetchContent ${dep}: using local third_party/${dir}/")
