@@ -236,6 +236,60 @@ fn lua_palette_set_changes_only_palhash_across_legs() {
     }
 }
 
+/// The #217 pin: a pure-Lua (session-less) cart that *draws content* via
+/// `blyt32.gfx.*` with **no `palettes:` declaration and no `palette_set`**
+/// presents through the console default (aurora) — byte-identically on every
+/// host-Lua leg (blytplay / wasm-fastpath / libretro).
+///
+/// Sibling coverage only touches half of this each: [`lua_palette_set_changes_
+/// only_palhash_across_legs`] pins the undeclared default's palhash but for a
+/// uniform `clear(5)` (palette-blind fbhash), and `gfx.rs`'s torture-frame Lua
+/// test pins the drawn fbhash but not palhash. Here a real content frame is drawn
+/// under the *undeclared* default so fbhash (the pixels) **and** palhash (the
+/// fully-expanded aurora colours) are pinned together — exercising
+/// `wasm_main.c`'s `lua_gfx_palette_ensure_default` on the actual drawing path,
+/// not just the test-card path that was the only prior exerciser of that default.
+///
+/// Aurora is pinned to the named built-in (`declared_palette(_, "aurora")`),
+/// independent of the cart under test, with a VGA foil so a wrong default palette
+/// cannot slip through as a false pass.
+#[test]
+fn lua_undeclared_default_palette_draw_parity_across_legs() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+    require_test_session_api();
+
+    let ops = gfx::torture_frame();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("lua_default_draw");
+    CartProject::new()
+        .lua(&format!(
+            "function init() end\n\
+             function update() blyt.quit() end\n\
+             function draw()\n{}end\n",
+            gfx::lua_draw_body(&ops)
+        ))
+        .write(&project);
+    let cart = build_cart(&project);
+
+    let fb = gfx::expected_hash_line(&gfx::render(&ops));
+    let aurora_ph =
+        gfx::expected_palhash_line(&declared_palette(&tmp.path().join("aurora_decl"), "aurora"));
+    let vga_ph = gfx::expected_palhash_line(&declared_palette(&tmp.path().join("vga_decl"), "vga"));
+    assert_ne!(
+        aurora_ph, vga_ph,
+        "sanity: aurora and vga must have distinct palette hashes"
+    );
+
+    // The undeclared cart draws real content under the aurora default: fbhash
+    // pins the drawn pixels, palhash pins the fully-expanded aurora colours —
+    // both identical across native / wasm / libretro.
+    run_cart_all_legs_frame_hash_exact(&cart, &fb);
+    run_cart_all_legs_frame_hash_exact(&cart, &aurora_ph);
+}
+
 /// The direct #199 regression: a HYBRID cart whose **Lua half** calls
 /// `palette_set`.  On wasm the Lua half runs on the host-Lua fast path (no
 /// emulator) while the native half runs in rv32emu (ADR-0130); before #201 the
