@@ -971,9 +971,7 @@ static void chunk_module_name(lua_State *L, char *out, size_t outsz) {
 }
 
 static lua_State *open_state(void) {
-    blyt_console_debug("open_state: before luaL_newstate");
     lua_State *L = luaL_newstate();
-    blyt_console_debug(L ? "open_state: newstate ok" : "open_state: newstate NULL");
     if (!L)
         return NULL;
 
@@ -994,17 +992,13 @@ static lua_State *open_state(void) {
     lua_pop(L, 1);
     luaL_requiref(L, LUA_UTF8LIBNAME, luaopen_utf8, 1);
     lua_pop(L, 1);
-    blyt_console_debug("open_state: stdlib subset opened");
 
-    blyt_console_debug("open_state: before register_blyt32");
     register_blyt32(L);
-    blyt_console_debug("open_state: register_blyt32 done");
 
     if (cart_lua_modules)
         cart_lua_modules(L);
 
     if (cart_lua_bytecode && cart_lua_bytecode_size) {
-        blyt_console_debug("open_state: before load lua bytecode");
         const unsigned char *data = cart_lua_bytecode;
         unsigned int remaining = cart_lua_bytecode_size;
 
@@ -1058,22 +1052,17 @@ static lua_State *open_state(void) {
         } else {
             int load_result = luaL_loadbuffer(L, (const char *)cart_lua_bytecode,
                                               cart_lua_bytecode_size, "@cart");
-            blyt_console_debug(load_result == LUA_OK ? "open_state: loadbuffer OK"
-                                                     : "open_state: loadbuffer FAILED");
             if (load_result != LUA_OK) {
                 blyt_console_debug(lua_tostring(L, -1));
                 lua_close(L);
                 return NULL;
             }
-            blyt_console_debug("open_state: before lua_pcall");
             if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
                 blyt_console_debug(lua_tostring(L, -1));
                 lua_close(L);
                 return NULL;
             }
-            blyt_console_debug("open_state: lua_pcall done");
         }
-        blyt_console_debug("open_state: lua bytecode loaded");
     }
 
     return L;
@@ -1105,9 +1094,7 @@ static void call_global(const char *name) {
 }
 
 void blyt_cart_init(void) {
-    blyt_console_debug("blyt_cart_init: start");
     g_L = open_state();
-    blyt_console_debug(g_L ? "blyt_cart_init: open_state ok" : "blyt_cart_init: open_state FAILED");
 #ifdef BLYT_DAP
     if (g_L && blyt_dap_active()) {
         fc_master_hook_cfg.dap_enabled = true;
@@ -1115,7 +1102,6 @@ void blyt_cart_init(void) {
     }
 #endif
     call_global("init");
-    blyt_console_debug("blyt_cart_init: done");
 }
 
 void blyt_cart_update(void) {
