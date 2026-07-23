@@ -6,16 +6,22 @@
 //! stays EMULATED under rv32emu, bridged via the ADR-0130 ECALL Lua C API — the
 //! native counterpart of the WASM host-Lua hybrid path (`wasm_main.c`
 //! run_lua_cart). Determinism across every leg is the core contract (ADR-0007),
-//! so each test asserts the SAME cart-visible output on all five legs:
-//!   * the emulated leg        (`run_cart_native` — blytplay, rv32emu),
-//!   * the native host-Lua leg (`run_cart_native_with_env` + `BLYT_HOSTLUA=1`),
-//!   * the WASM host-Lua leg   (`run_cart_wasm`),
-//!   * the libretro emulated `.so` leg (`run_cart_libretro`), and
-//!   * the libretro host-Lua `.so` leg (`run_cart_libretro_with_env` +
-//!     `BLYT_HOSTLUA=1`) — the embedded core's host-Lua path with the ADR-0130
-//!     bridge stub embedded (#232 S5).
-//! A divergence between the native host-Lua bridge and the reference fails here
-//! by construction rather than relying on per-leg smoke (anti-#98).
+//! so each test asserts the SAME cart-visible output on all five legs via
+//! [`run_cart_hybrid_all_legs_exact`] (#299): each cart emits self-delimiting
+//! `<m:…>` markers and every leg's full marker sequence must equal the same
+//! `expected` — same payloads, order, and count — so all five are identical to
+//! each other. The five legs are:
+//!   * the emulated leg        (blytplay, rv32emu),
+//!   * the native host-Lua leg (blytplay + `BLYT_HOSTLUA=1`),
+//!   * the WASM host-Lua leg   (the node `run_cart.js` driver),
+//!   * the libretro emulated `.so` leg (embedded `libblyt32lua.so`), and
+//!   * the libretro host-Lua `.so` leg (embedded ADR-0130 bridge stub +
+//!     `BLYT_HOSTLUA=1`, #232 S5).
+//! An exact five-way sequence compare fails on a leg that emits extra, repeated,
+//! or reordered output — the anti-#98/#283 blind spot a per-leg `.contains`
+//! substring check left open (#299 is the hybrid half of #284). Numeric parity
+//! (probed `cart_allocations`/`filled` figures, #250/#276/#278/#280) is already
+//! exact via `assert_eq!` and stays as-is.
 //!
 //! Slices land incrementally: S1 typed export, S2 raw/bridged export, S3 state
 //! buffers + save/restore + reset-every-frame, S4 native-lifecycle, S5 libretro
@@ -24,40 +30,13 @@
 mod common;
 
 use common::{
-    CartProject, build_lua_cart, capture_cart_libretro, capture_cart_native, capture_cart_wasm,
-    require_cpp_sdk, require_libretro_core, require_lua_sdk, require_rust_riscv_target,
-    require_sdk, require_wasm, run_cart_libretro, run_cart_libretro_with_env,
-    run_cart_libretro_with_env_and_flags, run_cart_libretro_with_flags, run_cart_native,
-    run_cart_native_with_env, run_cart_wasm, run_cart_wasm_with_env,
+    CartProject, assert_markers_exact, build_lua_cart, capture_cart_libretro, capture_cart_native,
+    capture_cart_wasm, require_cpp_sdk, require_libretro_core, require_lua_sdk,
+    require_rust_riscv_target, require_sdk, require_wasm, run_cart_hybrid_all_legs_exact,
+    run_cart_hybrid_all_legs_exact_reset_every_frame,
 };
 use std::path::Path;
 use tempfile::TempDir;
-
-/// Run blytplay --headless with both extra env (e.g. BLYT_HOSTLUA=1) and flags
-/// (e.g. --reset-every-frame); assert `expected` in stdout. (Mirrors hostlua.rs.)
-fn run_native_env_flags(
-    cart: &std::path::Path,
-    env: &[(&str, &str)],
-    flags: &[&str],
-    expected: &str,
-) {
-    use assert_cmd::Command;
-    let mut cmd = Command::new(common::blytplay());
-    cmd.arg("--headless");
-    for f in flags {
-        cmd.arg(f);
-    }
-    cmd.arg(cart.to_str().unwrap());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let out = cmd.assert().success().get_output().stdout.clone();
-    let s = String::from_utf8_lossy(&out);
-    assert!(
-        s.contains(expected),
-        "expected {expected:?} (env={env:?} flags={flags:?}): {s}"
-    );
-}
 
 /// S1 — a typed export (`BLYT_LUA_EXPORT_I32`, ≤4 scalar args, no bridge ECALLs):
 /// the host-Lua VM marshals the Lua args into rv32 registers, drives the emulated
@@ -80,7 +59,7 @@ fn hostlua_hybrid_typed_export_parity() {
             r#"
 function init()
     local r = add_one(41)
-    blyt.debug.print("lua+c typed add_one=" .. r)
+    blyt.debug.print("<m:typed add_one=" .. r .. ">")
 end
 function update() blyt.quit() end
 function draw() end
@@ -89,17 +68,9 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "lua+c typed add_one=42";
-
-    // Emulated (rv32emu) — the reference.
-    run_cart_native(&cart, expected);
-    // Native host-Lua fast path (#232) — the leg under test.
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    // WASM host-Lua fast path — the existing hybrid host-Lua leg.
-    run_cart_wasm(&cart, expected);
-    // libretro core — emulated + host-Lua (embedded bridge stub, #232 S5).
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    // One marker, emitted once: the emulated reference, the native host-Lua leg
+    // under test, WASM, and both libretro legs must all emit exactly this.
+    run_cart_hybrid_all_legs_exact(&cart, "m", &["typed add_one=42"]);
 }
 
 /// S2 — a raw/bridged export (`BLYT_LUA_MODULE_EXPORT_RAW`, ADR-0130): the guest
@@ -137,8 +108,11 @@ BLYT_LUA_MODULE_EXPORT_RAW(greeting, echo) {
             r#"
 local greeting = require("greeting")
 function init()
-    greeting.log("hybrid-bridge-log")
-    blyt.debug.print("echo:" .. greeting.echo("hybrid-bridge-echo"))
+    -- greeting.log writes its string arg verbatim from the emulated native half,
+    -- so the marker is carried through the bridge; the echo round-trips a string
+    -- through the bridge in both directions.
+    greeting.log("<m:log:hybrid-bridge-log>")
+    blyt.debug.print("<m:echo:" .. greeting.echo("hybrid-bridge-echo") .. ">")
 end
 function update() blyt.quit() end
 function draw() end
@@ -147,15 +121,13 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    // Both legs emit the native console line then the Lua echo line; assert the
-    // echo (which round-trips a string through the bridge in both directions).
-    let expected = "echo:hybrid-bridge-echo";
-
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    // The native console line then the Lua echo line, in that order, on every leg
+    // — exact sequence so a leg that drops or reorders either is caught.
+    run_cart_hybrid_all_legs_exact(
+        &cart,
+        "m",
+        &["log:hybrid-bridge-log", "echo:hybrid-bridge-echo"],
+    );
 }
 
 /// S3 — the hello-lua-c acceptance surface: state buffers (S proxy) + entity ref
@@ -218,7 +190,7 @@ function on_new_state()
     S.globals[0].player = blyt.buf.ref(S.CHARACTER, slot)
     S.character[slot].x = 160
     S.character[slot].y = 120
-    greeting.log("init player pos: 160, 120")
+    greeting.log("<m:init player pos: 160, 120>")
 end
 
 function update()
@@ -231,7 +203,7 @@ function update()
             local y = (S.character[slot].y + 1) % 240
             S.character[slot].x = x
             S.character[slot].y = y
-            greeting.log("update frame " .. frame .. " player pos: " .. x .. ", " .. y)
+            greeting.log("<m:update frame " .. frame .. " player pos: " .. x .. ", " .. y .. ">")
         end
     end
     if frame >= 20 then blyt.quit() end
@@ -251,33 +223,23 @@ end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "update frame 20 player pos: 162, 122";
+    // The full trajectory: on_new_state emits the init pos once, then update
+    // emits one line every 10th frame (frames 10 and 20). Exact sequence pins the
+    // count and order so a leg that repeats on_new_state or runs an extra frame
+    // (the #283 class) is caught, not just the presence of the final line.
+    let expected = &[
+        "init player pos: 160, 120",
+        "update frame 10 player pos: 161, 121",
+        "update frame 20 player pos: 162, 122",
+    ];
 
     // Plain run — every execution model agrees.
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_hybrid_all_legs_exact(&cart, "m", expected);
 
     // Reset-every-frame — the host-Lua VM-rebuild cycle must reach the SAME
     // trajectory as the emulated (BSS-zero) and WASM legs, with the state buffers
     // shared with the persisting rv32 session across each rebuild.
-    run_native_env_flags(&cart, &[], &["--reset-every-frame"], expected);
-    run_native_env_flags(
-        &cart,
-        &[("BLYT_HOSTLUA", "1")],
-        &["--reset-every-frame"],
-        expected,
-    );
-    run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
-    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], expected);
-    run_cart_libretro_with_env_and_flags(
-        &cart,
-        &[("BLYT_HOSTLUA", "1")],
-        &["--reset-every-frame"],
-        expected,
-    );
+    run_cart_hybrid_all_legs_exact_reset_every_frame(&cart, "m", expected);
 }
 
 /// #261 — the teeth for the native-half BSS reset gap. A hybrid whose NATIVE half
@@ -356,7 +318,7 @@ function update()
     -- one that lets its BSS drift (5).
     local ticks = native_tick(0)
     if frame >= 5 then
-        blyt.debug.print("native ticks at frame 5 = " .. ticks)
+        blyt.debug.print("<m:native ticks at frame 5 = " .. ticks .. ">")
         blyt.quit()
     end
 end
@@ -378,33 +340,13 @@ end
 
     // Plain run — no reset, the native counter accumulates to the frame count on
     // every leg (this is the same for emulated and host-Lua: nothing is reset).
-    let expected_plain = "native ticks at frame 5 = 5";
-    run_cart_native(&cart, expected_plain);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected_plain);
-    run_cart_wasm(&cart, expected_plain);
-    run_cart_libretro(&cart, expected_plain);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected_plain);
+    run_cart_hybrid_all_legs_exact(&cart, "m", &["native ticks at frame 5 = 5"]);
 
     // Reset-every-frame — the native half's BSS must be zeroed each cycle in
     // lockstep with the Lua VM rebuild, so the single per-frame tick returns 1 on
     // EVERY leg. Before the #261 fix the host-Lua legs (native + WASM) would report
     // 5 here (drift), diverging from the emulated legs.
-    let expected_reset = "native ticks at frame 5 = 1";
-    run_native_env_flags(&cart, &[], &["--reset-every-frame"], expected_reset);
-    run_native_env_flags(
-        &cart,
-        &[("BLYT_HOSTLUA", "1")],
-        &["--reset-every-frame"],
-        expected_reset,
-    );
-    run_cart_wasm_with_env(&cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected_reset);
-    run_cart_libretro_with_flags(&cart, &["--reset-every-frame"], expected_reset);
-    run_cart_libretro_with_env_and_flags(
-        &cart,
-        &[("BLYT_HOSTLUA", "1")],
-        &["--reset-every-frame"],
-        expected_reset,
-    );
+    run_cart_hybrid_all_legs_exact_reset_every_frame(&cart, "m", &["native ticks at frame 5 = 1"]);
 }
 
 /// S4 — a native-lifecycle hybrid: the C half defines `blyt_cart_update`,
@@ -436,7 +378,7 @@ static int32_t ticks = 0;
 void blyt_cart_update(void) {
     ticks++;
     if (ticks == 5) {
-        blyt_console_debug("native update reached tick 5");
+        blyt_console_debug("<m:native update reached tick 5>");
         blyt_quit();
     }
 }
@@ -444,7 +386,7 @@ void blyt_cart_update(void) {
         .lua(
             r#"
 function init()
-    blyt.debug.print("lua init before native update loop")
+    blyt.debug.print("<m:lua init before native update loop>")
 end
 function draw() end
 "#,
@@ -452,26 +394,57 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "native update reached tick 5";
+    // The Lua init line, then the native-half tick-5 line, in that order. The cart
+    // self-quits at tick 5; the per-leg safety cap (--quit-after on blytplay,
+    // --run-frames on libretro) only turns a broken bridge into a clean assertion
+    // failure rather than a hang, so it never changes the marker sequence. The
+    // flags differ per leg, so this drives the five legs inline against one shared
+    // `expected` — identical on every leg ⇒ all five identical.
+    let expected: &[&str] = &[
+        "lua init before native update loop",
+        "native update reached tick 5",
+    ];
 
     // Emulated (rv32emu) — the reference; native blyt_cart_update drives directly.
-    run_native_env_flags(&cart, &[], &["--quit-after", "60"], expected);
+    assert_markers_exact(
+        "emulated-native",
+        &common::capture_cart_native_with_flags(&cart, &["--quit-after", "60"], &[]),
+        "m",
+        expected,
+    );
     // Native host-Lua fast path (#232 S4) — native lifecycle injected as a global.
-    run_native_env_flags(
-        &cart,
-        &[("BLYT_HOSTLUA", "1")],
-        &["--quit-after", "60"],
+    assert_markers_exact(
+        "native-host-lua",
+        &common::capture_cart_native_with_flags(
+            &cart,
+            &["--quit-after", "60"],
+            &[("BLYT_HOSTLUA", "1")],
+        ),
+        "m",
         expected,
     );
     // WASM host-Lua fast path — the existing native-lifecycle hybrid leg.
-    run_cart_wasm(&cart, expected);
-    // libretro core — emulated + host-Lua. The cart self-quits at tick 5, so no
-    // frame cap is needed; --run-frames guards against a broken host-Lua bridge.
-    run_cart_libretro_with_flags(&cart, &["--run-frames", "60"], expected);
-    run_cart_libretro_with_env_and_flags(
-        &cart,
-        &[("BLYT_HOSTLUA", "1")],
-        &["--run-frames", "60"],
+    assert_markers_exact(
+        "wasm-host-lua",
+        &capture_cart_wasm(&cart, &[]),
+        "m",
+        expected,
+    );
+    // libretro core — emulated + host-Lua.
+    assert_markers_exact(
+        "libretro-emulated",
+        &common::capture_cart_libretro_with_flags(&cart, &["--run-frames", "60"], &[]),
+        "m",
+        expected,
+    );
+    assert_markers_exact(
+        "libretro-host-lua",
+        &common::capture_cart_libretro_with_flags(
+            &cart,
+            &["--run-frames", "60"],
+            &[("BLYT_HOSTLUA", "1")],
+        ),
+        "m",
         expected,
     );
 }
@@ -502,7 +475,7 @@ BLYT_LUA_EXPORT_I32(cube, int32_t x) { return (int32_t)cpp_cube((int)x); }
         .lua(
             r#"
 function init()
-    blyt.debug.print("lua+cpp cube=" .. cube(3))
+    blyt.debug.print("<m:lua+cpp cube=" .. cube(3) .. ">")
 end
 function update() blyt.quit() end
 function draw() end
@@ -511,13 +484,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "lua+cpp cube=27";
-
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_hybrid_all_legs_exact(&cart, "m", &["lua+cpp cube=27"]);
 }
 
 /// S5 — a Rust raw/bridged export hybrid: the exact `#[lua_export(module =
@@ -553,7 +520,7 @@ fn log(l: LuaState) {
             r#"
 local greeting = require("greeting")
 function init()
-    greeting.log("lua+rust bridged log line")
+    greeting.log("<m:lua+rust bridged log line>")
 end
 function update() blyt.quit() end
 function draw() end
@@ -562,13 +529,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "lua+rust bridged log line";
-
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_hybrid_all_legs_exact(&cart, "m", &["lua+rust bridged log line"]);
 }
 
 /// Copy the tree at `src` into `dst`, skipping any generated `build/` dir, so an
@@ -613,6 +574,71 @@ fn build_example_capped(example: &str, tmp: &Path) -> std::path::PathBuf {
     build_lua_cart(&dst)
 }
 
+/// The real shipped examples emit their game-loop trace (`… player pos: …`) via
+/// `blyt.debug.print`; they are NOT rewritten to carry self-delimiting `<m:…>`
+/// markers (that would edit the acceptance sources under test — the documented
+/// #299/#284 exception). So instead of the marker helper this extracts the
+/// example's own deterministic lines for a line-based cross-leg compare. Line
+/// extraction is safe here because all five legs are host runtimes that
+/// newline-frame their output (the bare-metal no-newline leg that forced markers
+/// to be self-delimiting is not in this matrix), and each line is normalised to
+/// start at the cart's own phase keyword so any leg-specific log prefix does not
+/// defeat the comparison.
+fn example_player_pos_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|l| l.contains("player pos:"))
+        .filter_map(|l| {
+            let start = ["init ", "update ", "draw "]
+                .iter()
+                .filter_map(|kw| l.find(kw))
+                .min()?;
+            Some(l[start..].trim_end().to_owned())
+        })
+        .collect()
+}
+
+/// Cross-leg exact parity for the two real hybrid examples: all five hybrid legs
+/// must emit the IDENTICAL ordered `player pos:` line sequence (same lines, same
+/// order, same count), and `must_contain` must be one of them. This is strictly
+/// stronger than the pre-#299 per-leg `.contains` — which passed if the one line
+/// appeared anywhere on each leg, blind to a leg emitting extra, reordered, or
+/// diverging game-loop lines. Its one documented limit vs the marker helper:
+/// non-`player pos:` noise a leg might emit is out of scope here (the exact-marker
+/// teeth for this exact output shape live in the synthetic S3 test,
+/// `hostlua_hybrid_state_buffers_save_restore_parity`).
+fn assert_hybrid_example_lines_parity(cart: &Path, must_contain: &str) {
+    let legs = [
+        ("emulated-native", capture_cart_native(cart, &[])),
+        (
+            "native-host-lua",
+            capture_cart_native(cart, &[("BLYT_HOSTLUA", "1")]),
+        ),
+        ("wasm-host-lua", capture_cart_wasm(cart, &[])),
+        ("libretro-emulated", capture_cart_libretro(cart, &[])),
+        (
+            "libretro-host-lua",
+            capture_cart_libretro(cart, &[("BLYT_HOSTLUA", "1")]),
+        ),
+    ];
+    let (ref_name, ref_out) = (&legs[0].0, &legs[0].1);
+    let ref_seq = example_player_pos_lines(ref_out);
+    assert!(
+        ref_seq.iter().any(|l| l == must_contain),
+        "expected {must_contain:?} in the {ref_name} example line sequence: {ref_seq:#?}\nfull output:\n{ref_out}"
+    );
+    for (name, out) in &legs[1..] {
+        let seq = example_player_pos_lines(out);
+        assert_eq!(
+            seq,
+            ref_seq,
+            "example game-loop line sequence diverged: {ref_name} vs {name}\n  {ref_name} ({} lines): {ref_seq:#?}\n  {name} ({} lines): {seq:#?}\nfull {name} output:\n{out}",
+            ref_seq.len(),
+            seq.len(),
+        );
+    }
+}
+
 /// S5 acceptance — the actual `examples/hello-lua-c` (Lua + a C `greeting.log`
 /// raw export + state buffers) runs on the native host-Lua path with output
 /// identical to the emulated + WASM + libretro legs (the PLAN.md acceptance
@@ -626,13 +652,7 @@ fn hostlua_hybrid_example_hello_lua_c_parity() {
 
     let tmp = TempDir::new().unwrap();
     let cart = build_example_capped("hello-lua-c", tmp.path());
-    let expected = "update frame 20 player pos: 162, 122";
-
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    assert_hybrid_example_lines_parity(&cart, "update frame 20 player pos: 162, 122");
 }
 
 /// S5 acceptance — the actual `examples/hello-lua-rust` (Lua + a Rust
@@ -649,13 +669,7 @@ fn hostlua_hybrid_example_hello_lua_rust_parity() {
 
     let tmp = TempDir::new().unwrap();
     let cart = build_example_capped("hello-lua-rust", tmp.path());
-    let expected = "update frame 20 player pos: 162, 122";
-
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    assert_hybrid_example_lines_parity(&cart, "update frame 20 player pos: 162, 122");
 }
 
 /// S6 — reverse-trampoline (#262): the native half calls a Lua function BACK
@@ -694,7 +708,7 @@ function on_tick(n)
     return n * 2
 end
 function init()
-    blyt.debug.print("cb:" .. host.tick())
+    blyt.debug.print("<m:cb:" .. host.tick() .. ">")
 end
 function update() blyt.quit() end
 function draw() end
@@ -703,13 +717,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "cb:14";
-
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_hybrid_all_legs_exact(&cart, "m", &["cb:14"]);
 }
 
 /// S6 — reverse-trampoline error semantics (#262): `lua_pcall` returns a status
@@ -753,7 +761,7 @@ end
 function init()
     local pc = host.protected_call()        -- true: pcall caught boom's error
     local ok = pcall(host.unprotected_call) -- false: lua_call re-raised, caught here
-    blyt.debug.print("err:" .. tostring(pc) .. ":" .. tostring(ok))
+    blyt.debug.print("<m:err:" .. tostring(pc) .. ":" .. tostring(ok) .. ">")
 end
 function update() blyt.quit() end
 function draw() end
@@ -762,13 +770,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "err:true:false";
-
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_hybrid_all_legs_exact(&cart, "m", &["err:true:false"]);
 }
 
 /// S6 — RE-ENTRANT reverse-trampoline (#262): native `host.outer()` calls Lua
@@ -812,7 +814,7 @@ function middle(n)
     return host.inner(n) * 2
 end
 function init()
-    blyt.debug.print("re:" .. host.outer())
+    blyt.debug.print("<m:re:" .. host.outer() .. ">")
 end
 function update() blyt.quit() end
 function draw() end
@@ -821,13 +823,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "re:211";
-
-    run_cart_native(&cart, expected);
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    run_cart_hybrid_all_legs_exact(&cart, "m", &["re:211"]);
 }
 
 // ── #250: hybrid heap accounting + unified 16 MB budget across both halves ────
@@ -993,7 +989,7 @@ function init()
     -- Native half: 9 MiB. Alone it fits the 16 MiB arena; combined with the
     -- Lua half's ~8 MiB it exceeds the unified 16 MiB pool and MUST fail.
     local ok = host.grab(9 * MIB)
-    blyt.debug.print("BUDGET grab_ok=" .. tostring(ok))
+    blyt.debug.print("<m:BUDGET grab_ok=" .. tostring(ok) .. ">")
 end
 function update() blyt.quit() end
 function draw() end
@@ -1002,14 +998,31 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "BUDGET grab_ok=false";
-
-    // Deterministic, leg-identical over-budget rejection across the three
-    // host-Lua legs (anti-#98). A green here without the shared fail-point would
-    // print grab_ok=true (native arena allows 9 MiB on its own).
-    run_cart_native_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
-    run_cart_wasm(&cart, expected);
-    run_cart_libretro_with_env(&cart, &[("BLYT_HOSTLUA", "1")], expected);
+    // Deterministic, leg-identical over-budget rejection. Per #250 the emulated
+    // leg is NOT the anchor (its single arena unifies the budget for free and is
+    // being retired, ADR-0136); the bar is the THREE host-Lua legs identical, so
+    // this drives only those three — inline, since the fixed five-leg helper would
+    // pull in the emulated legs. Exact marker sequence (anti-#98): a green without
+    // the shared fail-point would print grab_ok=true (native arena allows 9 MiB).
+    let expected: &[&str] = &["BUDGET grab_ok=false"];
+    assert_markers_exact(
+        "native-host-lua",
+        &capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]),
+        "m",
+        expected,
+    );
+    assert_markers_exact(
+        "wasm-host-lua",
+        &capture_cart_wasm(&cart, &[]),
+        "m",
+        expected,
+    );
+    assert_markers_exact(
+        "libretro-host-lua",
+        &capture_cart_libretro(&cart, &[("BLYT_HOSTLUA", "1")]),
+        "m",
+        expected,
+    );
 }
 
 // ── #278: hybrid must reserve its persistent footprint during init() ─────────
