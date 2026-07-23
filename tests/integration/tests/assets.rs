@@ -14,7 +14,8 @@ use common::{
     CartProject, blyt_bin, blytplay, build_cart, build_cart_expect_failure, build_dev_elf,
     build_lua_cart, find_wasm_dir, libretro_so, repo_root, require_libretro_core, require_lua_sdk,
     require_playwright, require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs,
-    run_cart_all_legs_evict_every_frame, sdk_dir, test_libretro_core,
+    run_cart_all_legs_exact, run_cart_all_legs_exact_evict_every_frame, sdk_dir,
+    test_libretro_core,
 };
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -67,6 +68,7 @@ function draw() end
 const LOADER_C: &str = r#"
 #include "blyt.h"
 #include "cart_resources.h"
+#include <stdio.h>
 #include <string.h>
 
 void blyt_cart_init(void) {
@@ -77,9 +79,11 @@ void blyt_cart_init(void) {
         size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
         memcpy(buf, t, n);
         buf[n] = '\0';
-        blyt_console_debug(buf);
+        char line[300];
+        snprintf(line, sizeof(line), "<m:%s>", buf);
+        blyt_console_debug(line);
     } else {
-        blyt_console_debug("NO RESOURCE");
+        blyt_console_debug("<m:NO RESOURCE>");
     }
 }
 
@@ -133,7 +137,7 @@ void blyt_cart_init(void) {
     }
 
     char line[128];
-    snprintf(line, sizeof(line), "RES_MANY pin_ok=%d match=%d first_bad=%d", pin_ok, match,
+    snprintf(line, sizeof(line), "<m:RES_MANY pin_ok=%d match=%d first_bad=%d>", pin_ok, match,
              first_bad);
     blyt_console_debug(line);
 }
@@ -167,7 +171,7 @@ fn many_resources_round_trip_all_legs() {
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    run_cart_all_legs(&cart, "RES_MANY pin_ok=100 match=100 first_bad=-1");
+    run_cart_all_legs_exact(&cart, "m", &["RES_MANY pin_ok=100 match=100 first_bad=-1"]);
 }
 
 /// Packed cart: the greeting asset is embedded as an ELF section and reaches the
@@ -188,7 +192,7 @@ fn text_asset_round_trips_all_legs() {
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    run_cart_all_legs(&cart, "Hello from assets!");
+    run_cart_all_legs_exact(&cart, "m", &["Hello from assets!"]);
 }
 
 /// Pure-Lua cart resolving the resource id through the packer-generated
@@ -199,7 +203,7 @@ fn text_asset_round_trips_all_legs() {
 const LUA_RESOURCE_REQUIRE: &str = r#"
 local R = require("cart_resources")
 function init()
-    blyt.debug.print(string.format("R[%d]=%s", R.GREETING:id(), R.GREETING:text()))
+    blyt.debug.print(string.format("<m:R[%d]=%s>", R.GREETING:id(), R.GREETING:text()))
 end
 function update() blyt.quit() end
 function draw() end
@@ -223,7 +227,7 @@ fn lua_resource_require_round_trips_all_legs() {
 
     // :id() returns the baked console-wide constant (ADR-0134): R_GREETING is the
     // first resource, id 1 -> 0x20000001 = 536870913.
-    run_cart_all_legs(&cart, "R[536870913]=Hello from assets!");
+    run_cart_all_legs_exact(&cart, "m", &["R[536870913]=Hello from assets!"]);
 }
 
 /// Pure-Lua cart exercising the constant-direct surface (ADR-0134): a typed
@@ -265,6 +269,11 @@ fn lua_resource_lifecycle_round_trips_all_legs() {
         .write(&project);
 
     let cart = build_lua_cart(&project);
+    // NOT migrated to the exact-marker helper (#284): this line's asserted value
+    // contains literal `<`/`>` (`ts=text_resource<536870913>`), which collides with
+    // the self-delimiting `<m:…>` marker delimiter (cart_markers stops at the first
+    // `>`). It emits a single deterministic line — count is not load-bearing — so a
+    // substring match is the right tool here.
     run_cart_all_legs(
         &cart,
         "L[Hello from assets!] tlen=18 size=19 id=536870913 ptr=true ts=text_resource<536870913>",
@@ -295,7 +304,7 @@ pub extern "C" fn blyt_cart_init() {
     let borrowed = pinned.as_str().unwrap();
 
     blyt::console_debug(&format!(
-        "R[{}] owned_len={} pin_len={} eq={}",
+        "<m:R[{}] owned_len={} pin_len={} eq={}>",
         borrowed,
         owned.len(),
         borrowed.len(),
@@ -333,9 +342,10 @@ fn rust_resource_round_trips_all_legs() {
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    run_cart_all_legs(
+    run_cart_all_legs_exact(
         &cart,
-        "R[Hello from assets!] owned_len=18 pin_len=18 eq=true",
+        "m",
+        &["R[Hello from assets!] owned_len=18 pin_len=18 eq=true"],
     );
 }
 
@@ -1456,9 +1466,13 @@ void blyt_cart_init(void) {
     blyt_resource_pin(R_BLOB, &ptr, &size);
     const unsigned char *p = (const unsigned char *)ptr;
     char line[256];
-    int off = snprintf(line, sizeof(line), "BLOB len=%d bytes=", (int)size);
+    int off = snprintf(line, sizeof(line), "<m:BLOB len=%d bytes=", (int)size);
     for (size_t i = 0; i < size && off + 2 < (int)sizeof(line); i++)
         off += snprintf(line + off, (size_t)((int)sizeof(line) - off), "%02x", p[i]);
+    if (off + 1 < (int)sizeof(line)) {
+        line[off++] = '>';
+        line[off] = '\0';
+    }
     blyt_resource_unpin(R_BLOB);
     blyt_console_debug(line);
 }
@@ -1541,7 +1555,7 @@ fn raw_asset_round_trips_all_legs() {
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    run_cart_all_legs(&cart, "BLOB len=6 bytes=00ff10686900");
+    run_cart_all_legs_exact(&cart, "m", &["BLOB len=6 bytes=00ff10686900"]);
 }
 
 /// Native dev leg: a raw `.dat` hot-swaps and the cache-at-init cart sees the new
@@ -1659,9 +1673,13 @@ void blyt_cart_init(void) {
     size_t len = 0;
     unsigned char *b = (unsigned char *)blyt_resource_bytes_get(R_BLOB, &len);
     char line[256];
-    int off = snprintf(line, sizeof(line), "BYTES len=%d hex=", (int)len);
+    int off = snprintf(line, sizeof(line), "<m:BYTES len=%d hex=", (int)len);
     for (size_t i = 0; i < len && off + 2 < (int)sizeof(line); i++)
         off += snprintf(line + off, (size_t)((int)sizeof(line) - off), "%02x", b[i]);
+    if (off + 1 < (int)sizeof(line)) {
+        line[off++] = '>';
+        line[off] = '\0';
+    }
     free(b);
     blyt_console_debug(line);
 }
@@ -1686,7 +1704,7 @@ pub extern "C" fn blyt_cart_init() {
     for b in &bytes {
         hex.push_str(&format!("{:02x}", b));
     }
-    blyt::console_debug(&format!("BYTES len={} hex={}", bytes.len(), hex));
+    blyt::console_debug(&format!("<m:BYTES len={} hex={}>", bytes.len(), hex));
 }
 
 #[no_mangle]
@@ -1708,7 +1726,7 @@ function init()
     for i = 1, #s do
         hex[i] = string.format("%02x", string.byte(s, i))
     end
-    blyt.debug.print(string.format("BYTES len=%d hex=%s", #s, table.concat(hex)))
+    blyt.debug.print(string.format("<m:BYTES len=%d hex=%s>", #s, table.concat(hex)))
 end
 function update() blyt.quit() end
 function draw() end
@@ -1730,7 +1748,7 @@ fn c_bytes_get_round_trips_all_legs() {
         .write(&project);
 
     let cart = build_cart(&project);
-    run_cart_all_legs(&cart, BLOB_HEX);
+    run_cart_all_legs_exact(&cart, "m", &[BLOB_HEX]);
 }
 
 /// Packed Rust cart: BytesResource::bytes_vec returns the exact opaque bytes,
@@ -1750,7 +1768,7 @@ fn rust_bytes_vec_round_trips_all_legs() {
         .write(&project);
 
     let cart = build_cart(&project);
-    run_cart_all_legs(&cart, BLOB_HEX);
+    run_cart_all_legs_exact(&cart, "m", &[BLOB_HEX]);
 }
 
 /// Packed Lua cart: res:bytes() returns the exact opaque bytes as a binary-safe
@@ -1769,7 +1787,7 @@ fn lua_resource_bytes_round_trips_all_legs() {
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_all_legs(&cart, BLOB_HEX);
+    run_cart_all_legs_exact(&cart, "m", &[BLOB_HEX]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1797,7 +1815,7 @@ void blyt_cart_init(void) {
     size_t len = 0;
     char *t = blyt_resource_text_get(R_GREETING, &len);
     char line[64];
-    snprintf(line, sizeof(line), "TXTLEN=%d:%s", (int)len, t ? t : "NULL");
+    snprintf(line, sizeof(line), "<m:TXTLEN=%d:%s>", (int)len, t ? t : "NULL");
     blyt_console_debug(line);
     free(t);
 }
@@ -1822,7 +1840,7 @@ fn c_text_get_content_length_all_legs() {
         .write(&project);
 
     let cart = build_cart(&project);
-    run_cart_all_legs(&cart, "TXTLEN=18:Hello from assets!");
+    run_cart_all_legs_exact(&cart, "m", &["TXTLEN=18:Hello from assets!"]);
 }
 
 /// C cart: blyt_resource_text_get on a *raw* resource returns NULL — the bytes
@@ -1837,7 +1855,7 @@ const TEXT_GET_ON_RAW_C: &str = r#"
 void blyt_cart_init(void) {
     size_t len = 7;
     char *t = blyt_resource_text_get((blyt_text_resource_t)R_BLOB, &len);
-    blyt_console_debug(t ? "TEXT_OK" : "TEXT_NULL");
+    blyt_console_debug(t ? "<m:TEXT_OK>" : "<m:TEXT_NULL>");
     free(t);
 }
 
@@ -1861,7 +1879,7 @@ fn c_text_get_on_raw_returns_null_all_legs() {
         .write(&project);
 
     let cart = build_cart(&project);
-    run_cart_all_legs(&cart, "TEXT_NULL");
+    run_cart_all_legs_exact(&cart, "m", &["TEXT_NULL"]);
 }
 
 /// A `text` resource that is not valid UTF-8 is a build error naming the file
@@ -2035,7 +2053,7 @@ void blyt_cart_init(void) {
         h *= 16777619u;
     }
     char line[96];
-    snprintf(line, sizeof(line), "BLOB pin=%d size=%d fnv=%08x", (int)pr, (int)size, h);
+    snprintf(line, sizeof(line), "<m:BLOB pin=%d size=%d fnv=%08x>", (int)pr, (int)size, h);
     blyt_console_debug(line);
 }
 void blyt_cart_update(void) { blyt_quit(); }
@@ -2070,7 +2088,7 @@ fn compressed_resource_round_trips_all_legs() {
         "blob.dat should have packed zstd"
     );
 
-    run_cart_all_legs(&cart, &expected);
+    run_cart_all_legs_exact(&cart, "m", &[expected.as_str()]);
 }
 
 /// C cart that pins R_BLOB and prints its FNV-1a every frame (init + each
@@ -2097,7 +2115,7 @@ static void read_and_print(void) {
     }
     blyt_resource_unpin(R_BLOB);
     char line[96];
-    snprintf(line, sizeof(line), "BLOB pin=%d size=%d fnv=%08x", (int)pr, (int)size, h);
+    snprintf(line, sizeof(line), "<ev:BLOB pin=%d size=%d fnv=%08x>", (int)pr, (int)size, h);
     blyt_console_debug(line);
 }
 
@@ -2120,7 +2138,7 @@ fn evicted_resource_rehydrates_byte_identical_all_legs() {
     require_libretro_core();
 
     let blob = compressible_blob();
-    let expected = format!("BLOB pin=0 size={} fnv={:08x}", blob.len(), fnv1a(&blob));
+    let line = format!("BLOB pin=0 size={} fnv={:08x}", blob.len(), fnv1a(&blob));
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("evict_rehydrate");
@@ -2138,10 +2156,15 @@ fn evicted_resource_rehydrates_byte_identical_all_legs() {
         "blob.dat should have packed zstd"
     );
 
+    // init() reads once, then update() re-reads on each of 3 frames = 4 identical
+    // markers. The exact sequence (#284) proves every rehydration produced
+    // byte-identical bytes on every leg — a substring match would still pass if a
+    // single frame's re-decode diverged, since the other frames carry the line.
+    let expected = [line.as_str(), line.as_str(), line.as_str(), line.as_str()];
     // Forced eviction after every frame: each re-read rehydrates from scratch.
-    run_cart_all_legs_evict_every_frame(&cart, &expected);
+    run_cart_all_legs_exact_evict_every_frame(&cart, "ev", &expected);
     // No eviction: identical cart-visible output — eviction never changes it.
-    run_cart_all_legs(&cart, &expected);
+    run_cart_all_legs_exact(&cart, "ev", &expected);
 }
 
 /// The packed section of a compressible resource is zstd-flagged, smaller than

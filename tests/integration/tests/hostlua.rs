@@ -15,8 +15,9 @@ mod common;
 use common::{
     CartProject, blytplay, build_lua_cart, capture_cart_wasm_combined,
     capture_cart_wasm_debug_combined, libretro_so, require_libretro_core, require_lua_sdk,
-    require_sdk, require_wasm, require_wasm_debug, run_cart_all_legs,
-    run_cart_all_legs_reset_every_frame, run_cart_all_legs_with_save_dir, test_libretro_core,
+    require_sdk, require_wasm, require_wasm_debug, run_cart_all_legs_exact,
+    run_cart_all_legs_exact_reset_every_frame, run_cart_all_legs_exact_with_save_dir,
+    test_libretro_core,
 };
 use tempfile::TempDir;
 
@@ -36,7 +37,7 @@ fn hostlua_debug_print_parity() {
         .lua(
             r#"
 function init()
-    blyt.debug.print("hello from host-lua")
+    blyt.debug.print("<m:hello from host-lua>")
 end
 
 function update()
@@ -49,7 +50,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_all_legs(&cart, "hello from host-lua");
+    run_cart_all_legs_exact(&cart, "m", &["hello from host-lua"]);
 }
 
 /// `blyt.quit()` called from `init()` terminates before any `update()`/`draw()`
@@ -153,7 +154,7 @@ end
 
 function update()
     blyt.save_read(0)
-    blyt.debug.print("score=" .. tostring(S.game[slot].score))
+    blyt.debug.print("<m:score=" .. tostring(S.game[slot].score) .. ">")
     blyt.quit()
 end
 
@@ -163,7 +164,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_all_legs_with_save_dir(&cart, "score=42");
+    run_cart_all_legs_exact_with_save_dir(&cart, "m", &["score=42"]);
 }
 
 /// S3: entity-ref + multi-buffer surface without save I/O — mirrors `hello`'s
@@ -212,7 +213,7 @@ function update()
     if blyt.buf.ref_valid(S.CHARACTER, player) then
         local slot = blyt.buf.ref_slot(player)
         S.character[slot].x = S.character[slot].x + 5
-        blyt.debug.print("x=" .. S.character[slot].x)
+        blyt.debug.print("<m:x=" .. S.character[slot].x .. ">")
     end
     blyt.quit()
 end
@@ -223,7 +224,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_all_legs(&cart, "x=15");
+    run_cart_all_legs_exact(&cart, "m", &["x=15"]);
 }
 
 /// #253: the f64 counterpart of [`hostlua_state_buffer_save_round_trip_parity`].
@@ -261,7 +262,7 @@ end
 
 function update()
     blyt.save_read(0)
-    blyt.debug.print("health=" .. tostring(S.game[slot].health))
+    blyt.debug.print("<m:health=" .. tostring(S.game[slot].health) .. ">")
     blyt.quit()
 end
 
@@ -271,7 +272,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_all_legs_with_save_dir(&cart, "health=42.5");
+    run_cart_all_legs_exact_with_save_dir(&cart, "m", &["health=42.5"]);
 }
 
 /// #253: carries a single f64 state-buffer field through the reset-every-frame
@@ -308,7 +309,7 @@ end
 function update()
     S.game[0].health = S.game[0].health + 0.25
     if S.game[0].health >= 5.25 then
-        blyt.debug.print("health=" .. tostring(S.game[0].health))
+        blyt.debug.print("<hl:health=" .. tostring(S.game[0].health) .. ">")
         blyt.quit()
     end
 end
@@ -324,9 +325,12 @@ function draw() end
     // the fractional result proves the field was never coerced through i32.
     let expected = "health=5.25";
 
-    run_cart_all_legs(&cart, expected);
+    // Exact marker sequence (#284): the cart prints its f64 exactly once, so a
+    // leg that repeats or drops the line — or runs an extra reset cycle (#283) —
+    // must fail, not slip past a substring match.
+    run_cart_all_legs_exact(&cart, "hl", &[expected]);
     // The host-Lua VM-rebuild reset cycle must reach the SAME f64 value each frame.
-    run_cart_all_legs_reset_every_frame(&cart, expected);
+    run_cart_all_legs_exact_reset_every_frame(&cart, "hl", &[expected]);
 }
 
 /// S4: the full `hello` acceptance surface — state buffers + entity ref + a plain
@@ -383,7 +387,7 @@ function on_new_state()
     S.globals[0].player = blyt.buf.ref(S.CHARACTER, slot)
     S.character[slot].x = 160
     S.character[slot].y = 120
-    blyt.debug.print("init player pos: 160, 120")
+    blyt.debug.print("<hl:init player pos: 160, 120>")
 end
 
 function update()
@@ -396,7 +400,7 @@ function update()
             local y = (S.character[slot].y + 1) % 240
             S.character[slot].x = x
             S.character[slot].y = y
-            blyt.debug.print("update frame " .. frame .. " player pos: " .. x .. ", " .. y)
+            blyt.debug.print("<hl:update frame " .. frame .. " player pos: " .. x .. ", " .. y .. ">")
         end
     end
     if frame >= 20 then
@@ -418,12 +422,21 @@ end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    let expected = "update frame 20 player pos: 162, 122";
+    // The full marker sequence, in order: on_new_state prints the initial pos
+    // once, then update prints every 10th frame through frame 20. Asserting the
+    // exact sequence (#284) — not just the final line — is what would catch a leg
+    // that repeats on_new_state, runs an extra reset cycle (#283), or diverges on
+    // an intermediate frame; a substring match on the last line would not.
+    let expected = [
+        "init player pos: 160, 120",
+        "update frame 10 player pos: 161, 121",
+        "update frame 20 player pos: 162, 122",
+    ];
 
-    run_cart_all_legs(&cart, expected);
+    run_cart_all_legs_exact(&cart, "hl", &expected);
     // Reset-every-frame — the host-Lua VM-rebuild cycle must reach the SAME
     // trajectory on every leg.
-    run_cart_all_legs_reset_every_frame(&cart, expected);
+    run_cart_all_legs_exact_reset_every_frame(&cart, "hl", &expected);
 }
 
 /// Capture a cart's blytplay `--headless` stdout (the runner's `log_fn` channel,

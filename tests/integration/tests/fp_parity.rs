@@ -39,7 +39,7 @@ use common::fp::{FP_PARITY_CART, FP_PARITY_DIGEST};
 use common::{
     CartProject, build_dir, build_lua_cart, hostlua_native, hostlua_native_fma,
     require_hostlua_native, require_hostlua_native_fma, require_libretro_core, require_lua_sdk,
-    require_sdk, require_wasm, run_cart_all_legs, run_cart_native_hostlua,
+    require_sdk, require_wasm, run_cart_all_legs_exact_cross_leg, run_cart_native_hostlua,
 };
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -69,7 +69,12 @@ fn fp_transcendental_parity_across_legs() {
     CartProject::new().lua(FP_PARITY_CART).write(&project);
     let cart = build_lua_cart(&project);
 
-    run_cart_all_legs(&cart, FP_PARITY_DIGEST);
+    // The cart folds a runtime-computed corpus into per-item `[blyt:fpspot]` lines
+    // whose values are not enumerated here, so this asserts all three host-Lua
+    // legs emit the IDENTICAL marker sequence (count + order) and pins the golden
+    // digest within it (#284) — stronger than the old substring check, which was
+    // blind to whether the surrounding spot lines agreed across legs.
+    run_cart_all_legs_exact_cross_leg(&cart, "m", FP_PARITY_DIGEST);
 }
 
 /// Spike Z / #225 (Q1 + Q3): the native host-Lua leg — the same Lua fork and

@@ -28,7 +28,7 @@ mod common;
 
 use common::{
     CartProject, build_lua_cart, require_hostlua_native, require_libretro_core, require_lua_sdk,
-    require_sdk, require_wasm, run_cart_all_legs, run_cart_native_hostlua,
+    require_sdk, require_wasm, run_cart_all_legs_exact, run_cart_native_hostlua,
 };
 use tempfile::TempDir;
 
@@ -127,7 +127,7 @@ end
 
 function init()
     run()
-    blyt.debug.print("[blyt:nonfphash] " .. digest_hex())
+    blyt.debug.print("<m:[blyt:nonfphash] " .. digest_hex() .. ">")
 end
 function update()
     blyt.quit()
@@ -156,7 +156,7 @@ fn native_hostlua_nonfp_parity() {
     let cart = build_lua_cart(&project);
 
     // Emulated / WASM / libretro all agree on the reference…
-    run_cart_all_legs(&cart, NONFP_DIGEST);
+    run_cart_all_legs_exact(&cart, "m", &[NONFP_DIGEST]);
     // …and the native host-Lua leg reproduces it bit-for-bit.
     run_cart_native_hostlua(&cart, NONFP_DIGEST);
 }

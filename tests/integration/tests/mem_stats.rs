@@ -16,7 +16,7 @@ mod common;
 
 use common::{
     CartProject, blytplay, build_cart, build_lua_cart, require_libretro_core, require_lua_sdk,
-    require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs,
+    require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs_exact,
 };
 use tempfile::TempDir;
 
@@ -145,7 +145,7 @@ void blyt_cart_init(void) {
     uint32_t fid = n > 0 ? res[0].id : 0;
     uint32_t fsz = n > 0 ? res[0].size : 0;
     char line[128];
-    snprintf(line, sizeof(line), "MEM cap=%u inv=%d loaded=%u first=%u:%u",
+    snprintf(line, sizeof(line), "<m:MEM cap=%u inv=%d loaded=%u first=%u:%u>",
              s.budget_cap, inv, n, fid, fsz);
     blyt_console_debug(line);
 }
@@ -162,7 +162,7 @@ function init()
     local first = m.resources_loaded[1]
     local fid = first and first.id or 0
     local fsz = first and first.size or 0
-    blyt.debug.print(string.format("MEM cap=%d inv=%d loaded=%d first=%d:%d",
+    blyt.debug.print(string.format("<m:MEM cap=%d inv=%d loaded=%d first=%d:%d>",
         m.budget_cap, inv, #m.resources_loaded, fid, fsz))
 end
 function update() blyt.quit() end
@@ -187,7 +187,7 @@ pub extern "C" fn blyt_cart_init() {
         .map(|r| (r.id, r.size))
         .unwrap_or((0, 0));
     blyt::console_debug(&format!(
-        "MEM cap={} inv={} loaded={} first={}:{}",
+        "<m:MEM cap={} inv={} loaded={} first={}:{}>",
         m.budget_cap, inv, m.resources_loaded.len(), fid, fsz
     ));
 }
@@ -216,7 +216,7 @@ fn mem_stats_c_parity_all_legs() {
 
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
-    run_cart_all_legs(&cart, PARITY_EXPECT);
+    run_cart_all_legs_exact(&cart, "m", &[PARITY_EXPECT]);
 }
 
 /// AC4 (Lua, incl. the WASM host-Lua fast path): `blyt32.mem.stats()` returns
@@ -238,7 +238,7 @@ fn mem_stats_lua_parity_all_legs() {
     assert!(cart.exists(), "cart not found at {}", cart.display());
     // Host-Lua is the default for a pure-Lua cart on non-RISC-V hosts (ADR-0136),
     // so all three legs exercise mem.stats() + the resource table with no session.
-    run_cart_all_legs(&cart, PARITY_EXPECT);
+    run_cart_all_legs_exact(&cart, "m", &[PARITY_EXPECT]);
 }
 
 /// AC4 (Rust): the Rust SDK surface returns the same fields as C/Lua for the
@@ -259,5 +259,5 @@ fn mem_stats_rust_parity_all_legs() {
 
     let cart = build_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
-    run_cart_all_legs(&cart, PARITY_EXPECT);
+    run_cart_all_legs_exact(&cart, "m", &[PARITY_EXPECT]);
 }

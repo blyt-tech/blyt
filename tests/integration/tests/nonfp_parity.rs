@@ -56,18 +56,21 @@ use std::path::Path;
 use common::nonfp;
 use common::{
     CartProject, build_lua_cart, require_libretro_core, require_lua_sdk, require_sdk, require_wasm,
-    run_cart_all_legs,
+    run_cart_all_legs_exact,
 };
 use tempfile::TempDir;
 
-/// Assert `expected` appears on every shipped leg that runs a pure-Lua cart — the
-/// three host-Lua reference legs (native blytplay, wasm, libretro core), which are
-/// exactly `run_cart_all_legs` now that ADR-0136 makes host-Lua the default for a
-/// pure-Lua cart on non-RISC-V hosts (#236 retired the emulated RV32 Lua VM as a
-/// shipped path). RISC-V-Lua parity is the QEMU native gate (Gate 33); FP
-/// determinism is the FP suite + its QEMU gate.
-fn assert_all_hostlua_legs(cart: &Path, expected: &str) {
-    run_cart_all_legs(cart, expected);
+/// Assert the EXACT marker sequence `expected` (payloads, order, count) on every
+/// shipped leg that runs a pure-Lua cart — the three host-Lua reference legs
+/// (native blytplay, wasm, libretro core), which are exactly the
+/// `run_cart_all_legs_exact` legs now that ADR-0136 makes host-Lua the default
+/// for a pure-Lua cart on non-RISC-V hosts (#236 retired the emulated RV32 Lua VM
+/// as a shipped path). RISC-V-Lua parity is the QEMU native gate (Gate 33); FP
+/// determinism is the FP suite + its QEMU gate. Exact rather than substring
+/// (#284): a leg that emitted an extra or divergent line would be invisible to a
+/// `.contains` check.
+fn assert_all_hostlua_legs(cart: &Path, expected: &[&str]) {
+    run_cart_all_legs_exact(cart, "m", expected);
 }
 
 #[test]
@@ -86,10 +89,10 @@ fn nonfp_nan_boundary_f64_state_buffer_parity() {
     let cart = build_lua_cart(&project);
 
     // Cross-leg agreement + golden: the digest folds the *read-back* bits, so it
-    // only matches if every leg canonicalized the NaN identically.
-    assert_all_hostlua_legs(&cart, nonfp::NAN_DIGEST);
-    // Positive ADR-0010 contract: the literal canonical value on every leg.
-    assert_all_hostlua_legs(&cart, nonfp::NAN_CANON_LINE);
+    // only matches if every leg canonicalized the NaN identically; the cart then
+    // prints the literal canonical value (positive ADR-0010 contract). Both, in
+    // order, are the cart's entire marker output — asserted exactly.
+    assert_all_hostlua_legs(&cart, &[nonfp::NAN_DIGEST, nonfp::NAN_CANON_LINE]);
 }
 
 #[test]
@@ -104,5 +107,5 @@ fn nonfp_gc_finalizer_order_parity() {
     CartProject::new().lua(nonfp::GC_CART).write(&project);
     let cart = build_lua_cart(&project);
 
-    assert_all_hostlua_legs(&cart, nonfp::GC_DIGEST);
+    assert_all_hostlua_legs(&cart, &[nonfp::GC_DIGEST]);
 }
