@@ -19,7 +19,7 @@ mod common;
 use common::gfx;
 use common::{
     CartProject, build_cart, build_lua_cart, require_lua_sdk, require_sdk, require_wasm,
-    run_cart_all_legs_frame_hash, write_c_cart_project,
+    run_cart_all_legs_frame_hash_exact, write_c_cart_project,
 };
 
 /// Build a C cart whose `blyt_cart_draw` runs `draw_body` once, then quits.
@@ -106,7 +106,7 @@ fn gfx_torture_frame_hashes_identically_across_legs() {
     let cart = build_draw_cart(&tmp.path().join("gfx-torture"), &gfx::c_draw_body(&ops));
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// `blyt_gfx_palette_set` (issue #201): the new op must be serviced without
@@ -128,7 +128,7 @@ fn gfx_palette_set_does_not_perturb_index_hash_across_legs() {
     let cart = build_draw_cart(&tmp.path().join("gfx-palette-set"), &draw_body);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Q1 — the acquire/present raw-framebuffer contract.  `blyt_gfx_acquire()`
@@ -150,7 +150,7 @@ fn gfx_acquire_present_raw_framebuffer_hashes_identically_across_legs() {
     );
 
     let expected = gfx::expected_hash_line(&gfx::raw_pattern_frame());
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Q1 across execution models — the **host-Lua path** (ADR-0136).  A pure-Lua
@@ -181,7 +181,7 @@ fn gfx_torture_frame_lua_hashes_identically_across_legs() {
     let cart = build_cart(&project);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Build a Lua + native-C **hybrid** cart whose torture frame is split across
@@ -231,7 +231,7 @@ fn gfx_hybrid_both_halves_hash_identically_across_legs() {
     let cart = build_gfx_hybrid_cart(&tmp.path().join("gfx-hybrid"), &ops, 8);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Build a hybrid cart whose native half uses the raw `acquire`/`present` path
@@ -267,5 +267,5 @@ fn gfx_hybrid_native_acquire_present_hashes_identically_across_legs() {
     let cart = build_gfx_hybrid_raw_cart(&tmp.path().join("gfx-hybrid-raw"));
 
     let expected = gfx::expected_hash_line(&gfx::raw_pattern_frame());
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }

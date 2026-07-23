@@ -73,7 +73,7 @@ void blyt_cart_init(void) {
     blyt_resource_unpin(pid);
 
     char line[128];
-    snprintf(line, sizeof(line), "PERS r0=%d sum=%u sz=%u r1=%d sum2=%u", r0, sum, (unsigned)sz, r1,
+    snprintf(line, sizeof(line), "<m:PERS r0=%d sum=%u sz=%u r1=%d sum2=%u>", r0, sum, (unsigned)sz, r1,
              sum2);
     blyt_console_debug(line);
 }
@@ -102,7 +102,7 @@ fn persistent_usable_without_load_all_legs() {
     assert!(cart.exists(), "cart not found at {}", cart.display());
     // r0=1 (resident from frame 0), sum/sz of the 5 known bytes, r1=1 (still
     // resident after release/unpin), sum2 identical (bytes still valid).
-    run_cart_all_legs(&cart, "PERS r0=1 sum=240 sz=5 r1=1 sum2=240");
+    run_cart_all_legs_exact(&cart, "m", &["PERS r0=1 sum=240 sz=5 r1=1 sum2=240"]);
 }
 
 /// AC2 (C): under budget pressure a persistent resource is NOT evicted while a
@@ -153,7 +153,7 @@ void blyt_cart_init(void) {
     blyt_resource_unpin((blyt_resource_id_t)R_PERS4);
 
     char line[96];
-    snprintf(line, sizeof(line), "PERSEVICT n=%d pers_ok=%d", n, pers_ok);
+    snprintf(line, sizeof(line), "<m:PERSEVICT n=%d pers_ok=%d>", n, pers_ok);
     blyt_console_debug(line);
 }
 void blyt_cart_update(void) { blyt_quit(); }
@@ -180,7 +180,7 @@ fn persistent_not_evicted_under_pressure_all_legs() {
     assert!(cart.exists(), "cart not found at {}", cart.display());
     // 12 MiB headroom (only the persistent 4 MiB reserved) -> 191 blocks; the
     // persistent resource survives the pressure (pers_ok=1). Same on every leg.
-    run_cart_all_legs(&cart, "PERSEVICT n=191 pers_ok=1");
+    run_cart_all_legs_exact(&cart, "m", &["PERSEVICT n=191 pers_ok=1"]);
 }
 
 /// AC1 + AC5 (Lua, incl. the WASM host-Lua fast path): a persistent resource is
@@ -195,7 +195,7 @@ function init()
     for _, r in ipairs(m.resources_loaded) do
         if r.id == R.PERS:id() then resident = 1 end
     end
-    blyt.debug.print(string.format("PERSLUA resident=%d loaded=%d", resident, #m.resources_loaded))
+    blyt.debug.print(string.format("<m:PERSLUA resident=%d loaded=%d>", resident, #m.resources_loaded))
 end
 function update() blyt.quit() end
 function draw() end
@@ -220,7 +220,7 @@ fn persistent_resident_from_frame0_lua_all_legs() {
     // The single persistent resource is the only resident one, from frame 0. Host-Lua
     // is the default for a pure-Lua cart on non-RISC-V hosts (ADR-0136), so all three
     // legs preload persistent resources into the runner's resource table (no session).
-    run_cart_all_legs(&cart, "PERSLUA resident=1 loaded=1");
+    run_cart_all_legs_exact(&cart, "m", &["PERSLUA resident=1 loaded=1"]);
 }
 
 /// AC4 (build-time guard, the primary over-budget oracle): a persistent set whose

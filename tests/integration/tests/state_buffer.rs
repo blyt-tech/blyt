@@ -3,7 +3,7 @@ mod common;
 use common::{
     CartProject, build_cart, build_lua_cart, require_cpp_sdk, require_libretro_core,
     require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm,
-    run_cart_all_legs_reset_every_frame, run_cart_all_legs_with_save_dir,
+    run_cart_all_legs_exact_reset_every_frame, run_cart_all_legs_exact_with_save_dir,
     run_cart_cross_version_all_legs, run_cart_libretro, run_cart_libretro_with_flags,
     run_cart_native_with_env, run_cart_native_with_flags, run_cart_wasm, run_cart_wasm_with_env,
 };
@@ -1776,7 +1776,7 @@ end
 function update()
     frame = frame + 1
     if frame == 10 then
-        blyt.debug.print("reason=" .. last_reason)
+        blyt.debug.print("<sb:reason=" .. last_reason .. ">")
         blyt.quit()
     end
 end
@@ -1788,8 +1788,9 @@ function draw() end
 /// restores with BLYT_LOAD_HOT_RELOAD (3) on native, WASM and libretro alike, so
 /// the same cart must observe `info.reason == 3` identically on every leg — the
 /// native/WASM divergence #98 reported (native saw `info == nil`) is gone. Driven
-/// through `run_cart_all_legs_reset_every_frame` so any future per-leg divergence
-/// fails by construction.
+/// through `run_cart_all_legs_exact_reset_every_frame` so any future per-leg
+/// divergence — in the value or the number of times it is emitted — fails by
+/// construction.
 #[test]
 fn lua_cart_on_load_state_receives_reason() {
     require_sdk();
@@ -1807,7 +1808,10 @@ fn lua_cart_on_load_state_receives_reason() {
 
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
-    run_cart_all_legs_reset_every_frame(&cart, "reason=3");
+    // Exact marker sequence (#284): the cart records the reason exactly once, so
+    // a leg that runs an extra reset cycle or repeats the line fails here rather
+    // than passing a substring match.
+    run_cart_all_legs_exact_reset_every_frame(&cart, "sb", &["reason=3"]);
 }
 
 /// Cart for Gap A of issue #110: the most common real load path — a cart that
@@ -1839,12 +1843,13 @@ function update()
     S.game[slot].score = 99
     blyt.save_read(0)
     blyt.debug.print(
-        "save_read reason="
+        "<m:save_read reason="
             .. got_reason
             .. " version="
             .. got_version
             .. " score="
             .. S.game[slot].score
+            .. ">"
     )
     blyt.quit()
 end
@@ -1874,7 +1879,7 @@ fn lua_cart_save_read_delivers_load_info() {
 
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
-    run_cart_all_legs_with_save_dir(&cart, "save_read reason=0 version=7 score=42");
+    run_cart_all_legs_exact_with_save_dir(&cart, "m", &["save_read reason=0 version=7 score=42"]);
 }
 
 /// Writer for the cross-version round trip: declares save_version=1, writes

@@ -22,7 +22,7 @@ mod common;
 use common::gfx;
 use common::{
     CartProject, build_cart, require_lua_sdk, require_rust_riscv_target, require_sdk,
-    run_cart_all_legs_frame_hash, write_c_cart_project,
+    run_cart_all_legs_frame_hash_exact, write_c_cart_project,
 };
 
 /// One horizontal band of the shared test picture: filled with palette index
@@ -196,17 +196,17 @@ fn named_color_sets_hash_identically_across_langs_and_legs() {
 
     // C.
     let c_cart = build_c_cart(&tmp.path().join("colors-c"), &c_body(&bands));
-    run_cart_all_legs_frame_hash(&c_cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&c_cart, &expected);
 
     // Lua (emulated-Lua on native/libretro, host-Lua fast path on wasm).
     require_lua_sdk();
     let lua_cart = build_lua_draw_cart(&tmp.path().join("colors-lua"), &lua_body(&bands));
-    run_cart_all_legs_frame_hash(&lua_cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&lua_cart, &expected);
 
     // Rust.
     require_rust_riscv_target();
     let rust_cart = build_rust_draw_cart(&tmp.path().join("colors-rust"), &rust_body(&bands));
-    run_cart_all_legs_frame_hash(&rust_cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&rust_cart, &expected);
 }
 
 /// Packer-generated `C_<NAME>` constants (from a manifest `colors:` swatch map)
@@ -233,7 +233,7 @@ fn packer_generated_color_constants_hash_identically_across_langs_and_legs() {
             void blyt_cart_draw(void) { blyt_gfx_clear(C_BRAND); }\n")
         .write(&c_dir);
     let c_cart = build_cart(&c_dir);
-    run_cart_all_legs_frame_hash(&c_cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&c_cart, &expected);
 
     // Lua: require the generated module, use C.BRAND.
     require_lua_sdk();
@@ -248,7 +248,7 @@ fn packer_generated_color_constants_hash_identically_across_langs_and_legs() {
         )
         .write(&lua_dir);
     let lua_cart = build_cart(&lua_dir);
-    run_cart_all_legs_frame_hash(&lua_cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&lua_cart, &expected);
 
     // Rust: include! the generated module, use C_BRAND.
     require_rust_riscv_target();
@@ -267,5 +267,5 @@ fn packer_generated_color_constants_hash_identically_across_langs_and_legs() {
         )
         .write(&rust_dir);
     let rust_cart = build_cart(&rust_dir);
-    run_cart_all_legs_frame_hash(&rust_cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&rust_cart, &expected);
 }

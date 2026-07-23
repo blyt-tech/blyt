@@ -891,13 +891,22 @@ static void lua_gfx_palette_ensure_default(void) {
     g_lua_gfx_palette_init = true;
 }
 
+/* Expand a paletted frame into g_xrgb for presentation, WITHOUT emitting a frame
+ * hash. Split out from lua_present_paletted so the one-off startup test-card
+ * present can prime the canvas without adding a frame to the cross-leg oracle. */
+static void lua_expand_paletted(const uint8_t *pixels, const uint32_t *palette) {
+    for (int i = 0; i < BLYT_FRAME_W * BLYT_FRAME_H; i++)
+        g_xrgb[i] = palette[pixels[i]];
+}
+
 /* Expand a paletted frame to g_xrgb for presentation and, when BLYT_FRAME_HASH
  * is set, emit the cross-leg "[blyt:fbhash] <hex>" line — the host-Lua fast
  * path's equivalent of the host runtime's frame_done emit (cart_run.c), over the
- * same paletted bytes so every leg's hash matches (#188). */
+ * same paletted bytes so every leg's hash matches (#188). One call == one cart
+ * frame in the oracle, so it must fire exactly once per completed frame and
+ * never for the pre-loop startup present (see render_testcard_frame). */
 static void lua_present_paletted(const uint8_t *pixels, const uint32_t *palette) {
-    for (int i = 0; i < BLYT_FRAME_W * BLYT_FRAME_H; i++)
-        g_xrgb[i] = palette[pixels[i]];
+    lua_expand_paletted(pixels, palette);
     static int s_hash_on = -1;
     if (s_hash_on < 0)
         s_hash_on = getenv("BLYT_FRAME_HASH") != NULL ? 1 : 0;
@@ -922,12 +931,34 @@ static void lua_present_paletted(const uint8_t *pixels, const uint32_t *palette)
  * through that same palette, so its colours track the cart's declared palette
  * exactly as on every emulated leg. */
 static uint32_t *lua_gfx_palette(void);
-static void render_testcard(void) {
+
+/* Render the animated test card into g_xrgb.
+ *
+ * `emit_hash == true` — a real running frame in which the cart drew nothing:
+ * a genuine cart frame that must appear in the cross-leg frame-hash oracle,
+ * mirroring native's `hl_frame_done` (which likewise renders + hashes a test
+ * card while `!drawn`).
+ *
+ * `emit_hash == false` — the one-off STARTUP present (before the main loop):
+ * this primes g_xrgb for the first canvas paint but is NOT a cart frame. It must
+ * neither emit a frame hash nor advance the animation counter the running frames
+ * hash against — otherwise wasm carries an extra leading test-card frame that
+ * native/libretro never produce, breaking exact cross-leg frame-hash parity
+ * (#284). Native/libretro have no such pre-loop present.
+ */
+static void render_testcard_frame(bool emit_hash) {
     static uint8_t s_pixels[BLYT_FRAME_W * BLYT_FRAME_H];
     static uint32_t s_frame = 0;
     const uint32_t *pal = lua_gfx_palette();
-    blyt_testcard_draw(s_frame++, pal, s_pixels);
-    lua_present_paletted(s_pixels, pal);
+    blyt_testcard_draw(emit_hash ? s_frame++ : s_frame, pal, s_pixels);
+    if (emit_hash)
+        lua_present_paletted(s_pixels, pal);
+    else
+        lua_expand_paletted(s_pixels, pal);
+}
+
+static void render_testcard(void) {
+    render_testcard_frame(true);
 }
 
 /* The paletted framebuffer the host-Lua gfx bindings rasterize into.  For a
@@ -3705,8 +3736,10 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         fc_consolelua_master_hook_install(g_lua_co);
 #endif
 
-    /* Render one static test card frame before starting the loop. */
-    render_testcard();
+    /* Prime g_xrgb with a static test card for the first canvas paint. This is
+     * not a cart frame, so it must not emit a frame hash (#284) — see
+     * render_testcard_frame. */
+    render_testcard_frame(false);
 
     g_lua_active = true;
     emscripten_set_main_loop(wasm_lua_loop, 0, 1);

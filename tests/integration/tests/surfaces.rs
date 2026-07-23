@@ -19,7 +19,7 @@ use common::{
     require_rust_riscv_target, require_sdk, require_wasm, run_cart_native_expect_fail,
     write_c_cart_project,
 };
-use common::{run_cart_all_legs_frame_hash, run_cart_native_with_env};
+use common::{run_cart_all_legs_frame_hash_exact, run_cart_native_with_env};
 
 /// Build a C cart whose `blyt_cart_draw` runs `draw_body` once, then quits.
 fn build_draw_cart(dir: &std::path::Path, draw_body: &str) -> std::path::PathBuf {
@@ -88,7 +88,7 @@ void blyt_cart_draw(void) {
     screen[(gfx::FRAME_H - 1) * gfx::FRAME_W + (gfx::FRAME_W - 1)] = 1;
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Out-of-phase READ is cleared (release, every leg).  Frame 0's `draw()` fills
@@ -136,7 +136,7 @@ void blyt_cart_draw(void) {
     let expected = gfx::expected_hash_line(&screen);
 
     // Two frames: the target hash is frame 1's, so run long enough to reach it.
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Out-of-phase surface access in a *debug* cart is a hard error (dev trap).
@@ -182,7 +182,7 @@ fn surface_screen_torture_frame_hashes_identically_across_legs() {
     );
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// End-to-end off-screen surface: create a blank surface, draw into it, then blit
@@ -229,7 +229,7 @@ fn surface_offscreen_draw_then_blit_to_screen_hashes_identically_across_legs() {
     );
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Tier-1 ≡ tier-2 (#205 acceptance oracle): the torture frame drawn into the
@@ -250,7 +250,7 @@ fn surface_lock_tier2_screen_equals_tier1_torture_across_legs() {
     );
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Per-pixel round-trip through the copy-in/copy-out path: create an off-screen
@@ -299,7 +299,7 @@ fn surface_lock_raw_per_pixel_roundtrips_across_legs() {
     );
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// A lock-view token is rejected once released (generation/lock-state check,
@@ -327,7 +327,7 @@ fn surface_lock_stale_token_release_rejected_across_legs() {
     let screen = vec![x; gfx::FRAME_W * gfx::FRAME_H];
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Exclusive-lock invariant (#207): a **blit reading a locked surface as its
@@ -360,7 +360,7 @@ fn surface_blit_from_locked_src_rejected_across_legs() {
     let screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Exclusive-lock invariant (#207): a **tier-1 op on the locked surface itself**
@@ -391,7 +391,7 @@ fn surface_tier1_on_locked_screen_rejected_across_legs() {
     let screen = vec![a; gfx::FRAME_W * gfx::FRAME_H];
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// A tier-1 op on a *locked* surface in a **debug** cart is a hard error (dev
@@ -448,7 +448,7 @@ fn surface_over_budget_create_returns_none_across_legs() {
     let screen = vec![bg; gfx::FRAME_W * gfx::FRAME_H];
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// The Lua tier-1 surface API (`blyt32.surface.*`) drawing the torture frame
@@ -473,7 +473,7 @@ fn surface_lua_screen_torture_hashes_identically_across_legs() {
     let cart = build_cart(&project);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// #208 Stage 2: the Lua tier-2 per-pixel lock (`blyt32.surface.acquire` →
@@ -500,7 +500,7 @@ fn surface_lua_lock_tier2_screen_torture_hashes_identically_across_legs() {
     let cart = build_cart(&project);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// #208: `lk:get` reads back what `lk:set` wrote (per-pixel round-trip), and an
@@ -537,7 +537,7 @@ fn surface_lua_lock_get_roundtrip_across_legs() {
     let cart = build_cart(&project);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// #208: using a lock after `lk:release()` is a defined no-op in a release cart
@@ -566,7 +566,7 @@ fn surface_lua_lock_use_after_release_is_noop_across_legs() {
     let cart = build_cart(&project);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// #208: in a DEBUG cart, an out-of-bounds `lk:set` is a hard Lua error — not the
@@ -646,7 +646,7 @@ fn surface_lua_offscreen_draw_then_blit_hashes_identically_across_legs() {
     );
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// #208 cross-half screen-lock coherence: while the host-Lua half holds a tier-2
@@ -684,7 +684,7 @@ fn surface_hybrid_lua_screen_lock_rejects_native_tier1_across_legs() {
     // Golden = only the Lua lock's draws; the native rect is rejected on every leg.
     let ops = [gfx::Op::Clear(3), gfx::Op::Pixel(10, 10, 7)];
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// Hybrid coherence with the tier-2 lock crossing the Lua/native boundary
@@ -721,7 +721,7 @@ fn surface_hybrid_native_tier2_lua_tier1_coheres_across_legs() {
     let cart = build_lua_cart(&dir);
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// A lock-view token is inert once it crosses the Lua/native boundary (#205).
@@ -768,7 +768,7 @@ fn surface_lockview_token_across_bridge_rejected_across_legs() {
     // no-ops, so the screen stays uniformly X — Y never lands.
     let screen = vec![x; gfx::FRAME_W * gfx::FRAME_H];
     let expected = gfx::expected_hash_line(&screen);
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// The Rust SDK surface API (`blyt::gfx`) draws the torture frame into the
@@ -788,7 +788,7 @@ fn surface_rust_screen_torture_hashes_identically_across_legs() {
     );
 
     let expected = gfx::expected_hash_line(&gfx::render(&ops));
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// The Rust `SurfaceLock` guard (tier-2): create an off-screen surface, draw into
@@ -838,7 +838,7 @@ fn surface_rust_lock_offscreen_blit_hashes_identically_across_legs() {
     );
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
 
 /// FLAGSHIP cross-registry coherence (#210): a hybrid cart where the **Lua** half
@@ -915,5 +915,5 @@ fn surface_hybrid_lua_offscreen_handle_blit_by_c_coheres_across_legs() {
     );
     let expected = gfx::expected_hash_line(&screen);
 
-    run_cart_all_legs_frame_hash(&cart, &expected);
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }
