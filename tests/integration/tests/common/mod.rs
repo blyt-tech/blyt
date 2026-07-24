@@ -2145,10 +2145,9 @@ pub fn run_cart_all_legs(cart: &std::path::Path, expected: &str) {
 /// defeat the comparison.
 ///
 /// Line-based extraction (unlike the self-delimiting [`cart_markers`]) is safe
-/// here because the frame-hash legs are the three **host runtimes**, which all
-/// newline-frame their log output. Bare metal — the no-trailing-newline leg that
-/// forced markers to be self-delimiting (#291) — never runs `BLYT_FRAME_HASH`, so
-/// its framing does not apply.
+/// here because each hash is emitted as its own whole log line on every leg that
+/// runs `BLYT_FRAME_HASH` — the three host runtimes. (Bare metal newline-frames
+/// its console output too since #291, but never runs `BLYT_FRAME_HASH`.)
 pub fn frame_hash_lines(output: &str) -> Vec<String> {
     output
         .lines()
@@ -2246,13 +2245,17 @@ pub fn run_cart_all_legs_frame_hash_exact(cart: &std::path::Path, expected: &str
 /// what the *cart* emitted is what lets the comparison be EXACT without first
 /// normalising every leg's own noise.
 ///
-/// Markers are self-delimiting rather than line-based on purpose. Bare metal's
-/// `blyt_console_debug` goes straight to `write(2)` with no trailing newline, so
-/// a whole run arrives as a single line with the guest's own trace output run
-/// together with the cart's — a line-based extractor yields NOTHING there and the
-/// assertion fails (or worse, an `is_empty()`-tolerant one passes) for a reason
-/// that has nothing to do with the cart. That is the same shape as the coverage
-/// gap these helpers exist to close (#284).
+/// Markers are self-delimiting rather than line-based on purpose: a marker stays
+/// findable however its leg framed the surrounding output, so the comparison
+/// never depends on log framing it is not trying to test. That mattered acutely
+/// before #291, when bare metal's `blyt_console_debug` went straight to
+/// `write(2)` with no trailing newline and a whole run arrived as one line — a
+/// line-based extractor yielded NOTHING there, failing (or with an
+/// `is_empty()`-tolerant assertion, passing) for a reason that had nothing to do
+/// with the cart. Every leg line-frames its console output now, but the
+/// self-delimiting form keeps a marker intact even when a leg interleaves its own
+/// output mid-line. The line framing itself is asserted in
+/// tests/console_framing.rs and QEMU Gate 36, via [`marker_lines`].
 pub fn cart_markers(output: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}:");
     let mut out = Vec::new();
@@ -2282,6 +2285,56 @@ pub fn assert_markers_exact(leg: &str, output: &str, tag: &str, expected: &[&str
         got,
         expected,
         "\n{leg} leg emitted a different marker sequence.\n  expected ({} lines): {:#?}\n  got      ({} lines): {:#?}\nfull {leg} output:\n{output}",
+        expected.len(),
+        expected,
+        got.len(),
+        got,
+    );
+}
+
+/// Every output line carrying a `<{tag}:…>` marker, trimmed — the **line-based**
+/// view of cart output, as opposed to [`cart_markers`]' self-delimiting scan.
+///
+/// This is the teeth for the `blyt_console_debug` line-framing contract (#291):
+/// one call emits exactly one line, so a cart that made N calls must produce N
+/// marker-bearing lines, each equal to exactly one whole marker. Two markers
+/// sharing a line (bare metal's pre-#291 behaviour, where consecutive calls ran
+/// together into one unbroken write) fails the equality, as does a call that
+/// emitted no line at all.
+pub fn marker_lines(output: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}:");
+    output
+        .lines()
+        .filter(|line| line.contains(&open))
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+/// Assert one leg framed each `<{tag}:…>` marker on its own line — the
+/// `blyt_console_debug` line-framing contract (#291), which every leg including
+/// bare metal must satisfy identically.
+///
+/// `expected` is the whole markers (`<lf:one>`, …), not the payloads
+/// [`assert_markers_exact`] compares: the point here is *where the line breaks
+/// fall*, which a payload-only comparison cannot see. Cross-checks the
+/// self-delimiting [`cart_markers`] scan so a cart that never ran is reported as
+/// that, rather than as a framing failure.
+pub fn assert_marker_lines_exact(leg: &str, output: &str, tag: &str, expected: &[&str]) {
+    let payloads = cart_markers(output, tag);
+    assert_eq!(
+        payloads.len(),
+        expected.len(),
+        "\n{leg} leg emitted {} <{tag}:…> markers, expected {} — the cart did not run as \
+         expected, so its line framing cannot be judged.\nfull {leg} output:\n{output}",
+        payloads.len(),
+        expected.len(),
+    );
+    let got = marker_lines(output, tag);
+    assert_eq!(
+        got,
+        expected,
+        "\n{leg} leg did not frame one console_debug call per line (#291).\n  \
+         expected ({} lines): {:#?}\n  got      ({} lines): {:#?}\nfull {leg} output:\n{output}",
         expected.len(),
         expected,
         got.len(),

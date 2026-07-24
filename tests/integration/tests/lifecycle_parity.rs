@@ -21,8 +21,8 @@ use tempfile::TempDir;
 
 /// The tag every marker these carts print is wrapped in (`<lc:...>`), so the
 /// comparison sees only cart output — never the libretro banner or an ungated
-/// guest trace line — and stays exact on bare metal, whose console output carries
-/// no newlines at all. See `common::cart_markers`.
+/// guest trace line — and stays exact on every leg regardless of how each frames
+/// the surrounding output. See `common::cart_markers`.
 const M: &str = "lc";
 
 /// The state-buffer schema the reset-every-frame carts share: a frame counter
