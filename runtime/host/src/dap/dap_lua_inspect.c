@@ -69,6 +69,38 @@ static struct {
 
 static dap_lua_transport_ops_t g_ops;
 
+/* Cross-boundary splice provider (#273): NULL by default (single-thread stack);
+ * the native host-Lua runner installs it so a callback-paused stack splices onto
+ * its native caller's thread.  See master_hook.h and splice_resolve() below. */
+lua_State *(*fc_dap_parent_thread)(lua_State *) = NULL;
+
+/* Resolve a DAP frame id — counting only @-source Lua frames, exactly as
+ * handle_stack_trace lists them — to its owning lua_State + Lua stack level,
+ * walking the spliced native->Lua callback chain via fc_dap_parent_thread
+ * (#273).  Returns the thread and sets *out_level, or NULL if the id is past the
+ * end.  With no provider (emulated/WASM) it stays on `start`, reproducing the
+ * previous single-thread behaviour. */
+static lua_State *splice_resolve(lua_State *start, int dap_frame_id, int *out_level) {
+    int display = 0;
+    for (lua_State *cur = start; cur && display <= DAP_LUA_MAX_FRAMES;
+         cur = fc_dap_parent_thread ? fc_dap_parent_thread(cur) : NULL) {
+        lua_Debug ar;
+        for (int level = 0; lua_getstack(cur, level, &ar); level++) {
+            lua_getinfo(cur, "S", &ar);
+            const char *src = ar.source ? ar.source : "";
+            if (*src != '@')
+                continue;
+            if (display == dap_frame_id) {
+                *out_level = level;
+                return cur;
+            }
+            if (++display > DAP_LUA_MAX_FRAMES)
+                return NULL;
+        }
+    }
+    return NULL;
+}
+
 void dap_lua_set_transport(const dap_lua_transport_ops_t *ops) {
     if (ops)
         g_ops = *ops;
@@ -478,56 +510,44 @@ static void handle_stack_trace(int seq, const char *args) {
     static char body[DAP_LUA_MAX_MSG];
     int off = snprintf(body, sizeof body, "{\"stackFrames\":[");
     int display = 0;
-    int lua_frame = 0;
-    lua_Debug ar;
-    while (lua_frame < DAP_LUA_MAX_FRAMES && lua_getstack(L, lua_frame, &ar)) {
-        lua_getinfo(L, "Snl", &ar);
-        lua_frame++;
-        /* Skip synthetic frames (inline strings, C functions).
-         * Only show @-prefixed file-backed sources so VS Code gets real paths. */
-        const char *src = ar.source ? ar.source : "";
-        if (*src != '@')
-            continue;
-        src++; /* strip leading @ */
-        const char *name = ar.name ? ar.name : (ar.what ? ar.what : "?");
-        off += snprintf(body + off, sizeof(body) - (size_t)off,
-                        "%s{\"id\":%d,\"name\":\"%s\","
-                        "\"source\":{\"path\":\"%s\"},\"line\":%d,\"column\":1}",
-                        display ? "," : "", display, name, src, ar.currentline);
-        display++;
+    /* Walk the spliced native->Lua callback chain (#273): the paused thread's
+     * frames first, then each parent thread's live frames via fc_dap_parent_thread
+     * — so a stop inside a callback shows on_native spliced onto its caller init,
+     * matching the emulated single-lua_State leg.  With no provider the loop stays
+     * on the paused thread (single-stack legs).  C/synthetic frames are skipped
+     * (only @-prefixed file-backed sources), so VS Code gets real paths. */
+    for (lua_State *cur = L; cur && display < DAP_LUA_MAX_FRAMES;
+         cur = fc_dap_parent_thread ? fc_dap_parent_thread(cur) : NULL) {
+        lua_Debug ar;
+        for (int level = 0; display < DAP_LUA_MAX_FRAMES && lua_getstack(cur, level, &ar);
+             level++) {
+            lua_getinfo(cur, "Snl", &ar);
+            const char *src = ar.source ? ar.source : "";
+            if (*src != '@')
+                continue;
+            src++; /* strip leading @ */
+            const char *name = ar.name ? ar.name : (ar.what ? ar.what : "?");
+            off += snprintf(body + off, sizeof(body) - (size_t)off,
+                            "%s{\"id\":%d,\"name\":\"%s\","
+                            "\"source\":{\"path\":\"%s\"},\"line\":%d,\"column\":1}",
+                            display ? "," : "", display, name, src, ar.currentline);
+            display++;
+        }
     }
     snprintf(body + off, sizeof(body) - (size_t)off, "],\"totalFrames\":%d}", display);
     send_response(seq, "stackTrace", 1, body);
 }
 
-/* Map a DAP frame id (counting only @-source Lua frames) to the actual Lua
- * stack level so lua_getstack/lua_getlocal see the right activation record.
- * handle_stack_trace skips C frames when assigning DAP frame ids; without
- * this mapping, evaluate/variables land on the wrong (C) frame and miss locals. */
-static int lua_level_for_dap_frame(lua_State *L, int dap_frame_id) {
-    lua_Debug ar;
-    int display = 0;
-    for (int level = 0; lua_getstack(L, level, &ar); level++) {
-        lua_getinfo(L, "S", &ar);
-        const char *src = ar.source ? ar.source : "";
-        if (*src != '@')
-            continue;
-        if (display == dap_frame_id)
-            return level;
-        display++;
-    }
-    return dap_frame_id; /* fallback: pass through */
-}
-
 static void handle_scopes(int seq, const char *args) {
     int frame_id = json_get_int(args, "frameId", 0);
-    lua_State *L = g_core.paused_L;
-    int lua_level = L ? lua_level_for_dap_frame(L, frame_id) : frame_id;
+    /* The variablesReference carries the DAP frame id (+1); handle_variables
+     * re-resolves it to (thread, level) through splice_resolve, so a spliced
+     * parent frame's locals are reachable across the boundary (#273). */
     char body[256];
     snprintf(body, sizeof body,
              "{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":%d,"
              "\"expensive\":false}]}",
-             lua_level + 1);
+             frame_id + 1);
     send_response(seq, "scopes", 1, body);
 }
 
@@ -551,16 +571,21 @@ static int append_variable(char *buf, size_t remaining, const char *vn, lua_Stat
 
 static void handle_variables(int seq, const char *args) {
     int vref = json_get_int(args, "variablesReference", 0);
-    int frame_id = vref - 1;
-    lua_State *L = g_core.paused_L;
-    if (!L || frame_id < 0) {
+    int dap_frame_id = vref - 1;
+    /* Resolve across the spliced callback chain so a parent frame's locals are
+     * inspectable (#273); L becomes the frame's OWNING thread, not necessarily
+     * the paused thread. */
+    int frame_level = 0;
+    lua_State *L =
+        g_core.paused_L ? splice_resolve(g_core.paused_L, dap_frame_id, &frame_level) : NULL;
+    if (!L || dap_frame_id < 0) {
         send_response(seq, "variables", 1, "{\"variables\":[]}");
         return;
     }
     static char body[DAP_LUA_MAX_MSG];
     int off = snprintf(body, sizeof body, "{\"variables\":[");
     lua_Debug ar;
-    if (lua_getstack(L, frame_id, &ar)) {
+    if (lua_getstack(L, frame_level, &ar)) {
         int first = 1;
 
         /* Local variables. */
@@ -613,15 +638,18 @@ static void handle_evaluate(int seq, const char *args) {
     json_get_string(args, "expression", expr, sizeof expr);
     int frame_id = json_get_int(args, "frameId", 0);
 
-    lua_State *L = g_core.paused_L;
-    if (!L || expr[0] == '\0') {
+    if (!g_core.paused_L || expr[0] == '\0') {
         send_response(seq, "evaluate", 1, "{\"result\":\"(not paused)\",\"variablesReference\":0}");
         return;
     }
 
+    /* Resolve the frame across the spliced callback chain so an expression can be
+     * evaluated in a parent (native-caller) frame too (#273); L is the frame's
+     * owning thread. */
     lua_Debug ar;
-    int lua_level = lua_level_for_dap_frame(L, frame_id);
-    if (!lua_getstack(L, lua_level, &ar)) {
+    int lua_level = 0;
+    lua_State *L = splice_resolve(g_core.paused_L, frame_id, &lua_level);
+    if (!L || !lua_getstack(L, lua_level, &ar)) {
         send_response(seq, "evaluate", 1, "{\"result\":\"(no frame)\",\"variablesReference\":0}");
         return;
     }
@@ -711,12 +739,17 @@ static void handle_continue(int seq, const char *args) {
 
 static void handle_step(int seq, const char *args, int mode) {
     (void)args;
-    /* Depth at pause time — used for step-over / step-out depth comparison. */
-    int depth = 0;
+    /* Depth at pause time — used for step-over / step-out depth comparison.  Add
+     * the spliced callback chain's frame base (#273) so the base is the LOGICAL
+     * depth, matching the composed depth the master hook compares against; 0
+     * outside a callback, so single-thread stepping is unchanged. */
+    int depth = fc_master_hook_cfg.dap_frame_base;
     if (g_core.paused_L) {
         lua_Debug ar;
-        while (lua_getstack(g_core.paused_L, depth, &ar))
-            depth++;
+        int n = 0;
+        while (lua_getstack(g_core.paused_L, n, &ar))
+            n++;
+        depth += n;
     }
     g_core.pending_step_mode = mode;
     g_core.pending_step_base_depth = depth;
@@ -922,9 +955,12 @@ void dap_lua_enter_paused(lua_State *L) {
     g_core.continue_pending = 0;
     g_core.pending_pause = 0;
 
-    const char *reason = (fc_master_hook_cfg.dap_pending_pause)                ? "pause"
-                         : (fc_master_hook_cfg.dap_step_mode != DAP_STEP_NONE) ? "step"
-                                                                               : "breakpoint";
+    /* The step logic clears dap_step_mode before pausing, so reason is taken from
+     * the sticky dap_stop_is_step flag it sets (#273) — otherwise a step stop is
+     * misreported as "breakpoint" (a divergence from the emulated leg). */
+    const char *reason = (fc_master_hook_cfg.dap_pending_pause)  ? "pause"
+                         : (fc_master_hook_cfg.dap_stop_is_step) ? "step"
+                                                                 : "breakpoint";
     char body[256];
     if (strcmp(reason, "breakpoint") == 0 && g_core.hit_bp_id > 0) {
         snprintf(body, sizeof body,

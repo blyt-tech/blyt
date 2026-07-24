@@ -1771,6 +1771,25 @@ static int hl_bridged_trampoline(lua_State *L) {
         blyt_session_lua_bridge_attach(hl->session, prev_exch);
         return luaL_error(L, "blyt hybrid: bridged call setup failed");
     }
+
+    /* Cross-boundary DAP stepping (#273): the wrapper about to run may call a Lua
+     * function BACK (the reverse-trampoline), which executes on `ex` — a different
+     * lua_State from this caller `L`.  Publish the caller's logical depth as the
+     * frame base so the master hook's step-depth comparison composes across that
+     * boundary.  Restored (below) alongside the exch_depth pop, before any
+     * error re-raise longjmps, so nesting stays balanced.  caller_depth counts L's
+     * own live frames (added to any outer base — the C recursion is the stack). */
+#ifdef BLYT_DAP
+    int saved_frame_base = fc_master_hook_cfg.dap_frame_base;
+    if (hl->dap_enabled) {
+        lua_Debug fbar;
+        int caller_depth = 0;
+        while (lua_getstack(L, caller_depth, &fbar))
+            caller_depth++;
+        fc_master_hook_cfg.dap_frame_base = saved_frame_base + caller_depth;
+    }
+#endif
+
     blyt_cart_run_err_t ferr;
     do {
         ferr = blyt_session_run_frame(hl->session);
@@ -1780,6 +1799,9 @@ static int hl_bridged_trampoline(lua_State *L) {
     /* Pop the nesting NOW — before any result marshalling that could raise — so
      * hl->lua_exch / exch_depth stay consistent even on a longjmp.  `ex` (local)
      * still holds the wrapper's results/error. */
+#ifdef BLYT_DAP
+    fc_master_hook_cfg.dap_frame_base = saved_frame_base;
+#endif
     hl->exch_depth--;
     hl->lua_exch = prev_exch;
     blyt_session_lua_bridge_attach(hl->session, prev_exch);
@@ -1809,6 +1831,25 @@ static int hl_bridged_trampoline(lua_State *L) {
     lua_settop(ex, 0);
     return m;
 }
+
+#ifdef BLYT_DAP
+/* Cross-boundary splice provider (#273): given a Lua thread paused inside a
+ * native->Lua callback, return the parent thread whose live stack sits below it
+ * in the spliced call chain.  A reverse-trampoline callback runs on
+ * exch_pool[k]; its caller ran on exch_pool[k-1] (or the driver coroutine hl->co
+ * at depth 0).  Returns NULL at the root (hl->co) or when L is not an active
+ * exchange thread, ending the splice walk in dap_lua_inspect.c.  Recovers hl from
+ * L's extraspace (copied to every child thread), so it needs no global. */
+static lua_State *hl_dap_parent_thread(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (!hl || L == hl->co)
+        return NULL;
+    for (int k = 0; k < hl->exch_depth && k < HL_EXCH_POOL_DEPTH; k++)
+        if (L == hl->exch_pool[k])
+            return (k == 0) ? hl->co : hl->exch_pool[k - 1];
+    return NULL;
+}
+#endif
 
 /* Install one closure per .lua_exports entry as a Lua global, or as module.fn for
  * a dotted lua_name.  Mirrors wasm_visit_export_cb byte-for-byte. */
@@ -2144,6 +2185,9 @@ static int build_vm(blyt_hostlua_t *hl, bool reload_boot) {
      * does not allocate, so arming here is baseline-neutral. */
     if (hl->dap_enabled) {
         fc_master_hook_cfg.dap_enabled = true;
+        /* Splice a callback-paused stack onto its native caller for stackTrace /
+         * step-depth / inspection across the boundary (#273). */
+        fc_dap_parent_thread = hl_dap_parent_thread;
         fc_consolelua_master_hook_install(hl->L);
         /* Reverse-trampoline callbacks (#262) run on the exchange threads, NOT on
          * hl->L or the driver coroutine, so a breakpoint in a Lua function reached
