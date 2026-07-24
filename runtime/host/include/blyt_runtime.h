@@ -158,6 +158,12 @@ typedef enum blyt_cart_run_err {
     BLYT_RUN_FN_DONE = 7, /* host→guest fn call completed; call blyt_session_fn_return_value */
     BLYT_RUN_FN_ERROR = 8, /* ADR-0130: bridged Lua→native call raised a Lua error;
                             * the error value is on top of the exchange thread */
+    BLYT_RUN_REVERSE_CALL_PENDING = 9, /* #272 (DAP only): the rv32 is parked at a
+                                        * reverse-trampoline PCALL op; the frontend
+                                        * must drive the Lua callback at this clean
+                                        * (yieldable) C boundary — see
+                                        * blyt_session_reverse_call_* — then re-enter
+                                        * run_frame to advance the guest past the op. */
 } blyt_cart_run_err_t;
 
 /*
@@ -569,6 +575,60 @@ typedef struct {
 
 void blyt_session_save_call_frame(blyt_session_t *s, blyt_session_call_frame_t *frame);
 void blyt_session_restore_call_frame(blyt_session_t *s, const blyt_session_call_frame_t *frame);
+
+/*
+ * Reverse-trampoline (native→Lua callback) driver — DAP debugging only (#272).
+ *
+ * Normally the reverse-trampoline PCALL op runs `lua_pcall(EX)` synchronously
+ * inside the rv32 ECALL dispatch (deep inside rv_step).  On WASM, a DAP pause
+ * inside such a callback pauses by `lua_yield`, which cannot cross the
+ * `lua_pcall` + rv32-interpreter C frames.  So when DAP is enabled, the PCALL op
+ * instead PARKS the rv32 (halt, PC left at the op) and run_frame returns
+ * BLYT_RUN_REVERSE_CALL_PENDING; the frontend trampoline — now at a clean,
+ * yieldable C boundary below its driver coroutine — drives the callback here via
+ * `lua_resume(EX)` (which also makes `lua_yield(EX)` legal), so a WASM pause can
+ * unwind through it via `lua_yieldk`.  Native blocks-a-thread inside the hook, so
+ * the resume never yields and the flow runs inline.  Bare-metal / emulated legs
+ * never take this path.  No-ops (return false / LUA_OK) when BLYT_LUA_BRIDGE is
+ * not compiled in.
+ *
+ * The descriptor is CALLER-OWNED (a C local, or continuation-stable storage on
+ * WASM) so nested native→Lua→native→Lua callbacks — whose parks would otherwise
+ * clobber a shared slot — each keep their own parked frame; the trampoline's C
+ * recursion (native) / per-depth storage (WASM) is the save stack.  Usage on
+ * BLYT_RUN_REVERSE_CALL_PENDING:
+ *   blyt_reverse_call_t rc;
+ *   blyt_session_reverse_call_take(s, &rc);   // copies out + frees the handoff slot
+ *   int st;
+ *   while ((st = blyt_session_reverse_resume(s, &rc, from_L)) == LUA_YIELD)
+ *       ... yield the driver coroutine (lua_yieldk); re-enter on resume ...
+ *   blyt_session_finish_reverse_call(s, &rc, st);   // parks -> guest register + PC
+ *   ... re-enter blyt_session_run_frame to continue the guest ...
+ */
+typedef struct {
+    struct lua_State *exch; /* the callback's exchange thread */
+    int32_t nargs;
+    int32_t nresults; /* LUA_MULTRET (-1) or a fixed count */
+    int32_t base; /* exch stack level below the function — results land at base+1.. */
+    int is_protected; /* pcall (return status) vs call (re-raise) semantics */
+    bool started; /* false until the first resume; true across a DAP-yield continue */
+    blyt_session_call_frame_t frame; /* parked outer-call rv32 CPU + bridge state */
+} blyt_reverse_call_t;
+
+/* Copy the parked reverse-call descriptor out to `*out` and free the run-context
+ * handoff slot (so a nested park can reuse it).  Returns false (and leaves *out
+ * unset) if none is pending. */
+bool blyt_session_reverse_call_take(blyt_session_t *s, blyt_reverse_call_t *out);
+/* Start (or, after a DAP yield, continue) the parked callback on rc->exch.
+ * `from` is the resuming (driver-coroutine) lua_State.  Returns a lua_resume
+ * status: LUA_OK (done), LUA_YIELD (paused — call again to continue), or a Lua
+ * error code.  Results/error are left on rc->exch. */
+int blyt_session_reverse_resume(blyt_session_t *s, blyt_reverse_call_t *rc, struct lua_State *from);
+/* Finalise the parked reverse call with the terminal `lua_resume` status: trims
+ * rc->exch results to rc->nresults, restores rc->frame, and either writes the Lua
+ * status into the guest result register + advances past the op, or (unprotected
+ * error) re-raises into the guest (halt, run_frame returns BLYT_RUN_FN_ERROR). */
+void blyt_session_finish_reverse_call(blyt_session_t *s, blyt_reverse_call_t *rc, int status);
 
 /*
  * Visitor callback for blyt_session_visit_lua_exports.
