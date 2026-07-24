@@ -143,6 +143,10 @@ async function main() {
 		const extensionsDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), 'blyt-vscode-ext-'),
 		);
+		/* Per-window diagnostics file (issue #304): the extension appends the
+		 * reason each time it cancels a launch, and the harness reads it back so a
+		 * `startDebugging()===false` names its cause instead of a bare boolean. */
+		const diagFile = path.join(userDataDir, 'blyt-cancel-diag.log');
 		console.log(`[runTests] running ${spec} in a ${key} window …`);
 		try {
 			await runTests({
@@ -175,6 +179,7 @@ async function main() {
 					BLYT_TRACE: '',
 					BLYT_IT_SPEC: spec,
 					BLYT_IT_GREP: process.env.BLYT_IT_GREP || '',
+					BLYT_IT_DIAG_FILE: diagFile,
 					/* Per-entry overrides (e.g. BLYT_HOSTLUA=1); the extension's
 					 * spawned blytdebug inherits the extension-host env. */
 					...(cartEnv || {}),

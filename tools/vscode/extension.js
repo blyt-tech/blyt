@@ -1086,6 +1086,26 @@ class BlytGdbDapProxy {
 function activate(context) {
 	const output = vscode.window.createOutputChannel('Blyt');
 
+	/* Test-only diagnostics tee (issue #304).  When a debug launch is cancelled
+	 * the resolver returns undefined, and VS Code turns that into a bare
+	 * startDebugging()===false with no reason attached — the reason otherwise
+	 * lives only in this Output channel, which the headless integration harness
+	 * cannot read.  When BLYT_IT_DIAG_FILE is set (the harness sets it per
+	 * window), record the cancellation reason there so a false return can name
+	 * its cause instead of being re-diagnosed from scratch.  Fully inert unless
+	 * that env var is set, so it does not change what a real debug session does
+	 * (no manual VS Code retest needed). */
+	function diagCancel(reason) {
+		const p = process.env.BLYT_IT_DIAG_FILE;
+		if (!p) return;
+		output.appendLine(`[cancel] ${reason}`);
+		try {
+			fs.appendFileSync(p, `${reason}\n`);
+		} catch {
+			/* best-effort diagnostics */
+		}
+	}
+
 	/* Open the cart game panel, or navigate the existing one to a new URL.
 	 *
 	 * First launch: creates a custom WebviewPanel in ViewColumn.Two (right of
@@ -1274,7 +1294,10 @@ function activate(context) {
 
 				output.show(true);
 				const target = resolveTarget(folder, config);
-				if (!target) return undefined;
+				if (!target) {
+					diagCancel('resolveTarget found no cart to debug');
+					return undefined;
+				}
 				const { cart, cwd, isLua, isHybrid } = target;
 
 				/* Mode taxonomy (#90):
@@ -1631,6 +1654,9 @@ function activate(context) {
 					result = await startDevtool(launchArg, cwd, output);
 				} catch (e) {
 					vscode.window.showErrorMessage(`Blyt: ${e.message}`);
+					diagCancel(
+						`startDevtool (blyt debug) failed: ${e.message}`,
+					);
 					return undefined;
 				}
 				const { proc, httpPort, dapPort, gdbPort, devCtrlPort } =
@@ -1659,6 +1685,7 @@ function activate(context) {
 						'Blyt: blyt debug did not announce a GDB port. ' +
 							'Ensure the debug WASM build includes BLYT_GDB=ON.',
 					);
+					diagCancel('blyt debug announced no GDB port');
 					return undefined;
 				}
 

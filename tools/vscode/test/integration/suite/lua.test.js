@@ -97,8 +97,17 @@ describe('Lua cart (native debug)', () => {
 		/* Edit + save → `blyt debug` watcher rebuilds → dev-control `reload` →
 		 * blytdebug hot-swaps the Lua state (same base, breakpoints persist in
 		 * g_dap.bps[], no session restart).  The re-armed init() breakpoint
-		 * surfaces on the same DAP connection with reason 'breakpoint'. */
+		 * surfaces on the same DAP connection with reason 'breakpoint'.
+		 *
+		 * Gate the stop wait on the rebuild actually completing (the dev ELF's
+		 * bytes change) rather than racing a fixed timeout: under a saturated box
+		 * the watcher-notice + rebuild is the slow, variable step the green
+		 * headless reload test bypasses, so waiting for it explicitly keeps a slow
+		 * rebuild from being misread as a failed rebind (issue #249). */
+		const elf = h.devElfPath(wf);
+		const beforeReload = h.fileHash(elf);
 		h.touchRebuildLua(uri);
+		await h.waitCartRebuilt(elf, beforeReload, 120000);
 		const stop2 = await h.waitStopped(
 			session,
 			'post-reload init() stop',
