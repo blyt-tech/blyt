@@ -2140,24 +2140,6 @@ pub fn run_cart_all_legs(cart: &std::path::Path, expected: &str) {
     run_cart_libretro(cart, expected);
 }
 
-/// The framebuffer-hash sibling of [`run_cart_all_legs`]: run `cart` with
-/// `BLYT_FRAME_HASH=1` on all three host-runtime legs — blytplay, wasm, and the
-/// embedded libretro core — asserting the same `expected` (`[blyt:fbhash]` /
-/// `[blyt:palhash]`) line on each.
-///
-/// Per ADR-0136 the frontend dispatches each leg by cart type: a **Lua** cart
-/// runs the three **host-Lua** legs — the determinism reference after #236
-/// retired the emulated RV32 Lua VM as a shipped path — while a **C/Rust/C++**
-/// cart runs the three **emulated rv32** legs (native cart code is kept on
-/// rv32emu). Either way the three legs must agree bit-for-bit, so this single
-/// helper serves both without the caller distinguishing them.
-pub fn run_cart_all_legs_frame_hash(cart: &std::path::Path, expected: &str) {
-    let env = [("BLYT_FRAME_HASH", "1")];
-    run_cart_native_with_env(cart, &env, expected);
-    run_cart_wasm_with_env(cart, &env, expected);
-    run_cart_libretro_with_env(cart, &env, expected);
-}
-
 /// Every `[blyt:fbhash]`/`[blyt:palhash]` line a leg emitted, in order,
 /// normalised to the marker-onward text so a leg-specific log prefix does not
 /// defeat the comparison.
@@ -2184,8 +2166,8 @@ pub fn frame_hash_lines(output: &str) -> Vec<String> {
 ///
 /// Two conditions, both required:
 /// 1. **Cross-leg determinism** — the three legs emit the *identical* ordered
-///    hash sequence. This is the tooth [`run_cart_all_legs_frame_hash`]'s
-///    substring check lacks: that passes if `expected` appears on *any* frame of
+///    hash sequence. This is the tooth a per-leg substring frame-hash check
+///    lacks: that passes if `expected` appears on *any* frame of
 ///    *any* leg, so a leg that diverges on a non-target frame, renders a
 ///    different number of frames, or repeats one stays green (the #280/#283
 ///    class). An exact sequence compare cannot.
@@ -2241,11 +2223,11 @@ pub fn frame_hash_parity_error(
     None
 }
 
-/// The exact-sequence counterpart to [`run_cart_all_legs_frame_hash`] (#284): run
-/// `cart` with `BLYT_FRAME_HASH=1` on all three host-runtime legs, require every
+/// The exact-sequence frame-hash parity check (#284): run `cart` with
+/// `BLYT_FRAME_HASH=1` on all three host-runtime legs, require every
 /// leg to emit the *identical* ordered `[blyt:fbhash]`/`[blyt:palhash]` sequence,
-/// and pin `expected` present in it. See [`frame_hash_parity_error`] for why the
-/// substring helper's per-frame blindness is a determinism hole this closes.
+/// and pin `expected` present in it. See [`frame_hash_parity_error`] for why a
+/// per-leg substring check's per-frame blindness is a determinism hole this closes.
 pub fn run_cart_all_legs_frame_hash_exact(cart: &std::path::Path, expected: &str) {
     let env = [("BLYT_FRAME_HASH", "1")];
     let native = frame_hash_lines(&capture_cart_native(cart, &env));
@@ -2254,17 +2236,6 @@ pub fn run_cart_all_legs_frame_hash_exact(cart: &std::path::Path, expected: &str
     if let Some(msg) = frame_hash_parity_error(&native, &wasm, &libretro, expected) {
         panic!("{msg}");
     }
-}
-
-/// Like [`run_cart_all_legs`], but drives each leg's `--reset-every-frame`
-/// save/restore stress cycle, translating the per-leg knob (blytplay flag /
-/// `BLYT_RESET_EVERY_FRAME` env / driver flag). The cart must terminate itself
-/// (call `blyt.quit()` / `blyt_quit()`), as the WASM and libretro drivers do not
-/// pass a frame cap.
-pub fn run_cart_all_legs_reset_every_frame(cart: &std::path::Path, expected: &str) {
-    run_cart_native_with_flags(cart, &["--reset-every-frame"], expected);
-    run_cart_wasm_with_env(cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
-    run_cart_libretro_with_flags(cart, &["--reset-every-frame"], expected);
 }
 
 /// Extract a cart's own markers from one leg's captured output, in order. A
@@ -2300,8 +2271,12 @@ pub fn cart_markers(output: &str, tag: &str) -> Vec<String> {
 }
 
 /// Assert one leg's markers are EXACTLY `expected` — same payloads, same order,
-/// same count.
-fn assert_markers_exact(leg: &str, output: &str, tag: &str, expected: &[&str]) {
+/// same count. Public so callers whose per-leg invocation does not fit a fixed
+/// helper — e.g. the hybrid matrix's native-lifecycle test, which passes a
+/// *different* safety-cap flag to the blytplay legs (`--quit-after`) than to the
+/// libretro legs (`--run-frames`) — can still assert every leg against one shared
+/// `expected` (identical-to-`expected` on every leg ⇒ all legs identical).
+pub fn assert_markers_exact(leg: &str, output: &str, tag: &str, expected: &[&str]) {
     let got = cart_markers(output, tag);
     assert_eq!(
         got,
@@ -2330,6 +2305,101 @@ pub fn run_cart_all_legs_exact(cart: &std::path::Path, tag: &str, expected: &[&s
     assert_markers_exact("native", &capture_cart_native(cart, &[]), tag, expected);
     assert_markers_exact("wasm", &capture_cart_wasm(cart, &[]), tag, expected);
     assert_markers_exact("libretro", &capture_cart_libretro(cart, &[]), tag, expected);
+}
+
+/// The **five-leg hybrid** counterpart to [`run_cart_all_legs_exact`] (#299): the
+/// exact-sequence guard for hybrid carts (Lua half + native C/Rust half), which
+/// split across TWO backends and so run a wider matrix than the single-model
+/// pure-Lua legs. Each leg's full `<{tag}:…>` marker sequence must equal
+/// `expected` exactly, so — every leg being identical to the same `expected` —
+/// all five are identical to each other (same payloads, order, count):
+///   * emulated native      (`blytplay`, rv32emu, `libblyt32lua.so`),
+///   * native host-Lua      (`blytplay` + `BLYT_HOSTLUA=1`),
+///   * WASM host-Lua        (the node `run_cart.js` driver),
+///   * libretro emulated    (embedded `libblyt32lua.so`), and
+///   * libretro host-Lua    (embedded bridge stub + `BLYT_HOSTLUA=1`).
+///
+/// The pre-#299 hybrid tests asserted only that one substring *appeared* on each
+/// leg independently, so a leg emitting extra, repeated, or reordered output
+/// still passed — the anti-#98/#283 blind spot that let #240's dozen ungated
+/// `libblyt32lua.so` breadcrumbs (emitted only on the two emulated legs) slip by.
+/// An exact five-way sequence compare closes it. The emulated legs stay in the
+/// matrix because `libblyt32lua.so` remains live post-flip (hybrid native half +
+/// real RISC-V), so a divergence there is a real determinism bug (ADR-0007).
+pub fn run_cart_hybrid_all_legs_exact(cart: &std::path::Path, tag: &str, expected: &[&str]) {
+    assert_markers_exact(
+        "emulated-native",
+        &capture_cart_native(cart, &[]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "native-host-lua",
+        &capture_cart_native(cart, &[("BLYT_HOSTLUA", "1")]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "wasm-host-lua",
+        &capture_cart_wasm(cart, &[]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "libretro-emulated",
+        &capture_cart_libretro(cart, &[]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "libretro-host-lua",
+        &capture_cart_libretro(cart, &[("BLYT_HOSTLUA", "1")]),
+        tag,
+        expected,
+    );
+}
+
+/// [`run_cart_hybrid_all_legs_exact`] under each leg's `--reset-every-frame`
+/// save/restore stress cycle (#299), translating the per-leg knob exactly as
+/// [`run_cart_all_legs_exact_reset_every_frame`] does (blytplay flag /
+/// `BLYT_RESET_EVERY_FRAME` env / driver flag). The host-Lua legs rebuild the Lua
+/// VM each cycle; the emulated legs zero guest BSS and re-run init(); every leg
+/// must still emit the identical marker sequence. The cart must terminate itself.
+pub fn run_cart_hybrid_all_legs_exact_reset_every_frame(
+    cart: &std::path::Path,
+    tag: &str,
+    expected: &[&str],
+) {
+    assert_markers_exact(
+        "emulated-native",
+        &capture_cart_native_with_flags(cart, &["--reset-every-frame"], &[]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "native-host-lua",
+        &capture_cart_native_with_flags(cart, &["--reset-every-frame"], &[("BLYT_HOSTLUA", "1")]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "wasm-host-lua",
+        &capture_cart_wasm(cart, &[("BLYT_RESET_EVERY_FRAME", "1")]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "libretro-emulated",
+        &capture_cart_libretro_with_flags(cart, &["--reset-every-frame"], &[]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "libretro-host-lua",
+        &capture_cart_libretro_with_flags(cart, &["--reset-every-frame"], &[("BLYT_HOSTLUA", "1")]),
+        tag,
+        expected,
+    );
 }
 
 /// Cross-leg exact parity for carts whose marker sequence is deterministic but
@@ -2371,8 +2441,8 @@ pub fn run_cart_all_legs_exact_cross_leg(cart: &std::path::Path, tag: &str, must
 }
 
 /// [`run_cart_all_legs_exact`] under each leg's `--reset-every-frame` save/restore
-/// stress cycle, translating the per-leg knob exactly as
-/// [`run_cart_all_legs_reset_every_frame`] does. The cart must terminate itself.
+/// stress cycle, translating the per-leg knob (blytplay flag /
+/// `BLYT_RESET_EVERY_FRAME` env / driver flag). The cart must terminate itself.
 pub fn run_cart_all_legs_exact_reset_every_frame(
     cart: &std::path::Path,
     tag: &str,
@@ -2398,27 +2468,15 @@ pub fn run_cart_all_legs_exact_reset_every_frame(
     );
 }
 
-/// Like [`run_cart_all_legs`], but force-evicts every evictable resource after
-/// each frame (ADR-0027 v2, #137), translating the per-leg knob (blytplay
+/// The exact-sequence resource-eviction parity check (#284): force-evict every
+/// evictable resource after each frame (ADR-0027 v2, #137; blytplay
 /// `--evict-every-frame` flag / `BLYT_RESOURCE_EVICT_EVERY_FRAME` env / driver
-/// flag). A cart that re-reads a resource each frame thus rehydrates it from
-/// scratch every frame; asserting the same `expected` here and under plain
-/// [`run_cart_all_legs`] proves eviction is cart-invisible (bytes byte-identical
-/// after rehydration, output unchanged). The cart must terminate itself.
-pub fn run_cart_all_legs_evict_every_frame(cart: &std::path::Path, expected: &str) {
-    run_cart_native_with_flags(cart, &["--evict-every-frame"], expected);
-    run_cart_wasm_with_env(cart, &[("BLYT_RESOURCE_EVICT_EVERY_FRAME", "1")], expected);
-    run_cart_libretro_with_flags(cart, &["--evict-every-frame"], expected);
-}
-
-/// The exact-sequence counterpart to [`run_cart_all_legs_evict_every_frame`]
-/// (#284): force-evict every evictable resource after each frame and require each
-/// leg's full marker sequence to equal `expected`. A cart that re-reads a
-/// resource each frame emits one marker per frame; asserting the exact sequence
-/// proves every rehydration produced byte-identical bytes on every leg — a
-/// substring match would pass even if a single frame's re-decode diverged, since
-/// the other frames still carry the expected line. The cart must terminate
-/// itself.
+/// flag) and require each leg's full marker sequence to equal `expected`. A cart
+/// that re-reads a resource each frame emits one marker per frame; asserting the
+/// exact sequence proves every rehydration produced byte-identical bytes on every
+/// leg — a substring match would pass even if a single frame's re-decode
+/// diverged, since the other frames still carry the expected line. The cart must
+/// terminate itself.
 pub fn run_cart_all_legs_exact_evict_every_frame(
     cart: &std::path::Path,
     tag: &str,
@@ -2444,24 +2502,13 @@ pub fn run_cart_all_legs_exact_evict_every_frame(
     );
 }
 
-/// Like [`run_cart_all_legs`], but for carts that do disk-backed
-/// `save_write`/`save_read`: each leg is given a `BLYT_SAVE_DIR`. Native and
-/// libretro share a fresh host tempdir; WASM uses `/tmp` (the only path that
-/// exists in its Emscripten MEMFS by default — a host tempdir path would not).
-/// Each leg writes its save before reading it back within the same run, so the
-/// shared native/libretro dir is self-contained per leg.
-pub fn run_cart_all_legs_with_save_dir(cart: &std::path::Path, expected: &str) {
-    let save_dir = tempfile::TempDir::new().unwrap();
-    let sd = save_dir.path().to_str().unwrap();
-    run_cart_native_with_env(cart, &[("BLYT_SAVE_DIR", sd)], expected);
-    run_cart_wasm_with_env(cart, &[("BLYT_SAVE_DIR", "/tmp")], expected);
-    run_cart_libretro_with_env(cart, &[("BLYT_SAVE_DIR", sd)], expected);
-}
-
-/// The exact-sequence counterpart to [`run_cart_all_legs_with_save_dir`] (#284):
-/// same `BLYT_SAVE_DIR` wiring per leg (native/libretro share a host tempdir,
-/// WASM uses `/tmp`), but requiring each leg's full marker sequence to equal
-/// `expected` rather than merely containing a substring.
+/// The exact-sequence save-dir parity check (#284) for carts that do disk-backed
+/// `save_write`/`save_read`: each leg is given a `BLYT_SAVE_DIR` (native/libretro
+/// share a fresh host tempdir, WASM uses `/tmp` — the only path in its Emscripten
+/// MEMFS by default), and each leg's full marker sequence must equal `expected`
+/// rather than merely containing a substring. Each leg writes its save before
+/// reading it back within the same run, so the shared native/libretro dir is
+/// self-contained per leg.
 pub fn run_cart_all_legs_exact_with_save_dir(cart: &std::path::Path, tag: &str, expected: &[&str]) {
     let save_dir = tempfile::TempDir::new().unwrap();
     let sd = save_dir.path().to_str().unwrap();

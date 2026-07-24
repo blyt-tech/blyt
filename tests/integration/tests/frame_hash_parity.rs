@@ -1,6 +1,6 @@
 //! Teeth for the exact frame-hash parity helper (#284).
 //!
-//! `run_cart_all_legs_frame_hash` asserts only that the expected hash line
+//! A per-leg substring frame-hash check asserts only that the expected hash line
 //! *appears* in each leg's output, so a leg that diverges on a non-target frame,
 //! renders a different number of frames, or repeats one still passes — the
 //! #280/#283 determinism-hole class. `run_cart_all_legs_frame_hash_exact`
