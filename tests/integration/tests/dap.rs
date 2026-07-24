@@ -570,6 +570,122 @@ fn sdl_dap_hybrid_native_to_lua_callback_breakpoint() {
         .success();
 }
 
+/// Cross-boundary stepping cart (#273): a native→Lua callback with a landing
+/// line after the callback call, so a step can cross the native↔Lua boundary.
+/// `init` calls `host.run_cb` (native), which calls the Lua `on_native` back
+/// through the ADR-0130 reverse-trampoline.  On the native host-Lua path
+/// `on_native` runs on an exchange thread — a DIFFERENT lua_State from `init`
+/// on the driver coroutine — so stepping/stackTrace across the boundary must be
+/// spliced.  Line map (1-based): 3 = `local a = 41`, 4 = `local b = a + 1`,
+/// 7 = `local p = 1`, 8 = `host.run_cb()`, 9 = `local q = 2`.
+const XBOUND_C: &str = "#include \"blyt.h\"\n\
+     BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+     \x20   lua_getglobal(L, \"on_native\");\n\
+     \x20   lua_pcall(L, 0, 0, 0);\n\
+     \x20   return 0;\n\
+     }\n";
+const XBOUND_LUA: &str = "local host = require(\"host\")\n\
+     function on_native()\n\
+     \x20   local a = 41\n\
+     \x20   local b = a + 1\n\
+     end\n\
+     function init()\n\
+     \x20   local p = 1\n\
+     \x20   host.run_cb()\n\
+     \x20   local q = 2\n\
+     end\n\
+     function update() blyt.quit() end\n\
+     function draw() end\n";
+
+/// The scripted step walk (BLYT_DAP_SEQUENCE), asserting the SAME landings the
+/// emulated single-lua_State control produces.  Breakpoint at line 8 (the
+/// `host.run_cb()` call site):
+///   1. initial stop: in init@8, one frame (pre-call, not yet spliced).
+///   2. stepIn: DIVES across native into the callback → on_native@3; the stack
+///      is spliced (on_native@3 over init@8) and init's local `p` is inspectable
+///      from the parent frame — the two things #262 left unresolved.
+///   3. next: intra-callback step → on_native@4, still spliced.
+///   4. stepOut: crosses the boundary back → init@9, one frame again.
+const XBOUND_SEQUENCE: &str = concat!(
+    r#"[{"reason":"breakpoint","stack":[8],"frames":1},"#,
+    r#"{"do":"stepIn","reason":"step","stack":[3,8],"frames":2,"#,
+    r#""eval":[{"line":8,"expr":"p","result":"1"}]},"#,
+    r#"{"do":"next","reason":"step","stack":[4,8],"frames":2},"#,
+    r#"{"do":"stepOut","reason":"step","stack":[9],"frames":1},"#,
+    r#"{"do":"continue"}]"#
+);
+
+/// Native host-Lua DAP (#273): DAP stepping ACROSS the native↔Lua callback
+/// boundary.  #262 made a breakpoint inside a native→Lua callback fire; this pins
+/// that stepIn/next/stepOut and the stackTrace splice compose across the
+/// exchange-thread boundary (dap_call_depth is per-lua_State, so without the
+/// frame-base + splice machinery a stepOut of the callback runs away past init
+/// and the paused stack shows only the callback's own frame).  Must match the
+/// emulated control below line-for-line.
+#[test]
+fn sdl_dap_hostlua_hybrid_step_across_callback_boundary() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua_xbound");
+    CartProject::new()
+        .c(XBOUND_C)
+        .lua(XBOUND_LUA)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "8")
+        .env("BLYT_DAP_SEQUENCE", XBOUND_SEQUENCE)
+        .env("BLYT_HOSTLUA", "1")
+        .assert()
+        .success();
+}
+
+/// Emulated-leg control for the above (#273): the SAME cart + step script WITHOUT
+/// BLYT_HOSTLUA.  Fully emulated, the whole hybrid is one rv32 machine / one guest
+/// lua_State, so the callback runs on the same stack as init and stepping +
+/// stackTrace compose for free — this is the behavioural oracle the host-Lua leg
+/// is pinned to.  Identical scripted landings prove parity.
+#[test]
+fn sdl_dap_hybrid_step_across_callback_boundary() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_xbound_emulated");
+    CartProject::new()
+        .c(XBOUND_C)
+        .lua(XBOUND_LUA)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "8")
+        .env("BLYT_DAP_SEQUENCE", XBOUND_SEQUENCE)
+        .assert()
+        .success();
+}
+
 /// Native host-Lua DAP (#257): restart parity — after the first breakpoint stop,
 /// the client restarts the cart (twice) and it stops at the same breakpoint each
 /// time with locals re-inspectable, then continues to a clean exit.  Mirrors

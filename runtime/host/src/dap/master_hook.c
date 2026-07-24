@@ -39,13 +39,19 @@ static void dap_dispatch(lua_State *L, lua_Debug *ar) {
 
     if (fc_master_hook_cfg.dap_pending_pause) {
         fc_master_hook_cfg.dap_pending_pause = 0;
+        fc_master_hook_cfg.dap_stop_is_step = 0;
         if (fc_dap_pause_loop)
             fc_dap_pause_loop(L, ar);
         return;
     }
 
     if (ar->event == LUA_HOOKLINE && fc_master_hook_cfg.dap_step_mode != DAP_STEP_NONE) {
-        int depth = dap_call_depth(L);
+        /* Compose the per-lua_State call depth with the frame base of any
+         * spliced native->Lua callback chain below this thread (#273), so
+         * step-over/out computed on one thread carries across the exchange-thread
+         * boundary.  dap_frame_base is 0 outside a callback (and on every leg but
+         * native host-Lua), leaving the intra-thread comparison unchanged. */
+        int depth = fc_master_hook_cfg.dap_frame_base + dap_call_depth(L);
         bool should_pause = false;
         switch (fc_master_hook_cfg.dap_step_mode) {
         case DAP_STEP_IN:
@@ -62,6 +68,7 @@ static void dap_dispatch(lua_State *L, lua_Debug *ar) {
         }
         if (should_pause) {
             fc_master_hook_cfg.dap_step_mode = DAP_STEP_NONE;
+            fc_master_hook_cfg.dap_stop_is_step = 1; /* reason = "step", not "breakpoint" */
             if (fc_dap_pause_loop)
                 fc_dap_pause_loop(L, ar);
             return;
@@ -70,6 +77,7 @@ static void dap_dispatch(lua_State *L, lua_Debug *ar) {
 
     if (ar->event == LUA_HOOKLINE) {
         if (fc_dap_should_break && fc_dap_should_break(L, ar)) {
+            fc_master_hook_cfg.dap_stop_is_step = 0;
             if (fc_dap_pause_loop)
                 fc_dap_pause_loop(L, ar);
         }
