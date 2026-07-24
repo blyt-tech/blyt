@@ -143,6 +143,64 @@ function removeBreakpoint(bp) {
 	vscode.debug.removeBreakpoints([bp]);
 }
 
+/* Await the blyt extension's activation.  It activates lazily (onDebugResolve:
+ * blyt et al.), and VS Code normally activates it before resolving a launch —
+ * but forcing activation to complete BEFORE we call startDebugging removes any
+ * activation/registration race from the readiness path: if the debug-config
+ * provider / adapter factory were not yet registered, startDebugging would
+ * fast-refuse (return false).  Cached so it runs once per window (issue #304). */
+let activation;
+function activateExtension() {
+	if (!activation) {
+		const ext = vscode.extensions.getExtension('blyt.blyt');
+		activation = Promise.resolve(ext ? ext.activate() : undefined);
+	}
+	return activation;
+}
+
+/* The extension appends a one-line reason to BLYT_IT_DIAG_FILE (when set) each
+ * time it cancels a launch (resolver returns undefined) — otherwise the reason
+ * lives only in the extension's Output channel, which a test cannot read.  Read
+ * back the last such line so a startDebugging===false failure names its cause
+ * instead of surfacing a bare boolean (issue #304). */
+function lastResolverDiag() {
+	const p = process.env.BLYT_IT_DIAG_FILE;
+	if (!p) return '';
+	try {
+		const lines = fs.readFileSync(p, 'utf8').trim().split('\n');
+		return lines[lines.length - 1] || '';
+	} catch {
+		return '';
+	}
+}
+
+/* Activate the extension, call startDebugging, and turn a `false` return into a
+ * self-diagnosing error: classify by how quickly it was refused (a prompt
+ * refusal = the resolver returned undefined/threw; a slow one = something hung),
+ * and fold in the extension's own last cancellation reason when available.
+ * Every launch path goes through here (issue #304). */
+async function startDebuggingChecked(wf, config, label) {
+	install();
+	await activateExtension();
+	const t0 = Date.now();
+	const ok = await vscode.debug.startDebugging(wf, config);
+	if (!ok) {
+		const ms = Date.now() - t0;
+		const ext = vscode.extensions.getExtension('blyt.blyt');
+		const kind =
+			ms < 2000
+				? 'fast refusal — the debug-config resolver returned undefined/null ' +
+					'or threw (launch cancelled); NOT a timeout'
+				: 'slow refusal';
+		const diag = lastResolverDiag();
+		throw new Error(
+			`vscode.debug.startDebugging returned false for ${label} ` +
+				`after ${ms}ms — ${kind}. extension active=${ext?.isActive}.` +
+				(diag ? `\n  resolver reason: ${diag}` : ''),
+		);
+	}
+}
+
 /* Launch a player-mode (native SDL2 window) debug session for the given folder.
  * No explicit `cart`: with one cart per window, the extension auto-detects it
  * (the real F5 path).  The extension resolves cart type itself and tags the
@@ -151,14 +209,16 @@ function removeBreakpoint(bp) {
  * #90 rename of the former `native`; `_blytMode: 'gdb'` the rename of the former
  * `native`.) */
 async function startNative(wf) {
-	install();
-	const ok = await vscode.debug.startDebugging(wf, {
-		type: 'blyt',
-		request: 'launch',
-		name: `blyt:${path.basename(wf.uri.fsPath)}`,
-		mode: 'player',
-	});
-	if (!ok) throw new Error('vscode.debug.startDebugging returned false');
+	await startDebuggingChecked(
+		wf,
+		{
+			type: 'blyt',
+			request: 'launch',
+			name: `blyt:${path.basename(wf.uri.fsPath)}`,
+			mode: 'player',
+		},
+		`native (player) ${path.basename(wf.uri.fsPath)}`,
+	);
 }
 
 /* Launch a default WASM-mode debug session (no `mode`): `blyt debug <dir>`
@@ -168,13 +228,15 @@ async function startNative(wf) {
  * relay vs direct).  Regression coverage for the #90 WASM-debug path, including
  * the native `program` return (the `debugCart` ReferenceError). */
 async function startWasm(wf) {
-	install();
-	const ok = await vscode.debug.startDebugging(wf, {
-		type: 'blyt',
-		request: 'launch',
-		name: `blyt-wasm:${path.basename(wf.uri.fsPath)}`,
-	});
-	if (!ok) throw new Error('vscode.debug.startDebugging returned false');
+	await startDebuggingChecked(
+		wf,
+		{
+			type: 'blyt',
+			request: 'launch',
+			name: `blyt-wasm:${path.basename(wf.uri.fsPath)}`,
+		},
+		`wasm-debug ${path.basename(wf.uri.fsPath)}`,
+	);
 }
 
 /* Wait until a 'blyt' session matching `pred` exists. */
