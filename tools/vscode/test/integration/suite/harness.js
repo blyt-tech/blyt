@@ -14,6 +14,7 @@
 const vscode = require('vscode');
 const path = require('node:path');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const assert = require('node:assert');
 
 /* session.id -> { session, stops: [], stopWaiters: [], terminated } */
@@ -21,6 +22,24 @@ const records = new Map();
 /* pending waitForSession() calls: { pred, resolve, timer } */
 const sessionWaiters = [];
 let installed = false;
+
+/* Append a compact, timestamped label to a session's bounded adapter trail. */
+function note(rec, label) {
+	rec.trail.push(`+${Date.now() - rec.t0}ms ${label}`);
+	if (rec.trail.length > 60) rec.trail.shift();
+}
+
+/* One-line-ish description of a session's observed state, for timeout messages:
+ * mode, whether it terminated, queued stops, and its recent adapter trail. */
+function describeSession(rec) {
+	const mode = rec.session.configuration?._blytMode ?? '?';
+	const tail = rec.trail.slice(-12).join(' | ') || '(no adapter traffic)';
+	return (
+		`session[${mode}] terminated=${rec.terminated} ` +
+		`queuedStops=${rec.stops.length} bpResults=${rec.bpResults.length}\n` +
+		`  adapter trail: ${tail}`
+	);
+}
 
 function registerSession(session) {
 	let rec = records.get(session.id);
@@ -38,6 +57,13 @@ function registerSession(session) {
 			bpReqSource: new Map(),
 			/* pending waitBreakpointBound() calls: { line, resolve, timer }. */
 			bpWaiters: [],
+			/* Bounded trail of adapter traffic (compact labels + ms since this
+			 * record was created), so a timeout can report what the adapter DID
+			 * send instead of a bare "timeout" — the difference between "session
+			 * terminated mid-reload" and "session alive, reload never arrived"
+			 * (issue #249). */
+			t0: Date.now(),
+			trail: [],
 		};
 		records.set(session.id, rec);
 	}
@@ -78,6 +104,14 @@ function install() {
 						rec.bpReqSource.delete(m.request_seq);
 						const breakpoints = m.body?.breakpoints ?? [];
 						rec.bpResults.push({ source, breakpoints });
+						const nverified = breakpoints.filter(
+							(b) => b.verified,
+						).length;
+						note(
+							rec,
+							`setBreakpoints ${path.basename(source) || '?'} ` +
+								`verified=${nverified}/${breakpoints.length}`,
+						);
 						/* Resolve any waiters whose line is now bound (verified). */
 						for (const bp of breakpoints) {
 							if (!bp.verified) continue;
@@ -96,6 +130,12 @@ function install() {
 						return;
 					}
 					if (m.type !== 'event') return;
+					note(
+						rec,
+						m.event === 'stopped'
+							? `stopped(${m.body?.reason ?? '?'})`
+							: m.event,
+					);
 					if (m.event === 'stopped') {
 						if (rec.stopWaiters.length) {
 							const w = rec.stopWaiters.shift();
@@ -272,7 +312,12 @@ function waitStopped(session, label = 'stopped event', timeoutMs = 90000) {
 		const timer = setTimeout(() => {
 			const i = rec.stopWaiters.findIndex((w) => w.resolve === resolve);
 			if (i >= 0) rec.stopWaiters.splice(i, 1);
-			reject(new Error(`timeout waiting for ${label}`));
+			reject(
+				new Error(
+					`timeout waiting for ${label} after ${timeoutMs}ms\n` +
+						`  ${describeSession(rec)}`,
+				),
+			);
 		}, timeoutMs);
 		rec.stopWaiters.push({ resolve, timer });
 	});
@@ -414,6 +459,49 @@ function touchRebuildLua(uri) {
 	fs.appendFileSync(uri.fsPath, marker);
 }
 
+/* Absolute path of the dev ELF the `blyt debug` watcher rebuilds on every edit
+ * (build/.dbg.elf).  build_for_dev rewrites it whenever a reload actually
+ * rebuilds the cart, so its bytes are the reload's real readiness signal —
+ * observable from the test without reading the devtool's (extension-captured)
+ * stdout. */
+function devElfPath(wf) {
+	return path.join(wf.uri.fsPath, 'build', '.dbg.elf');
+}
+
+/* sha1 of a file's bytes, or null if it cannot be read. */
+function fileHash(p) {
+	try {
+		return crypto
+			.createHash('sha1')
+			.update(fs.readFileSync(p))
+			.digest('hex');
+	} catch {
+		return null;
+	}
+}
+
+/* Wait until the dev ELF's bytes differ from `beforeHash` — i.e. the reload's
+ * rebuild has completed and produced a new cart — then return the new hash.
+ * Gating the post-reload stop on THIS (instead of a bare fixed timeout) removes
+ * the one behaviour the green headless reload test bypasses: the real
+ * file-watcher notice + rebuild.  A slow-under-load rebuild can then no longer
+ * be misread as a failed rebind, and a watcher that never notices the edit
+ * surfaces as an explicit "did not rebuild" instead of a vague stop-timeout
+ * (issue #249). */
+async function waitCartRebuilt(elfPath, beforeHash, timeoutMs = 60000) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const h = fileHash(elfPath);
+		if (h && h !== beforeHash) return h;
+		await new Promise((r) => setTimeout(r, 100));
+	}
+	throw new Error(
+		`dev ELF ${path.basename(elfPath)} did not rebuild within ` +
+			`${timeoutMs}ms (hash still ${String(beforeHash).slice(0, 8)}) — ` +
+			`the file watcher never noticed the edit, or the rebuild failed`,
+	);
+}
+
 /* Stop everything and clear breakpoints between tests. */
 async function reset() {
 	try {
@@ -448,6 +536,9 @@ module.exports = {
 	waitBreakpointBound,
 	touchRebuild,
 	touchRebuildLua,
+	devElfPath,
+	fileHash,
+	waitCartRebuilt,
 	reset,
 	assert,
 };
