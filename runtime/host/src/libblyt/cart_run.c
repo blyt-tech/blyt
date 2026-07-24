@@ -270,6 +270,12 @@ typedef struct {
      * park.  So this is only ever live between one park and its matching take. */
     bool rc_pending;
     blyt_reverse_call_t rc_handoff;
+    /* Set by blyt_session_finish_reverse_call before the frontend re-enters
+     * run_frame to advance the guest past the parked op: this re-entry CONTINUES
+     * an in-flight bridged call mid-frame, so the frame-entry pin/scratch reset
+     * must be suppressed or it would release a resource pin the native half took
+     * before the callback.  Cleared at run_frame entry after it is read. */
+    bool rc_resuming;
 #endif
     /* State buffer context — pointer into the owning blyt_session_t. */
     blyt_state_ctx_t *state_ctx;
@@ -4107,9 +4113,22 @@ static blyt_cart_run_err_t run_frame_impl(blyt_session_t *session) {
     session->ctx.fn_return_done = false;
     /* Reset the resource scratch bump allocator and force-release any pins still
      * held: a resource pin (and the guest pointer it returned) is valid only for
-     * the frame it was taken in (ADR-0027 frame-scope amendment, #123). */
-    session->ctx.resource_scratch_off = 0;
-    blyt_resource_table_force_release_pins(&session->ctx.resources);
+     * the frame it was taken in (ADR-0027 frame-scope amendment, #123).
+     *
+     * Skip when RESUMING a parked reverse call (#272): that re-entry continues a
+     * bridged call already in flight this frame, so releasing pins here would
+     * invalidate one the native half took before the callback — the frame-scope
+     * rule already exempts host-fn drives (the surface reap below skips them for
+     * the same reason). */
+    bool rc_resuming = false;
+#ifdef BLYT_LUA_BRIDGE
+    rc_resuming = session->ctx.rc_resuming;
+    session->ctx.rc_resuming = false;
+#endif
+    if (!rc_resuming) {
+        session->ctx.resource_scratch_off = 0;
+        blyt_resource_table_force_release_pins(&session->ctx.resources);
+    }
     /* Reap the previous frame's off-screen surfaces: they are draw-scoped derived
      * artifacts (#205), so none survive the frame boundary.  Frees their buffers
      * and drops their bytes from the budget footprint (republished below).
@@ -4623,6 +4642,9 @@ void blyt_session_finish_reverse_call(blyt_session_t *s, blyt_reverse_call_t *rc
     rv_set_reg(s->rv, rv_reg_a1, 0);
     rv_set_reg(s->rv, rv_reg_a2, 0);
     s->rv->PC += 4;
+    /* The frontend re-enters run_frame next to continue the guest — tell it to
+     * skip the frame-entry pin/scratch reset (this is mid-bridged-call). */
+    s->ctx.rc_resuming = true;
 }
 #else
 void blyt_session_save_call_frame(blyt_session_t *s, blyt_session_call_frame_t *frame) {
