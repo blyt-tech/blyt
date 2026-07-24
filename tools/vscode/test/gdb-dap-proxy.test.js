@@ -28,6 +28,11 @@ const { EventEmitter } = require('node:events');
  * test can assert whether a request was forwarded.  Reset per construction. */
 let lldbStdinWrites = [];
 
+/* The most recently spawned fake lldb-dap process, so a test can drive its
+ * teardown (emit 'exit', flip exitCode, emit a stdin 'error') and exercise the
+ * #268 write guard.  Reset per construction. */
+let lastProc = null;
+
 /* Minimal vscode.EventEmitter: `.event` registers a listener and is detached
  * from the instance by the proxy (`this.onDidSendMessage = emitter.event`), so
  * it must stay bound — an arrow class field does that. */
@@ -54,13 +59,17 @@ Module._load = function (request, ...rest) {
 				const proc = new EventEmitter();
 				proc.stdout = new EventEmitter();
 				proc.stderr = new EventEmitter();
-				proc.stdin = {
-					write: (chunk) => {
-						lldbStdinWrites.push(chunk.toString());
-						return true;
-					},
+				/* Real ChildProcess.stdin is a Writable (an EventEmitter) — the
+				 * proxy attaches an 'error' handler to it (issue #268), so the
+				 * fake must be one too. */
+				proc.stdin = new EventEmitter();
+				proc.stdin.write = (chunk) => {
+					lldbStdinWrites.push(chunk.toString());
+					return true;
 				};
+				proc.exitCode = null;
 				proc.kill = () => {};
+				lastProc = proc;
 				return proc;
 			},
 		};
@@ -236,5 +245,85 @@ test('non-stopped events are never auto-continued', () => {
 			1000,
 		),
 		false,
+	);
+});
+
+/* ── stdin write teardown-race guard (issue #268) ─────────────────────────────
+ * On session teardown the lldb-dap child can exit before the proxy's last
+ * stdin.write lands.  Without a guard the write raises an uncaught EPIPE (plus
+ * "Unexpected SIGPIPE"), thrown from a Mocha teardown hook — reddening a run
+ * whose tests all passed.  The identical race was already guarded for the
+ * dev-ctrl socket (`sock.on('error', …)`); these pin the same guard on the
+ * child's stdin, scoped so a genuine mid-session write error still surfaces. */
+
+/* A plain forwardable request (not setBreakpoints, not .lua): handleMessage
+ * routes it straight to lldb-dap's stdin via _writeFrame. */
+function forwardableRequest(seq, command) {
+	return { type: 'request', command, seq, arguments: {} };
+}
+
+test('after dispose(), forwarded writes are dropped rather than sent to a dead pipe', () => {
+	const { proxy } = makeProxy();
+
+	proxy.handleMessage(forwardableRequest(1, 'continue'));
+	assert.strictEqual(
+		lldbStdinWrites.length,
+		1,
+		'live proxy forwards the write',
+	);
+
+	proxy.dispose();
+	proxy.handleMessage(forwardableRequest(2, 'continue'));
+	assert.strictEqual(
+		lldbStdinWrites.length,
+		1,
+		'no write is attempted after dispose()',
+	);
+});
+
+test('after the child exits, forwarded writes are dropped', () => {
+	const { proxy } = makeProxy();
+
+	lastProc.exitCode = 0;
+	lastProc.emit('exit', 0, null);
+
+	proxy.handleMessage(forwardableRequest(1, 'continue'));
+	assert.strictEqual(
+		lldbStdinWrites.length,
+		0,
+		'no write is attempted once the child is gone',
+	);
+});
+
+test('a stdin error after the child exits is swallowed, not thrown', () => {
+	makeProxy();
+
+	lastProc.exitCode = 1;
+	lastProc.emit('exit', 1, null);
+
+	assert.doesNotThrow(() => {
+		lastProc.stdin.emit('error', new Error('write EPIPE'));
+	}, 'post-exit EPIPE must not escape as an uncaught exception');
+});
+
+test('a stdin error after dispose() is swallowed, not thrown', () => {
+	const { proxy } = makeProxy();
+
+	proxy.dispose();
+
+	assert.doesNotThrow(() => {
+		lastProc.stdin.emit('error', new Error('write EPIPE'));
+	}, 'shutdown-race EPIPE must not escape as an uncaught exception');
+});
+
+test('a stdin error while the child is still alive is NOT masked', () => {
+	makeProxy();
+
+	/* Child neither exited nor disposed: a write error here is a genuine
+	 * mid-session fault and must surface rather than be silently swallowed. */
+	const genuine = new Error('genuine mid-session failure');
+	assert.throws(
+		() => lastProc.stdin.emit('error', genuine),
+		/genuine mid-session failure/,
 	);
 });

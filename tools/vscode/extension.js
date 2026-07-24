@@ -850,6 +850,9 @@ class BlytGdbDapProxy {
 		/* End of the current reload auto-continue window (epoch ms); 0 = none. */
 		this._reloadWindowUntil = 0;
 		this._devCtrlSock = null;
+		/* Teardown state for the stdin write guard (issue #268). */
+		this._disposed = false;
+		this._procGone = false;
 
 		/* VS Code's DebugAdapterInlineImplementation requires the DebugAdapter
 		 * interface: onDidSendMessage must be a vscode.Event<T>, not a plain
@@ -865,6 +868,24 @@ class BlytGdbDapProxy {
 			this._drain();
 		});
 		this._proc.stderr.on('data', () => {});
+		this._proc.on('exit', () => {
+			this._procGone = true;
+		});
+
+		/* Teardown race guard (issue #268): on session end the lldb-dap child can
+		 * exit before our last stdin.write lands.  The write then raises EPIPE
+		 * with nothing to catch it, and Node surfaces it as an uncaught exception
+		 * (plus "Unexpected SIGPIPE") — reddening an otherwise-green test-vscode
+		 * run from a teardown hook.  Mirror the dev-ctrl socket guard below
+		 * (`sock.on('error', …)`), but scoped: swallow the error only once the
+		 * child is gone or we are disposing.  A write error while the child is
+		 * still alive is a genuine failure and is left to surface, so we don't
+		 * mask a real mid-session fault. */
+		this._proc.stdin.on('error', (err) => {
+			if (this._disposed || this._procGone || this._proc.exitCode != null)
+				return;
+			throw err;
+		});
 
 		/* Observe the devtool's dev-control hub (issue #119): on each `reload`
 		 * broadcast, open an auto-continue window so the reload's solib-swap
@@ -949,6 +970,18 @@ class BlytGdbDapProxy {
 		}
 	}
 
+	/* Frame a JSON payload as a DAP message and write it to lldb-dap's stdin.
+	 * Skips the write once the child is gone or we are disposing so we never
+	 * attempt to write into a dead pipe (issue #268); the async EPIPE that can
+	 * still slip through the race is caught by the stdin `error` handler in the
+	 * constructor. */
+	_writeFrame(json) {
+		if (this._disposed || this._procGone) return;
+		this._proc.stdin.write(
+			`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`,
+		);
+	}
+
 	_ask(cmd, args) {
 		const seq = ++this._lldbSeq;
 		return new Promise((resolve) => {
@@ -959,9 +992,7 @@ class BlytGdbDapProxy {
 				command: cmd,
 				arguments: args || {},
 			});
-			this._proc.stdin.write(
-				`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`,
-			);
+			this._writeFrame(json);
 		});
 	}
 
@@ -980,9 +1011,7 @@ class BlytGdbDapProxy {
 				}),
 			);
 			const json = JSON.stringify({ ...msg, seq });
-			this._proc.stdin.write(
-				`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`,
-			);
+			this._writeFrame(json);
 		}
 	}
 
@@ -1042,6 +1071,7 @@ class BlytGdbDapProxy {
 	}
 
 	dispose() {
+		this._disposed = true;
 		try {
 			this._proc.kill();
 		} catch (_) {}
