@@ -696,6 +696,25 @@ static void wasm_dap_arm_exch_pool(void) {
         if (g_lua_exch_pool[i])
             fc_consolelua_master_hook_install(g_lua_exch_pool[i]);
 }
+
+/* Cross-boundary splice provider (#309, the #273 port): given a Lua thread paused
+ * inside a native→Lua callback, return the parent thread whose live stack sits
+ * below it in the spliced call chain.  A reverse-trampoline callback runs on
+ * g_lua_exch_pool[k]; its caller ran on g_lua_exch_pool[k-1] (or the driver
+ * coroutine g_lua_co at depth 0).  Returns NULL at the root and for any thread
+ * that is not an ACTIVE exchange thread (a cart coroutine, a pure-Lua cart's
+ * g_lua_co), ending the splice walk in dap_lua_inspect.c — so stackTrace and the
+ * frame-id resolver behave exactly as before outside a callback.  The native
+ * counterpart is cart_run_hostlua.c's hl_dap_parent_thread; this leg reads the
+ * runner globals directly instead of recovering them from L's extraspace. */
+static lua_State *wasm_dap_parent_thread(lua_State *L) {
+    if (!L || L == g_lua_co)
+        return NULL;
+    for (int k = 0; k < g_lua_exch_depth && k < BLYT_HOSTLUA_EXCH_POOL_DEPTH; k++)
+        if (L == g_lua_exch_pool[k])
+            return (k == 0) ? g_lua_co : g_lua_exch_pool[k - 1];
+    return NULL;
+}
 #endif
 
 /* Create the ADR-0130 exchange-thread pool (#232, #262) off g_lua, anchored in
@@ -738,6 +757,10 @@ typedef struct {
     lua_State *ex; /* this level's exchange thread (== g_lua_exch_pool[d]) */
     lua_State *prev_exch; /* the caller's exchange thread, restored on finish */
     blyt_reverse_call_t rc; /* an in-flight reverse callback (survives its yield) */
+#ifdef BLYT_DAP
+    int frame_base; /* #309: dap_frame_base this level publishes (see below) */
+    int saved_frame_base; /* the enclosing level's base, restored on finish */
+#endif
 } wasm_bridged_state_t;
 static wasm_bridged_state_t g_bridged_state[BLYT_HOSTLUA_EXCH_POOL_DEPTH];
 
@@ -749,6 +772,13 @@ static int wasm_bridged_drive(lua_State *L, int d);
 static int wasm_bridged_finish(lua_State *L, int d, blyt_cart_run_err_t ferr) {
     lua_State *ex = g_bridged_state[d].ex;
     lua_State *prev_exch = g_bridged_state[d].prev_exch;
+
+#ifdef BLYT_DAP
+    /* This level's call is over, so its spliced frame base is too — restore the
+     * enclosing level's (#309).  Before any marshalling that could raise, so the
+     * base stays balanced even when the tail below longjmps out. */
+    fc_master_hook_cfg.dap_frame_base = g_bridged_state[d].saved_frame_base;
+#endif
 
     /* Pop the nesting NOW — before any marshalling that could raise — so the pool
      * state stays consistent even on a longjmp.  `ex` still holds the results. */
@@ -790,6 +820,7 @@ static int wasm_bridged_finish(lua_State *L, int d, blyt_cart_run_err_t ferr) {
 static int wasm_bridged_resume_k(lua_State *L, int status, lua_KContext ctx) {
     (void)status;
     int d = (int)(intptr_t)ctx;
+    fc_master_hook_cfg.dap_frame_base = g_bridged_state[d].frame_base; /* #309 */
     int st = blyt_session_reverse_resume(g_session, &g_bridged_state[d].rc, L);
     if (st == LUA_YIELD)
         return lua_yieldk(L, 0, (lua_KContext)(intptr_t)d, wasm_bridged_resume_k);
@@ -805,6 +836,13 @@ static int wasm_bridged_resume_k(lua_State *L, int status, lua_KContext ctx) {
  * unwinds through this frame's lua_yieldk (#272).  On completion, marshal via
  * wasm_bridged_finish. */
 static int wasm_bridged_drive(lua_State *L, int d) {
+#ifdef BLYT_DAP
+    /* (Re-)publish this level's frame base (#309).  Already current on the first
+     * call; on re-entry from wasm_bridged_resume_k an inner level may have
+     * finished and restored its own.  Asserting it at every entry into the drive
+     * keeps the invariant independent of what ran — or unwound — in between. */
+    fc_master_hook_cfg.dap_frame_base = g_bridged_state[d].frame_base;
+#endif
     blyt_cart_run_err_t ferr;
     for (;;) {
         ferr = blyt_session_run_frame(g_session);
@@ -855,6 +893,34 @@ static int wasm_make_bridged_trampoline(lua_State *L) {
         blyt_session_lua_bridge_attach(g_session, g_bridged_state[d].prev_exch);
         return luaL_error(L, "blyt bridge: call setup failed");
     }
+
+#ifdef BLYT_DAP
+    /* Cross-boundary DAP stepping (#309, the #273 port): the wrapper about to run
+     * may call a Lua value BACK (the reverse-trampoline), which executes on `ex` —
+     * a different lua_State from this caller `L`.  Publish the caller's logical
+     * depth as the frame base so the master hook's step-depth comparison composes
+     * across that boundary.  caller_depth counts L's own live frames, added to any
+     * enclosing level's base (the C recursion is the stack).
+     *
+     * Unlike native (hl_bridged_trampoline), this CANNOT be a C local saved and
+     * restored around the drive.  A DAP pause on this leg unwinds the entire C
+     * stack — lua_yield out through wasm_bridged_drive's lua_yieldk — and the
+     * client's step request is served from there, with handle_step reading
+     * dap_frame_base while unwound.  A C local would be gone by then and the base
+     * would read 0, so a stepOut of the callback would run away past the caller.
+     * Hence it lives in g_bridged_state[d] (which #272 already made survive the
+     * yield): published here, re-asserted at every re-entry, and restored only
+     * when wasm_bridged_finish ends this level's call. */
+    g_bridged_state[d].saved_frame_base = fc_master_hook_cfg.dap_frame_base;
+    g_bridged_state[d].frame_base = g_bridged_state[d].saved_frame_base;
+    if (fc_master_hook_cfg.dap_enabled) {
+        lua_Debug fbar;
+        int caller_depth = 0;
+        while (lua_getstack(L, caller_depth, &fbar))
+            caller_depth++;
+        g_bridged_state[d].frame_base += caller_depth;
+    }
+#endif
     return wasm_bridged_drive(L, d);
 }
 
@@ -3812,6 +3878,10 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         int dap_port = blyt_js_dap_port();
         if (dap_port > 0 && fc_consolelua_dap_listen(dap_port) > 0) {
             fc_master_hook_cfg.dap_enabled = true;
+            /* Splice a callback-paused stack onto its caller for stackTrace and
+             * cross-boundary inspection (#309).  The provider reads the runner
+             * globals, so it survives every VM rebuild — install once here. */
+            fc_dap_parent_thread = wasm_dap_parent_thread;
             /* Initial-load pool was created before DAP was enabled; arm it now so a
              * breakpoint inside a native→Lua callback fires on this leg too (#272). */
             wasm_dap_arm_exch_pool();
