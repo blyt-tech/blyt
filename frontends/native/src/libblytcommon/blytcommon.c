@@ -1461,8 +1461,23 @@ __attribute__((noreturn)) void blyt_exit(int code) {
     blyt_rs_exit_group(code);
 }
 
-/* blyt_console_debug — SYS_write(fd=2, s, len).
- * write(2) is NR 64, in the restricted allowlist. */
+/* blyt_console_debug — SYS_write(fd=2, s, len) + the framing newline.
+ * write(2) is NR 64, in the restricted allowlist.
+ *
+ * The API is line-oriented (blyt.h, ADR-0085): one call emits exactly one line
+ * and the RUNTIME appends the trailing newline, so cart code never has to.  On
+ * the emulated legs the host log sink does it ("%s\n" in libretro_log and
+ * blytplay's sdl_log; likewise the emulated ECALL handler's log_fn); here there
+ * is no host sink between the cart and fd 2, so this is where it happens.
+ *
+ * Appended unconditionally — exactly what the host sinks' "%s\n" does — so a
+ * string that already ends in '\n' yields a blank line on EVERY leg.  Identical
+ * output across legs is the point; suppressing the second newline here would
+ * itself be the divergence (#291).
+ *
+ * Emitted as a second write rather than by copying into a stack buffer: the
+ * payload is arbitrary length, and this path must not allocate or bound the
+ * message.  The extra syscall is diagnostics-only cost. */
 void blyt_console_debug(const char *s) {
     unsigned int len = blyt32_native_strlen(s);
     if (blyt32_trace_api_enabled()) {
@@ -1477,11 +1492,21 @@ void blyt_console_debug(const char *s) {
         tp = blyt32_trace_app_str(tp, tend, "\")");
         blyt32_trace_emit(tbuf, tp, tend);
     }
-    register long a0 __asm__("a0") = 2; /* STDERR_FILENO */
-    register const char *a1 __asm__("a1") = s;
-    register long a2 __asm__("a2") = len;
-    register long a7 __asm__("a7") = 64; /* SYS_write */
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    {
+        register long a0 __asm__("a0") = 2; /* STDERR_FILENO */
+        register const char *a1 __asm__("a1") = s;
+        register long a2 __asm__("a2") = len;
+        register long a7 __asm__("a7") = 64; /* SYS_write */
+        __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    }
+    {
+        static const char nl = '\n';
+        register long a0 __asm__("a0") = 2; /* STDERR_FILENO */
+        register const char *a1 __asm__("a1") = &nl;
+        register long a2 __asm__("a2") = 1;
+        register long a7 __asm__("a7") = 64; /* SYS_write */
+        __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    }
 }
 
 /* ── State buffer typed get/set (Phase 9; field-major storage #134) ───────

@@ -298,6 +298,29 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
         hello_cart.display()
     );
 
+    // ── Build the line-framing cart (Gate 36, #291) ───────────────────
+    // C, so this gate never SKIPs on a missing Lua SDK. The two back-to-back
+    // calls in update() are the load-bearing case: adjacent calls are exactly
+    // what ran together into one unbroken line before bare metal framed its
+    // console output. Same source and same expected sequence as the host-leg
+    // half in tests/console_framing.rs — that identity is the contract.
+    let line_framing_project = tmp.path().join("line_framing");
+    write_c_cart_project(
+        &line_framing_project,
+        r#"
+#include "blyt.h"
+static int s_frame = 0;
+void blyt_cart_init(void)   { blyt_console_debug("<lf:init>"); }
+void blyt_cart_update(void) {
+    blyt_console_debug("<lf:update>");
+    blyt_console_debug("<lf:adjacent>");
+    if (++s_frame >= 2) blyt_quit();
+}
+void blyt_cart_draw(void)   { blyt_console_debug("<lf:draw>"); }
+"#,
+    );
+    let line_framing_cart = build_cart(&line_framing_project);
+
     // ── Build the dirty-frm cart (FCSR gate 4) ────────────────────────
     let dirty_project = tmp.path().join("dirty_frm");
     write_c_cart_project(
@@ -1049,6 +1072,10 @@ function draw() end
     assert!(
         qemu.scp_to(&surface_locked_tier1_cart, "/tmp/blyt_gate/"),
         "scp surface_locked_tier1.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&line_framing_cart, "/tmp/blyt_gate/"),
+        "scp line_framing.blyt failed"
     );
 
     // ── Diagnostics ───────────────────────────────────────────────────
@@ -2985,6 +3012,54 @@ void blyt_cart_draw(void) {}
         println!("  PASS: {markers:?}");
     } else {
         println!("Gate 35: SKIP (libblyt32lua.so not available or luac not found)");
+    }
+
+    // ── Gate 36: console_debug line framing on metal (#291) ───────────
+    // blyt_console_debug is line-oriented: one call emits exactly one line, and
+    // the runtime appends the trailing newline (blyt.h, ADR-0085). The three
+    // host runtimes always framed "%s\n"; bare metal issued a raw
+    // write(2, s, strlen(s)) and appended nothing, so an entire run arrived as
+    // one unbroken line with the guest lib's own output run together with the
+    // cart's.
+    //
+    // That silently defeats any test helper that extracts cart output by lines:
+    // it yields NOTHING on metal — the very leg that arbitrates parity
+    // (ADR-0136) — and an is_empty()-tolerant assertion then passes for a
+    // reason unrelated to the cart. It bit PR #286 directly.
+    //
+    // This gate is the anchor-side teeth: it parses metal output BY LINES and
+    // requires one whole marker per line, so it fails on the pre-fix runtime
+    // and can only pass once metal frames its console output like every other
+    // leg. Its expected sequence is identical to the host legs' in
+    // tests/console_framing.rs.
+    println!("Gate 36: console_debug line framing on metal...");
+    {
+        let out = qemu.ssh(
+            "/tmp/blyt_gate/blyt_native \
+             --lib-dir /tmp/blyt_gate/native \
+             -- /tmp/blyt_gate/line_framing.blyt 2>&1",
+        );
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "line_framing.blyt exited non-zero ({:?})\noutput: {output}",
+            out.status.code()
+        );
+        common::assert_marker_lines_exact(
+            "bare metal",
+            &output,
+            "lf",
+            &[
+                "<lf:init>",
+                "<lf:update>",
+                "<lf:adjacent>",
+                "<lf:draw>",
+                "<lf:update>",
+                "<lf:adjacent>",
+                "<lf:draw>",
+            ],
+        );
+        println!("  PASS: {:?}", common::marker_lines(&output, "lf"));
     }
 
     println!("Gate tests passed.");

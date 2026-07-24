@@ -323,6 +323,17 @@ void blyt_frame_done(void);
 /* -------------------------------------------------------------------------
  * Debug output (ADR-0085, ECALL 1)
  * ------------------------------------------------------------------------- */
+
+/* Write one diagnostic line.
+ *
+ * LINE-ORIENTED: one call emits exactly one line.  The runtime appends the
+ * trailing newline, so `s` should NOT end in one — a message that does yields a
+ * blank line after it, identically on every leg.  Every execution model honours
+ * this framing: the emulated legs through their host log sink, bare metal by
+ * writing the newline itself after the payload (#291).
+ *
+ * Diagnostics only: output is not part of the determinism/save-state contract,
+ * and a shipped console may drop it entirely. */
 void blyt_console_debug(const char *s);
 
 /* -------------------------------------------------------------------------
