@@ -24,6 +24,7 @@
 #include "state_buffer.h"
 #ifdef BLYT_DAP
 #include "dap_server.h"
+#include "master_hook.h" /* fc_master_hook_cfg.dap_enabled — host-Lua DAP arm signal (#272) */
 #endif
 #ifdef BLYT_GDB
 #include "gdb_stub.h"
@@ -262,6 +263,13 @@ typedef struct {
     bool lua_bridge_active; /* a bridged Lua→native call is in flight */
     uint32_t lua_bridge_token; /* nonce passed to the wrapper as its lua_State* */
     bool lua_bridge_error; /* a bridge op raised; run_frame returns FN_ERROR */
+    /* Deferred reverse-trampoline handoff (#272, DAP only): a native→Lua callback
+     * PCALL op fills this and halts so run_frame returns REVERSE_CALL_PENDING; the
+     * frontend trampoline immediately blyt_session_reverse_call_take()s it into its
+     * own (recursion-/continuation-stable) storage, freeing this slot for a nested
+     * park.  So this is only ever live between one park and its matching take. */
+    bool rc_pending;
+    blyt_reverse_call_t rc_handoff;
 #endif
     /* State buffer context — pointer into the owning blyt_session_t. */
     blyt_state_ctx_t *state_ctx;
@@ -1366,12 +1374,44 @@ static void bridge_lua_op(riscv_t *rv) {
             bridge_fail_msg(rv, EX, "blyt bridge: pcall result stack overflow");
             return;
         }
+        blyt_session_t *sess = session_from_run_ctx(g_run_ctx);
+
+#ifdef BLYT_DAP
+        /* #272: a DAP pause inside this callback pauses by lua_yield, which cannot
+         * cross the lua_pcall + rv32-interpreter C frames we are nested under here.
+         * So when the host-Lua DAP master hook is armed (native host-Lua AND WASM —
+         * fc_master_hook_cfg.dap_enabled, the unified host-Lua DAP signal), PARK
+         * instead: save the outer call's rv32 frame, stash the op shape in the
+         * run-context handoff slot, halt (PC left AT the op), and let run_frame
+         * return BLYT_RUN_REVERSE_CALL_PENDING.  The frontend trampoline drives the
+         * callback at its clean, yieldable boundary (blyt_session_reverse_resume)
+         * and calls blyt_session_finish_reverse_call, which restores the frame,
+         * writes `st`, and advances the PC — the exact tail the synchronous branch
+         * does below.  Run mode / release / bare-metal / the emulated leg keep the
+         * synchronous lua_pcall and its byte-exact allocation behaviour (#267/#270),
+         * because the host-Lua hook is not armed there. */
+        if (fc_master_hook_cfg.dap_enabled) {
+            blyt_session_save_call_frame(sess, &g_run_ctx->rc_handoff.frame);
+            g_run_ctx->rc_handoff.exch = EX;
+            g_run_ctx->rc_handoff.nargs = nargs;
+            g_run_ctx->rc_handoff.nresults = nresults;
+            /* Stack level below the function (== top - func - args): lua_resume
+             * leaves the returns here, and finish trims to base+nresults to match
+             * lua_pcall's contract the guest stub expects. */
+            g_run_ctx->rc_handoff.base = top - nargs - 1;
+            g_run_ctx->rc_handoff.is_protected = is_protected;
+            g_run_ctx->rc_handoff.started = false;
+            g_run_ctx->rc_pending = true;
+            rv_halt(rv);
+            return;
+        }
+#endif
+
         /* Re-entrancy (#262): the callback may call another native export, whose
          * trampoline clobbers THIS parked call's CPU + bridge state on the single
          * rv32.  Save it and restore after lua_pcall — which is protected, so it
          * never longjmps out and the restore always runs (even if the callback
          * errored).  The C recursion of nested PCALL ops is the save stack. */
-        blyt_session_t *sess = session_from_run_ctx(g_run_ctx);
         blyt_session_call_frame_t frame;
         blyt_session_save_call_frame(sess, &frame);
         int rc = lua_pcall(EX, nargs, nresults, 0);
@@ -4357,6 +4397,16 @@ static blyt_cart_run_err_t run_frame_impl(blyt_session_t *session) {
 #endif
     }
 
+#ifdef BLYT_LUA_BRIDGE
+    if (session->ctx.rc_pending) {
+        /* #272: the rv32 is parked at a reverse-trampoline PCALL op (DAP only).
+         * Hand back to the frontend to drive the callback at its yieldable
+         * boundary; it re-enters run_frame after blyt_session_finish_reverse_call
+         * advances the guest past the op. */
+        g_run_ctx = NULL;
+        return BLYT_RUN_REVERSE_CALL_PENDING;
+    }
+#endif
     if (session->ctx.fn_return_done) {
 #ifdef BLYT_LUA_BRIDGE
         session->ctx.lua_bridge_active = false;
@@ -4521,6 +4571,59 @@ void blyt_session_restore_call_frame(blyt_session_t *s, const blyt_session_call_
     s->ctx.lua_bridge_error = frame->lua_bridge_error;
     s->ctx.fn_return_done = frame->fn_return_done;
 }
+
+/* -------------------------------------------------------------------------
+ * Deferred reverse-trampoline driver (#272, DAP only).  See blyt_runtime.h for
+ * the contract; bridge_lua_op's PCALL branch fills ctx.rc_handoff and parks.
+ * ------------------------------------------------------------------------- */
+
+bool blyt_session_reverse_call_take(blyt_session_t *s, blyt_reverse_call_t *out) {
+    if (!s->ctx.rc_pending)
+        return false;
+    *out = s->ctx.rc_handoff;
+    s->ctx.rc_pending = false; /* free the handoff slot for a nested park */
+    return true;
+}
+
+int blyt_session_reverse_resume(blyt_session_t *s, blyt_reverse_call_t *rc, lua_State *from) {
+    (void)s;
+    /* First resume STARTS the callback — the guest wrapper already pushed
+     * function + args onto rc->exch, so pass nargs.  A resume after a DAP-pause
+     * lua_yield CONTINUES the suspended coroutine, so pass 0. */
+    int nargs = rc->started ? 0 : rc->nargs;
+    rc->started = true;
+    int nres = 0;
+    return lua_resume(rc->exch, from, nargs, &nres);
+}
+
+void blyt_session_finish_reverse_call(blyt_session_t *s, blyt_reverse_call_t *rc, int status) {
+    lua_State *EX = rc->exch;
+    /* Restore the parked outer call: the callback (and any nested native call it
+     * made) ran on the single rv32 in between, so its PC/regs/bridge token must
+     * come back before we hand results to the guest. */
+    blyt_session_restore_call_frame(s, &rc->frame);
+
+    if (status != LUA_OK && status != LUA_YIELD && !rc->is_protected) {
+        /* lua_call semantics: re-raise the error (on EX top) into the guest's
+         * calling Lua context — mirrors the synchronous branch's bridge_fail. */
+        s->ctx.lua_bridge_error = true;
+        rv_halt(s->rv); /* PC NOT advanced; run_frame returns FN_ERROR */
+        return;
+    }
+
+    /* pcall semantics: lua_resume leaves ALL returns (like MULTRET); trim to the
+     * guest's requested count at base+nresults so the stack matches what a
+     * synchronous lua_pcall(EX, nargs, nresults) would have produced. */
+    if (rc->nresults != LUA_MULTRET)
+        lua_settop(EX, rc->base + rc->nresults);
+
+    /* Same tail as the synchronous op: a0 = status, a1 = a2 = 0, advance the PC
+     * past the parked ECALL so the guest stub resumes after the reverse call. */
+    rv_set_reg(s->rv, rv_reg_a0, (uint32_t)status);
+    rv_set_reg(s->rv, rv_reg_a1, 0);
+    rv_set_reg(s->rv, rv_reg_a2, 0);
+    s->rv->PC += 4;
+}
 #else
 void blyt_session_save_call_frame(blyt_session_t *s, blyt_session_call_frame_t *frame) {
     (void)s;
@@ -4529,6 +4632,23 @@ void blyt_session_save_call_frame(blyt_session_t *s, blyt_session_call_frame_t *
 void blyt_session_restore_call_frame(blyt_session_t *s, const blyt_session_call_frame_t *frame) {
     (void)s;
     (void)frame;
+}
+bool blyt_session_reverse_call_take(blyt_session_t *s, blyt_reverse_call_t *out) {
+    (void)s;
+    (void)out;
+    return false;
+}
+int blyt_session_reverse_resume(blyt_session_t *s, blyt_reverse_call_t *rc,
+                                struct lua_State *from) {
+    (void)s;
+    (void)rc;
+    (void)from;
+    return 0; /* LUA_OK */
+}
+void blyt_session_finish_reverse_call(blyt_session_t *s, blyt_reverse_call_t *rc, int status) {
+    (void)s;
+    (void)rc;
+    (void)status;
 }
 #endif
 

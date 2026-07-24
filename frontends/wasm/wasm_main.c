@@ -683,6 +683,21 @@ static int wasm_make_trampoline(lua_State *L) {
  * same way.  The call is driven synchronously within the Lua C function.
  * ------------------------------------------------------------------------- */
 
+#ifdef BLYT_DAP
+/* Arm the DAP master hook on every exchange-pool thread (#272).  Reverse-trampoline
+ * callbacks run on the pool, NOT on g_lua_co, and Lua 5.4 hooks are per-thread and
+ * not inherited by lua_newthread — so without this a breakpoint inside a native→Lua
+ * callback never fires on WASM.  Mirrors cart_run_hostlua.c's build_vm pool arming;
+ * no-op until fc_master_hook_cfg.dap_enabled is set (mask would be empty). */
+static void wasm_dap_arm_exch_pool(void) {
+    if (!fc_master_hook_cfg.dap_enabled)
+        return;
+    for (int i = 0; i < BLYT_HOSTLUA_EXCH_POOL_DEPTH; i++)
+        if (g_lua_exch_pool[i])
+            fc_consolelua_master_hook_install(g_lua_exch_pool[i]);
+}
+#endif
+
 /* Create the ADR-0130 exchange-thread pool (#232, #262) off g_lua, anchored in
  * the registry, and attach the base to the session's bridge.  Recreated on every
  * (re)load/reset; wasm_teardown_exch_pool drops the old refs first. */
@@ -694,6 +709,11 @@ static void wasm_create_exch_pool(void) {
     g_lua_exch_depth = 0;
     g_lua_exch = g_lua_exch_pool[0];
     blyt_session_lua_bridge_attach(g_session, g_lua_exch);
+#ifdef BLYT_DAP
+    /* Reload path: DAP is already enabled, so arm the freshly-created pool now
+     * (the initial-load pool is armed when DAP is turned on — see below). */
+    wasm_dap_arm_exch_pool();
+#endif
 }
 
 /* Drop the exchange-thread pool's registry anchors and clear it. */
@@ -708,39 +728,27 @@ static void wasm_teardown_exch_pool(void) {
     g_lua_exch = NULL;
 }
 
-/* Upvalues: [1]=wrap_guest_addr */
-static int wasm_make_bridged_trampoline(lua_State *L) {
-    uint32_t wrap_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
-    int n = lua_gettop(L);
+/* Per-nesting-level bridged-call state (#262, #272).  The run_frame drive for a
+ * bridged export must survive a DAP-pause lua_yield (which longjmps away every C
+ * local), so the state a re-entering continuation needs lives here, indexed by
+ * the exchange-thread nesting depth `d` (0 = top level).  Distinct d per level →
+ * native→Lua→native→Lua nesting keeps each level's parked state.  Sequential
+ * calls reuse slot d (each finishes before the next starts). */
+typedef struct {
+    lua_State *ex; /* this level's exchange thread (== g_lua_exch_pool[d]) */
+    lua_State *prev_exch; /* the caller's exchange thread, restored on finish */
+    blyt_reverse_call_t rc; /* an in-flight reverse callback (survives its yield) */
+} wasm_bridged_state_t;
+static wasm_bridged_state_t g_bridged_state[BLYT_HOSTLUA_EXCH_POOL_DEPTH];
 
-    /* Reverse-trampoline re-entrancy (#262): the callback that reached this export
-     * may be running ON an exchange thread, so a nested native call needs a
-     * DISTINCT clean one.  g_lua_exch_pool[g_lua_exch_depth] is guaranteed != L. */
-    if (g_lua_exch_depth >= BLYT_HOSTLUA_EXCH_POOL_DEPTH)
-        return luaL_error(L, "blyt bridge: reverse-trampoline nesting too deep");
-    lua_State *ex = g_lua_exch_pool[g_lua_exch_depth];
-    if (!lua_checkstack(ex, n + 2))
-        return luaL_error(L, "blyt bridge: exchange stack overflow");
-    lua_settop(ex, 0); /* defensive: previous call always cleans up */
-    lua_xmove(L, ex, n); /* wrapper sees args at exch indices 1..n */
+static int wasm_bridged_drive(lua_State *L, int d);
 
-    lua_State *prev_exch = g_lua_exch;
-    g_lua_exch = ex;
-    blyt_session_lua_bridge_attach(g_session, ex);
-    g_lua_exch_depth++;
-
-    wasm_budget_enter_native(); /* publish the Lua-half heap into the budget (#250) */
-    if (blyt_session_begin_bridged_call(g_session, wrap_addr) != 0) {
-        g_lua_exch_depth--;
-        g_lua_exch = prev_exch;
-        blyt_session_lua_bridge_attach(g_session, prev_exch);
-        return luaL_error(L, "blyt bridge: call setup failed");
-    }
-    blyt_cart_run_err_t ferr;
-    do {
-        ferr = blyt_session_run_frame(g_session);
-    } while (ferr != BLYT_RUN_FN_DONE && ferr != BLYT_RUN_FN_ERROR &&
-             ferr != BLYT_RUN_ERR_ECALL_TRAP && ferr != BLYT_RUN_ERR_ABORT);
+/* Pop the nesting and marshal the completed call's results/error back to L.
+ * Same tail as the original synchronous trampoline; reads its state from
+ * g_bridged_state[d] so it is reachable from a post-yield continuation. */
+static int wasm_bridged_finish(lua_State *L, int d, blyt_cart_run_err_t ferr) {
+    lua_State *ex = g_bridged_state[d].ex;
+    lua_State *prev_exch = g_bridged_state[d].prev_exch;
 
     /* Pop the nesting NOW — before any marshalling that could raise — so the pool
      * state stays consistent even on a longjmp.  `ex` still holds the results. */
@@ -773,6 +781,81 @@ static int wasm_make_bridged_trampoline(lua_State *L) {
     lua_xmove(ex, L, m);
     lua_settop(ex, 0);
     return m;
+}
+
+#ifdef BLYT_DAP
+/* Continuation after a DAP pause inside a native→Lua callback (#272): the driver
+ * coroutine was resumed, so continue the parked reverse callback on its exchange
+ * thread, then resume driving this level's native call. */
+static int wasm_bridged_resume_k(lua_State *L, int status, lua_KContext ctx) {
+    (void)status;
+    int d = (int)(intptr_t)ctx;
+    int st = blyt_session_reverse_resume(g_session, &g_bridged_state[d].rc, L);
+    if (st == LUA_YIELD)
+        return lua_yieldk(L, 0, (lua_KContext)(intptr_t)d, wasm_bridged_resume_k);
+    blyt_session_finish_reverse_call(g_session, &g_bridged_state[d].rc, st);
+    return wasm_bridged_drive(L, d);
+}
+#endif
+
+/* Drive blyt_session_run_frame for bridged-call level `d` until it completes.
+ * On BLYT_RUN_REVERSE_CALL_PENDING (DAP only) the native half called a Lua value
+ * back (the ADR-0130 reverse-trampoline); run that callback here, at this clean,
+ * yieldable boundary — a DAP breakpoint inside it pauses by lua_yield, which
+ * unwinds through this frame's lua_yieldk (#272).  On completion, marshal via
+ * wasm_bridged_finish. */
+static int wasm_bridged_drive(lua_State *L, int d) {
+    blyt_cart_run_err_t ferr;
+    for (;;) {
+        ferr = blyt_session_run_frame(g_session);
+#ifdef BLYT_DAP
+        if (ferr == BLYT_RUN_REVERSE_CALL_PENDING) {
+            blyt_session_reverse_call_take(g_session, &g_bridged_state[d].rc);
+            int st = blyt_session_reverse_resume(g_session, &g_bridged_state[d].rc, L);
+            if (st == LUA_YIELD)
+                return lua_yieldk(L, 0, (lua_KContext)(intptr_t)d, wasm_bridged_resume_k);
+            blyt_session_finish_reverse_call(g_session, &g_bridged_state[d].rc, st);
+            continue;
+        }
+#endif
+        if (ferr == BLYT_RUN_FN_DONE || ferr == BLYT_RUN_FN_ERROR ||
+            ferr == BLYT_RUN_ERR_ECALL_TRAP || ferr == BLYT_RUN_ERR_ABORT)
+            break;
+    }
+    return wasm_bridged_finish(L, d, ferr);
+}
+
+/* Upvalues: [1]=wrap_guest_addr */
+static int wasm_make_bridged_trampoline(lua_State *L) {
+    uint32_t wrap_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
+    int n = lua_gettop(L);
+
+    /* Reverse-trampoline re-entrancy (#262): the callback that reached this export
+     * may be running ON an exchange thread, so a nested native call needs a
+     * DISTINCT clean one.  g_lua_exch_pool[g_lua_exch_depth] is guaranteed != L. */
+    if (g_lua_exch_depth >= BLYT_HOSTLUA_EXCH_POOL_DEPTH)
+        return luaL_error(L, "blyt bridge: reverse-trampoline nesting too deep");
+    int d = g_lua_exch_depth;
+    lua_State *ex = g_lua_exch_pool[d];
+    if (!lua_checkstack(ex, n + 2))
+        return luaL_error(L, "blyt bridge: exchange stack overflow");
+    lua_settop(ex, 0); /* defensive: previous call always cleans up */
+    lua_xmove(L, ex, n); /* wrapper sees args at exch indices 1..n */
+
+    g_bridged_state[d].ex = ex;
+    g_bridged_state[d].prev_exch = g_lua_exch;
+    g_lua_exch = ex;
+    blyt_session_lua_bridge_attach(g_session, ex);
+    g_lua_exch_depth++;
+
+    wasm_budget_enter_native(); /* publish the Lua-half heap into the budget (#250) */
+    if (blyt_session_begin_bridged_call(g_session, wrap_addr) != 0) {
+        g_lua_exch_depth--;
+        g_lua_exch = g_bridged_state[d].prev_exch;
+        blyt_session_lua_bridge_attach(g_session, g_bridged_state[d].prev_exch);
+        return luaL_error(L, "blyt bridge: call setup failed");
+    }
+    return wasm_bridged_drive(L, d);
 }
 
 /* Sandboxed require() for WASM Lua carts: looks up pre-registered modules in
@@ -3729,6 +3812,9 @@ static int run_lua_cart(const void *bytecode, size_t bytecode_size) {
         int dap_port = blyt_js_dap_port();
         if (dap_port > 0 && fc_consolelua_dap_listen(dap_port) > 0) {
             fc_master_hook_cfg.dap_enabled = true;
+            /* Initial-load pool was created before DAP was enabled; arm it now so a
+             * breakpoint inside a native→Lua callback fires on this leg too (#272). */
+            wasm_dap_arm_exch_pool();
             g_lua_needs_start = true;
         }
     }

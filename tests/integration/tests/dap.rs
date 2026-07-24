@@ -570,6 +570,121 @@ fn sdl_dap_hybrid_native_to_lua_callback_breakpoint() {
         .success();
 }
 
+/// WASM host-Lua DAP (#272): the WASM analog of
+/// `sdl_dap_hostlua_hybrid_native_to_lua_callback_breakpoint`.  A breakpoint in a
+/// Lua function reached via a native→Lua CALLBACK (the ADR-0130 reverse-trampoline
+/// — the native half does `lua_getglobal`+`lua_pcall`) must fire on the WASM
+/// host-Lua leg too.  On WASM the callback runs on an ADR-0130 exchange thread,
+/// invoked via `lua_pcall(EX)` from inside the rv32 ECALL dispatch, so pausing
+/// there (which pauses by `lua_yield`, not block-a-thread) needs the deferred /
+/// yieldable reverse-call restructure this issue tracks — without it the
+/// breakpoint silently never stops.  Evaluates a local in the paused callback
+/// frame (`a == 41`).  Emulated control: `sdl_dap_hybrid_native_to_lua_callback_breakpoint`.
+#[test]
+fn wasm_dap_hybrid_native_to_lua_callback_breakpoint() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_hostlua_reverse");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+            \x20   lua_getglobal(L, \"on_native\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n")
+        .lua(
+            "local host = require(\"host\")\n\
+             function on_native()\n\
+             \x20   local a = 41\n\
+             \x20   local b = a + 1\n\
+             end\n\
+             function init() host.run_cb() end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "a")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "41")
+        .assert()
+        .success();
+}
+
+/// WASM host-Lua DAP (#272), NESTED re-entrant case: native→Lua→native→Lua with
+/// the breakpoint at the BOTTOM.  `init` calls `host.run_cb` (native) → `on_native`
+/// (Lua, exchange thread EX0) → `host.run_cb_inner` (native again) → `on_native_inner`
+/// (Lua, exchange thread EX1), where the breakpoint sits.  This forces the DAP
+/// pause `lua_yield` to propagate outward through TWO forward-trampoline levels and
+/// TWO parked reverse-call states — the continuation chain either composes or hides
+/// a #98-class latent bug.  Evaluates a local in the deepest paused frame (`a == 41`).
+#[test]
+fn wasm_dap_hybrid_reentrant_callback_breakpoint() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_hostlua_reentrant");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+            \x20   lua_getglobal(L, \"on_native\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb_inner) {\n\
+            \x20   lua_getglobal(L, \"on_native_inner\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n")
+        .lua(
+            "local host = require(\"host\")\n\
+             function on_native_inner()\n\
+             \x20   local a = 41\n\
+             \x20   local b = a + 1\n\
+             end\n\
+             function on_native()\n\
+             \x20   host.run_cb_inner()\n\
+             end\n\
+             function init() host.run_cb() end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "a")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "41")
+        .assert()
+        .success();
+}
+
 /// Cross-boundary stepping cart (#273): a native→Lua callback with a landing
 /// line after the callback call, so a step can cross the native↔Lua boundary.
 /// `init` calls `host.run_cb` (native), which calls the Lua `on_native` back

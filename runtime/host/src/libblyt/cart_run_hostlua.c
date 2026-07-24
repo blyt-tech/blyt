@@ -1791,10 +1791,26 @@ static int hl_bridged_trampoline(lua_State *L) {
 #endif
 
     blyt_cart_run_err_t ferr;
-    do {
+    for (;;) {
         ferr = blyt_session_run_frame(hl->session);
-    } while (ferr != BLYT_RUN_FN_DONE && ferr != BLYT_RUN_FN_ERROR &&
-             ferr != BLYT_RUN_ERR_ECALL_TRAP && ferr != BLYT_RUN_ERR_ABORT);
+        if (ferr == BLYT_RUN_REVERSE_CALL_PENDING) {
+            /* #272: the rv32 parked at a native→Lua callback PCALL op (DAP only).
+             * Drive the callback here, at a clean C boundary.  This leg pauses by
+             * blocking the exec thread inside the DAP hook (never lua_yield), so
+             * the resume runs to a terminal status inline; the defensive loop just
+             * guards the invariant. */
+            blyt_reverse_call_t rc;
+            blyt_session_reverse_call_take(hl->session, &rc);
+            int st;
+            while ((st = blyt_session_reverse_resume(hl->session, &rc, L)) == LUA_YIELD)
+                ;
+            blyt_session_finish_reverse_call(hl->session, &rc, st);
+            continue;
+        }
+        if (ferr == BLYT_RUN_FN_DONE || ferr == BLYT_RUN_FN_ERROR ||
+            ferr == BLYT_RUN_ERR_ECALL_TRAP || ferr == BLYT_RUN_ERR_ABORT)
+            break;
+    }
 
     /* Pop the nesting NOW — before any result marshalling that could raise — so
      * hl->lua_exch / exch_depth stay consistent even on a longjmp.  `ex` (local)
