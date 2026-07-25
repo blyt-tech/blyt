@@ -107,24 +107,21 @@ FetchContent_Declare(
 # transcendentals + pow through blyt_fpm when BLYT_HOSTLUA_FP_SEAM is defined).
 # p3 adds the Phase-B number-format companion (luaconf.h routes lua_str2number /
 # l_sprintf through blyt_fpm_strtod / blyt_fpm_snprintf under the same guard).
-# -heapseam adds the #231 rv32 heap-accounting seam (BLYT_HOSTLUA_HEAP_SEAM /
-# _ACCT: rv32 object sizing + LUAL_BUFFERSIZE pin + stack/CallInfo exclusion for
-# byte-identical guest_heap_used on the 64-bit host). -heapseamkind2 closes that
-# seam's two remaining host-width leaks (#267): long-string sizing is now
-# kind-aware (Lua 5.5 has three long-string layouts and the seam modelled all
-# three as LSTRREG, over-counting every luaL_Buffer-boxed external string by the
-# falloc/ud pointer pair), and the GC's pacing constants (LUAI_GCSTEPSIZE,
-# incstep's work-per-step divisor) are pinned to rv32 instead of the host's
-# sizeof(Table) / sizeof(void*) — pacing is observable through cart_allocations,
-# because sweep order drives which arena blocks get recycled. PRE-RELEASE
-# feature tag — replace with a stable v5.5.0-blyt-v0-p4 at the #231 pre-merge
-# gate.
-set(LUA_VERSION "v5.5.0-blyt-v0-p3-heapseamkind2")
+# p4 adds the rv32 heap-accounting seam (BLYT_HOSTLUA_HEAP_SEAM / _ACCT) that
+# makes guest_heap_used byte-identical on the 64-bit host: rv32 object sizing +
+# LUAL_BUFFERSIZE pin + stack/CallInfo exclusion (#231), kind-aware long-string
+# sizing (#267 — Lua 5.5 has three long-string layouts and the seam first
+# modelled all three as LSTRREG, over-counting every luaL_Buffer-boxed external
+# string by the falloc/ud pointer pair), and the GC's pacing constants
+# (LUAI_GCSTEPSIZE, incstep's work-per-step divisor) pinned to rv32 instead of
+# the host's sizeof(Table) / sizeof(void*) (#267 — pacing is observable through
+# cart_allocations, because sweep order drives which arena blocks get recycled).
+set(LUA_VERSION "v5.5.0-blyt-v0-p4")
 FetchContent_Declare(
   lua
   URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=365bb34d1d68e0cbf0cb848be09ef308baeae90730a86d08587cd84b508079c9)
+    SHA256=aa76bf19a2bf5cf7adce4337ef3ddba924e35dfbcb9006926872388ea396caaf)
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)

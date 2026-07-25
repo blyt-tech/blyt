@@ -9,7 +9,7 @@ worktrees.
 
 | Dep | Source | Tag convention |
 |---|---|---|
-| lua | upstream (github.com/lua/lua) | `v5.4.7` (release tag) |
+| lua | blyt-tech/lua | `v<upstream>-blyt-v0-p<N>` (e.g. `v5.5.0-blyt-v0-p4`) |
 | flatcc | upstream (github.com/dvidelabs/flatcc) | `v0.6.1` (release tag) |
 | zstd | upstream (github.com/facebook/zstd) | `v1.5.7` (release tag) |
 | libopenmpt | upstream (github.com/OpenMPT/openmpt) | `libopenmpt-0.8.7` (release tag) |
@@ -77,7 +77,14 @@ Delete `third_party/<dep>` to revert to the downloaded tarball.
 
 Before merging a blyt PR that touches fork deps:
 
-1. Rebase the fork's feature commits onto `blyt-patches-v0`.
+1. Land the fork's feature commits on `blyt-patches-v0` — a `merge --ff-only`
+   when the feature branch was cut from the current `blyt-patches-v0` head, a
+   rebase when it has since moved. Confirm which before pushing:
+   ```sh
+   git -C third_party/<dep> fetch origin
+   git -C third_party/<dep> merge-base --is-ancestor \
+     origin/blyt-patches-v0 origin/<feature-branch> && echo "fast-forward"
+   ```
 2. Run the appropriate release script to create a stable (non-feature) tag
    and upload the tarball:
    ```sh
@@ -95,19 +102,36 @@ removed after the feature lands.
 
 ### Post-merge cleanup
 
-After the blyt PR merges and CI on main is green, delete the pre-release
-release and tag from each affected fork:
+After the blyt PR merges and CI on main is green, delete the pre-release tag
+— and its release, if it has one — from each affected fork.
+
+**A pre-release tag usually has no release.** The "in-progress patches" step
+above cuts it with a plain `git tag` + `git push`, which creates no release
+object, so `gh release delete` fails with `release not found`. Check first:
 
 ```sh
-gh release delete v1.2.6-blyt-v0-p2-mypatch --repo blyt-tech/musl --yes --cleanup-tag
-# or
+gh release view <tag> --repo blyt-tech/<dep> >/dev/null 2>&1 \
+  && echo "has release" || echo "tag only"
+```
+
+Tag only — delete the ref directly:
+
+```sh
+git push origin --delete v1.2.6-blyt-v0-p2-mypatch
+# or, without a local clone:
+gh api -X DELETE repos/blyt-tech/musl/git/refs/tags/v1.2.6-blyt-v0-p2-mypatch
+```
+
+Has a release (anything minted by a `release-*.sh` script, since those run
+`gh release create`) — one command does both:
+
+```sh
 gh release delete g<sha>-blyt-v0-p4-mypatch --repo blyt-tech/rv32emu --yes --cleanup-tag
 ```
 
-`--cleanup-tag` deletes the tag along with the release. For rv32emu this
-also removes the uploaded tarball asset. For deps that use GitHub's
-auto-generated tarball (musl, lua) there is no asset to remove, but the
-release entry and tag are still cleaned up the same way.
+`--cleanup-tag` deletes the tag along with the release. For rv32emu and
+libcxx this also removes the uploaded tarball asset; for deps that use
+GitHub's auto-generated tarball (musl, lua) there is no asset to remove.
 
 ## Custom tarballs
 
@@ -127,10 +151,10 @@ The full `llvm-project` tarball is hundreds of MB; only `libcxx/` and
 needed. `scripts/release-libcxx.sh` extracts these and uploads the curated
 tarball as a release asset on `blyt-tech/llvm-project`.
 
-### musl and upstream deps
+### musl, lua, and upstream deps
 
-musl uses GitHub's auto-generated tarball via `scripts/release-dep.sh`.
-Upstream deps (lua, flatcc, zstd, libopenmpt, libretro-common) use the
+musl and lua use GitHub's auto-generated tarball via `scripts/release-dep.sh`.
+Upstream deps (flatcc, zstd, libopenmpt, libretro-common) use the
 auto-generated tarballs directly — no release script needed.
 
 ## Release workflows
