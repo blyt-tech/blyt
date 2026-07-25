@@ -315,10 +315,25 @@ static int call_lifecycle(blyt_hostlua_t *hl, lua_State *L, const char *name);
  * the guest's report-and-continue semantics (#236/#258/#264). */
 static void hl_report_lua_error(blyt_hostlua_t *hl, lua_State *L);
 
+#ifdef BLYT_DAP
+/* Exception message handler for the lifecycle pcall (#319).  A message handler
+ * runs the instant an uncaught error is raised — before the frame unwinds — so
+ * this is the only point where the erroring cart's live call stack is still
+ * walkable.  Capture it for the pending exception stop, then return the error
+ * object unchanged so the existing report-and-continue path (l_blyt_call_k ->
+ * hl_report_lua_error) is untouched. */
+static int l_hl_dap_exc_msgh(lua_State *L) {
+    fc_hostlua_dap_capture_exception(L);
+    return 1; /* leave the error object (arg 1) as the handler's result */
+}
+#endif
+
 static int l_blyt_call_k(lua_State *L, int status, lua_KContext ctx) {
-    (void)ctx;
+    int msgh = (int)ctx; /* stack index of the #319 message handler, or 0 */
     if (status != LUA_OK && status != LUA_YIELD)
         hl_report_lua_error(hl_from(L), L);
+    if (msgh > 0)
+        lua_remove(L, msgh); /* balance the handler pushed in l_blyt_call */
     return 0;
 }
 
@@ -329,14 +344,29 @@ static int l_blyt_call(lua_State *L) {
         lua_pop(L, 1);
         return 0;
     }
+    /* Under a debugger, push an exception message handler UNDER the function so an
+     * uncaught error's live stack is captured before it unwinds (#319).  The index
+     * is threaded through the continuation's ctx so it is removed on both the
+     * direct-return and (wasm) yield-resume completion paths. */
+    lua_KContext msgh = 0;
+#ifdef BLYT_DAP
+    {
+        blyt_hostlua_t *hl = hl_from(L);
+        if (hl && hl->dap_enabled) {
+            lua_pushcfunction(L, l_hl_dap_exc_msgh); /* [name][fn][msgh] */
+            lua_insert(L, -2); /* [name][msgh][fn] */
+            msgh = (lua_KContext)(lua_gettop(L) - 1);
+        }
+    }
+#endif
     /* lua_pcallK with a continuation — the same call shape the wasm leg uses, so
      * the two legs' allocation sequences stay identical by construction.  Native
      * never actually yields here (it pauses for a debugger by BLOCKING the thread,
      * dap_transport_tcp_lua.c), but the wasm leg MUST be able to yield out of a
      * breakpoint through this frame, and the shared driver only stays shared if
      * both legs call the cart the same way. */
-    int st = lua_pcallk(L, 0, 0, 0, 0, l_blyt_call_k);
-    return l_blyt_call_k(L, st, 0);
+    int st = lua_pcallk(L, 0, 0, (int)msgh, msgh, l_blyt_call_k);
+    return l_blyt_call_k(L, st, msgh);
 }
 
 /* Phase brackets (#205, #232 S4) driven by the shared chunk; no-ops for a

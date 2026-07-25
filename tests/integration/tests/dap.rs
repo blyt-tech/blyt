@@ -926,6 +926,9 @@ fn sdl_dap_exception_breakpoint() {
             cart.to_str().unwrap(),
         ])
         .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
+        // #319: the stop must be inspectable — stackTrace with a frame at the
+        // error site (line 2, `error("test exception")`), matching emulated.
+        .env("BLYT_DAP_EXCEPTION_EXPECT_LINE", "2")
         .assert()
         .success();
 }
@@ -1161,6 +1164,9 @@ fn wasm_dap_exception_breakpoint() {
             cart.to_str().unwrap(),
         ])
         .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
+        // #319: the stop must be inspectable — stackTrace with a frame at the
+        // error site (line 2, `error("test exception")`), matching emulated.
+        .env("BLYT_DAP_EXCEPTION_EXPECT_LINE", "2")
         .assert()
         .success();
 }

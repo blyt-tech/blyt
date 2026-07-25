@@ -94,6 +94,13 @@ int dap_lua_exception_filter(void);
  * the filter matches and a client is attached.  Returns 1 if it paused. */
 int dap_lua_on_exception(const char *msg, int is_uncaught);
 
+/* Capture L's live call stack for the next exception stop (#319).  Called as the
+ * lifecycle pcall's Lua message handler — i.e. the instant an uncaught error is
+ * raised, before the frame unwinds — so handle_stack_trace can serve a real call
+ * stack while parked (by then paused_L is NULL).  No-op unless a client with an
+ * exception filter is attached. */
+void dap_lua_capture_exception(lua_State *L);
+
 /* Emit a DAP "output" event (routes to the Debug Console). */
 void dap_lua_output(const char *msg);
 

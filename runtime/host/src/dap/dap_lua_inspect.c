@@ -65,6 +65,16 @@ static struct {
 
     dcore_srcmap_t srcmap[DAP_LUA_MAX_SRCMAP]; /* launch sourceMap, issue #51 */
     int n_srcmap;
+
+    /* Exception-stop stack snapshot (#319).  An uncaught Lua error unwinds the
+     * frame before the exception park runs (paused_L == NULL there), so the live
+     * stack is gone by pause time.  The lifecycle pcall's message handler
+     * (dap_lua_capture_exception) walks the still-live frames the instant the
+     * error is raised and stashes the ready stackTrace body here; handle_stack_trace
+     * serves it while parked, so VS Code shows the call stack pointing at the error
+     * site — matching the emulated path. Cleared on resume/reset/live-pause. */
+    char exc_stack_body[DAP_LUA_MAX_MSG];
+    int has_exc_stack;
 } g_core;
 
 static dap_lua_transport_ops_t g_ops;
@@ -123,6 +133,7 @@ void dap_lua_reset(void) {
     g_core.restart_pending = 0;
     g_core.exception_filter = 0;
     g_core.hit_bp_id = 0;
+    g_core.has_exc_stack = 0;
 }
 
 lua_State *dap_lua_paused_state(void) {
@@ -500,22 +511,17 @@ static void handle_threads(int seq, const char *args) {
     send_response(seq, "threads", 1, "{\"threads\":[{\"id\":1,\"name\":\"cart\"}]}");
 }
 
-static void handle_stack_trace(int seq, const char *args) {
-    (void)args;
-    lua_State *L = g_core.paused_L;
-    if (!L) {
-        send_response(seq, "stackTrace", 0, "not paused");
-        return;
-    }
-    static char body[DAP_LUA_MAX_MSG];
-    int off = snprintf(body, sizeof body, "{\"stackFrames\":[");
+/* Build the DAP stackTrace response body by walking L's live frames into `body`.
+ *
+ * Walk the spliced native->Lua callback chain (#273): the paused thread's frames
+ * first, then each parent thread's live frames via fc_dap_parent_thread — so a
+ * stop inside a callback shows on_native spliced onto its caller init, matching
+ * the emulated single-lua_State leg.  With no provider the loop stays on the
+ * paused thread (single-stack legs).  C/synthetic frames are skipped (only
+ * @-prefixed file-backed sources), so VS Code gets real paths. */
+static void build_stack_body(lua_State *L, char *body, size_t bodysz) {
+    int off = snprintf(body, bodysz, "{\"stackFrames\":[");
     int display = 0;
-    /* Walk the spliced native->Lua callback chain (#273): the paused thread's
-     * frames first, then each parent thread's live frames via fc_dap_parent_thread
-     * — so a stop inside a callback shows on_native spliced onto its caller init,
-     * matching the emulated single-lua_State leg.  With no provider the loop stays
-     * on the paused thread (single-stack legs).  C/synthetic frames are skipped
-     * (only @-prefixed file-backed sources), so VS Code gets real paths. */
     for (lua_State *cur = L; cur && display < DAP_LUA_MAX_FRAMES;
          cur = fc_dap_parent_thread ? fc_dap_parent_thread(cur) : NULL) {
         lua_Debug ar;
@@ -527,14 +533,42 @@ static void handle_stack_trace(int seq, const char *args) {
                 continue;
             src++; /* strip leading @ */
             const char *name = ar.name ? ar.name : (ar.what ? ar.what : "?");
-            off += snprintf(body + off, sizeof(body) - (size_t)off,
+            off += snprintf(body + off, bodysz - (size_t)off,
                             "%s{\"id\":%d,\"name\":\"%s\","
                             "\"source\":{\"path\":\"%s\"},\"line\":%d,\"column\":1}",
                             display ? "," : "", display, name, src, ar.currentline);
             display++;
         }
     }
-    snprintf(body + off, sizeof(body) - (size_t)off, "],\"totalFrames\":%d}", display);
+    snprintf(body + off, bodysz - (size_t)off, "],\"totalFrames\":%d}", display);
+}
+
+void dap_lua_capture_exception(lua_State *L) {
+    /* Only relevant when a client with an exception filter is attached — the same
+     * gate the exception park (dap_lua_on_exception) uses.  Runs as the lifecycle
+     * pcall's message handler, so L's erroring frames are still live here. */
+    if (!core_connected() || g_core.exception_filter == 0)
+        return;
+    build_stack_body(L, g_core.exc_stack_body, sizeof g_core.exc_stack_body);
+    g_core.has_exc_stack = 1;
+}
+
+static void handle_stack_trace(int seq, const char *args) {
+    (void)args;
+    lua_State *L = g_core.paused_L;
+    if (!L) {
+        /* Exception stop (#319): the erroring frame already unwound (paused_L
+         * NULL), but the pcall's message handler stashed the live stack — serve
+         * it so the stop is inspectable, matching a breakpoint stop. */
+        if (g_core.has_exc_stack) {
+            send_response(seq, "stackTrace", 1, g_core.exc_stack_body);
+            return;
+        }
+        send_response(seq, "stackTrace", 0, "not paused");
+        return;
+    }
+    static char body[DAP_LUA_MAX_MSG];
+    build_stack_body(L, body, sizeof body);
     send_response(seq, "stackTrace", 1, body);
 }
 
@@ -954,6 +988,7 @@ void dap_lua_enter_paused(lua_State *L) {
     g_core.paused = 1;
     g_core.continue_pending = 0;
     g_core.pending_pause = 0;
+    g_core.has_exc_stack = 0; /* a live pause supersedes any stale exception snapshot (#319) */
 
     /* The step logic clears dap_step_mode before pausing, so reason is taken from
      * the sticky dap_stop_is_step flag it sets (#273) — otherwise a step stop is
@@ -985,6 +1020,7 @@ void dap_lua_apply_resume(void) {
     g_core.paused_L = NULL;
     g_core.paused = 0;
     g_core.continue_pending = 0;
+    g_core.has_exc_stack = 0; /* snapshot is single-stop only (#319) */
 
     fc_master_hook_cfg.dap_step_mode = (dap_step_mode_t)step_mode;
     fc_master_hook_cfg.dap_step_base_depth = step_base;
