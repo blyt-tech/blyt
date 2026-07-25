@@ -59,14 +59,24 @@ gh release create "${TAG}" \
 TARBALL_URL="https://github.com/${REPO_SLUG}/archive/refs/tags/${TAG}.tar.gz"
 
 echo "==> Computing SHA256 of ${TARBALL_URL}"
-SHA256=$(curl -fsSL "${TARBALL_URL}" | sha256sum | awk '{print $1}')
+# macOS ships sha256sum in /sbin; older images only have shasum.
+if command -v sha256sum > /dev/null 2>&1; then
+    SHA256=$(curl -fsSL "${TARBALL_URL}" | sha256sum | awk '{print $1}')
+else
+    SHA256=$(curl -fsSL "${TARBALL_URL}" | shasum -a 256 | awk '{print $1}')
+fi
+
+# ${DEP^^} is a bash 4 expansion; macOS ships bash 3.2, where it is a fatal
+# "bad substitution" — and it fires *after* the tag and release are already
+# pushed, so the script would exit 1 on work that actually succeeded.
+DEP_UPPER=$(printf '%s' "${DEP}" | tr '[:lower:]' '[:upper:]')
 
 echo ""
 echo "=== CMakeLists.txt snippet ==="
 echo ""
-echo "set(${DEP^^}_VERSION \"${TAG}\")"
+echo "set(${DEP_UPPER}_VERSION \"${TAG}\")"
 echo "FetchContent_Declare("
 echo "  ${DEP}"
-echo "  URL \"https://github.com/${REPO_SLUG}/archive/refs/tags/\${${DEP^^}_VERSION}.tar.gz\""
+echo "  URL \"https://github.com/${REPO_SLUG}/archive/refs/tags/\${${DEP_UPPER}_VERSION}.tar.gz\""
 echo "  URL_HASH SHA256=${SHA256})"
 echo ""
