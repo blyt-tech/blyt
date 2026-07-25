@@ -170,9 +170,13 @@ jobs:
         env:
           QEMU_IMAGE_URL: ${{ vars.BLYT_QEMU_IMAGE_URL }}
         run: |
+          # The QEMU gate is the only coverage of the RISC-V bare-metal path
+          # (libblyt32lua.so included), and it hard-fails on a missing image
+          # rather than skipping (#312) — so an unset variable must fail HERE,
+          # where the cause is obvious, not deep inside the test log.
           if [ -z "$QEMU_IMAGE_URL" ]; then
-            echo "::warning::BLYT_QEMU_IMAGE_URL not set — native QEMU gate will be skipped"
-            exit 0
+            echo "::error::BLYT_QEMU_IMAGE_URL not set — the native QEMU gate cannot run"
+            exit 1
           fi
           mkdir -p /tmp/blyt-qemu
           curl -fsSL "$QEMU_IMAGE_URL/kernel"       -o /tmp/blyt-qemu/Image
@@ -196,8 +200,9 @@ jobs:
 
       # The QEMU native ILP32 gate runs inside this step as a regular test:
       # nextest overlaps its ~30s QEMU boot with the other suites. The
-      # BLYT_QEMU_* env points at the files downloaded above — when
-      # BLYT_QEMU_IMAGE_URL is unset they don't exist and the gate skips.
+      # BLYT_QEMU_* env points at the files downloaded above; the gate fails
+      # rather than skips if they are missing (#312), and the download step
+      # above already fails when BLYT_QEMU_IMAGE_URL is unset.
       # BLYT_BUILD_DIR is injected by the CMake target via cmake -E env.
       - name: Integration tests
         timeout-minutes: 20

@@ -225,6 +225,13 @@ fn native_riscv_qemu_gate() {
     }
 
     // ── Prerequisites ──────────────────────────────────────────────────
+    //
+    // Every one of these is a HARD failure, never a skip (#312).  This gate is
+    // the only automated coverage of the RISC-V bare-metal path — a missing
+    // image or a missing qemu used to make all 36 gates vanish behind a green
+    // run, which is precisely the silent-coverage-loss the per-gate Lua skips
+    // caused at a finer grain.  BLYT_SKIP_QEMU_GATE above is the one sanctioned
+    // opt-out: deliberate, explicit, and visible in the run log.
 
     let kernel = std::env::var("BLYT_QEMU_KERNEL")
         .map(PathBuf::from)
@@ -241,28 +248,32 @@ fn native_riscv_qemu_gate() {
         ("rootfs", &rootfs),
         ("ssh key", &ssh_key),
     ] {
-        if !path.exists() {
-            eprintln!(
-                "native_riscv_qemu_gate: {label} not found ({}) — skip",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.exists(),
+            "QEMU {label} not found ({}) — \
+             run: cmake --build build --target fetch_qemu_images\n\
+             (override the location with BLYT_QEMU_KERNEL / BLYT_QEMU_ROOTFS / \
+             BLYT_QEMU_SSH_KEY, or set BLYT_SKIP_QEMU_GATE=1 to opt out \
+             explicitly, as the Linux Docker leg does)",
+            path.display()
+        );
     }
 
-    if Command::new("qemu-system-riscv64")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("native_riscv_qemu_gate: qemu-system-riscv64 not found — skip");
-        return;
-    }
+    assert!(
+        Command::new("qemu-system-riscv64")
+            .arg("--version")
+            .output()
+            .is_ok(),
+        "qemu-system-riscv64 not found — install QEMU (macOS: brew install qemu; \
+         Debian/Ubuntu: apt install qemu-system-misc)\n\
+         (or set BLYT_SKIP_QEMU_GATE=1 to opt out explicitly)"
+    );
 
-    if !Command::new("ssh").arg("-V").output().is_ok() {
-        eprintln!("native_riscv_qemu_gate: ssh not found — skip");
-        return;
-    }
+    assert!(
+        Command::new("ssh").arg("-V").output().is_ok(),
+        "ssh not found — install an OpenSSH client\n\
+         (or set BLYT_SKIP_QEMU_GATE=1 to opt out explicitly)"
+    );
 
     let native_dir = sdk_dir().join("lib/native");
     assert!(
@@ -273,6 +284,29 @@ fn native_riscv_qemu_gate() {
     assert!(
         sdk_dir().join("bin/blyt-clang").exists(),
         "SDK not assembled — run: cmake --build build --target sdk"
+    );
+
+    // Native RV32 Lua runtime — a HARD prerequisite, never a skip (#312).
+    //
+    // Since #230 item 9 a Lua-bearing cart runs host-Lua on every non-RISC-V
+    // host, so this gate (plus real hardware) is the ONLY remaining coverage of
+    // the shipped `libblyt32lua.so`.  These gates used to print
+    // "Gate N: SKIP (libblyt32lua.so not available...)" and pass, which turned a
+    // total loss of coverage for a shipped guest library into a green run.  Per
+    // CLAUDE.md — missing prerequisites are test failures, not silent skips.
+    let lua_sdk_native = native_dir.join("libblyt32lua.so");
+    assert!(
+        lua_sdk_native.exists(),
+        "sdk/lib/native/libblyt32lua.so not found ({}) — \
+         run: cmake --build build --target libblyt32_native_so\n\
+         This is the only coverage of the RV32 guest Lua runtime; it must not be skipped.",
+        lua_sdk_native.display()
+    );
+    assert!(
+        has_luac(),
+        "luac not available — run `cmake --build build --target sdk` (provides \
+         sdk/bin/blyt-luac) or set BLYT_LUAC\n\
+         This is the only coverage of the RV32 guest Lua runtime; it must not be skipped."
     );
 
     // ── Build the hello cart ───────────────────────────────────────────
@@ -299,11 +333,11 @@ void blyt_cart_draw(void)   { blyt_console_debug("draw"); }
     );
 
     // ── Build the line-framing cart (Gate 36, #291) ───────────────────
-    // C, so this gate never SKIPs on a missing Lua SDK. The two back-to-back
-    // calls in update() are the load-bearing case: adjacent calls are exactly
-    // what ran together into one unbroken line before bare metal framed its
-    // console output. Same source and same expected sequence as the host-leg
-    // half in tests/console_framing.rs — that identity is the contract.
+    // The two back-to-back calls in update() are the load-bearing case:
+    // adjacent calls are exactly what ran together into one unbroken line
+    // before bare metal framed its console output. Same source and same
+    // expected sequence as the host-leg half in tests/console_framing.rs —
+    // that identity is the contract.
     let line_framing_project = tmp.path().join("line_framing");
     write_c_cart_project(
         &line_framing_project,
@@ -349,10 +383,7 @@ void blyt_cart_draw(void)   { }
     );
 
     // ── Build Lua and hybrid carts (gates 7 & 8) ──────────────────────
-    let lua_sdk_native = sdk_dir().join("lib/native/libblyt32lua.so");
-    let have_lua_gate = lua_sdk_native.exists() && has_luac();
-
-    let lua_cart = if have_lua_gate {
+    let lua_cart = {
         let project = tmp.path().join("lua_metal");
         CartProject::new()
             .lua(
@@ -365,14 +396,12 @@ function draw() end
 "#,
             )
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // Gate 35 (#283): a Lua cart whose full ADR-0087 lifecycle is observable, so
     // bare metal can be checked against the host-Lua legs callback for callback.
-    let lifecycle_cart = if have_lua_gate {
+    let lifecycle_cart = {
         let project = tmp.path().join("lifecycle_metal");
         CartProject::new()
             .lua(
@@ -390,12 +419,10 @@ function cleanup() blyt32.debug.print("<lc:cleanup>") end
 "#,
             )
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
-    let hybrid_cart = if have_lua_gate {
+    let hybrid_cart = {
         let project = tmp.path().join("hybrid_metal");
         CartProject::new()
             .lib_file(
@@ -419,9 +446,7 @@ function draw() end
 "#,
             )
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // ── Build the init-budget hybrid cart (#278) ─────────────────────
@@ -430,7 +455,7 @@ function draw() end
     // the parity anchor: it reserves persistent in its ONE arena from frame 0, so
     // the init() fill sees only (16 - 8) MiB — the exact block count the host-Lua
     // legs must match. Same cart + figure as hostlua_hybrid's parity test (#278).
-    let init_budget_cart = if have_lua_gate {
+    let init_budget_cart = {
         let project = tmp.path().join("init_budget_metal");
         CartProject::new()
             .c(common::INIT_BUDGET_HYBRID_C)
@@ -438,9 +463,7 @@ function draw() end
             .asset_bytes("pers8.bin", &vec![0u8; common::INIT_BUDGET_PERSIST_BYTES])
             .persistent(&["pers8"])
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // ── Build the reverse-trampoline re-entrant hybrid cart (#262) ────
@@ -448,7 +471,7 @@ function draw() end
     // native half links the real in-machine libblyt32lua, so native->Lua->native
     // runs on the natural call stack (no exchange-thread pool).  Its `re:211`
     // must match what the host-Lua legs produce via the pool + CPU save/restore.
-    let reentrant_cart = if have_lua_gate {
+    let reentrant_cart = {
         let project = tmp.path().join("reentrant_metal");
         CartProject::new()
             .lib_file(
@@ -484,9 +507,7 @@ function draw() end
 "#,
             )
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // ── Build the non-FP parity carts (gate 33, #235 / Spike Z Q5) ────
@@ -495,24 +516,20 @@ function draw() end
     // native RV32 guest-lib path, must emit the same pinned golden digests
     // (NaN-boundary canonicalization + GC finalization order). Shared source /
     // goldens live in `common::nonfp`.
-    let nonfp_nan_cart = if have_lua_gate {
+    let nonfp_nan_cart = {
         let project = tmp.path().join("nonfp_nan");
         CartProject::new()
             .config(common::nonfp::NAN_CONFIG)
             .lua(common::nonfp::NAN_CART)
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
-    let nonfp_gc_cart = if have_lua_gate {
+    let nonfp_gc_cart = {
         let project = tmp.path().join("nonfp_gc");
         CartProject::new()
             .lua(common::nonfp::GC_CART)
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // ── Build the FP parity cart (gate 34, #223/#225, ADR-0136) ───────
@@ -521,14 +538,12 @@ function draw() end
     // native RV32 guest-lib softfloat — an independent softfloat implementation
     // that must reproduce the pinned golden. Shared source / golden live in
     // `common::fp`.
-    let fp_cart = if have_lua_gate {
+    let fp_cart = {
         let project = tmp.path().join("fp_parity");
         CartProject::new()
             .lua(common::fp::FP_PARITY_CART)
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // ── Build the gfx carts (gates 16 & 17, #188 / Spike X) ───────────
@@ -619,7 +634,7 @@ function draw() end
     // halves.  Both draw the SAME torture frame and must emit the SAME golden as
     // every emulated leg — on metal the whole cart shares one framebuffer, so
     // this is the low-risk single-buffer end of the #193 coherence proof.
-    let gfx_lua_cart = if have_lua_gate {
+    let gfx_lua_cart = {
         let project = tmp.path().join("gfx_lua");
         CartProject::new()
             .lua(&format!(
@@ -629,11 +644,9 @@ function draw() end
                 common::gfx::lua_draw_body(&common::gfx::torture_frame())
             ))
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
-    let gfx_hybrid_cart = if have_lua_gate {
+    let gfx_hybrid_cart = {
         // Native half draws the clear + rects + first pixel; Lua draws the rest.
         let ops = common::gfx::torture_frame();
         let (native_ops, lua_ops) = ops.split_at(8);
@@ -656,9 +669,7 @@ function draw() end
                 common::gfx::lua_draw_body(lua_ops)
             ))
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // ── Build the surface carts (gates 22–24, #205) ───────────────────
@@ -791,7 +802,7 @@ function draw() end
     // Lua off-screen surface cart (gate 25, #205): the native RV32 Lua VM →
     // blyt32.surface.* binding → native surface pool → framebuffer path.  Same
     // frame + golden as the C off-screen cart (surface_offscreen_golden).
-    let surface_lua_cart = if have_lua_gate {
+    let surface_lua_cart = {
         let mut draw = format!("  local s = blyt32.surface.create({SURF_SW}, {SURF_SH})\n");
         draw += &common::gfx::lua_surface_draw_body(&surf_ops, "s");
         draw += &format!("  blyt32.surface.clear(blyt32.surface.SCREEN, {surf_bg})\n");
@@ -804,9 +815,7 @@ function draw() end
                  function draw()\n{draw}end\n"
             ))
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // Hybrid cross-registry cart (gate 28, #210): the Lua half creates an
@@ -815,7 +824,7 @@ function draw() end
     // metal the whole cart shares ONE surface registry (already coherent), so
     // this anchors the WASM fast-path fix's golden on real hardware — the same
     // frame + golden as the C off-screen cart (gate 22).
-    let surface_hybrid_handle_cart = if have_lua_gate {
+    let surface_hybrid_handle_cart = {
         let mut draw = format!("  local s = blyt32.surface.create({SURF_SW}, {SURF_SH})\n");
         draw += &common::gfx::lua_surface_draw_body(&surf_ops, "s");
         draw += &format!("  blyt32.surface.clear(blyt32.surface.SCREEN, {surf_bg})\n");
@@ -841,9 +850,7 @@ function draw() end
                  function draw()\n{draw}end\n"
             ))
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // Lua tier-2 lock cart (gate 29, #208): the native RV32 Lua VM →
@@ -851,7 +858,7 @@ function draw() end
     // → the native surface pool's direct-pointer lock.  The torture frame drawn
     // under a screen lock must equal the tier-1 / C-tier-2 torture golden on
     // metal (surface_lock_golden), pinning the Lua per-pixel path bare-metal.
-    let surface_lua_lock_cart = if have_lua_gate {
+    let surface_lua_lock_cart = {
         let project = tmp.path().join("surface_lua_lock");
         CartProject::new()
             .lua(&format!(
@@ -865,9 +872,7 @@ function draw() end
                 )
             ))
             .write(&project);
-        Some(build_cart(&project))
-    } else {
-        None
+        build_cart(&project)
     };
 
     // ── Start QEMU ────────────────────────────────────────────────────
@@ -936,15 +941,13 @@ function draw() end
         }
     }
 
-    // Lua runtime library (optional; gates 7 & 8 are skipped when absent).
-    // libblyt32lua.so embeds the Lua VM and has DT_NEEDED: libblyt32.so only;
-    // no separate libblytcommonlua.so is needed at runtime.
-    if have_lua_gate {
-        assert!(
-            qemu.scp_to(&lua_sdk_native, "/tmp/blyt_gate/native/"),
-            "scp libblyt32lua.so failed"
-        );
-    }
+    // Lua runtime library.  libblyt32lua.so embeds the Lua VM and has
+    // DT_NEEDED: libblyt32.so only; no separate libblytcommonlua.so is needed
+    // at runtime.  Its presence was asserted with the other prerequisites (#312).
+    assert!(
+        qemu.scp_to(&lua_sdk_native, "/tmp/blyt_gate/native/"),
+        "scp libblyt32lua.so failed"
+    );
 
     // Carts.
     assert!(
@@ -955,54 +958,38 @@ function draw() end
         qemu.scp_to(&dirty_cart, "/tmp/blyt_gate/"),
         "scp dirty_frm.blyt failed"
     );
-    if let Some(ref cart) = lua_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp lua_metal.blyt failed"
-        );
-    }
-    if let Some(ref cart) = lifecycle_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp lifecycle_metal.blyt failed"
-        );
-    }
-    if let Some(ref cart) = hybrid_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp hybrid_metal.blyt failed"
-        );
-    }
-    if let Some(ref cart) = init_budget_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp init_budget_metal.blyt failed"
-        );
-    }
-    if let Some(ref cart) = reentrant_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp reentrant_metal.blyt failed"
-        );
-    }
-    if let Some(ref cart) = nonfp_nan_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp nonfp_nan.blyt failed"
-        );
-    }
-    if let Some(ref cart) = nonfp_gc_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp nonfp_gc.blyt failed"
-        );
-    }
-    if let Some(ref cart) = fp_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp fp_parity.blyt failed"
-        );
-    }
+    assert!(
+        qemu.scp_to(&lua_cart, "/tmp/blyt_gate/"),
+        "scp lua_metal.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&lifecycle_cart, "/tmp/blyt_gate/"),
+        "scp lifecycle_metal.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&hybrid_cart, "/tmp/blyt_gate/"),
+        "scp hybrid_metal.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&init_budget_cart, "/tmp/blyt_gate/"),
+        "scp init_budget_metal.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&reentrant_cart, "/tmp/blyt_gate/"),
+        "scp reentrant_metal.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&nonfp_nan_cart, "/tmp/blyt_gate/"),
+        "scp nonfp_nan.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&nonfp_gc_cart, "/tmp/blyt_gate/"),
+        "scp nonfp_gc.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&fp_cart, "/tmp/blyt_gate/"),
+        "scp fp_parity.blyt failed"
+    );
     assert!(
         qemu.scp_to(&gfx_torture_cart, "/tmp/blyt_gate/"),
         "scp gfx_torture.blyt failed"
@@ -1023,18 +1010,14 @@ function draw() end
         qemu.scp_to(&gfx_palette_custom_default_cart, "/tmp/blyt_gate/"),
         "scp gfx_palette_custom_default.blyt failed"
     );
-    if let Some(ref cart) = gfx_lua_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp gfx_lua.blyt failed"
-        );
-    }
-    if let Some(ref cart) = gfx_hybrid_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp gfx_hybrid.blyt failed"
-        );
-    }
+    assert!(
+        qemu.scp_to(&gfx_lua_cart, "/tmp/blyt_gate/"),
+        "scp gfx_lua.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&gfx_hybrid_cart, "/tmp/blyt_gate/"),
+        "scp gfx_hybrid.blyt failed"
+    );
     assert!(
         qemu.scp_to(&surface_offscreen_cart, "/tmp/blyt_gate/"),
         "scp surface_offscreen.blyt failed"
@@ -1047,24 +1030,18 @@ function draw() end
         qemu.scp_to(&surface_raw_cart, "/tmp/blyt_gate/"),
         "scp surface_raw.blyt failed"
     );
-    if let Some(ref cart) = surface_lua_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp surface_lua.blyt failed"
-        );
-    }
-    if let Some(ref cart) = surface_hybrid_handle_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp surface_hybrid_handle.blyt failed"
-        );
-    }
-    if let Some(ref cart) = surface_lua_lock_cart {
-        assert!(
-            qemu.scp_to(cart, "/tmp/blyt_gate/"),
-            "scp surface_lua_lock.blyt failed"
-        );
-    }
+    assert!(
+        qemu.scp_to(&surface_lua_cart, "/tmp/blyt_gate/"),
+        "scp surface_lua.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&surface_hybrid_handle_cart, "/tmp/blyt_gate/"),
+        "scp surface_hybrid_handle.blyt failed"
+    );
+    assert!(
+        qemu.scp_to(&surface_lua_lock_cart, "/tmp/blyt_gate/"),
+        "scp surface_lua_lock.blyt failed"
+    );
     assert!(
         qemu.scp_to(&surface_locked_blit_cart, "/tmp/blyt_gate/"),
         "scp surface_locked_blit.blyt failed"
@@ -1225,7 +1202,7 @@ function draw() end
     println!("  PASS: abort message present, exit 1");
 
     // ── Gate 7: pure Lua cart ─────────────────────────────────────────
-    if have_lua_gate {
+    {
         println!("Gate 7: pure Lua cart on metal...");
         let out = qemu.ssh(
             "/tmp/blyt_gate/blyt_native \
@@ -1243,12 +1220,10 @@ function draw() end
             "expected 'lua-metal-ok' in output\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
-    } else {
-        println!("Gate 7: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 8: hybrid Lua + C lib cart ──────────────────────────────
-    if have_lua_gate {
+    {
         println!("Gate 8: hybrid Lua+C cart on metal...");
         let out = qemu.ssh(
             "/tmp/blyt_gate/blyt_native \
@@ -1266,12 +1241,10 @@ function draw() end
             "expected 'lua+c metal ok' in output\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
-    } else {
-        println!("Gate 8: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 8b: reverse-trampoline re-entrant hybrid on metal (#262) ─
-    if let Some(ref _cart) = reentrant_cart {
+    {
         println!("Gate 8b: reverse-trampoline native->Lua->native on metal...");
         let out = qemu.ssh(
             "/tmp/blyt_gate/blyt_native \
@@ -1292,12 +1265,10 @@ function draw() end
             "expected 're:211' in output\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
-    } else {
-        println!("Gate 8b: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 8c: hybrid reserves persistent budget during init() (#278) ─
-    if let Some(ref _cart) = init_budget_cart {
+    {
         println!("Gate 8c: hybrid init() budget reservation on metal...");
         let out = qemu.ssh(
             "/tmp/blyt_gate/blyt_native \
@@ -1322,8 +1293,6 @@ function draw() end
             "expected {expected:?} in output\noutput: {output}"
         );
         println!("  PASS: output = {:?}", output.trim());
-    } else {
-        println!("Gate 8c: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 9: state buffer save/load round-trip on metal ───────────
@@ -2467,7 +2436,7 @@ void blyt_cart_draw(void) {}
     // VM (blyt32lua.c binding → native libblyt32 primitives → native framebuffer
     // → weak-hook hash).  Must emit the SAME golden as the C metal leg (gate 17)
     // and every emulated Lua leg.
-    if gfx_lua_cart.is_some() {
+    {
         println!("Gate 20: Lua gfx torture frame hashes to golden on metal...");
         let expected =
             common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
@@ -2488,8 +2457,6 @@ void blyt_cart_draw(void) {}
              the C and emulated legs (expected {expected:?}; #193)\noutput: {output}"
         );
         println!("  PASS: {expected}");
-    } else {
-        println!("Gate 20: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 21: hybrid gfx torture frame hashes to golden on metal (#193) ──
@@ -2499,7 +2466,7 @@ void blyt_cart_draw(void) {}
     // both halves' primitives compose into the same back buffer and must hash to
     // the single-buffer golden — the low-risk end of the #193 coherence proof
     // (its high-risk end is the wasm two-address-space cell in gfx.rs).
-    if gfx_hybrid_cart.is_some() {
+    {
         println!("Gate 21: hybrid gfx torture frame hashes to golden on metal...");
         let expected =
             common::gfx::expected_hash_line(&common::gfx::render(&common::gfx::torture_frame()));
@@ -2521,8 +2488,6 @@ void blyt_cart_draw(void) {}
              {expected:?}; #193)\noutput: {output}"
         );
         println!("  PASS: {expected}");
-    } else {
-        println!("Gate 21: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 22: off-screen surface draw + blit on metal (#205) ───────
@@ -2614,7 +2579,7 @@ void blyt_cart_draw(void) {}
     // blyt32.surface.* → blyt32lua.c binding → the native surface pool →
     // framebuffer.  Same frame + golden as the C off-screen cart (gate 22),
     // proving the Lua surface binding is pixel-identical to C on metal too.
-    if surface_lua_cart.is_some() {
+    {
         println!("Gate 25: Lua off-screen surface draw + blit on metal...");
         let out = qemu.ssh(
             "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
@@ -2634,8 +2599,6 @@ void blyt_cart_draw(void) {}
              {surface_offscreen_golden:?}; #205)\noutput: {output}"
         );
         println!("  PASS: {surface_offscreen_golden}");
-    } else {
-        println!("Gate 25: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 26: blit reading a locked surface as src is rejected (#207) ──
@@ -2702,7 +2665,7 @@ void blyt_cart_draw(void) {}
     // share one registry, so the handle resolves and the pattern lands — the same
     // golden as the C off-screen cart (gate 22).  This anchors the golden the
     // WASM fast-path fix must match on real hardware.
-    if surface_hybrid_handle_cart.is_some() {
+    {
         println!("Gate 28: cross-registry hybrid (Lua surface, C blit) on metal...");
         let out = qemu.ssh(
             "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
@@ -2722,8 +2685,6 @@ void blyt_cart_draw(void) {}
              legs (expected {surface_offscreen_golden:?}; #210)\noutput: {output}"
         );
         println!("  PASS: {surface_offscreen_golden}");
-    } else {
-        println!("Gate 28: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 29: blyt_gfx_palette_set on metal (#201/#199/#204) ────────
@@ -2858,7 +2819,7 @@ void blyt_cart_draw(void) {}
     // pool's direct-pointer lock.  The torture frame drawn under a screen lock
     // must equal the tier-1 / C-tier-2 torture golden on metal, proving the Lua
     // per-pixel path is pixel-identical to C on hardware too.
-    if surface_lua_lock_cart.is_some() {
+    {
         println!("Gate 32: Lua tier-2 lock (acquire/set/release) on metal...");
         let out = qemu.ssh(
             "BLYT_FRAME_HASH=1 /tmp/blyt_gate/blyt_native \
@@ -2878,8 +2839,6 @@ void blyt_cart_draw(void) {}
              {surface_lock_golden:?}; #208)\noutput: {output}"
         );
         println!("  PASS: {surface_lock_golden}");
-    } else {
-        println!("Gate 32: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 33: non-FP determinism parity on metal (#235 / Spike Z Q5) ──
@@ -2887,7 +2846,7 @@ void blyt_cart_draw(void) {}
     // `nonfp_parity.rs` runs on the host-Lua legs must emit the same pinned
     // golden digests through the native RV32 guest-lib path — closing the
     // ADR-0136 reference model (host-Lua legs + golden + QEMU native gate).
-    if nonfp_nan_cart.is_some() {
+    {
         println!("Gate 33a: non-FP NaN-boundary canonicalization on metal...");
         let out = qemu.ssh(
             "/tmp/blyt_gate/blyt_native \
@@ -2913,10 +2872,8 @@ void blyt_cart_draw(void) {}
             common::nonfp::NAN_CANON_LINE
         );
         println!("  PASS: {}", common::nonfp::NAN_DIGEST);
-    } else {
-        println!("Gate 33a: SKIP (libblyt32lua.so not available or luac not found)");
     }
-    if nonfp_gc_cart.is_some() {
+    {
         println!("Gate 33b: non-FP GC finalization order on metal...");
         let out = qemu.ssh(
             "/tmp/blyt_gate/blyt_native \
@@ -2936,8 +2893,6 @@ void blyt_cart_draw(void) {}
             common::nonfp::GC_DIGEST
         );
         println!("  PASS: {}", common::nonfp::GC_DIGEST);
-    } else {
-        println!("Gate 33b: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 34: FP determinism parity on metal (#223/#225, ADR-0136) ──
@@ -2949,7 +2904,7 @@ void blyt_cart_draw(void) {}
     // legs would leave FP with strictly less cross-implementation coverage than the
     // non-FP matrix (Gate 33). Closes the ADR-0136 FP model (host-Lua legs +
     // golden + contraction-torture + this QEMU gate).
-    if fp_cart.is_some() {
+    {
         println!("Gate 34: FP transcendental/number-format parity on metal...");
         let out = qemu.ssh(
             "/tmp/blyt_gate/blyt_native \
@@ -2969,8 +2924,6 @@ void blyt_cart_draw(void) {}
             common::fp::FP_PARITY_DIGEST
         );
         println!("  PASS: {}", common::fp::FP_PARITY_DIGEST);
-    } else {
-        println!("Gate 34: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 35: Lua cart lifecycle tail on metal (#283) ──────────────
@@ -2989,7 +2942,7 @@ void blyt_cart_draw(void) {}
     // the anchor-side half of the fix, asserting the exact marker sequence so a
     // regression that drops or repeats a callback fails rather than passing on a
     // substring.
-    if lifecycle_cart.is_some() {
+    {
         println!("Gate 35: Lua lifecycle on_quit/cleanup on metal...");
         let out = qemu.ssh(
             "/tmp/blyt_gate/blyt_native \
@@ -3010,8 +2963,6 @@ void blyt_cart_draw(void) {}
              (ADR-0087 order, #283)\noutput: {output}"
         );
         println!("  PASS: {markers:?}");
-    } else {
-        println!("Gate 35: SKIP (libblyt32lua.so not available or luac not found)");
     }
 
     // ── Gate 36: console_debug line framing on metal (#291) ───────────
