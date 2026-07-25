@@ -225,6 +225,13 @@ fn native_riscv_qemu_gate() {
     }
 
     // ── Prerequisites ──────────────────────────────────────────────────
+    //
+    // Every one of these is a HARD failure, never a skip (#312).  This gate is
+    // the only automated coverage of the RISC-V bare-metal path — a missing
+    // image or a missing qemu used to make all 36 gates vanish behind a green
+    // run, which is precisely the silent-coverage-loss the per-gate Lua skips
+    // caused at a finer grain.  BLYT_SKIP_QEMU_GATE above is the one sanctioned
+    // opt-out: deliberate, explicit, and visible in the run log.
 
     let kernel = std::env::var("BLYT_QEMU_KERNEL")
         .map(PathBuf::from)
@@ -241,28 +248,32 @@ fn native_riscv_qemu_gate() {
         ("rootfs", &rootfs),
         ("ssh key", &ssh_key),
     ] {
-        if !path.exists() {
-            eprintln!(
-                "native_riscv_qemu_gate: {label} not found ({}) — skip",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.exists(),
+            "QEMU {label} not found ({}) — \
+             run: cmake --build build --target fetch_qemu_images\n\
+             (override the location with BLYT_QEMU_KERNEL / BLYT_QEMU_ROOTFS / \
+             BLYT_QEMU_SSH_KEY, or set BLYT_SKIP_QEMU_GATE=1 to opt out \
+             explicitly, as the Linux Docker leg does)",
+            path.display()
+        );
     }
 
-    if Command::new("qemu-system-riscv64")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("native_riscv_qemu_gate: qemu-system-riscv64 not found — skip");
-        return;
-    }
+    assert!(
+        Command::new("qemu-system-riscv64")
+            .arg("--version")
+            .output()
+            .is_ok(),
+        "qemu-system-riscv64 not found — install QEMU (macOS: brew install qemu; \
+         Debian/Ubuntu: apt install qemu-system-misc)\n\
+         (or set BLYT_SKIP_QEMU_GATE=1 to opt out explicitly)"
+    );
 
-    if !Command::new("ssh").arg("-V").output().is_ok() {
-        eprintln!("native_riscv_qemu_gate: ssh not found — skip");
-        return;
-    }
+    assert!(
+        Command::new("ssh").arg("-V").output().is_ok(),
+        "ssh not found — install an OpenSSH client\n\
+         (or set BLYT_SKIP_QEMU_GATE=1 to opt out explicitly)"
+    );
 
     let native_dir = sdk_dir().join("lib/native");
     assert!(
