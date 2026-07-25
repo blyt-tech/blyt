@@ -28,23 +28,31 @@
 //! (probed `cart_allocations`/`filled` figures, #250/#276/#278/#280) is already
 //! exact via `assert_eq!` and stays as-is.
 //!
-//! NOTE (coverage gap worth closing): these tests pin marker sequences and heap
-//! numbers, not FRAME HASHES. The three latent hybrid gfx/surface defects the
-//! ADR-0136 flip exposed (#193/#207/#210 unification never ported to the native
-//! runner) were all caught by `gfx.rs`/`surfaces.rs` via
-//! `run_cart_all_legs_frame_hash_exact`, not here.
+//! The matrix also has a PIXEL leg (S7, #314). Marker sequences and heap numbers
+//! are blind to what the cart actually rendered: a hybrid can emit a perfect
+//! marker sequence and byte-exact heap figures while drawing a completely wrong
+//! frame. That is not hypothetical — the three latent hybrid gfx/surface defects
+//! the ADR-0136 flip exposed (#193/#207/#210, the coherence slice never ported
+//! from wasm to the native runner) were caught by `gfx.rs`/`surfaces.rs` via
+//! `run_cart_all_legs_frame_hash_exact` and by NOTHING here. Those suites remain
+//! the per-mechanism detail coverage (one cart per mechanism, isolating it);
+//! [`hostlua_hybrid_both_halves_pixel_output_frame_hash_parity`] is this matrix's
+//! own single-frame composite, so a hybrid's cart-visible framebuffer (ADR-0007)
+//! is pinned here alongside its markers and heap.
 //!
 //! Slices land incrementally: S1 typed export, S2 raw/bridged export, S3 state
 //! buffers + save/restore + reset-every-frame, S4 native-lifecycle, S5 libretro
-//! + C++ + Rust bridged + the actual hello-lua-c / hello-lua-rust examples.
+//! + C++ + Rust bridged + the actual hello-lua-c / hello-lua-rust examples,
+//! S6 reverse-trampoline (#262), S7 the pixel leg (#314).
 
 mod common;
 
+use common::gfx;
 use common::{
     CartProject, assert_markers_exact, build_lua_cart, capture_cart_libretro, capture_cart_native,
     capture_cart_wasm, require_cpp_sdk, require_libretro_core, require_lua_sdk,
     require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs_exact,
-    run_cart_all_legs_exact_reset_every_frame,
+    run_cart_all_legs_exact_reset_every_frame, run_cart_all_legs_frame_hash_exact,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -1392,4 +1400,189 @@ function draw() end
          libretro-host-Lua (#276): native=(cache={n_cache},listed={n_listed},loaded={n_loaded}) \
          libretro=(cache={l_cache},listed={l_listed},loaded={l_loaded})\nnative:\n{native}\nlibretro:\n{libretro}"
     );
+}
+
+// -------------------------------------------------------------------------
+// S7 — the PIXEL leg (#314)
+// -------------------------------------------------------------------------
+
+/// S7 — the matrix's PIXEL leg (#314). A hybrid's framebuffer is cart-visible
+/// output and bit-identical behaviour across every leg is the core contract
+/// (ADR-0007), yet every other assertion in this file is a marker sequence or a
+/// heap integer — both blind to what was actually rendered. Item 9 (#311) proved
+/// that blind spot has teeth: flipping hybrids to host-Lua surfaced three latent
+/// defects, each of them a WRONG FRAME accompanied by perfectly correct markers
+/// and perfectly correct heap figures, and each caught by `gfx.rs`/`surfaces.rs`
+/// rather than by the suite dedicated to hybrids.
+///
+/// One composite hybrid cart, one frame, three spatially DISJOINT contributions
+/// — one per defect class — so the single golden hash guards all three jointly
+/// and a regression says *which* region moved instead of just "the hash changed":
+///
+/// 1. **#193 — the native half's framebuffer must reach the presented frame.**
+///    The native half (rv32-emulated behind the ADR-0130 bridge) fills a rect via
+///    the `blyt_gfx_*` ECALLs, which lands in `session->pixels[]`. The runner
+///    rasterized, presented, and hashed `hl->fb` unconditionally, so that rect
+///    was silently dropped; `hl_gfx_fb()` routing to the session when one exists
+///    is the fix. Undo it and the rect vanishes from this frame.
+/// 2. **#210 — both halves must share ONE surface registry.** The Lua half
+///    creates an *off-screen* surface, draws a pattern into it, and passes the
+///    handle across the bridge to a C export that blits it onto the screen. With
+///    the Lua half on the runner-local `hl->surf` pool the handle resolves to a
+///    different (or invalid) slot in the native half and the pattern never lands.
+/// 3. **#207 — the tier-2 exclusive lock must be seen across halves.** While the
+///    Lua half holds a lock on the SCREEN, a tier-1 op the native half issues on
+///    the screen must be REJECTED. The golden is the frame WITHOUT that op, so a
+///    lock that does not cross halves lets it land and diverges.
+///
+/// `gfx.rs`/`surfaces.rs` keep the per-mechanism carts that isolate each defect;
+/// this is the composite, and it lives HERE so the hybrid matrix itself is not
+/// pixel-blind. The three `assert_ne!`s below are the anti-#98 guard: they prove
+/// each contribution actually moves the hash, so a green cannot be vacuous.
+///
+/// TEETH, VERIFIED BY ABLATION (not assumed): each of the three #311 fixes was
+/// undone in `cart_run_hostlua.c` in turn and this test went RED for every one,
+/// each with a DIFFERENT wrong native hash (`hl_gfx_fb` → `hl->fb`;
+/// `l_surface_create`/`hl_resolve_target` → the local pool; `l_surface_acquire`
+/// → the local slot). It fails as a cross-leg divergence — the defects are
+/// native-runner-only, so wasm stays on the golden and the native leg moves off
+/// it, which is exactly the shape `run_cart_all_legs_frame_hash_exact` is built
+/// to catch and a per-leg substring check is not.
+#[test]
+fn hostlua_hybrid_both_halves_pixel_output_frame_hash_parity() {
+    require_sdk();
+    require_lua_sdk();
+    require_wasm();
+    require_libretro_core();
+
+    let bg = 3u8;
+    // (1) #193 — filled by the native half through the gfx ECALLs.
+    let (nx, ny, nw, nh, nc) = (200i32, 20i32, 60i32, 40i32, 12u8);
+    // (2) #210 — a Lua-created off-screen surface, blitted by the native half.
+    let (sw, sh, bx, by) = (120i32, 80i32, 40i32, 30i32);
+    let surf_ops = [
+        gfx::Op::Clear(5),
+        gfx::Op::Rect(10, 10, 40, 20, 7),
+        gfx::Op::Line(0, 0, 119, 79, 9),
+        gfx::Op::Pixel(60, 40, 11),
+    ];
+    // (3) #207 — issued by the native half while the Lua half holds the screen
+    // lock. Must be rejected, so it is deliberately absent from the golden.
+    let (rx, ry, rw, rh, rc) = (100i32, 180i32, 40i32, 30i32, 8u8);
+    // Drawn by the Lua half under that same lock (in-lock tier-2 primitives).
+    let lock_ops = [
+        gfx::Op::Rect(240, 150, 50, 30, 14),
+        gfx::Op::Pixel(5, 5, 15),
+    ];
+
+    let c_src = format!(
+        r#"#include "blyt.h"
+/* (1) #193 — the native half draws through the gfx ECALLs, i.e. into the
+ * session's canonical framebuffer. Unless the runner's framebuffer IS that
+ * buffer, this rect never reaches present and is silently dropped. */
+BLYT_LUA_EXPORT_VOID(native_gfx_rect) {{
+  blyt_gfx_rect_fill({nx}, {ny}, {nw}, {nh}, {nc});
+}}
+/* (2) #210 — blit a surface the LUA half created. The handle crosses the bridge
+ * as a scalar (a SURFACE handle keeps bit 31 clear, so it round-trips through
+ * the i32 arg unchanged) and must resolve to the SAME slot in this half. */
+BLYT_LUA_EXPORT_I32(blit_surf_to_screen, int32_t surf) {{
+  blyt_surface_blit(BLYT_SCREEN, (blyt_surface_h)(uint32_t)surf, {bx}, {by});
+  return 0;
+}}
+/* (3) #207 — issued while the Lua half holds a tier-2 lock on the SCREEN. The
+ * lock is exclusive, so this op must be REJECTED across the half boundary. */
+BLYT_LUA_EXPORT_VOID(native_rect_while_screen_locked) {{
+  blyt_surface_rect_fill(BLYT_SCREEN, {rx}, {ry}, {rw}, {rh}, {rc});
+}}
+"#
+    );
+
+    // The Lua half's screen-lock section, with the native half's (rejected) op
+    // issued from INSIDE the lock — the cross-half case `lua_lock_draw_body`
+    // cannot emit, so it is spelled out here from the same `lock_ops`.
+    let mut lock_src = String::from("  local lk = blyt32.surface.acquire(blyt32.surface.SCREEN)\n");
+    for op in &lock_ops {
+        lock_src += &match *op {
+            gfx::Op::Rect(x, y, w, h, c) => format!("  lk:rect_fill({x}, {y}, {w}, {h}, {c})\n"),
+            gfx::Op::Pixel(x, y, c) => format!("  lk:set({x}, {y}, {c})\n"),
+            gfx::Op::Clear(c) => format!("  lk:clear({c})\n"),
+            gfx::Op::Line(x0, y0, x1, y1, c) => {
+                format!("  lk:line({x0}, {y0}, {x1}, {y1}, {c})\n")
+            }
+        };
+    }
+    lock_src += "  native_rect_while_screen_locked()\n";
+    lock_src += "  lk:release()\n";
+
+    let lua_src = format!(
+        "function init() end\n\
+         function update() blyt.quit() end\n\
+         function draw()\n\
+         \x20 blyt32.gfx.clear({bg})\n\
+         \x20 native_gfx_rect()\n\
+         {lock_src}\
+         \x20 local surf = blyt32.surface.create({sw}, {sh})\n\
+         {surf_src}\
+         \x20 blit_surf_to_screen(surf)\n\
+         end\n",
+        surf_src = gfx::lua_surface_draw_body(&surf_ops, "surf"),
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("hostlua_hybrid_pixels");
+    CartProject::new().c(&c_src).lua(&lua_src).write(&project);
+    let cart = build_lua_cart(&project);
+
+    // Golden: the screen ops in cart order, then the off-screen blit on top —
+    // the blit is issued last by the cart, so it composes last here too.
+    let src = gfx::render_dims(&surf_ops, sw as usize, sh as usize);
+    let compose = |ops: &[gfx::Op], with_blit: bool| -> String {
+        let mut fb = gfx::render(ops);
+        if with_blit {
+            gfx::blit(
+                &mut fb,
+                gfx::FRAME_W,
+                gfx::FRAME_H,
+                &src,
+                sw as usize,
+                sh as usize,
+                bx,
+                by,
+            );
+        }
+        gfx::expected_hash_line(&fb)
+    };
+
+    let mut screen_ops = vec![gfx::Op::Clear(bg), gfx::Op::Rect(nx, ny, nw, nh, nc)];
+    screen_ops.extend_from_slice(&lock_ops);
+    let expected = compose(&screen_ops, true);
+
+    // Anti-#98: each of the three contributions must be OBSERVABLE in the hash,
+    // or a leg that lost one would still be green. Cheap arithmetic on the
+    // reference rasterizer — no cart run — proving the golden discriminates.
+    let without_native_rect: Vec<gfx::Op> = std::iter::once(gfx::Op::Clear(bg))
+        .chain(lock_ops.iter().copied())
+        .collect();
+    assert_ne!(
+        expected,
+        compose(&without_native_rect, true),
+        "#193 guard is vacuous: dropping the native half's gfx rect leaves the frame hash unchanged"
+    );
+    assert_ne!(
+        expected,
+        compose(&screen_ops, false),
+        "#210 guard is vacuous: dropping the native half's blit of the Lua-created \
+         off-screen surface leaves the frame hash unchanged"
+    );
+    let mut with_leaked_op = screen_ops.clone();
+    with_leaked_op.push(gfx::Op::Rect(rx, ry, rw, rh, rc));
+    assert_ne!(
+        expected,
+        compose(&with_leaked_op, true),
+        "#207 guard is vacuous: the op that must be rejected across halves leaves \
+         the frame hash unchanged even when it lands"
+    );
+
+    run_cart_all_legs_frame_hash_exact(&cart, &expected);
 }

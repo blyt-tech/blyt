@@ -10,6 +10,12 @@
 //! (`common::gfx`): the same logical frame drawn into a surface must hash
 //! bit-identically on every leg and equal the reference rasterizer's output,
 //! whether reached via gfx.* sugar or the surface API.
+//!
+//! The hybrid tests here are the PER-MECHANISM carts: one cart per defect class,
+//! isolating it. `hostlua_hybrid.rs`'s S7 pixel leg (#314) is the composite that
+//! folds them into one frame, so the hybrid parity matrix itself is not
+//! pixel-blind — it caught none of the three defects the ADR-0136 flip exposed
+//! (#193/#207/#210), which these suites did.
 
 mod common;
 
