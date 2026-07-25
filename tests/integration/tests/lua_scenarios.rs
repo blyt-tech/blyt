@@ -1,8 +1,12 @@
-//! Native host-Lua path scenario parity (#238, epic #230, ADR-0136).
+//! Pure-Lua cart scenario parity (#238/#259, epic #230, ADR-0136).
 //!
-//! A pure-Lua cart runs on the native host-Lua VM by default on every non-RISC-V
-//! host (ADR-0136; #236 retired the emulated RV32 Lua VM as a shipped path). These
-//! tests pin the cart-visible output of the surface a pure-Lua cart reaches —
+//! A pure-Lua cart runs on the native host-Lua VM on every non-RISC-V host — there
+//! is no longer a second Lua execution model to select between (ADR-0136 retired
+//! the emulated RV32 Lua VM as a shipped path, and the `BLYT_HOSTLUA` opt-in that
+//! chose between them is gone). This suite was named `hostlua.rs` when its premise
+//! was "opt-in host-Lua == emulated == wasm"; that comparison no longer exists, so
+//! it is simply the pure-Lua *scenario* suite (#259). These tests pin the
+//! cart-visible output of the surface a pure-Lua cart reaches —
 //! output/termination, state buffers + the `S` proxy + `save_write`/`save_read`,
 //! entity refs, f64 fields (#253), and the reset-every-frame save/clear/restore
 //! cycle — asserting the SAME `expected` on all three host-Lua legs (blytplay,

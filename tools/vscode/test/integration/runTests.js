@@ -39,18 +39,14 @@ const VSCODE_VERSION = '1.125.1';
  * `name` (optional) is the display + throwaway-workspace key; it defaults to
  * `dir` and only needs setting when two entries share a dir (so their
  * workspaces don't collide).  `env` (optional) is merged into extensionTestsEnv
- * for that window — used to select a runtime variant of the SAME cart+spec, e.g.
- * BLYT_HOSTLUA=1 runs the pure-Lua debug flow through the native host-Lua VM
- * (#234) instead of the emulated rv32 Lua VM, asserting identical debugger
- * behaviour across both. */
+ * for that window — used to select a runtime variant of the SAME cart+spec.
+ *
+ * The `hello` cart ran twice until ADR-0136's end-state landed: once emulated and
+ * once with BLYT_HOSTLUA=1 on the native host-Lua VM. Both now take the same path
+ * (a Lua-bearing cart is always host-Lua on a non-RISC-V host), so the second
+ * entry was an exact duplicate and is gone. */
 const CARTS = [
 	{ dir: 'hello', spec: 'lua.test.js' },
-	{
-		dir: 'hello',
-		spec: 'lua.test.js',
-		name: 'hello-hostlua',
-		env: { BLYT_HOSTLUA: '1' },
-	},
 	{ dir: 'hello-c', spec: 'c.test.js' },
 	{ dir: 'hello-c', spec: 'wasm.test.js' },
 	{ dir: 'hello-lua-c', spec: 'hybrid.test.js' },
@@ -112,7 +108,7 @@ async function main() {
 		 * build --debug; the extension rebuilds incrementally in-session.  The
 		 * workspace folder keeps its example basename (`dir`) — the specs look it
 		 * up by name via h.folder(dir) — under a per-entry parent (`key`) so two
-		 * entries sharing a dir (e.g. the emulated + host-Lua `hello` legs) get
+		 * entries sharing a dir (e.g. `hello-c`'s native + wasm specs) get
 		 * distinct workspaces. */
 		const src = path.join(repoRoot, 'examples', dir);
 		const workspace = path.join(tmpRoot, key, dir);
@@ -180,8 +176,8 @@ async function main() {
 					BLYT_IT_SPEC: spec,
 					BLYT_IT_GREP: process.env.BLYT_IT_GREP || '',
 					BLYT_IT_DIAG_FILE: diagFile,
-					/* Per-entry overrides (e.g. BLYT_HOSTLUA=1); the extension's
-					 * spawned blytdebug inherits the extension-host env. */
+					/* Per-entry `env` overrides; the extension's spawned
+					 * blytdebug inherits the extension-host env. */
 					...(cartEnv || {}),
 				},
 			});

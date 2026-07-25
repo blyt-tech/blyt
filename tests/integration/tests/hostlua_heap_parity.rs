@@ -534,7 +534,7 @@ function draw() end
 
     let cart = build_lua_cart(&project);
     let wasm = heap_used(&capture_cart_wasm(&cart, &[]));
-    let hostlua = heap_used(&capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]));
+    let hostlua = heap_used(&capture_cart_native(&cart, &[]));
     assert_eq!(
         hostlua,
         wasm,

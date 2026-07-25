@@ -375,73 +375,6 @@ function draw()   end\n";
     cmd.assert().success();
 }
 
-/// SDL2 hybrid on the NATIVE HOST-LUA path (#251): identical scenario to
-/// `sdl_hybrid_gdb_and_dap`, but the hybrid opts into host-Lua (`--host-lua`), so
-/// the Lua half runs on the host VM (host-Lua DAP, #234) while the native C half
-/// runs in the rv32 session with the GDB stub attached to it.  Two debuggers, one
-/// hybrid: the DAP steps the Lua half and the GDB breakpoint fires inside the
-/// native `blyt_native_work` — proving native-half GDB coexists with the host-Lua
-/// DAP.  This is the case that must reach parity before hybrids can default to
-/// host-Lua (epic item 9).
-///
-/// Requires: blytdebug built with BLYT_DAP=ON and BLYT_GDB=ON, Lua SDK, `readelf`.
-#[test]
-fn sdl_hybrid_gdb_and_dap_hostlua() {
-    require_sdk();
-    require_lua_sdk();
-    require_gdb();
-
-    let tmp = TempDir::new().unwrap();
-    let project = tmp.path().join("hybrid_gdb_dap_hostlua");
-
-    // Same hybrid cart shape as the emulated leg: a C export debuggable via GDB and
-    // a Lua half debuggable via DAP.
-    const C_SOURCE: &str = r#"
-#include "blyt.h"
-
-BLYT_LUA_EXPORT_VOID(blyt_native_work) {
-    volatile int x = 42;
-    volatile int y = x + 1;
-    (void)y;
-}
-"#;
-
-    const LUA_SOURCE: &str = "\
-function init()\n\
-    local _ = 0\n\
-    blyt_native_work()\n\
-    local done = true\n\
-    blyt.quit()\n\
-end\n\
-\n\
-function update() end\n\
-function draw()   end\n";
-
-    CartProject::new()
-        .c(C_SOURCE)
-        .lua(LUA_SOURCE)
-        .write(&project);
-
-    let cart = build_debug_lua_cart(&project);
-    assert!(cart.exists(), "cart not found at {}", cart.display());
-
-    let addr = require_symbol_addr(&cart, "blyt_native_work");
-
-    let orchestrator = repo_root().join("tests/gdb/run_sdl_hybrid_test.mjs");
-    let mut cmd = Command::new("node");
-    cmd.args([
-        orchestrator.to_str().unwrap(),
-        blytdebug().to_str().unwrap(),
-        cart.to_str().unwrap(),
-    ]);
-
-    cmd.env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"));
-    // Opt the hybrid onto the host-Lua path (the orchestrator adds --host-lua).
-    cmd.env("BLYT_HOSTLUA", "1");
-
-    cmd.assert().success();
-}
-
 /// SDL2 hybrid on the native host-Lua path, GDB-ONLY (#251, no DAP): a breakpoint
 /// in the native half fires with only the GDB stub attached — no Lua DAP session.
 /// Exercises the GDB-only boot-deferral path: with no DAP configurationDone to gate
@@ -485,7 +418,6 @@ fn sdl_hybrid_gdb_only_hostlua() {
             cart.to_str().unwrap(),
         ])
         .env("BLYT_GDB_BREAK_ADDR", format!("{addr:x}"))
-        .env("BLYT_HOSTLUA", "1")
         .assert()
         .success();
 }
@@ -538,7 +470,6 @@ fn sdl_hybrid_gdb_interrupt_hostlua() {
             blytdebug().to_str().unwrap(),
             cart.to_str().unwrap(),
         ])
-        .env("BLYT_HOSTLUA", "1")
         .assert()
         .success();
 }
