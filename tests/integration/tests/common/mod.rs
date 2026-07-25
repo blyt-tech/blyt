@@ -1819,9 +1819,8 @@ pub fn capture_cart_wasm(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> 
 
 /// Run a cart through the embedded libretro core with extra env and return its
 /// full output — the libretro companion to [`capture_cart_native`] /
-/// [`capture_cart_wasm`] for cross-leg value comparison (e.g. the host-Lua leg
-/// via `BLYT_HOSTLUA=1`). The embedded core logs to stderr, so that is what is
-/// captured.
+/// [`capture_cart_wasm`] for cross-leg value comparison. The embedded core logs
+/// to stderr, so that is what is captured.
 pub fn capture_cart_libretro(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
     use assert_cmd::Command;
     let mut cmd = Command::new(test_libretro_core());
@@ -1835,9 +1834,8 @@ pub fn capture_cart_libretro(cart: &std::path::Path, extra_env: &[(&str, &str)])
 }
 
 /// Like [`capture_cart_native`], but also passes blytplay flags — for probes that
-/// need a run-mode knob (`--reset-every-frame`) *and* an env selector
-/// (`BLYT_HOSTLUA=1`) at once, and parse a printed value rather than assert a
-/// fixed line (#280).
+/// need a run-mode knob (`--reset-every-frame`) and parse a printed value rather
+/// than assert a fixed line (#280).
 pub fn capture_cart_native_with_flags(
     cart: &std::path::Path,
     extra_flags: &[&str],
@@ -2043,36 +2041,6 @@ pub fn run_cart_libretro_with_env(
         String::from_utf8_lossy(&output).contains(expected),
         "expected {:?} in libretro core output, got: {}",
         expected,
-        String::from_utf8_lossy(&output)
-    );
-}
-
-/// Run a cart through the embedded libretro core with BOTH driver flags (e.g.
-/// `--run-frames N`, `--reset-every-frame`) AND extra process environment; assert
-/// `expected` appears in the output. For a leg that needs a frame cap (a
-/// never-quitting cart) plus custom env in one invocation.
-pub fn run_cart_libretro_with_env_and_flags(
-    cart: &std::path::Path,
-    extra_env: &[(&str, &str)],
-    flags: &[&str],
-    expected: &str,
-) {
-    use assert_cmd::Command;
-    let mut cmd = Command::new(test_libretro_core());
-    for f in flags {
-        cmd.arg(f);
-    }
-    cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    let output = cmd.assert().success().get_output().stderr.clone();
-    assert!(
-        String::from_utf8_lossy(&output).contains(expected),
-        "expected {:?} in libretro core output (env={:?} flags={:?}), got: {}",
-        expected,
-        extra_env,
-        flags,
         String::from_utf8_lossy(&output)
     );
 }
@@ -2358,101 +2326,6 @@ pub fn run_cart_all_legs_exact(cart: &std::path::Path, tag: &str, expected: &[&s
     assert_markers_exact("native", &capture_cart_native(cart, &[]), tag, expected);
     assert_markers_exact("wasm", &capture_cart_wasm(cart, &[]), tag, expected);
     assert_markers_exact("libretro", &capture_cart_libretro(cart, &[]), tag, expected);
-}
-
-/// The **five-leg hybrid** counterpart to [`run_cart_all_legs_exact`] (#299): the
-/// exact-sequence guard for hybrid carts (Lua half + native C/Rust half), which
-/// split across TWO backends and so run a wider matrix than the single-model
-/// pure-Lua legs. Each leg's full `<{tag}:…>` marker sequence must equal
-/// `expected` exactly, so — every leg being identical to the same `expected` —
-/// all five are identical to each other (same payloads, order, count):
-///   * emulated native      (`blytplay`, rv32emu, `libblyt32lua.so`),
-///   * native host-Lua      (`blytplay` + `BLYT_HOSTLUA=1`),
-///   * WASM host-Lua        (the node `run_cart.js` driver),
-///   * libretro emulated    (embedded `libblyt32lua.so`), and
-///   * libretro host-Lua    (embedded bridge stub + `BLYT_HOSTLUA=1`).
-///
-/// The pre-#299 hybrid tests asserted only that one substring *appeared* on each
-/// leg independently, so a leg emitting extra, repeated, or reordered output
-/// still passed — the anti-#98/#283 blind spot that let #240's dozen ungated
-/// `libblyt32lua.so` breadcrumbs (emitted only on the two emulated legs) slip by.
-/// An exact five-way sequence compare closes it. The emulated legs stay in the
-/// matrix because `libblyt32lua.so` remains live post-flip (hybrid native half +
-/// real RISC-V), so a divergence there is a real determinism bug (ADR-0007).
-pub fn run_cart_hybrid_all_legs_exact(cart: &std::path::Path, tag: &str, expected: &[&str]) {
-    assert_markers_exact(
-        "emulated-native",
-        &capture_cart_native(cart, &[]),
-        tag,
-        expected,
-    );
-    assert_markers_exact(
-        "native-host-lua",
-        &capture_cart_native(cart, &[("BLYT_HOSTLUA", "1")]),
-        tag,
-        expected,
-    );
-    assert_markers_exact(
-        "wasm-host-lua",
-        &capture_cart_wasm(cart, &[]),
-        tag,
-        expected,
-    );
-    assert_markers_exact(
-        "libretro-emulated",
-        &capture_cart_libretro(cart, &[]),
-        tag,
-        expected,
-    );
-    assert_markers_exact(
-        "libretro-host-lua",
-        &capture_cart_libretro(cart, &[("BLYT_HOSTLUA", "1")]),
-        tag,
-        expected,
-    );
-}
-
-/// [`run_cart_hybrid_all_legs_exact`] under each leg's `--reset-every-frame`
-/// save/restore stress cycle (#299), translating the per-leg knob exactly as
-/// [`run_cart_all_legs_exact_reset_every_frame`] does (blytplay flag /
-/// `BLYT_RESET_EVERY_FRAME` env / driver flag). The host-Lua legs rebuild the Lua
-/// VM each cycle; the emulated legs zero guest BSS and re-run init(); every leg
-/// must still emit the identical marker sequence. The cart must terminate itself.
-pub fn run_cart_hybrid_all_legs_exact_reset_every_frame(
-    cart: &std::path::Path,
-    tag: &str,
-    expected: &[&str],
-) {
-    assert_markers_exact(
-        "emulated-native",
-        &capture_cart_native_with_flags(cart, &["--reset-every-frame"], &[]),
-        tag,
-        expected,
-    );
-    assert_markers_exact(
-        "native-host-lua",
-        &capture_cart_native_with_flags(cart, &["--reset-every-frame"], &[("BLYT_HOSTLUA", "1")]),
-        tag,
-        expected,
-    );
-    assert_markers_exact(
-        "wasm-host-lua",
-        &capture_cart_wasm(cart, &[("BLYT_RESET_EVERY_FRAME", "1")]),
-        tag,
-        expected,
-    );
-    assert_markers_exact(
-        "libretro-emulated",
-        &capture_cart_libretro_with_flags(cart, &["--reset-every-frame"], &[]),
-        tag,
-        expected,
-    );
-    assert_markers_exact(
-        "libretro-host-lua",
-        &capture_cart_libretro_with_flags(cart, &["--reset-every-frame"], &[("BLYT_HOSTLUA", "1")]),
-        tag,
-        expected,
-    );
 }
 
 /// Cross-leg exact parity for carts whose marker sequence is deterministic but

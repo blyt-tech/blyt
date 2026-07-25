@@ -13,11 +13,11 @@ const BP_ASSIGN_X = 26; // S.character[slot].x = x   (x,y already computed)
 const BP_PRINT = 28; // blyt.debug.print(...)
 const BP_INIT = 6; // frame = 0   (first statement inside init())
 
-/* This spec runs twice from runTests.js: once on the emulated rv32 Lua VM and
- * once with BLYT_HOSTLUA=1 on the native host-Lua VM (#234) — the debugger
- * behaviour must be identical, hot reload included: #244 gave the native
- * host-Lua path its reload-while-debug mechanism, so the reload leg now runs on
- * both VMs. */
+/* A pure-Lua cart debugs on the native host-Lua VM (ADR-0136): breakpoints,
+ * stepping, inspection and hot reload all run against a host `lua_State` via the
+ * host-Lua DAP (#234), with reload-while-debug from #244.  This spec used to run
+ * twice — emulated and host-Lua — until the emulated RV32 Lua VM was retired as a
+ * shipped path and the two collapsed into one. */
 
 describe('Lua cart (native debug)', () => {
 	afterEach(async () => h.reset());

@@ -77,14 +77,12 @@ function findBothPorts(proc) {
 }
 
 async function main() {
-	// #251: BLYT_HOSTLUA opts the hybrid onto the native host-Lua path (Lua half on
-	// the host VM + rv32 GDB stub on the native half) instead of the fully-emulated
-	// rv32 session.  The env var also reaches blytplay (inherited), which the
-	// dispatch predicate reads; --host-lua sets it there too, so pass both.
-	const hostLuaArgs = process.env.BLYT_HOSTLUA ? ['--host-lua'] : [];
+	// A hybrid runs on the native host-Lua path by default (ADR-0136): the Lua half
+	// on the host VM, the rv32 GDB stub on the native half — two debuggers, one
+	// cart.
 	const blytplay = spawn(
 		BLYTRUN,
-		['--debug', '0', '--gdb', '0', '--headless', ...hostLuaArgs, CART],
+		['--debug', '0', '--gdb', '0', '--headless', CART],
 		{
 			stdio: ['ignore', 'pipe', 'pipe'],
 		},

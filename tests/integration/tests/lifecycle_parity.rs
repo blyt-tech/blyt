@@ -184,14 +184,19 @@ function cleanup() blyt.debug.print("<lc:cleanup>") end
     );
 }
 
-/// #283 as originally reported: the same **hybrid** cart, driven by the same
-/// blytplay/libretro loop, must produce an identical marker sequence whether the
-/// Lua half runs emulated (default for a hybrid) or on the host-Lua fast path
-/// (`BLYT_HOSTLUA=1`). The reported symptom was 5 `init()`s emulated vs 4 on the
-/// three host-Lua legs; this pins both halves of that comparison directly, since
-/// the exec model is the only variable between the two runs.
+/// #283 as originally reported: a **hybrid** cart driven through the
+/// `--reset-every-frame` save/clear/restore cycle must emit an exact lifecycle
+/// marker sequence — the reported symptom was an extra `init()` (5 vs 4) from
+/// blytplay driving one reset too many on an already-finished cart.
+///
+/// Originally this compared the emulated Lua half against the host-Lua fast path,
+/// the exec model being the only variable. ADR-0136 retired the emulated RV32 Lua
+/// VM, so a hybrid's Lua half now runs host-Lua on every non-RISC-V host and that
+/// comparison no longer exists. What still has teeth — and is what #283 was
+/// actually about — is the EXACT sequence, pinned here per leg. RISC-V-side
+/// coverage of the same lifecycle is QEMU Gate 35.
 #[test]
-fn hybrid_reset_every_frame_lifecycle_identical_emulated_and_hostlua() {
+fn hybrid_reset_every_frame_lifecycle_exact_across_legs() {
     require_sdk();
     require_lua_sdk();
     common::require_libretro_core();
@@ -202,8 +207,8 @@ fn hybrid_reset_every_frame_lifecycle_identical_emulated_and_hostlua() {
     CartProject::new()
         .config(GLOBALS_CONFIG)
         .c(r#"#include "blyt.h"
-/* Present only to make this a hybrid — a hybrid keeps its Lua half on the
- * emulated rv32 path by default, which is the leg under comparison here. */
+/* Present only to make this a hybrid: an exported native half, so the runner
+ * drives an rv32 session alongside the host Lua VM. */
 BLYT_LUA_EXPORT_I32(noop, int32_t x) {
     return x;
 }
@@ -251,24 +256,15 @@ function on_load_state(_info) frame = S.globals[0].frame end
     ];
 
     let flags = ["--reset-every-frame"];
-    let hostlua = [("BLYT_HOSTLUA", "1")];
 
     for (leg, out) in [
         (
-            "blytplay emulated",
+            "blytplay",
             capture_cart_native_with_flags(&cart, &flags, &[]),
         ),
         (
-            "blytplay host-Lua",
-            capture_cart_native_with_flags(&cart, &flags, &hostlua),
-        ),
-        (
-            "libretro emulated",
+            "libretro",
             capture_cart_libretro_with_flags(&cart, &flags, &[]),
-        ),
-        (
-            "libretro host-Lua",
-            capture_cart_libretro_with_flags(&cart, &flags, &hostlua),
         ),
     ] {
         assert_eq!(

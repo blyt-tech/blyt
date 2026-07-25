@@ -65,17 +65,12 @@ function findGdbPort(proc) {
 }
 
 async function main() {
-	// #251: BLYT_HOSTLUA + --host-lua opts a hybrid onto the native host-Lua path,
-	// so the GDB stub attaches to its native rv32 half while the Lua half runs on
-	// the host VM (GDB-only here — no DAP).
-	const hostLuaArgs = process.env.BLYT_HOSTLUA ? ['--host-lua'] : [];
-	const blytplay = spawn(
-		BLYTRUN,
-		['--gdb', '0', '--headless', ...hostLuaArgs, CART],
-		{
-			stdio: ['ignore', 'pipe', 'pipe'],
-		},
-	);
+	// A hybrid runs on the native host-Lua path by default (ADR-0136), so the GDB
+	// stub attaches to its native rv32 half while the Lua half runs on the host VM
+	// (GDB-only here — no DAP).
+	const blytplay = spawn(BLYTRUN, ['--gdb', '0', '--headless', CART], {
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
 	blytplay.stderr.on('data', (d) => process.stderr.write(d));
 
 	const port = await findGdbPort(blytplay);

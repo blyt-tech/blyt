@@ -6,22 +6,33 @@
 //! stays EMULATED under rv32emu, bridged via the ADR-0130 ECALL Lua C API — the
 //! native counterpart of the WASM host-Lua hybrid path (`wasm_main.c`
 //! run_lua_cart). Determinism across every leg is the core contract (ADR-0007),
-//! so each test asserts the SAME cart-visible output on all five legs via
-//! [`run_cart_hybrid_all_legs_exact`] (#299): each cart emits self-delimiting
+//! so each test asserts the SAME cart-visible output on all three legs via
+//! [`run_cart_all_legs_exact`] (#284/#299): each cart emits self-delimiting
 //! `<m:…>` markers and every leg's full marker sequence must equal the same
-//! `expected` — same payloads, order, and count — so all five are identical to
-//! each other. The five legs are:
-//!   * the emulated leg        (blytplay, rv32emu),
-//!   * the native host-Lua leg (blytplay + `BLYT_HOSTLUA=1`),
-//!   * the WASM host-Lua leg   (the node `run_cart.js` driver),
-//!   * the libretro emulated `.so` leg (embedded `libblyt32lua.so`), and
-//!   * the libretro host-Lua `.so` leg (embedded ADR-0130 bridge stub +
-//!     `BLYT_HOSTLUA=1`, #232 S5).
-//! An exact five-way sequence compare fails on a leg that emits extra, repeated,
-//! or reordered output — the anti-#98/#283 blind spot a per-leg `.contains`
+//! `expected` — same payloads, order, and count — so all three are identical to
+//! each other. The legs are:
+//!   * the native host-Lua leg (blytplay),
+//!   * the WASM host-Lua leg   (the node `run_cart.js` driver), and
+//!   * the libretro host-Lua `.so` leg (embedded ADR-0130 bridge stub, #232 S5).
+//!
+//! This suite used a FIVE-leg matrix until ADR-0136's end-state landed: a hybrid
+//! could be run with its Lua half emulated (`BLYT_HOSTLUA` unset) as an oracle
+//! against the host-Lua legs. That flag is gone — a Lua-bearing cart runs host-Lua
+//! on every non-RISC-V host — so the emulated legs are no longer reachable here.
+//! `libblyt32lua.so` itself is still live (real RISC-V), and its parity coverage
+//! is the QEMU native gate (`native_qemu.rs`), not this matrix.
+//!
+//! An exact sequence compare fails on a leg that emits extra, repeated, or
+//! reordered output — the anti-#98/#283 blind spot a per-leg `.contains`
 //! substring check left open (#299 is the hybrid half of #284). Numeric parity
 //! (probed `cart_allocations`/`filled` figures, #250/#276/#278/#280) is already
 //! exact via `assert_eq!` and stays as-is.
+//!
+//! NOTE (coverage gap worth closing): these tests pin marker sequences and heap
+//! numbers, not FRAME HASHES. The three latent hybrid gfx/surface defects the
+//! ADR-0136 flip exposed (#193/#207/#210 unification never ported to the native
+//! runner) were all caught by `gfx.rs`/`surfaces.rs` via
+//! `run_cart_all_legs_frame_hash_exact`, not here.
 //!
 //! Slices land incrementally: S1 typed export, S2 raw/bridged export, S3 state
 //! buffers + save/restore + reset-every-frame, S4 native-lifecycle, S5 libretro
@@ -32,8 +43,8 @@ mod common;
 use common::{
     CartProject, assert_markers_exact, build_lua_cart, capture_cart_libretro, capture_cart_native,
     capture_cart_wasm, require_cpp_sdk, require_libretro_core, require_lua_sdk,
-    require_rust_riscv_target, require_sdk, require_wasm, run_cart_hybrid_all_legs_exact,
-    run_cart_hybrid_all_legs_exact_reset_every_frame,
+    require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs_exact,
+    run_cart_all_legs_exact_reset_every_frame,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -70,7 +81,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     // One marker, emitted once: the emulated reference, the native host-Lua leg
     // under test, WASM, and both libretro legs must all emit exactly this.
-    run_cart_hybrid_all_legs_exact(&cart, "m", &["typed add_one=42"]);
+    run_cart_all_legs_exact(&cart, "m", &["typed add_one=42"]);
 }
 
 /// S2 — a raw/bridged export (`BLYT_LUA_MODULE_EXPORT_RAW`, ADR-0130): the guest
@@ -123,7 +134,7 @@ function draw() end
     let cart = build_lua_cart(&project);
     // The native console line then the Lua echo line, in that order, on every leg
     // — exact sequence so a leg that drops or reorders either is caught.
-    run_cart_hybrid_all_legs_exact(
+    run_cart_all_legs_exact(
         &cart,
         "m",
         &["log:hybrid-bridge-log", "echo:hybrid-bridge-echo"],
@@ -234,12 +245,12 @@ end
     ];
 
     // Plain run — every execution model agrees.
-    run_cart_hybrid_all_legs_exact(&cart, "m", expected);
+    run_cart_all_legs_exact(&cart, "m", expected);
 
     // Reset-every-frame — the host-Lua VM-rebuild cycle must reach the SAME
     // trajectory as the emulated (BSS-zero) and WASM legs, with the state buffers
     // shared with the persisting rv32 session across each rebuild.
-    run_cart_hybrid_all_legs_exact_reset_every_frame(&cart, "m", expected);
+    run_cart_all_legs_exact_reset_every_frame(&cart, "m", expected);
 }
 
 /// #261 — the teeth for the native-half BSS reset gap. A hybrid whose NATIVE half
@@ -340,13 +351,13 @@ end
 
     // Plain run — no reset, the native counter accumulates to the frame count on
     // every leg (this is the same for emulated and host-Lua: nothing is reset).
-    run_cart_hybrid_all_legs_exact(&cart, "m", &["native ticks at frame 5 = 5"]);
+    run_cart_all_legs_exact(&cart, "m", &["native ticks at frame 5 = 5"]);
 
     // Reset-every-frame — the native half's BSS must be zeroed each cycle in
     // lockstep with the Lua VM rebuild, so the single per-frame tick returns 1 on
     // EVERY leg. Before the #261 fix the host-Lua legs (native + WASM) would report
     // 5 here (drift), diverging from the emulated legs.
-    run_cart_hybrid_all_legs_exact_reset_every_frame(&cart, "m", &["native ticks at frame 5 = 1"]);
+    run_cart_all_legs_exact_reset_every_frame(&cart, "m", &["native ticks at frame 5 = 1"]);
 }
 
 /// S4 — a native-lifecycle hybrid: the C half defines `blyt_cart_update`,
@@ -398,28 +409,17 @@ function draw() end
     // self-quits at tick 5; the per-leg safety cap (--quit-after on blytplay,
     // --run-frames on libretro) only turns a broken bridge into a clean assertion
     // failure rather than a hang, so it never changes the marker sequence. The
-    // flags differ per leg, so this drives the five legs inline against one shared
-    // `expected` — identical on every leg ⇒ all five identical.
+    // flags differ per leg, so this drives the three legs inline against one shared
+    // `expected` — identical on every leg ⇒ all three identical.
     let expected: &[&str] = &[
         "lua init before native update loop",
         "native update reached tick 5",
     ];
 
-    // Emulated (rv32emu) — the reference; native blyt_cart_update drives directly.
-    assert_markers_exact(
-        "emulated-native",
-        &common::capture_cart_native_with_flags(&cart, &["--quit-after", "60"], &[]),
-        "m",
-        expected,
-    );
     // Native host-Lua fast path (#232 S4) — native lifecycle injected as a global.
     assert_markers_exact(
         "native-host-lua",
-        &common::capture_cart_native_with_flags(
-            &cart,
-            &["--quit-after", "60"],
-            &[("BLYT_HOSTLUA", "1")],
-        ),
+        &common::capture_cart_native_with_flags(&cart, &["--quit-after", "60"], &[]),
         "m",
         expected,
     );
@@ -430,20 +430,10 @@ function draw() end
         "m",
         expected,
     );
-    // libretro core — emulated + host-Lua.
-    assert_markers_exact(
-        "libretro-emulated",
-        &common::capture_cart_libretro_with_flags(&cart, &["--run-frames", "60"], &[]),
-        "m",
-        expected,
-    );
+    // libretro core, host-Lua with its own embedded guest libs.
     assert_markers_exact(
         "libretro-host-lua",
-        &common::capture_cart_libretro_with_flags(
-            &cart,
-            &["--run-frames", "60"],
-            &[("BLYT_HOSTLUA", "1")],
-        ),
+        &common::capture_cart_libretro_with_flags(&cart, &["--run-frames", "60"], &[]),
         "m",
         expected,
     );
@@ -484,7 +474,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_hybrid_all_legs_exact(&cart, "m", &["lua+cpp cube=27"]);
+    run_cart_all_legs_exact(&cart, "m", &["lua+cpp cube=27"]);
 }
 
 /// S5 — a Rust raw/bridged export hybrid: the exact `#[lua_export(module =
@@ -529,7 +519,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_hybrid_all_legs_exact(&cart, "m", &["lua+rust bridged log line"]);
+    run_cart_all_legs_exact(&cart, "m", &["lua+rust bridged log line"]);
 }
 
 /// Copy the tree at `src` into `dst`, skipping any generated `build/` dir, so an
@@ -598,7 +588,7 @@ fn example_player_pos_lines(output: &str) -> Vec<String> {
         .collect()
 }
 
-/// Cross-leg exact parity for the two real hybrid examples: all five hybrid legs
+/// Cross-leg exact parity for the two real hybrid examples: all three hybrid legs
 /// must emit the IDENTICAL ordered `player pos:` line sequence (same lines, same
 /// order, same count), and `must_contain` must be one of them. This is strictly
 /// stronger than the pre-#299 per-leg `.contains` — which passed if the one line
@@ -609,17 +599,9 @@ fn example_player_pos_lines(output: &str) -> Vec<String> {
 /// `hostlua_hybrid_state_buffers_save_restore_parity`).
 fn assert_hybrid_example_lines_parity(cart: &Path, must_contain: &str) {
     let legs = [
-        ("emulated-native", capture_cart_native(cart, &[])),
-        (
-            "native-host-lua",
-            capture_cart_native(cart, &[("BLYT_HOSTLUA", "1")]),
-        ),
+        ("native-host-lua", capture_cart_native(cart, &[])),
         ("wasm-host-lua", capture_cart_wasm(cart, &[])),
-        ("libretro-emulated", capture_cart_libretro(cart, &[])),
-        (
-            "libretro-host-lua",
-            capture_cart_libretro(cart, &[("BLYT_HOSTLUA", "1")]),
-        ),
+        ("libretro-host-lua", capture_cart_libretro(cart, &[])),
     ];
     let (ref_name, ref_out) = (&legs[0].0, &legs[0].1);
     let ref_seq = example_player_pos_lines(ref_out);
@@ -717,7 +699,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_hybrid_all_legs_exact(&cart, "m", &["cb:14"]);
+    run_cart_all_legs_exact(&cart, "m", &["cb:14"]);
 }
 
 /// S6 — reverse-trampoline error semantics (#262): `lua_pcall` returns a status
@@ -770,7 +752,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_hybrid_all_legs_exact(&cart, "m", &["err:true:false"]);
+    run_cart_all_legs_exact(&cart, "m", &["err:true:false"]);
 }
 
 /// S6 — RE-ENTRANT reverse-trampoline (#262): native `host.outer()` calls Lua
@@ -823,7 +805,7 @@ function draw() end
         .write(&project);
 
     let cart = build_lua_cart(&project);
-    run_cart_hybrid_all_legs_exact(&cart, "m", &["re:211"]);
+    run_cart_all_legs_exact(&cart, "m", &["re:211"]);
 }
 
 // ── #250: hybrid heap accounting + unified 16 MB budget across both halves ────
@@ -914,15 +896,9 @@ function draw() end
 
     let cart = build_lua_cart(&project);
 
-    let native = probe_u64(
-        &capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]),
-        "cart_allocations",
-    );
+    let native = probe_u64(&capture_cart_native(&cart, &[]), "cart_allocations");
     let wasm = probe_u64(&capture_cart_wasm(&cart, &[]), "cart_allocations");
-    let libretro = probe_u64(
-        &capture_cart_libretro(&cart, &[("BLYT_HOSTLUA", "1")]),
-        "cart_allocations",
-    );
+    let libretro = probe_u64(&capture_cart_libretro(&cart, &[]), "cart_allocations");
 
     // The native half's 1 MiB block must now be visible in cart_allocations
     // (before the fold it reflected only the Lua-shadow arena, << 1 MiB).
@@ -1007,7 +983,7 @@ function draw() end
     let expected: &[&str] = &["BUDGET grab_ok=false"];
     assert_markers_exact(
         "native-host-lua",
-        &capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]),
+        &capture_cart_native(&cart, &[]),
         "m",
         expected,
     );
@@ -1019,7 +995,7 @@ function draw() end
     );
     assert_markers_exact(
         "libretro-host-lua",
-        &capture_cart_libretro(&cart, &[("BLYT_HOSTLUA", "1")]),
+        &capture_cart_libretro(&cart, &[]),
         "m",
         expected,
     );
@@ -1061,31 +1037,19 @@ fn hostlua_hybrid_init_budget_reserves_persistent_parity() {
     let cart = build_lua_cart(&project);
     let golden = common::INIT_BUDGET_FILLED;
 
-    // The emulated rv32 leg (no BLYT_HOSTLUA): a hybrid defaults to emulated
-    // (ADR-0136), which reserves the 8 MiB persistent set from frame 0 (ADR-0028)
-    // — the same one-arena model bare metal runs. This cross-checks the pinned
-    // golden against the oracle, so a scaffolding shift is caught here (not only
-    // in the QEMU gate, native_qemu.rs, which pins the same figure on hardware).
-    let oracle = probe_u64(&capture_cart_native(&cart, &[]), "filled");
-    assert_eq!(
-        oracle, golden,
-        "emulated rv32 oracle filled={oracle} != pinned INIT_BUDGET_FILLED={golden}: \
-         the 8 MiB persistent reservation moved — update the shared const and the \
-         QEMU gate together (#278)"
-    );
+    // The emulated rv32 leg used to serve as the in-suite oracle for `golden` here.
+    // ADR-0136 retired it: a hybrid now runs host-Lua on every non-RISC-V host, so
+    // that leg is unreachable and the cross-check would just be `native` twice. The
+    // surviving oracle for this figure is real RISC-V — QEMU Gate 8c pins the SAME
+    // shared const (`INIT_BUDGET_FILLED`) on hardware, so a scaffolding shift still
+    // fails there and the two must be updated together (#278).
 
     // Every host-Lua leg must reserve the SAME persistent footprint from frame 0.
     // RED before the #278 fix: footprint = 0 until the first trampoline, so the
     // fill runs against the full 16 MiB and `filled` is ~255 (2x the golden).
-    let native = probe_u64(
-        &capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]),
-        "filled",
-    );
+    let native = probe_u64(&capture_cart_native(&cart, &[]), "filled");
     let wasm = probe_u64(&capture_cart_wasm(&cart, &[]), "filled");
-    let libretro = probe_u64(
-        &capture_cart_libretro(&cart, &[("BLYT_HOSTLUA", "1")]),
-        "filled",
-    );
+    let libretro = probe_u64(&capture_cart_libretro(&cart, &[]), "filled");
 
     assert_eq!(
         native, golden,
@@ -1180,26 +1144,18 @@ fn hostlua_hybrid_reset_cycle_budget_reserves_persistent_parity() {
     let cart = build_lua_cart(&project);
     let golden = common::INIT_BUDGET_FILLED;
 
-    // The emulated rv32 oracle (no BLYT_HOSTLUA): one arena, persistent reserved
-    // from frame 0 and kept across the reset (ADR-0028) — the model bare metal
-    // runs. It must hold that reservation on EVERY cycle, which before #280 it
-    // did not: re-running init() built a fresh guest Lua state without reclaiming
-    // the abandoned one, so the leak ate ~34 KB of headroom per cycle and the
-    // count decayed 127 → 126 → 125.
-    assert_reset_budget(
-        "emulated rv32 oracle",
-        &common::capture_cart_native_with_flags(&cart, &["--reset-every-frame"], &[]),
-        golden,
-    );
+    // The emulated rv32 leg was the in-suite oracle for this figure (one arena,
+    // persistent reserved from frame 0 and kept across the reset, ADR-0028 — the
+    // model bare metal runs). ADR-0136 retired it; the reservation is now pinned on
+    // hardware by the QEMU gate instead. The #280 defect it originally caught —
+    // re-running init() building a fresh guest Lua state without reclaiming the
+    // abandoned one, leaking ~34 KB per cycle so the count decayed 127 → 126 → 125
+    // — is still caught here, by each host-Lua leg holding `golden` on EVERY cycle.
 
     // The three host-Lua legs must hold the same reservation across the rebuild.
     assert_reset_budget(
         "native host-Lua",
-        &common::capture_cart_native_with_flags(
-            &cart,
-            &["--reset-every-frame"],
-            &[("BLYT_HOSTLUA", "1")],
-        ),
+        &common::capture_cart_native_with_flags(&cart, &["--reset-every-frame"], &[]),
         golden,
     );
     assert_reset_budget(
@@ -1209,11 +1165,7 @@ fn hostlua_hybrid_reset_cycle_budget_reserves_persistent_parity() {
     );
     assert_reset_budget(
         "libretro host-Lua",
-        &common::capture_cart_libretro_with_flags(
-            &cart,
-            &["--reset-every-frame"],
-            &[("BLYT_HOSTLUA", "1")],
-        ),
+        &common::capture_cart_libretro_with_flags(&cart, &["--reset-every-frame"], &[]),
         golden,
     );
 }
@@ -1280,11 +1232,7 @@ function on_load_state(_info) frame = S.globals[0].frame end
     let cart = build_lua_cart(&project);
 
     let native = probe_u64(
-        &common::capture_cart_native_with_flags(
-            &cart,
-            &["--reset-every-frame"],
-            &[("BLYT_HOSTLUA", "1")],
-        ),
+        &common::capture_cart_native_with_flags(&cart, &["--reset-every-frame"], &[]),
         "alloc",
     );
     let wasm = probe_u64(
@@ -1292,11 +1240,7 @@ function on_load_state(_info) frame = S.globals[0].frame end
         "alloc",
     );
     let libretro = probe_u64(
-        &common::capture_cart_libretro_with_flags(
-            &cart,
-            &["--reset-every-frame"],
-            &[("BLYT_HOSTLUA", "1")],
-        ),
+        &common::capture_cart_libretro_with_flags(&cart, &["--reset-every-frame"], &[]),
         "alloc",
     );
 
@@ -1397,9 +1341,9 @@ function draw() end
 
     let cart = build_lua_cart(&project);
 
-    let native = capture_cart_native(&cart, &[("BLYT_HOSTLUA", "1")]);
+    let native = capture_cart_native(&cart, &[]);
     let wasm = capture_cart_wasm(&cart, &[]);
-    let libretro = capture_cart_libretro(&cart, &[("BLYT_HOSTLUA", "1")]);
+    let libretro = capture_cart_libretro(&cart, &[]);
 
     let (n_cache, n_listed, n_loaded) = (
         probe_u64(&native, "cache_used"),

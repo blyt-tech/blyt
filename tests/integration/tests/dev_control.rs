@@ -642,8 +642,7 @@ fn native_dev_control_reload_hybrid_coordinated_hostlua() {
     let work = tmp.path().join("cart.blyt");
     std::fs::copy(&v1, &work).unwrap();
 
-    let (mut child, port, lines) =
-        spawn_player_with_dev_ctrl_args(&work, save_dir.path(), &["--host-lua"]);
+    let (mut child, port, lines) = spawn_player_with_dev_ctrl_args(&work, save_dir.path(), &[]);
 
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect dev control");
     stream
@@ -784,7 +783,7 @@ fn libretro_dev_control_reload_reloads_resource_hostlua() {
 /// libretro embedded core, host-Lua HYBRID coordinated reload (#251): the .so
 /// counterpart of `native_dev_control_reload_hybrid_coordinated_hostlua`, run
 /// against blyt_libretro.so's OWN embedded guest libs (incl. libblyt32lua-bridge.so).
-/// The hybrid opts into host-Lua via BLYT_HOSTLUA; v1/v2 differ in BOTH halves
+/// A hybrid runs host-Lua by default (ADR-0136); v1/v2 differ in BOTH halves
 /// (native `compute` returns x+1 vs x+100, plus the Lua marker), so seeing 141
 /// after the swap proves the native rv32 half was blyt_session_swap_cart'ed in
 /// lockstep with the Lua-VM rebuild — not left on the old image (anti-#98).
@@ -829,7 +828,7 @@ fn libretro_dev_control_reload_hybrid_coordinated_hostlua() {
         .write(&project_v2);
     let v2 = build_lua_cart(&project_v2);
 
-    let out = libretro_reload_capture(&v1, &v2, 2, 6, &[("BLYT_HOSTLUA", "1")]);
+    let out = libretro_reload_capture(&v1, &v2, 2, 6, &[]);
     assert!(
         out.contains("hybrid V1 init compute=42"),
         "libretro host-Lua hybrid: v1 did not run its native compute at init; core output:\n{out}"

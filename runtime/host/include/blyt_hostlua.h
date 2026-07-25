@@ -11,12 +11,13 @@
  * of a hybrid cart keep using rv32emu (blyt_session_*), bridged via the ADR-0130
  * ECALL Lua C API for hybrids.
  *
- * Default path (ADR-0136, #236): the frontend routes a PURE-LUA cart here by
- * default on every non-RISC-V host — the emulated RV32 Lua VM is retired as a
- * shipped path for that case. A HYBRID cart (native .lua_exports and/or a
- * cart-native lifecycle) stays emulated by default and reaches this path only via
- * the BLYT_HOSTLUA opt-in, so `blyt debug` on a hybrid keeps native-half GDB/lldb
- * on the rv32 session (host-Lua native-half debug is deferred to #251). The whole
+ * Default path (ADR-0136 end-state): the frontend routes EVERY Lua-bearing cart
+ * here on every non-RISC-V host — pure-Lua or hybrid, run or debug. The emulated
+ * RV32 Lua VM is retired as a shipped path there and the transitional
+ * `BLYT_HOSTLUA` opt-in is gone. A HYBRID cart (native .lua_exports and/or a
+ * cart-native lifecycle) runs its Lua half here while its native half keeps
+ * running under rv32emu in a bridge-mode session this runner owns, with
+ * native-half GDB/lldb attached to that session (#251). The whole
  * path is compiled only when the deterministic seam VM is available
  * (BLYT_HOSTLUA_EXEC, set on libblyt by CMake); on a build without it (e.g. real
  * RISC-V hardware, where carts run native RV32) every entry point below degrades to
@@ -56,6 +57,20 @@ bool blyt_hostlua_available(void);
  * #else stub returns false, so real RISC-V hardware runs native RV32.
  */
 bool blyt_hostlua_should_use(const blyt_cart_t *cart);
+
+/*
+ * True iff `cart` carries a REACHABLE native half — one the runner will spin an
+ * rv32 bridge session for: Lua-callable exports (`.lua_exports`) or native
+ * lifecycle callbacks (#232 S4).  This is the single source of truth for "is
+ * there a native half", used both to decide session creation and by the frontend
+ * to decide whether a GDB stub has anything to attach to.
+ *
+ * Deliberately NARROWER than blyt_cart_has_native_code(), which also counts an
+ * unexported helper: such code is never entered, so a breakpoint in it could
+ * never fire and there is no session to host the stub.  Keeping the frontend on
+ * this predicate is what stops it announcing a GDB port it cannot serve.
+ */
+bool blyt_hostlua_cart_has_native_half(const blyt_cart_t *cart);
 
 /*
  * Create a native host-Lua runner for `cart` and run its init() + on_new_state()

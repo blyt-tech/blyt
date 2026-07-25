@@ -920,6 +920,10 @@ static const uint8_t *hl_resolve_palette(blyt_hostlua_t *hl, uint32_t handle);
  * a cart that never calls palette_set renders — and its testcard remaps —
  * against the same palette on every leg. */
 static void hl_palette_ensure_default(blyt_hostlua_t *hl) {
+    /* Hybrids are unaffected: their active palette is the session's, already
+     * seeded by blyt_session_create — same carve-out as the WASM leg (#193). */
+    if (hl->session)
+        return;
     uint32_t handle = blyt_cart_default_palette(hl->cart);
     if (handle == 0)
         handle = BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
@@ -934,16 +938,42 @@ static void hl_palette_ensure_default(blyt_hostlua_t *hl) {
                          ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
 }
 
+/* The cart-facing framebuffer (#193, the native port of the WASM leg's
+ * lua_gfx_fb).  For a HYBRID cart a session is live — its native half runs in
+ * rv32emu (ADR-0130) and draws via the gfx ECALL handlers into the session's
+ * canonical framebuffer — so the host-Lua half must rasterize into the SAME
+ * buffer.  Drawing into hl->fb instead leaves the native half's acquire/present
+ * in session->pixels[], which nothing presents: its output is silently dropped
+ * (exactly the wasm defect #193 fixed, never ported to this runner).  Only a
+ * genuinely session-less pure-Lua cart uses the standalone hl->fb. */
+static uint8_t *hl_gfx_fb(blyt_hostlua_t *hl) {
+    if (hl->session)
+        return (uint8_t *)blyt_session_get_pixels(hl->session);
+    return hl->fb;
+}
+
+/* The active 256-entry palette (#201/#204) — the SAME "session when present,
+ * else standalone" routing as hl_gfx_fb, so a hybrid's Lua-half palette_set()
+ * lands in the session's canonical palette (shared with the native half via
+ * cart_run.c's ECALL handler) rather than a parallel buffer that never reaches
+ * present.  A hybrid's session palette is seeded by blyt_session_create, so
+ * hl_palette_ensure_default only applies to the session-less case. */
+static uint32_t *hl_gfx_palette(blyt_hostlua_t *hl) {
+    if (hl->session)
+        return (uint32_t *)blyt_session_get_palette(hl->session);
+    return hl->palette;
+}
+
 static int l_gfx_clear(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
-    blyt_raster_clear(hl->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+    blyt_raster_clear(hl_gfx_fb(hl), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
                       (uint8_t)luaL_checkinteger(L, 1));
     hl->drawn = true;
     return 0;
 }
 static int l_gfx_pixel(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
-    blyt_raster_pixel(hl->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+    blyt_raster_pixel(hl_gfx_fb(hl), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
                       (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
                       (uint8_t)luaL_checkinteger(L, 3));
     hl->drawn = true;
@@ -951,7 +981,7 @@ static int l_gfx_pixel(lua_State *L) {
 }
 static int l_gfx_rect_fill(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
-    blyt_raster_rect_fill(hl->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+    blyt_raster_rect_fill(hl_gfx_fb(hl), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
                           (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
                           (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
                           (uint8_t)luaL_checkinteger(L, 5));
@@ -960,9 +990,10 @@ static int l_gfx_rect_fill(lua_State *L) {
 }
 static int l_gfx_line(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
-    blyt_raster_line(hl->fb, BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H, (int)luaL_checkinteger(L, 1),
-                     (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3),
-                     (int)luaL_checkinteger(L, 4), (uint8_t)luaL_checkinteger(L, 5));
+    blyt_raster_line(hl_gfx_fb(hl), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                     (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                     (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                     (uint8_t)luaL_checkinteger(L, 5));
     hl->drawn = true;
     return 0;
 }
@@ -978,9 +1009,10 @@ static int l_gfx_palette_set(lua_State *L) {
     uint32_t handle = c ? c->id : (uint32_t)luaL_checkinteger(L, 1);
     const uint8_t *pal = hl_resolve_palette(hl, handle);
     if (pal) {
+        uint32_t *dst = hl_gfx_palette(hl);
         for (int i = 0; i < 256; i++)
-            hl->palette[i] = (uint32_t)pal[i * 4] | ((uint32_t)pal[i * 4 + 1] << 8) |
-                             ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
+            dst[i] = (uint32_t)pal[i * 4] | ((uint32_t)pal[i * 4 + 1] << 8) |
+                     ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
     }
     return 0;
 }
@@ -996,20 +1028,24 @@ static void hl_emit_frame_hash(blyt_hostlua_t *hl) {
     if (!s_on || !hl->log_fn)
         return;
     char buf[64];
-    uint64_t h = blyt_frame_hash(hl->fb, (size_t)BLYT_FRAME_W * (size_t)BLYT_FRAME_H);
+    uint64_t h = blyt_frame_hash(hl_gfx_fb(hl), (size_t)BLYT_FRAME_W * (size_t)BLYT_FRAME_H);
     snprintf(buf, sizeof(buf), "[blyt:fbhash] %016llx", (unsigned long long)h);
     hl->log_fn(buf);
-    uint64_t ph = blyt_frame_hash((const uint8_t *)hl->palette, 256 * sizeof(uint32_t));
+    uint64_t ph = blyt_frame_hash((const uint8_t *)hl_gfx_palette(hl), 256 * sizeof(uint32_t));
     snprintf(buf, sizeof(buf), "[blyt:palhash] %016llx", (unsigned long long)ph);
     hl->log_fn(buf);
 }
 
 /* Finalise a completed frame: while the cart has not drawn, render the testcard
  * into fb (mirroring the emulated path's !cart_has_drawn testcard in
- * blyt_session_run_frame), then emit the cross-leg frame hash. */
+ * blyt_session_run_frame), then emit the cross-leg frame hash.  For a HYBRID
+ * EITHER half drawing displaces the test card (#193): hl->drawn covers the Lua
+ * half, blyt_session_cart_has_drawn the native one — otherwise a cart that draws
+ * only from its native half would still show the test card here. */
 static void hl_frame_done(blyt_hostlua_t *hl) {
-    if (!hl->drawn)
-        blyt_testcard_draw(hl->frame_count++, hl->palette, hl->fb);
+    bool drawn = hl->drawn || (hl->session && blyt_session_cart_has_drawn(hl->session));
+    if (!drawn)
+        blyt_testcard_draw(hl->frame_count++, hl_gfx_palette(hl), hl_gfx_fb(hl));
     hl_emit_frame_hash(hl);
 }
 
@@ -1019,8 +1055,10 @@ static void hl_frame_done(blyt_hostlua_t *hl) {
  * cart's surfaces live in hl->surf; the SAME shared rasterizer draws them, so
  * they are pixel-identical to every leg.  Tier-1 (create/destroy/clear/pixel/
  * rect_fill/line/blit) plus the tier-2 per-pixel lock (acquire → get/set/clear/
- * rect_fill/line → release).  None of the WASM leg's hybrid/session routing is
- * needed — this path never has a session. */
+ * rect_fill/line → release).  Off-screen slots are always runner-local, but the
+ * SCREEN surface resolves through hl_gfx_fb() on every access, so a hybrid's
+ * screen writes land in the session's canonical framebuffer alongside its native
+ * half (#193) — the runner does have a session once the cart is a hybrid (#232). */
 
 #define HL_LOCK_MT BLYT_HOSTLUA_LOCK_MT /* shared key — see blyt_hostlua_api.h */
 
@@ -1045,7 +1083,8 @@ static hl_surface_t *hl_surf_resolve(blyt_hostlua_t *hl, uint32_t h) {
     if (!s->in_use || (uint16_t)blyt_dyn_decode_gen(h) != s->gen)
         return NULL;
     if (s->is_screen)
-        s->pixels = hl->fb; /* screen pixels are always the live fb */
+        s->pixels =
+            hl_gfx_fb(hl); /* screen pixels are always the live fb (session's for a hybrid) */
     return s;
 }
 
@@ -1062,7 +1101,19 @@ typedef struct {
     bool is_screen;
 } hl_draw_target_t;
 
+/* Unified tier-1 drawable target (#210, the native port of the WASM leg's
+ * lua_resolve_target).  A HYBRID cart runs its native half in the rv32 session;
+ * resolving against the session's ONE surface registry keeps the Lua half's
+ * surfaces and handles coherent with that native half — a Lua-created off-screen
+ * handle passed across the bridge must resolve to the SAME slot when the native
+ * half blits it, and a lock taken by one half must be seen by the other (#207).
+ * Two registries is precisely the divergence #210 fixed on wasm.  A session-less
+ * pure-Lua cart resolves against the local hl->surf pool. */
 static bool hl_resolve_target(blyt_hostlua_t *hl, uint32_t h, hl_draw_target_t *t) {
+    if (hl->session) {
+        t->pixels = blyt_session_surface_drawable(hl->session, h, &t->w, &t->h, &t->is_screen);
+        return t->pixels != NULL;
+    }
     hl_surface_t *s = hl_surf_resolve_drawable(hl, h);
     if (!s)
         return false;
@@ -1078,6 +1129,14 @@ static bool hl_resolve_target(blyt_hostlua_t *hl, uint32_t h, hl_draw_target_t *
  * is never freed but must not carry a lock into the next frame (#208).  Mirrors
  * the emulated path's frame-entry reap in blyt_session_run_frame. */
 static void hl_surf_reap(blyt_hostlua_t *hl) {
+    /* A hybrid's surfaces live in the session's unified registry (#210), so reap
+     * THAT.  blyt_session_run_frame suppresses its own reap for host-fn drives
+     * (it fires once per C-export trampoline call, which would reap mid-frame),
+     * so this per-real-frame call is what actually frees them. */
+    if (hl->session) {
+        blyt_session_reap_surfaces(hl->session);
+        return;
+    }
     hl_surf_ensure_init(hl);
     hl->surf[0].locked = false;
     for (uint32_t i = 1; i < HL_SURFACE_MAX; i++) {
@@ -1095,6 +1154,10 @@ static int l_surface_create(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
     int32_t w = (int32_t)luaL_checkinteger(L, 1);
     int32_t h = (int32_t)luaL_checkinteger(L, 2);
+    if (hl->session) { /* hybrid: create in the session's unified registry (#210) */
+        lua_pushinteger(L, (lua_Integer)blyt_session_surface_create(hl->session, w, h));
+        return 1;
+    }
     hl_surf_ensure_init(hl);
     if (w <= 0 || h <= 0 || w > 8192 || h > 8192) {
         lua_pushinteger(L, (lua_Integer)BLYT_HANDLE_NONE);
@@ -1124,6 +1187,10 @@ static int l_surface_create(lua_State *L) {
 
 static int l_surface_destroy(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
+    if (hl->session) { /* hybrid: destroy in the session's unified registry (#210) */
+        blyt_session_surface_destroy(hl->session, (uint32_t)luaL_checkinteger(L, 1));
+        return 0;
+    }
     hl_surface_t *s = hl_surf_resolve_drawable(hl, (uint32_t)luaL_checkinteger(L, 1)); /* #207 */
     if (s && !s->is_screen) {
         free(s->pixels);
@@ -1202,7 +1269,8 @@ static int l_surface_blit(lua_State *L) {
 typedef struct {
     uint8_t *pixels;
     int32_t w, h;
-    uint32_t handle; /* surface handle (release re-resolve) */
+    uint32_t handle; /* surface handle (pure-Lua release re-resolve) */
+    uint32_t token; /* session release token (hybrid); BLYT_HANDLE_NONE pure-Lua */
     uint32_t epoch; /* hl->lock_epoch captured at acquire */
     bool released;
     bool is_screen; /* writes flip hl->drawn */
@@ -1211,20 +1279,36 @@ typedef struct {
 static int l_surface_acquire(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
     uint32_t h = (uint32_t)luaL_checkinteger(L, 1);
-    hl_surface_t *s = hl_surf_resolve(hl, h);
-    if (!s || s->locked) {
+    uint8_t *pixels = NULL;
+    int32_t w = 0, hh = 0;
+    uint32_t token = BLYT_HANDLE_NONE;
+    bool is_screen;
+    if (hl->session) { /* hybrid: the session's unified registry (#210/#207) */
+        pixels = blyt_session_surface_acquire(hl->session, h, &w, &hh, &token);
+        is_screen = (h == (uint32_t)BLYT_SCREEN);
+    } else { /* pure-Lua: the local pool */
+        hl_surface_t *s = hl_surf_resolve(hl, h);
+        if (s && !s->locked) {
+            s->locked = true;
+            pixels = s->pixels;
+            w = s->w;
+            hh = s->h;
+        }
+        is_screen = s ? s->is_screen : false;
+    }
+    if (!pixels) {
         lua_pushnil(L);
         return 1;
     }
-    s->locked = true;
     hl_lock_t *u = (hl_lock_t *)lua_newuserdatauv(L, sizeof(*u), 0);
-    u->pixels = s->pixels;
-    u->w = s->w;
-    u->h = s->h;
+    u->pixels = pixels;
+    u->w = w;
+    u->h = hh;
     u->handle = h;
+    u->token = token;
     u->epoch = hl->lock_epoch;
     u->released = false;
-    u->is_screen = s->is_screen;
+    u->is_screen = is_screen;
     luaL_setmetatable(L, HL_LOCK_MT);
     return 1;
 }
@@ -1309,9 +1393,13 @@ static int l_lock_release(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
     hl_lock_t *u = (hl_lock_t *)luaL_checkudata(L, 1, HL_LOCK_MT);
     if (!u->released && u->epoch == hl->lock_epoch) {
-        hl_surface_t *s = hl_surf_resolve(hl, u->handle);
-        if (s)
-            s->locked = false;
+        if (hl->session) { /* hybrid: release in the session's registry (#210) */
+            blyt_session_surface_release(hl->session, u->token);
+        } else {
+            hl_surface_t *s = hl_surf_resolve(hl, u->handle);
+            if (s)
+                s->locked = false;
+        }
     }
     u->released = true;
     return 0;
@@ -2319,8 +2407,7 @@ static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_en
      * a hybrid's ONE cart-facing table is the session's ctx.resources (which
      * blyt_session_create_lua_bridge already loads + persistent-preloads), so the
      * runner never mirrors it — hl_active_resources resolves it from the session. */
-    if (blyt_cart_find_section(cart, ".lua_exports", NULL) ||
-        blyt_cart_has_native_lifecycle(cart)) {
+    if (blyt_hostlua_cart_has_native_half(cart)) {
         hl->session = blyt_session_create_lua_bridge(cart, log_fn);
         if (!hl->session) {
             if (log_fn)
@@ -2872,11 +2959,13 @@ blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
 /* Read-only accessors the frontend uses to present the host-Lua framebuffer
  * (there is no session, so retro_run cannot go through blyt_session_expand_frame
  * — it expands these directly into its XRGB buffer). */
+/* Presentation reads the SAME buffers the cart drew into — the session's for a
+ * hybrid, the runner's own for a pure-Lua cart (#193, hl_gfx_fb). */
 const uint8_t *blyt_hostlua_get_pixels(blyt_hostlua_t *hl) {
-    return hl ? hl->fb : NULL;
+    return hl ? hl_gfx_fb(hl) : NULL;
 }
 const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl) {
-    return hl ? hl->palette : NULL;
+    return hl ? hl_gfx_palette(hl) : NULL;
 }
 
 void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
@@ -2906,38 +2995,42 @@ void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
     free(hl);
 }
 
-/* Dispatch predicate (ADR-0136, #236).  On a non-RISC-V host, host-Lua is the
- * DEFAULT shipped execution path for a PURE-LUA cart — RUN *and* DEBUG — the
- * emulated RV32 Lua VM is retired as a shipped path for that case.  #257 brought
- * the native host-Lua DAP (restart / exception breakpoints / loadedSources /
- * source-map / multifile / evaluate-upvalue) to parity with the emulated + WASM
- * legs, so the debug opt-in gate is gone: a debugger-attached pure-Lua cart now
- * routes to host-Lua by default too.
+/* Dispatch predicate (ADR-0136 end-state).  On a non-RISC-V host, host-Lua is THE
+ * shipped execution path for every Lua-bearing cart — pure-Lua or hybrid, run or
+ * debug.  The emulated RV32 Lua VM is retired as a shipped path there, and the
+ * transitional `BLYT_HOSTLUA` opt-in that used to select between the two models is
+ * gone: there is nothing left to select.
  *
- * Host-Lua remains opt-in (BLYT_HOSTLUA), NOT the default, in ONE transitional
- * case:
+ * How the end-state was reached: #236 flipped pure-Lua RUN, #257 brought the native
+ * host-Lua DAP to parity (restart / exception breakpoints / loadedSources /
+ * source-map / multifile / evaluate-upvalue) and flipped pure-Lua DEBUG, and #251
+ * wired native-half GDB + coordinated hot-reload so a HYBRID no longer needs the
+ * emulated session to debug the half that rv32emu still runs.
  *
- *  - a HYBRID cart (one carrying ANY cart-authored native code — `.lua_exports`
- *    wrappers, a cart-native lifecycle, or even an unexported C/Rust helper, per
- *    blyt_cart_has_native_code): debugging its native half needs a GDB/lldb stub on
- *    the rv32 session, which the host-Lua path does not yet wire up (deferred to
- *    #251), so it must keep the emulated session.  The opt-in also preserves #232's
- *    hybrid host-Lua path (run/state/save parity) for testing.
+ * A hybrid is NOT special-cased here.  Its Lua half runs in this VM and its native
+ * half keeps running under rv32emu in a bridge-mode session (ADR-0130) that the
+ * runner owns — see blyt_hostlua_cart_has_native_half, the single source of truth
+ * for whether that session exists.
  *
- * A later issue makes the hybrid case default host-Lua once #251 (native-half GDB
- * + coordinated hybrid hot-reload) lands.
+ * A pure-native cart (no .cart.lua) returns false and keeps the rv32 session path.
  *
  * The compile gate BLYT_HOSTLUA_EXEC lives only in this TU: on real RISC-V hardware
  * it is absent and the #else stub returns false, so carts run native RV32 with no
- * host check needed here. */
+ * host check needed here — which is also why the RV32 Lua build (libblyt32lua.so)
+ * remains live, and why its parity coverage is the QEMU native gate. */
+bool blyt_hostlua_cart_has_native_half(const blyt_cart_t *cart) {
+    if (!cart)
+        return false;
+    return blyt_cart_find_section(cart, ".lua_exports", NULL) != NULL ||
+           blyt_cart_has_native_lifecycle(cart);
+}
+
 bool blyt_hostlua_should_use(const blyt_cart_t *cart) {
     if (!cart)
         return false;
     if (!blyt_cart_find_section(cart, ".cart.lua", NULL))
         return false;
-    if (blyt_cart_has_native_code(cart))
-        return getenv("BLYT_HOSTLUA") != NULL; /* hybrid: opt-in only pending #251 */
-    return true; /* pure-Lua (run OR debug): host-Lua by default (#236, #257) */
+    return true; /* any Lua-bearing cart, pure or hybrid, run or debug */
 }
 
 #else /* !BLYT_HOSTLUA_EXEC — seam VM absent; the frontend falls back to rv32. */
@@ -2947,6 +3040,11 @@ bool blyt_hostlua_available(void) {
 }
 
 bool blyt_hostlua_should_use(const blyt_cart_t *cart) {
+    (void)cart;
+    return false;
+}
+
+bool blyt_hostlua_cart_has_native_half(const blyt_cart_t *cart) {
     (void)cart;
     return false;
 }
