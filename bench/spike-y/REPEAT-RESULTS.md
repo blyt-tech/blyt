@@ -36,6 +36,12 @@ Two qualifications, both about Spike Y's *record*, not about host-Lua:
    the Spike Y success bar (1 k–10 k px/frame at ≤ 50 % of the 16.67 ms budget)
    across essentially the whole range — see [Against the bar](#against-the-bar).
 
+A follow-up then measured the method-dispatch patch **through the real runtime**
+(not the proxy) — it delivers 2.3× and reaches 53.6 k px/frame, but the striking
+result is that **~2.05× of that is available with no VM patch at all**, purely by
+offering an implicit `set_pixel(x,y,c)` form. See
+[the #208 follow-up](#follow-up-the-208-method-dispatch-fast-path-measured-through-the-real-runtime).
+
 ## The three legs
 
 All three ran on the same Pi in one session. Player legs are timed with a
@@ -178,6 +184,114 @@ call form), and the host-Lua hashes are also identical to the same carts run
 under macOS/arm64 `blytplay` — the determinism contract holds across host arch
 *and* execution model. The workload is self-checking in the strong sense: a
 dropped or misplaced write changes the hash.
+
+## Follow-up: the #208 method-dispatch fast path, measured through the real runtime
+
+The tables above use the **proxy** to price the unshipped VM patches. This
+section measures them **in `blytplay`** — the patched VM wired into the actual
+host-Lua runtime — so the 2.7× proxy projection can be checked against reality.
+Scope per the request: **method dispatch only**. The patch's other two hunks
+(`OP_GETTABLE`/`OP_SETTABLE`, i.e. `lk[i] = c`) are deliberately left out — that
+form is a cart-visible API change, not a dispatch optimisation.
+
+Three build configurations, all pixel-verified against each other (below):
+
+| | Lua VM | `blyt32.surface.set_pixel` |
+|---|---|---|
+| **A — shipped** | stock p4 fork | absent |
+| **B — bench** | stock p4 fork | added (`BLYT_HOSTLUA_PIXEL_BENCH`) |
+| **D — fastpixel** | p4 + the 2 method-dispatch hunks | added |
+
+µs/px on the Pi (1 k→10 k slope; each config's own frame floor removed):
+
+| form | B: stock VM | D: patched VM | patch buys |
+|---|---:|---:|---:|
+| `lk:set(x,y,c)` — the shipped form | 0.826 | **0.360** | 2.30× |
+| `set(lk,x,y,c)` — hoisted plain call | 0.740 | **0.334** | 2.21× |
+| `set_pixel(x,y,c)` — implicit lock | **0.404** | **0.301** | 1.34× |
+
+Raw ms/frame (floor / 1 k / 4 k / 10 k):
+
+| config · form | floor | 1 k | 4 k | 10 k | px @ 16.67 ms | px @ 8.33 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| A shipped · `lk:set` | 0.558 | 1.413 | 4.125 | 9.252 | ~18 400 | ~8 900 |
+| B · `lk:set` | 0.564 | 1.412 | 3.956 | 8.830 | ~19 500 | ~9 400 |
+| B · `set_pixel` | 0.564 | 0.983 | 2.232 | 4.610 | **~39 900** | ~19 200 |
+| D · `lk:set` | 0.557 | 0.929 | 2.037 | 4.160 | **~44 800** | ~21 600 |
+| D · `set_pixel` | 0.557 | 0.870 | 1.800 | 3.568 | **~53 600** | ~25 900 |
+
+### What this says
+
+- **The proxy was a good but slightly optimistic predictor.** It called
+  patched `lk:set` at 0.319 µs/px; through the real runtime it is 0.360 (11 %
+  worse). Baseline `set_pixel` it called at 0.412 vs 0.404 measured (2 %).
+- **PICO-8-class is reachable through the shipped runtime** — 53.6 k px/frame,
+  vs Spike Y's ~52 k proxy projection. The full 10 k-px workload costs 3.57 ms,
+  21 % of the frame.
+- **The biggest single win needs no VM patch at all.** Simply offering the
+  implicit `set_pixel(x,y,c)` form on the *stock* VM is **2.05×** over the
+  shipped `lk:set` (0.826 → 0.404 µs/px) — that is ~75 % of the total available
+  win, from a binding, with the Lua VM untouched. The VM patch then adds a
+  further 1.34×. Ranked by payoff-per-risk the order is clear: **API shape
+  first, VM patches second.**
+- Why: `lk:set` pays an `OP_SELF` metatable `__index` lookup, a `luaL_checkudata`
+  and an extra stack slot per pixel; the implicit form pays none of them. The
+  VM patch removes what is left (the C call frame and the `luaL_check*`
+  revalidation).
+
+### Correctness
+
+Every workload, 8 frames, `BLYT_FRAME_HASH=1`, on both macOS arm64 and the Pi —
+all three configurations produce **identical** `[blyt:fbhash]` streams, and the
+`set_pixel` carts hash identically to the `lk:set` and hoisted-call carts:
+
+```
+floor        shipped=1b9b8a0a  stockVM+bind=1b9b8a0a  patchedVM=1b9b8a0a
+method-1k    shipped=0556137f  stockVM+bind=0556137f  patchedVM=0556137f
+method-4k    shipped=0b2bbb7b  stockVM+bind=0b2bbb7b  patchedVM=0b2bbb7b
+method-10k   shipped=6d0e916a  stockVM+bind=6d0e916a  patchedVM=6d0e916a
+pset-*       (identical to the method-* row of the same size)
+setpixel-1k  shipped=absent    stockVM+bind=0556137f  patchedVM=0556137f
+setpixel-4k  shipped=absent    stockVM+bind=0b2bbb7b  patchedVM=0b2bbb7b
+setpixel-10k shipped=absent    stockVM+bind=6d0e916a  patchedVM=6d0e916a
+```
+
+The fast path is genuinely engaged (2.3× is not a fall-through) *and* pixel-exact.
+
+### What productionizing this would cost — three real hazards found
+
+Wiring the patch into the runtime was not mechanical. Each of these is a
+concrete cost to weigh, not a hypothetical:
+
+1. **The patch reads the lock through a hardcoded struct copy.** `lvm.c` casts
+   the userdata to its own `struct blyt_fp_lock { pixels; stride, w, h; token,
+   epoch; released; }`. That matches the *guest* binding's `lua_lock_t`, but
+   host-Lua's `hl_lock_t` had diverged (no `stride`, an extra `handle` before
+   `token`, `bool released`) — so the patch would have read `h` where it wanted
+   `w`: **silently wrong pixels, not a link error.** Fixed by re-laying-out
+   `hl_lock_t` with the prefix pinned by `_Static_assert`s. Any future field
+   reorder in either place is a silent corruption; the layout becomes a
+   cross-component ABI.
+2. **The VM reaches the runtime through process globals** (`blyt_lua_lock_epoch`,
+   `blyt_lua_lock_mt`, three function pointers). Fine while a process hosts one
+   host-Lua VM, but it hard-codes that assumption into the VM — the same class of
+   single-VM-per-process global state already noted for rv32emu.
+3. **The fast path bypasses `hl->drawn`.** Storing pixels inline never reaches
+   `l_lock_set`, so the "cart has drawn ⇒ retire the PM5544 test card" flag never
+   flips: a cart drawing *only* through the fast path would show the test card
+   forever. Worked around here by setting `drawn` when the screen is acquired —
+   acceptable for a bench, but a real change needs a deliberate answer.
+
+Also note the added `set_pixel` binding is **host-Lua-only** in these builds. As
+a shipped API it would have to land on the guest (`blyt32lua.c`) and WASM
+bindings in the same change, or a cart using it would work on desktop/browser
+and fail on the emulated and bare-metal legs — the cross-leg divergence class
+this project treats as blocking.
+
+**None of this is shipped.** The runtime side is behind `BLYT_HOSTLUA_PIXEL_BENCH`
+(off by default) and the VM side needs a patched fork; the default build is
+byte-for-byte the shipped configuration, which the identical hashes above
+confirm.
 
 ## Method
 

@@ -16,7 +16,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="${1:-$(cd "$HERE/../../.." && pwd)}"
 OUT="${2:-blytplay-aarch64}"
-VOL="blyt-aarch64-build-$(basename "$REPO")"
+VOL="blyt-aarch64-build-$(basename "$REPO")${VOL_SUFFIX:-}"
 DEST="$HERE/../dist"
 mkdir -p "$DEST"
 
@@ -28,8 +28,8 @@ docker run --platform linux/arm64 --rm \
   blyt-spike-y-arm64 bash -euc "
     cmake -B /build -G Ninja -S /repo \
       -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-      -DCMAKE_C_FLAGS='-O2 -fno-strict-aliasing' \
-      -DCMAKE_CXX_FLAGS='-O2 -fno-strict-aliasing'
+      -DCMAKE_C_FLAGS='-O2 -fno-strict-aliasing ${EXTRA_DEFS:-}' \
+      -DCMAKE_CXX_FLAGS='-O2 -fno-strict-aliasing' ${EXTRA_CMAKE:-}
     cmake --build /build --target blytplay
     cp /build/sdk/bin/blytplay /out/$OUT
     file /out/$OUT

@@ -41,6 +41,7 @@ version: 0.1.0
 EOF
   {
     echo "-- Spike Y repeat: per-pixel throughput workload ($form, ${w}x${h})."
+    [ "$form" = setpixel ] && echo "local set_pixel = blyt32.surface.set_pixel"
     echo "local W, H = $w, $h"
     echo "local t = 0"
     echo "function init() end"
@@ -52,6 +53,15 @@ EOF
         echo "    for y = 0, H - 1 do"
         echo "        for x = 0, W - 1 do"
         echo "            lk:set(x, y, (x + y + t) & 0xFF)"
+        echo "        end"
+        echo "    end"
+        ;;
+      setpixel)
+        # Implicit-lock form. Only resolvable on a BLYT_HOSTLUA_PIXEL_BENCH
+        # build — blyt32.surface.set_pixel is nil in the shipped API.
+        echo "    for y = 0, H - 1 do"
+        echo "        for x = 0, W - 1 do"
+        echo "            set_pixel(x, y, (x + y + t) & 0xFF)"
         echo "        end"
         echo "    end"
         ;;
@@ -72,7 +82,7 @@ EOF
   } >"$dir/src/game/lua/main.lua"
 }
 
-for form in method pset; do
+for form in method pset setpixel; do
   emit_project "$form-1k" 32 32 "$form"
   emit_project "$form-4k" 64 64 "$form"
   emit_project "$form-10k" 100 100 "$form"
