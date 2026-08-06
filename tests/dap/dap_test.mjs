@@ -31,6 +31,15 @@ const CONDITIONAL_COND = process.env.BLYT_DAP_CONDITIONAL_COND || '';
 const CONDITIONAL_COND_EDIT = process.env.BLYT_DAP_CONDITIONAL_COND_EDIT || '';
 const TEST_RESTART = !!process.env.BLYT_DAP_TEST_RESTART;
 const EXCEPTION_FILTER = process.env.BLYT_DAP_EXCEPTION_FILTER || '';
+/* When >0, assert that the exception stop is INSPECTABLE: stackTrace must
+ * succeed and include a frame at this (1-based) line — the Lua error site. This
+ * guards the #319 regression where the host-Lua exception stop parked after the
+ * erroring frame had unwound (paused_L == NULL), so stackTrace returned "not
+ * paused" and VS Code showed no call stack / locals. */
+const EXCEPTION_EXPECT_LINE = parseInt(
+	process.env.BLYT_DAP_EXCEPTION_EXPECT_LINE || '0',
+	10,
+);
 /* When set, the cart is expected to raise a Lua error during init() with no
  * exception breakpoint configured.  The driver only completes configuration and
  * lets the runtime run to its error; the orchestrator then asserts (on the
@@ -266,6 +275,35 @@ async function run() {
 			exStopped.body.reason === 'exception',
 			`exception stop: reason is "exception" (got "${exStopped.body.reason}")`,
 		);
+		if (EXCEPTION_EXPECT_LINE) {
+			/* The stop must be inspectable — a call stack pointing at the error
+			 * site — matching the emulated path (#319). request() rejects on a
+			 * success:false response ("not paused"), so catch and leave stk null
+			 * to fail the assertion cleanly rather than throw. */
+			let stk = null;
+			try {
+				stk = await request('stackTrace', { threadId: 1 });
+			} catch (_) {
+				/* server replied "not paused" — the regression; stk stays null */
+			}
+			assert(
+				!!stk &&
+					Array.isArray(stk.stackFrames) &&
+					stk.stackFrames.length >= 1,
+				'exception stop: stackTrace is inspectable (≥1 frame)',
+			);
+			assert(
+				!!stk &&
+					stk.stackFrames.some(
+						(f) => f.line === EXCEPTION_EXPECT_LINE,
+					),
+				`exception stop: a frame is at the error line ${EXCEPTION_EXPECT_LINE} (got ${
+					stk
+						? JSON.stringify(stk.stackFrames.map((f) => f.line))
+						: 'no stack'
+				})`,
+			);
+		}
 		await request('continue', { threadId: 1 });
 		_closeConn();
 		return;

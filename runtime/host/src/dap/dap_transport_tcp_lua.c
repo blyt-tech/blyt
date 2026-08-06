@@ -282,6 +282,16 @@ int fc_hostlua_dap_restart_pending(void) {
  * as fc_dap_pause_loop does for a breakpoint stop.  Returns 1 if it paused, 0 if
  * no filter matched (the caller then handles the error as a plain, non-paused
  * Lua error).  Called from the runner's call_lifecycle on a lua_pcall failure. */
+void fc_hostlua_dap_capture_exception(lua_State *L) {
+    /* Runs on the exec thread from the pcall message handler (frames still live).
+     * dap_lua_capture_exception no-ops unless a client + exception filter is set,
+     * so the lock is only needed to publish the snapshot coherently to the reader
+     * thread that will serve stackTrace during the park. */
+    pthread_mutex_lock(&g_hl.mu);
+    dap_lua_capture_exception(L);
+    pthread_mutex_unlock(&g_hl.mu);
+}
+
 int fc_hostlua_dap_report_exception(const char *msg, int is_uncaught) {
     pthread_mutex_lock(&g_hl.mu);
     if (!dap_lua_on_exception(msg, is_uncaught)) {

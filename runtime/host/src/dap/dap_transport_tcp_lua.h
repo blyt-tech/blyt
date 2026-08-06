@@ -14,6 +14,8 @@
 
 #include <stddef.h>
 
+struct lua_State;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,6 +40,12 @@ int fc_hostlua_dap_restart_pending(void);
  * exception breakpoint filter matches (issue #257).  Returns 1 if it paused
  * (client resumed/disconnected), 0 if no filter matched. */
 int fc_hostlua_dap_report_exception(const char *msg, int is_uncaught);
+
+/* Capture L's live call stack for the pending exception stop (#319).  Called as
+ * the lifecycle pcall's message handler — before the erroring frame unwinds — so
+ * the subsequent report_exception park (paused_L == NULL) can still serve a real
+ * stackTrace.  No-op unless a client with an exception filter is attached. */
+void fc_hostlua_dap_capture_exception(struct lua_State *L);
 
 #ifdef __cplusplus
 }

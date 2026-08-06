@@ -472,8 +472,19 @@ static int lua_wasm_phase_none(lua_State *L) {
  * inside the coroutine, so the coroutine never unwinds, stays resumable, and the
  * next frame still runs — matching the native/libretro legs and the guest's
  * call_global rather than tearing the cart down. */
+#ifdef BLYT_DAP
+/* Exception message handler for the lifecycle pcall — the twin of the native
+ * leg's l_hl_dap_exc_msgh (#319).  Runs before the erroring frame unwinds, so it
+ * is the only point the live stack is walkable; capture it for the exception stop
+ * and return the error object unchanged. */
+static int lua_wasm_dap_exc_msgh(lua_State *L) {
+    blyt_dap_capture_exception(L);
+    return 1;
+}
+#endif
+
 static int lua_wasm_blyt_call_k(lua_State *L, int status, lua_KContext ctx) {
-    (void)ctx;
+    int msgh = (int)ctx; /* stack index of the #319 message handler, or 0 */
     if (status != LUA_OK && status != LUA_YIELD) {
         const char *msg = lua_tostring(L, -1);
 #ifdef BLYT_DAP
@@ -486,6 +497,8 @@ static int lua_wasm_blyt_call_k(lua_State *L, int status, lua_KContext ctx) {
         blyt_js_error(msg ? msg : "(no message)");
         lua_pop(L, 1);
     }
+    if (msgh > 0)
+        lua_remove(L, msgh); /* balance the #319 handler pushed in lua_wasm_blyt_call */
     return 0;
 }
 
@@ -496,6 +509,19 @@ static int lua_wasm_blyt_call(lua_State *L) {
         lua_pop(L, 1);
         return 0;
     }
+    /* Under a debugger, push an exception message handler UNDER the function so an
+     * uncaught error's live stack is captured before it unwinds (#319).  The index
+     * is threaded through the continuation's ctx so it is removed on BOTH the
+     * direct-return path and the yield-resume completion path (a breakpoint below
+     * yields through this frame). */
+    lua_KContext msgh = 0;
+#ifdef BLYT_DAP
+    if (fc_master_hook_cfg.dap_enabled) {
+        lua_pushcfunction(L, lua_wasm_dap_exc_msgh); /* [name][fn][msgh] */
+        lua_insert(L, -2); /* [name][msgh][fn] */
+        msgh = (lua_KContext)(lua_gettop(L) - 1);
+    }
+#endif
     /* lua_pcallK, not lua_pcall — the K is load-bearing on THIS leg.
      *
      * A DAP breakpoint here pauses by lua_yield-ing out of the debug hook
@@ -505,8 +531,8 @@ static int lua_wasm_blyt_call(lua_State *L) {
      * across a C-call boundary" and the debugger would see an empty stack.
      * Passing a continuation makes this frame yieldable, so the pause can unwind
      * through it and resume back into lua_wasm_blyt_call_k. */
-    int st = lua_pcallk(L, 0, 0, 0, 0, lua_wasm_blyt_call_k);
-    return lua_wasm_blyt_call_k(L, st, 0);
+    int st = lua_pcallk(L, 0, 0, (int)msgh, msgh, lua_wasm_blyt_call_k);
+    return lua_wasm_blyt_call_k(L, st, msgh);
 }
 
 /* -------------------------------------------------------------------------

@@ -112,6 +112,12 @@ int fc_dap_on_exception(const char *msg, int is_uncaught);
 struct lua_State;
 int blyt_dap_report_exception(struct lua_State *L, int is_uncaught);
 
+/* Capture L's live call stack for the pending exception stop (#319).  Called as
+ * the lifecycle pcall's message handler, before the erroring frame unwinds, so
+ * the exception stop is inspectable (stackTrace) even though the frame is gone by
+ * report time.  No-op unless a client with an exception filter is attached. */
+void blyt_dap_capture_exception(struct lua_State *L);
+
 #ifdef __cplusplus
 }
 #endif

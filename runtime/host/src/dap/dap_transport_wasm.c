@@ -231,6 +231,12 @@ int blyt_dap_report_exception(lua_State *L, int is_uncaught) {
     return fc_dap_on_exception(msg, is_uncaught);
 }
 
+void blyt_dap_capture_exception(lua_State *L) {
+    /* Single-threaded here — just publish the snapshot the message handler walked
+     * (#319); dap_lua_capture_exception no-ops without a client + exception filter. */
+    dap_lua_capture_exception(L);
+}
+
 /* ── ECALL stubs (RV32 ELF cart path — not used in WASM Lua builds) ───────── */
 
 int fc_dap_check_hook_line(const char *source, int line, int depth) {
