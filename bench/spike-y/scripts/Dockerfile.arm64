@@ -1,0 +1,9 @@
+# Spike Y repeat — aarch64 (linux/arm64) build environment for the Pi Zero 2 W.
+# debian:trixie == the Pi's userland (Debian 13, glibc 2.41), so a binary built
+# here runs on the Pi with no compatibility shims.
+FROM debian:trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y -qq \
+    clang lld llvm cmake ninja-build pkg-config \
+    libsdl2-dev ca-certificates curl git file ccache \
+    && rm -rf /var/lib/apt/lists/*

@@ -1297,14 +1297,62 @@ static int l_surface_blit(lua_State *L) {
  * behaviour, uniform across legs; the debug hard-error is not wired on the fast
  * path, exactly as on the WASM leg). */
 typedef struct {
+    /* PREFIX — byte-identical to the guest binding's lua_lock_t (blyt32lua.c:
+     * blyt_lock_t + epoch + released) and hence to `struct blyt_fp_lock`, the
+     * layout the #208 VM fast paths read a lock through when
+     * BLYT_HOSTLUA_PIXEL_BENCH is compiled in.  Do not reorder (asserted below). */
     uint8_t *pixels;
+    int32_t stride; /* bytes per row (== w; surfaces are tightly packed) */
     int32_t w, h;
-    uint32_t handle; /* surface handle (pure-Lua release re-resolve) */
     uint32_t token; /* session release token (hybrid); BLYT_HANDLE_NONE pure-Lua */
     uint32_t epoch; /* hl->lock_epoch captured at acquire */
-    bool released;
+    int32_t released; /* int, not bool: the VM fast path reads an `int released` */
+    /* Host-Lua-only tail — past the prefix, invisible to the VM fast paths. */
+    uint32_t handle; /* surface handle (pure-Lua release re-resolve) */
     bool is_screen; /* writes flip hl->drawn */
 } hl_lock_t;
+
+/* ── #208 per-pixel VM fast paths — EXPERIMENT, NOT SHIPPED ──────────────────
+ *
+ * Compiled only under BLYT_HOSTLUA_PIXEL_BENCH, which the Spike Y repeat pairs
+ * with a Lua fork carrying the `spike/208-lua-vm-fastpixel` OP_SELF +
+ * OP_CALL-inline patches (bench/spike-y/scripts/build-fastpixel-player.sh).  The
+ * patched luaV_execute recognises a tier-2 lock by metatable identity and runs
+ * lk:set / lk:get inline — no __index lookup, no C call frame — falling through
+ * to the real C function for anything unusual (foreign self, non-integer args,
+ * OOB, stale lock), so the checked semantics are preserved.  It reaches the
+ * runtime through exactly these symbols.  See bench/spike-y/REPEAT-RESULTS.md.
+ *
+ * The globals are process-wide (the patch's contract); safe today because a
+ * process hosts one host-Lua VM, but that is why this stays behind a flag. */
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+_Static_assert(offsetof(hl_lock_t, pixels) == 0, "#208 lock prefix: pixels");
+_Static_assert(offsetof(hl_lock_t, stride) == sizeof(uint8_t *), "#208 lock prefix: stride");
+_Static_assert(offsetof(hl_lock_t, w) == sizeof(uint8_t *) + 4, "#208 lock prefix: w");
+_Static_assert(offsetof(hl_lock_t, h) == sizeof(uint8_t *) + 8, "#208 lock prefix: h");
+_Static_assert(offsetof(hl_lock_t, token) == sizeof(uint8_t *) + 12, "#208 lock prefix: token");
+_Static_assert(offsetof(hl_lock_t, epoch) == sizeof(uint8_t *) + 16, "#208 lock prefix: epoch");
+_Static_assert(offsetof(hl_lock_t, released) == sizeof(uint8_t *) + 20,
+               "#208 lock prefix: released");
+
+unsigned int blyt_lua_lock_epoch = 0; /* mirrors hl->lock_epoch for the VM */
+void *blyt_lua_lock_mt = NULL; /* the lock metatable, by pointer identity */
+int (*blyt_lua_fp_get)(lua_State *) = NULL;
+int (*blyt_lua_fp_set)(lua_State *) = NULL;
+int (*blyt_lua_fp_set_pixel)(lua_State *) = NULL;
+
+/* The live screen lock, for the implicit-lock set_pixel(x,y,c) form.  Owned by
+ * Lua (userdata do not move); the epoch check is what makes a stale pointer a
+ * defined no-op rather than a dangling write. */
+static hl_lock_t *hl_fp_screen = NULL;
+
+void blyt_lua_fast_set_pixel(int x, int y, int c) {
+    hl_lock_t *u = hl_fp_screen;
+    if (u && !u->released && u->epoch == blyt_lua_lock_epoch && x >= 0 && x < u->w && y >= 0 &&
+        y < u->h)
+        u->pixels[(uint32_t)y * (uint32_t)u->stride + (uint32_t)x] = (uint8_t)c;
+}
+#endif /* BLYT_HOSTLUA_PIXEL_BENCH */
 
 static int l_surface_acquire(lua_State *L) {
     blyt_hostlua_t *hl = hl_from(L);
@@ -1332,14 +1380,24 @@ static int l_surface_acquire(lua_State *L) {
     }
     hl_lock_t *u = (hl_lock_t *)lua_newuserdatauv(L, sizeof(*u), 0);
     u->pixels = pixels;
+    u->stride = w;
     u->w = w;
     u->h = hh;
     u->handle = h;
     u->token = token;
     u->epoch = hl->lock_epoch;
-    u->released = false;
+    u->released = 0;
     u->is_screen = is_screen;
     luaL_setmetatable(L, HL_LOCK_MT);
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+    if (is_screen) {
+        hl_fp_screen = u;
+        /* The VM fast path stores straight into the buffer without reaching
+         * l_lock_set, so it cannot flip hl->drawn per write; acquiring the screen
+         * is the last point that can.  Experiment-only, hence the guard. */
+        hl->drawn = true;
+    }
+#endif
     return 1;
 }
 
@@ -1431,9 +1489,39 @@ static int l_lock_release(lua_State *L) {
                 s->locked = false;
         }
     }
-    u->released = true;
+    u->released = 1;
     return 0;
 }
+
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+/* blyt32.surface.set_pixel(x, y, c) — EXPERIMENT (see the #208 block above).
+ * The implicit-lock form Spike Y measured: no handle argument, no userdata
+ * check, so it costs a plain call rather than OP_SELF + a metatable lookup.  It
+ * writes the screen lock acquired earlier this frame (a no-op if there is none).
+ * NOT in the shipped API on any leg — adding it for real is a cart-visible
+ * change that would have to land on the guest and WASM bindings too. */
+static int l_surface_set_pixel(lua_State *L) {
+    blyt_lua_fast_set_pixel((int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                            (int)luaL_checkinteger(L, 3));
+    return 0;
+}
+
+/* Publish the identities the patched VM compares against, and bind set_pixel.
+ * Runs immediately after blyt_hostlua_register_api so the metatable exists. */
+static void hl_wire_pixel_bench(lua_State *L) {
+    blyt_lua_fp_get = l_lock_get;
+    blyt_lua_fp_set = l_lock_set;
+    blyt_lua_fp_set_pixel = l_surface_set_pixel;
+    luaL_getmetatable(L, HL_LOCK_MT);
+    blyt_lua_lock_mt = (void *)lua_topointer(L, -1);
+    lua_pop(L, 1);
+    lua_getglobal(L, "blyt32");
+    lua_getfield(L, -1, "surface");
+    lua_pushcfunction(L, l_surface_set_pixel); /* light C fn — the OP_CALL path needs LUA_VLCF */
+    lua_setfield(L, -2, "set_pixel");
+    lua_pop(L, 2);
+}
+#endif /* BLYT_HOSTLUA_PIXEL_BENCH */
 
 /* ── Resource table + mem.stats (#93/#158/#159, #231) ────────────────────────
  *
@@ -2277,6 +2365,9 @@ static int build_vm(blyt_hostlua_t *hl, bool reload_boot) {
         api.ctx = sctx;
     }
     blyt_hostlua_register_api(hl->L, &api);
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+    hl_wire_pixel_bench(hl->L);
+#endif
 
     /* Hybrid (#232): attach the exchange thread and install the native-export
      * trampolines BEFORE the bytecode runs, so the cart's top-level
@@ -2940,6 +3031,11 @@ blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
      * any lock from the previous frame is now stale, and reap the previous
      * frame's draw-scoped off-screen surfaces. */
     hl->lock_epoch++;
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+    /* Keep the VM's process-global epoch in step with this VM's (#208 bench). */
+    blyt_lua_lock_epoch = hl->lock_epoch;
+    hl_fp_screen = NULL;
+#endif
     hl_surf_reap(hl);
 
     /* Resume the shared driver's frame chunk (#242): ONE resume == ONE frame, the
