@@ -1571,6 +1571,15 @@ set(BLYT_LINUX_ARCH
 # Opt out of the VS Code debugger integration leg inside the container (e.g.
 # when iterating on a Rust-only failure). The cargo suite still runs.
 option(BLYT_SKIP_VSCODE "Skip the VS Code suite in test-linux-docker" OFF)
+# The amd64 image runs emulated on an arm64 host, so the lldb-heavy VS Code
+# debug legs run several times slower than a native runner; scale their timeouts
+# up (BLYT_IT_TIMEOUT_SCALE, read by the VS Code suite) so a
+# slow-but-progressing session is not killed mid-flight. Native CI sets its own,
+# smaller value.
+set(BLYT_LINUX_VSCODE_TIMEOUT_SCALE
+    "3"
+    CACHE STRING
+          "BLYT_IT_TIMEOUT_SCALE for the VS Code suite in test-linux-docker")
 if(BLYT_SKIP_VSCODE)
   set(_blyt_docker_vscode
       "echo '[test-linux-docker] BLYT_SKIP_VSCODE=1 — skipping VS Code suite'")
@@ -1615,7 +1624,9 @@ if(_BLYT_DOCKER)
       BLYT_VSCODE_TEST_CACHE=/vscode-test-cache
       # The native RISC-V QEMU gate is host-independent and would run nested
       # under Rosetta here; skip it in the Docker image (runs natively + in CI).
-      -e BLYT_SKIP_QEMU_GATE=1 blyt-testing-${BLYT_LINUX_ARCH} bash -c
+      -e BLYT_SKIP_QEMU_GATE=1 -e
+      BLYT_IT_TIMEOUT_SCALE=${BLYT_LINUX_VSCODE_TIMEOUT_SCALE}
+      blyt-testing-${BLYT_LINUX_ARCH} bash -c
       "source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1; set -e && cmake -B /build -G Ninja -DBLYT_BUILD_NATIVE=OFF /repo && cmake --build /build --parallel && cmake --build /build --target sdk && BLYT_BUILD_DIR=/build CARGO_HOME=/build/cargo-home CARGO_TARGET_DIR=/build/cargo-target cargo test --workspace -- ${BLYT_LINUX_TEST_FILTER} --nocapture && ${_blyt_docker_vscode}"
     COMMENT "Building and running integration tests in Linux Docker container"
     USES_TERMINAL VERBATIM)

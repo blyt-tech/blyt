@@ -21,6 +21,17 @@ const assert = require('node:assert');
 const records = new Map();
 /* pending waitForSession() calls: { pred, resolve, timer } */
 const sessionWaiters = [];
+
+/* BLYT_IT_TIMEOUT_SCALE (default 1): every wait below multiplies its timeout by
+ * this, so a loaded CI runner or an emulated container gets proportional
+ * headroom without slowing fast local runs. Applied INSIDE each helper so an
+ * explicit call-site timeout (e.g. the post-reload waitStopped) scales too. The
+ * mocha per-test ceiling (suite/index.js) scales by the same factor and stays
+ * above the summed waits, so the harness's descriptive timeout — not a bare
+ * mocha kill — is what surfaces on a slow-but-progressing test. runTests.js
+ * forwards the env var into each cart window. */
+const TIMEOUT_SCALE = Number(process.env.BLYT_IT_TIMEOUT_SCALE) || 1;
+const scaled = (ms) => Math.round(ms * TIMEOUT_SCALE);
 let installed = false;
 
 /* Append a compact, timestamped label to a session's bounded adapter trail. */
@@ -281,6 +292,7 @@ async function startWasm(wf) {
 
 /* Wait until a 'blyt' session matching `pred` exists. */
 function waitForSession(pred, label = 'session', timeoutMs = 60000) {
+	timeoutMs = scaled(timeoutMs);
 	for (const rec of records.values())
 		if (pred(rec.session)) return Promise.resolve(rec.session);
 	return new Promise((resolve, reject) => {
@@ -305,6 +317,7 @@ const byMode = (mode) => (s) => s.configuration._blytMode === mode;
 /* Wait for the next 'stopped' event on a session (consumes one queued stop).
  * `label` names what we're waiting for, surfaced in the timeout message. */
 function waitStopped(session, label = 'stopped event', timeoutMs = 90000) {
+	timeoutMs = scaled(timeoutMs);
 	const rec = records.get(session.id);
 	if (!rec) return Promise.reject(new Error('no record for session'));
 	if (rec.stops.length) return Promise.resolve(rec.stops.shift());
@@ -327,6 +340,7 @@ function waitStopped(session, label = 'stopped event', timeoutMs = 90000) {
  * { session, ev } for whichever stops first. Used when two sessions (native +
  * companion Lua) can stop in a platform-dependent order. */
 function waitAnyStopped(sessions, label = 'stopped event', timeoutMs = 90000) {
+	timeoutMs = scaled(timeoutMs);
 	for (const s of sessions) {
 		const rec = records.get(s.id);
 		if (rec?.stops.length)
@@ -408,6 +422,7 @@ function breakpointResultsFor(session, suffix) {
  * added breakpoint can race the continue (the GDB stub inserts it against an
  * already-running process and it never binds), which flakes on slower runners. */
 function waitBreakpointBound(session, line, timeoutMs = 30000) {
+	timeoutMs = scaled(timeoutMs);
 	const rec = records.get(session.id);
 	if (!rec) return Promise.reject(new Error('no record for session'));
 	const bound = () =>
@@ -489,6 +504,7 @@ function fileHash(p) {
  * surfaces as an explicit "did not rebuild" instead of a vague stop-timeout
  * (issue #249). */
 async function waitCartRebuilt(elfPath, beforeHash, timeoutMs = 60000) {
+	timeoutMs = scaled(timeoutMs);
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		const h = fileHash(elfPath);

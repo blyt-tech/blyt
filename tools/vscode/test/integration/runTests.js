@@ -175,6 +175,11 @@ async function main() {
 					BLYT_TRACE: '',
 					BLYT_IT_SPEC: spec,
 					BLYT_IT_GREP: process.env.BLYT_IT_GREP || '',
+					/* Timeout headroom multiplier (default 1) for loaded CI
+					 * runners / emulated containers; read by suite/index.js
+					 * (mocha) and suite/harness.js (every wait). */
+					BLYT_IT_TIMEOUT_SCALE:
+						process.env.BLYT_IT_TIMEOUT_SCALE || '',
 					BLYT_IT_DIAG_FILE: diagFile,
 					/* Per-entry `env` overrides; the extension's spawned
 					 * blytdebug inherits the extension-host env. */

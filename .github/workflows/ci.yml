@@ -210,6 +210,10 @@ jobs:
           BLYT_QEMU_KERNEL: /tmp/blyt-qemu/Image
           BLYT_QEMU_ROOTFS: /tmp/blyt-qemu/rootfs.qcow2
           BLYT_QEMU_SSH_KEY: /tmp/blyt-qemu/id_ed25519
+          # Headroom for the lldb-heavy VS Code debug legs on a loaded runner:
+          # multiply every mocha/harness timeout so a slow-but-progressing
+          # session is not killed mid-flight (the recurring c/wasm/hybrid flake).
+          BLYT_IT_TIMEOUT_SCALE: "2"
         run: cmake --build build --target test-integration
 
       # VS Code extension unit tests (cart-detection helpers + the lldb-proxy
@@ -236,6 +240,9 @@ jobs:
       - name: VS Code debugger integration tests
         env:
           BLYT_SDK_DIR: ${{ github.workspace }}/build/sdk
+          # See the Integration tests step: scale the debug-leg timeouts up so a
+          # loaded runner does not trip the flake.
+          BLYT_IT_TIMEOUT_SCALE: "2"
         run: |
           cd tools/vscode
           xvfb-run -a npm run test:integration
