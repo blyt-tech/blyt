@@ -228,6 +228,547 @@ fn sdl_dap_breakpoint_step_inspect() {
         .success();
 }
 
+/// Native host-Lua DAP (#253): inspection of an **f64 state-buffer field**. The
+/// shared inspection core reads the field through the `S` proxy on the parked
+/// host `lua_State`, so it exercises the same `get_f64` accessor the #235 bug
+/// misrouted to `get_i32`. The cart stores a fractional f64 (`42.5`) into a
+/// state-buffer field, breaks on the following line, and evaluates
+/// `S.game[slot].health` — which must render as the exact `42.5`, not an
+/// i32-misdecoded value. This closes the DAP-inspect leg of the never-exercised-
+/// f64 audit (the host-Lua state-buffer DAP tests otherwise only touch i32/plain
+/// locals). The inspection core is shared and value-generic, so its correctness
+/// here rides on the f64 accessor being correct on the host-Lua path.
+#[test]
+fn sdl_dap_hostlua_f64_state_buffer_inspect() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    const SB_F64_CONFIG: &str = "\
+records:
+  Game:
+    fields:
+      - { name: health, type: f64 }
+state_buffers:
+  game:
+    record: Game
+    count: 1
+";
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua_f64");
+    CartProject::new()
+        .config(SB_F64_CONFIG)
+        .lua(
+            "function init()\n\
+             \x20   local slot = blyt.buf.alloc_slot(S.GAME)\n\
+             \x20   S.game[slot].health = 42.5\n\
+             \x20   local marker = slot\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    // Break on line 4 (`local marker = slot`) — line 3 has already stored 42.5
+    // and `slot` is a live local in the paused frame, so the evaluate can index
+    // the state buffer through the `S` proxy's f64 accessor.
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "S.game[slot].health")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "42.5")
+        .assert()
+        .success();
+}
+
+/// Native host-Lua DAP for a HYBRID cart (#232 S6): a breakpoint in the Lua half,
+/// set on the line AFTER it calls a native export (`add_one`, driven through the
+/// ADR-0130 ECALL bridge), hits under blytdebug's host-Lua path, and the
+/// native-derived local is evaluable in the paused frame (`x + 1 == 43`, with
+/// `x == add_one(41) == 42`). Proves `blyt_hostlua_create_debug` builds the
+/// bridge session AND arms the Lua master hook together — the Lua-half
+/// source-debug path of a hybrid, parity with the emulated + WASM legs. Native-
+/// half GDB is deferred to a follow-up (#232 close-out).
+#[test]
+fn sdl_dap_hostlua_hybrid_breakpoint_evaluate() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_hostlua_hybrid");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(add_one, int32_t x) { return x + 1; }\n")
+        .lua(
+            "function init()\n\
+             \x20   local x = add_one(41)\n\
+             \x20   local y = x + 1\n\
+             \x20   local z = y + 1\n\
+             end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "3")
+        .env("BLYT_DAP_EVALUATE_EXPR", "x + 1")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "43")
+        .assert()
+        .success();
+}
+
+/// Native host-Lua DAP (#262): a breakpoint inside a Lua function reached via a
+/// native→Lua CALLBACK (the ADR-0130 reverse-trampoline — the native half does
+/// `lua_getglobal` + `lua_pcall`) must fire.  The callback runs on an exchange
+/// thread rather than the cart coroutine, so this only works because the master
+/// hook is armed across the exchange-thread pool.
+///
+/// This test was originally the EMULATED control for its host-Lua twin (one rv32
+/// machine, one guest lua_State, the guest master hook applying uniformly).
+/// ADR-0136 retired that leg, and the twin became an exact duplicate of this test,
+/// so the two are merged here.  The surviving cross-implementation checks are the
+/// WASM leg (`wasm_dap_hybrid_native_to_lua_callback_breakpoint`, #272) and real
+/// RISC-V via the QEMU gate.
+#[test]
+fn sdl_dap_hybrid_native_to_lua_callback_breakpoint() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_reverse_emulated");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+            \x20   lua_getglobal(L, \"on_native\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n")
+        .lua(
+            "local host = require(\"host\")\n\
+             function on_native()\n\
+             \x20   local a = 41\n\
+             \x20   local b = a + 1\n\
+             end\n\
+             function init() host.run_cb() end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "a")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "41")
+        .assert()
+        .success();
+}
+
+/// WASM host-Lua DAP (#272): the WASM analog of
+/// `sdl_dap_hybrid_native_to_lua_callback_breakpoint`.  A breakpoint in a
+/// Lua function reached via a native→Lua CALLBACK (the ADR-0130 reverse-trampoline
+/// — the native half does `lua_getglobal`+`lua_pcall`) must fire on the WASM
+/// host-Lua leg too.  On WASM the callback runs on an ADR-0130 exchange thread,
+/// invoked via `lua_pcall(EX)` from inside the rv32 ECALL dispatch, so pausing
+/// there (which pauses by `lua_yield`, not block-a-thread) needs the deferred /
+/// yieldable reverse-call restructure this issue tracks — without it the
+/// breakpoint silently never stops.  Evaluates a local in the paused callback
+/// frame (`a == 41`).  Native counterpart: `sdl_dap_hybrid_native_to_lua_callback_breakpoint`.
+#[test]
+fn wasm_dap_hybrid_native_to_lua_callback_breakpoint() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_hostlua_reverse");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+            \x20   lua_getglobal(L, \"on_native\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n")
+        .lua(
+            "local host = require(\"host\")\n\
+             function on_native()\n\
+             \x20   local a = 41\n\
+             \x20   local b = a + 1\n\
+             end\n\
+             function init() host.run_cb() end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "a")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "41")
+        .assert()
+        .success();
+}
+
+/// WASM host-Lua DAP (#272), NESTED re-entrant case: native→Lua→native→Lua with
+/// the breakpoint at the BOTTOM.  `init` calls `host.run_cb` (native) → `on_native`
+/// (Lua, exchange thread EX0) → `host.run_cb_inner` (native again) → `on_native_inner`
+/// (Lua, exchange thread EX1), where the breakpoint sits.  This forces the DAP
+/// pause `lua_yield` to propagate outward through TWO forward-trampoline levels and
+/// TWO parked reverse-call states — the continuation chain either composes or hides
+/// a #98-class latent bug.  Evaluates a local in the deepest paused frame (`a == 41`).
+#[test]
+fn wasm_dap_hybrid_reentrant_callback_breakpoint() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_hostlua_reentrant");
+    CartProject::new()
+        .c("#include \"blyt.h\"\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+            \x20   lua_getglobal(L, \"on_native\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n\
+            BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb_inner) {\n\
+            \x20   lua_getglobal(L, \"on_native_inner\");\n\
+            \x20   lua_pcall(L, 0, 0, 0);\n\
+            \x20   return 0;\n\
+            }\n")
+        .lua(
+            "local host = require(\"host\")\n\
+             function on_native_inner()\n\
+             \x20   local a = 41\n\
+             \x20   local b = a + 1\n\
+             end\n\
+             function on_native()\n\
+             \x20   host.run_cb_inner()\n\
+             end\n\
+             function init() host.run_cb() end\n\
+             function update() blyt.quit() end\n\
+             function draw() end\n",
+        )
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "4")
+        .env("BLYT_DAP_EVALUATE_EXPR", "a")
+        .env("BLYT_DAP_EVALUATE_EXPECT", "41")
+        .assert()
+        .success();
+}
+
+/// Cross-boundary stepping cart (#273): a native→Lua callback with a landing
+/// line after the callback call, so a step can cross the native↔Lua boundary.
+/// `init` calls `host.run_cb` (native), which calls the Lua `on_native` back
+/// through the ADR-0130 reverse-trampoline.  On the native host-Lua path
+/// `on_native` runs on an exchange thread — a DIFFERENT lua_State from `init`
+/// on the driver coroutine — so stepping/stackTrace across the boundary must be
+/// spliced.  Line map (1-based): 3 = `local a = 41`, 4 = `local b = a + 1`,
+/// 7 = `local p = 1`, 8 = `host.run_cb()`, 9 = `local q = 2`.
+const XBOUND_C: &str = "#include \"blyt.h\"\n\
+     BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+     \x20   lua_getglobal(L, \"on_native\");\n\
+     \x20   lua_pcall(L, 0, 0, 0);\n\
+     \x20   return 0;\n\
+     }\n";
+const XBOUND_LUA: &str = "local host = require(\"host\")\n\
+     function on_native()\n\
+     \x20   local a = 41\n\
+     \x20   local b = a + 1\n\
+     end\n\
+     function init()\n\
+     \x20   local p = 1\n\
+     \x20   host.run_cb()\n\
+     \x20   local q = 2\n\
+     end\n\
+     function update() blyt.quit() end\n\
+     function draw() end\n";
+
+/// The scripted step walk (BLYT_DAP_SEQUENCE), asserting the SAME landings the
+/// emulated single-lua_State control produces.  Breakpoint at line 8 (the
+/// `host.run_cb()` call site):
+///   1. initial stop: in init@8, one frame (pre-call, not yet spliced).
+///   2. stepIn: DIVES across native into the callback → on_native@3; the stack
+///      is spliced (on_native@3 over init@8) and init's local `p` is inspectable
+///      from the parent frame — the two things #262 left unresolved.
+///   3. next: intra-callback step → on_native@4, still spliced.
+///   4. stepOut: crosses the boundary back → init@9, one frame again.
+const XBOUND_SEQUENCE: &str = concat!(
+    r#"[{"reason":"breakpoint","stack":[8],"frames":1},"#,
+    r#"{"do":"stepIn","reason":"step","stack":[3,8],"frames":2,"#,
+    r#""eval":[{"line":8,"expr":"p","result":"1"}]},"#,
+    r#"{"do":"next","reason":"step","stack":[4,8],"frames":2},"#,
+    r#"{"do":"stepOut","reason":"step","stack":[9],"frames":1},"#,
+    r#"{"do":"continue"}]"#
+);
+
+/// Native host-Lua DAP (#273): stepping ACROSS the native↔Lua callback boundary.
+/// The Lua half and the callback run on different `lua_State`s (cart coroutine vs
+/// exchange thread), so `dap_call_depth` is per-state and the stackTrace must be
+/// spliced across the boundary for step-in/next/step-out to land where a single
+/// stack would put them.  The scripted landings in [`XBOUND_SEQUENCE`] pin that.
+///
+/// This test was originally the EMULATED control (one rv32 machine / one guest
+/// lua_State, where the callback shares init's stack and stepping composes for
+/// free — the oracle the host-Lua leg was pinned to).  ADR-0136 retired that leg
+/// and its host-Lua twin became an exact duplicate, so they are merged here; the
+/// same `XBOUND_SEQUENCE` is still asserted on the WASM leg (#309) and the
+/// composed-stack behaviour it encodes is what bare metal does natively.
+#[test]
+fn sdl_dap_hybrid_step_across_callback_boundary() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_xbound_emulated");
+    CartProject::new()
+        .c(XBOUND_C)
+        .lua(XBOUND_LUA)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "8")
+        .env("BLYT_DAP_SEQUENCE", XBOUND_SEQUENCE)
+        .assert()
+        .success();
+}
+
+/// WASM host-Lua DAP (#309): the WASM analog of
+/// `sdl_dap_hybrid_step_across_callback_boundary` — the SAME cart and the
+/// SAME scripted step walk, so the landings are pinned identical across all three
+/// legs.  #272 made a breakpoint inside a native→Lua callback *stop* on WASM; this
+/// pins that stepIn/next/stepOut and the stackTrace splice compose across the
+/// exchange-thread boundary here too.  WASM differs from native in one way that
+/// matters: its DAP pause unwinds the whole C stack (`lua_yield` out through
+/// `wasm_bridged_drive`'s `lua_yieldk`), so the step-depth frame base cannot live
+/// in a C local as it does on native — it is published in `g_bridged_state[d]` and
+/// must survive the pause for `handle_step` to read.  Without that, a stepOut of
+/// the callback runs away past `init`.  Emulated oracle:
+/// `sdl_dap_hybrid_step_across_callback_boundary`.
+#[test]
+fn wasm_dap_hybrid_step_across_callback_boundary() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_hostlua_xbound");
+    CartProject::new()
+        .c(XBOUND_C)
+        .lua(XBOUND_LUA)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "8")
+        .env("BLYT_DAP_SEQUENCE", XBOUND_SEQUENCE)
+        .assert()
+        .success();
+}
+
+/// NESTED cross-boundary stepping cart (#309): native→Lua→native→Lua, with a
+/// landing line after EACH callback call so a step can cross the boundary twice.
+/// On the host-Lua legs the two callbacks run on DIFFERENT exchange threads (EX0,
+/// EX1), neither of which is the driver coroutine `init` runs on — so a correct
+/// step depth here is the sum of THREE per-lua_State depths, and the frame base
+/// each level publishes must be saved and restored in a balanced chain.  A base
+/// that composed only one level deep would still pass the single-level script
+/// above; this is what pins the chain.  Line map (1-based): 3 = `local a = 41`,
+/// 4 = `local b = a + 1`, 7 = `local m = 5`, 8 = `host.run_cb_inner()`,
+/// 9 = `local n = 6`, 12 = `local p = 1`, 13 = `host.run_cb()`, 14 = `local q = 2`.
+const XBOUND2_C: &str = "#include \"blyt.h\"\n\
+     BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb) {\n\
+     \x20   lua_getglobal(L, \"on_native\");\n\
+     \x20   lua_pcall(L, 0, 0, 0);\n\
+     \x20   return 0;\n\
+     }\n\
+     BLYT_LUA_MODULE_EXPORT_RAW(host, run_cb_inner) {\n\
+     \x20   lua_getglobal(L, \"on_native_inner\");\n\
+     \x20   lua_pcall(L, 0, 0, 0);\n\
+     \x20   return 0;\n\
+     }\n";
+const XBOUND2_LUA: &str = "local host = require(\"host\")\n\
+     function on_native_inner()\n\
+     \x20   local a = 41\n\
+     \x20   local b = a + 1\n\
+     end\n\
+     function on_native()\n\
+     \x20   local m = 5\n\
+     \x20   host.run_cb_inner()\n\
+     \x20   local n = 6\n\
+     end\n\
+     function init()\n\
+     \x20   local p = 1\n\
+     \x20   host.run_cb()\n\
+     \x20   local q = 2\n\
+     end\n\
+     function update() blyt.quit() end\n\
+     function draw() end\n";
+
+/// The nested step walk.  Breakpoint at line 8 — inside the OUTER callback, at its
+/// call to the inner native export — so the very first stop is already spliced:
+///   1. initial stop: on_native@8 over init@13 (two frames, one boundary crossed).
+///   2. stepIn: dives across the second boundary → on_native_inner@3, three frames
+///      spanning three lua_States, with locals readable in BOTH ancestors (`m` in
+///      the middle callback frame, `p` two levels up in init).
+///   3. next: intra-callback → @4.
+///   4. stepOut: unwinds ONE boundary → on_native@9 (not all the way to init —
+///      an unbalanced base restore would overshoot to 14 or run away entirely).
+///   5. stepOut: unwinds the outer boundary → init@14.
+const XBOUND2_SEQUENCE: &str = concat!(
+    r#"[{"reason":"breakpoint","stack":[8,13],"frames":2},"#,
+    r#"{"do":"stepIn","reason":"step","stack":[3,8,13],"frames":3,"#,
+    r#""eval":[{"line":8,"expr":"m","result":"5"},{"line":13,"expr":"p","result":"1"}]},"#,
+    r#"{"do":"next","reason":"step","stack":[4,8,13],"frames":3},"#,
+    r#"{"do":"stepOut","reason":"step","stack":[9,13],"frames":2},"#,
+    r#"{"do":"stepOut","reason":"step","stack":[14],"frames":1},"#,
+    r#"{"do":"continue"}]"#
+);
+
+/// Native host-Lua DAP, NESTED two-boundary walk (#309): the whole
+/// native↔Lua↔native↔Lua chain, stepped end to end.  Each boundary crossing adds
+/// another `lua_State`, so the splice must compose recursively rather than only
+/// one level deep — the landings in [`XBOUND2_SEQUENCE`] pin that.
+///
+/// Originally the EMULATED oracle (one rv32 machine / one guest lua_State, where
+/// the whole chain lives on a single stack and the landings come for free).
+/// ADR-0136 retired that leg; its host-Lua twin was an exact duplicate and the two
+/// are merged here.  The same sequence is asserted on the WASM leg below.
+#[test]
+fn sdl_dap_hybrid_nested_step_across_callback_boundary() {
+    require_sdk();
+    require_lua_sdk();
+    assert!(blytdebug().exists(), "blytdebug not built");
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("sdl_dap_xbound2_emulated");
+    CartProject::new()
+        .c(XBOUND2_C)
+        .lua(XBOUND2_LUA)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let orchestrator = repo_root().join("tests/dap/run_sdl_dap_test.mjs");
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            blytdebug().to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "8")
+        .env("BLYT_DAP_SEQUENCE", XBOUND2_SEQUENCE)
+        .assert()
+        .success();
+}
+
+/// WASM host-Lua leg of the nested walk (#309).  Here each level's base lives in
+/// its own `g_bridged_state[d]` slot and every level's pause unwinds the C stack,
+/// so the save/restore chain is carried entirely by that array — the case where a
+/// single shared base, or a base restored on the way out of a pause, silently
+/// breaks.  Companion to `wasm_dap_hybrid_reentrant_callback_breakpoint` (#272),
+/// which pinned the nested *stop* but not nested stepping.
+#[test]
+fn wasm_dap_hybrid_nested_step_across_callback_boundary() {
+    require_wasm_debug();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("wasm_dap_hostlua_xbound2");
+    CartProject::new()
+        .c(XBOUND2_C)
+        .lua(XBOUND2_LUA)
+        .write(&project);
+
+    let cart = build_lua_cart(&project);
+    assert!(cart.exists(), "cart not found at {}", cart.display());
+
+    let wasm_dir = find_wasm_debug_dir();
+    let orchestrator = repo_root().join("tests/dap/run_dap_test.mjs");
+
+    Command::new("node")
+        .args([
+            orchestrator.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .env("BLYT_DAP_BP_LINE", "8")
+        .env("BLYT_DAP_SEQUENCE", XBOUND2_SEQUENCE)
+        .assert()
+        .success();
+}
+
 /// SDL2 DAP: verify loadedSources returns the cart's Lua source after a stop.
 #[test]
 fn sdl_dap_loaded_sources() {
@@ -385,6 +926,9 @@ fn sdl_dap_exception_breakpoint() {
             cart.to_str().unwrap(),
         ])
         .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
+        // #319: the stop must be inspectable — stackTrace with a frame at the
+        // error site (line 2, `error("test exception")`), matching emulated.
+        .env("BLYT_DAP_EXCEPTION_EXPECT_LINE", "2")
         .assert()
         .success();
 }
@@ -620,6 +1164,9 @@ fn wasm_dap_exception_breakpoint() {
             cart.to_str().unwrap(),
         ])
         .env("BLYT_DAP_EXCEPTION_FILTER", "uncaught")
+        // #319: the stop must be inspectable — stackTrace with a frame at the
+        // error site (line 2, `error("test exception")`), matching emulated.
+        .env("BLYT_DAP_EXCEPTION_EXPECT_LINE", "2")
         .assert()
         .success();
 }
@@ -780,6 +1327,13 @@ fn wasm_hybrid_lua_c_dap_no_gdb() {
 ///
 /// This is the exact scenario reported as failing: Lua BPs don't stop in
 /// hybrid mode while C BPs (via lldb-dap) do.
+///
+/// The C half EXPORTS its function deliberately.  GDB attaches to the rv32
+/// session, which exists only for a reachable native half
+/// (`blyt_hostlua_cart_has_native_half`); an unexported helper is code that can
+/// never execute, so there would be no session, no GDB port, and no breakpoint
+/// that could ever fire.  Exporting it makes this a genuine two-debugger hybrid
+/// rather than a pure-Lua cart wearing a hybrid's name.
 #[test]
 fn sdl_hybrid_lua_c_dap_with_gdb() {
     require_sdk();
@@ -803,7 +1357,7 @@ fn sdl_hybrid_lua_c_dap_with_gdb() {
              function draw() end\n",
         )
         .c("#include \"blyt.h\"\n\
-             void c_helper(void) { (void)0; }\n")
+             BLYT_LUA_EXPORT_VOID(c_helper) { (void)0; }\n")
         .write(&project);
 
     let cart = build_debug_lua_cart(&project);

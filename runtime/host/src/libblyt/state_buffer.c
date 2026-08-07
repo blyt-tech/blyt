@@ -178,6 +178,12 @@ int blyt_state_get(const blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, u
 
     uint32_t fi = field - 1;
     uint8_t tag = bc->field_types[fi];
+    /* The 32-bit accessor never handles f64 — that is the 64-bit get64 path
+     * (#253 audit). Guarding here mirrors get64/set64's f64-only checks and,
+     * defensively, stops a stray f64 field (elem=8) from overflowing the 4-byte
+     * `bits` below should a future caller misroute it. */
+    if (tag == TYPE_F64)
+        return -1;
     size_t elem = field_sizeof(tag);
     const uint8_t *ptr = (const uint8_t *)bc->field_data[fi] + (size_t)slot * elem;
 
@@ -200,6 +206,12 @@ int blyt_state_set(blyt_state_ctx_t *ctx, uint32_t buf_id, int32_t slot, uint32_
     uint32_t fi = field - 1;
     uint8_t tag = bc->field_types[fi];
     (void)type_tag; /* tag from the field declaration is authoritative */
+
+    /* f64 is the 64-bit set64 path only (#253 audit). Guard mirrors get above
+     * and get64/set64: a stray f64 field (elem=8) would over-read the 4-byte
+     * `value_bits` source in the memcpy below. */
+    if (tag == TYPE_F64)
+        return -1;
 
     /* NaN canonicalization for f32 (ADR-0010); shared with the native path. */
     if (tag == TYPE_F32)

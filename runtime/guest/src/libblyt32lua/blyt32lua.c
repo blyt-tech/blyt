@@ -971,9 +971,7 @@ static void chunk_module_name(lua_State *L, char *out, size_t outsz) {
 }
 
 static lua_State *open_state(void) {
-    blyt_console_debug("open_state: before luaL_newstate");
     lua_State *L = luaL_newstate();
-    blyt_console_debug(L ? "open_state: newstate ok" : "open_state: newstate NULL");
     if (!L)
         return NULL;
 
@@ -994,17 +992,13 @@ static lua_State *open_state(void) {
     lua_pop(L, 1);
     luaL_requiref(L, LUA_UTF8LIBNAME, luaopen_utf8, 1);
     lua_pop(L, 1);
-    blyt_console_debug("open_state: stdlib subset opened");
 
-    blyt_console_debug("open_state: before register_blyt32");
     register_blyt32(L);
-    blyt_console_debug("open_state: register_blyt32 done");
 
     if (cart_lua_modules)
         cart_lua_modules(L);
 
     if (cart_lua_bytecode && cart_lua_bytecode_size) {
-        blyt_console_debug("open_state: before load lua bytecode");
         const unsigned char *data = cart_lua_bytecode;
         unsigned int remaining = cart_lua_bytecode_size;
 
@@ -1058,22 +1052,17 @@ static lua_State *open_state(void) {
         } else {
             int load_result = luaL_loadbuffer(L, (const char *)cart_lua_bytecode,
                                               cart_lua_bytecode_size, "@cart");
-            blyt_console_debug(load_result == LUA_OK ? "open_state: loadbuffer OK"
-                                                     : "open_state: loadbuffer FAILED");
             if (load_result != LUA_OK) {
                 blyt_console_debug(lua_tostring(L, -1));
                 lua_close(L);
                 return NULL;
             }
-            blyt_console_debug("open_state: before lua_pcall");
             if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
                 blyt_console_debug(lua_tostring(L, -1));
                 lua_close(L);
                 return NULL;
             }
-            blyt_console_debug("open_state: lua_pcall done");
         }
-        blyt_console_debug("open_state: lua bytecode loaded");
     }
 
     return L;
@@ -1105,9 +1094,7 @@ static void call_global(const char *name) {
 }
 
 void blyt_cart_init(void) {
-    blyt_console_debug("blyt_cart_init: start");
     g_L = open_state();
-    blyt_console_debug(g_L ? "blyt_cart_init: open_state ok" : "blyt_cart_init: open_state FAILED");
 #ifdef BLYT_DAP
     if (g_L && blyt_dap_active()) {
         fc_master_hook_cfg.dap_enabled = true;
@@ -1115,7 +1102,6 @@ void blyt_cart_init(void) {
     }
 #endif
     call_global("init");
-    blyt_console_debug("blyt_cart_init: done");
 }
 
 void blyt_cart_update(void) {
@@ -1133,6 +1119,24 @@ void blyt_cart_on_new_state(void) {
 }
 void blyt_cart_on_save_state(void) {
     call_global("on_save_state");
+}
+/* The loop-exit tail of blyt_main, per ADR-0087's Lua entry-point table (#283).
+ * These two were missing here since the Lua runtime was introduced, so the weak
+ * libblytcommon no-ops won and a Lua cart's on_quit()/cleanup() had NEVER run on
+ * the emulated path — nor on bare metal, which links this same shim — while the
+ * host-Lua driver chunk (BLYT_HOSTLUA_CO_BODY_RUNNING) called them faithfully.
+ * A cart-observable cross-leg divergence that stayed invisible because every
+ * assertion covering it was a substring match on output the cart emitted earlier
+ * in its life (#284).
+ *
+ * No blyt_quit() here, unlike libblytcommon's weak on_quit default: that default
+ * exists to end the loop when nothing else would, and by the time this runs the
+ * loop has already exited on the cart's own blyt_quit(). */
+void blyt_cart_on_quit(void) {
+    call_global("on_quit");
+}
+void blyt_cart_cleanup(void) {
+    call_global("cleanup");
 }
 void blyt_cart_on_load_state(blyt_load_info_t info) {
     if (!g_L)

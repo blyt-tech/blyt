@@ -3,9 +3,11 @@
 /* SDK-internal Lua declarations for BLYT_LUA_EXPORT_* macro-generated wrappers
  * and devtool-generated cart_lua_modules glue.  Not for direct use in cart code.
  *
- * Deliberately omits: lua_call, lua_pcall, lua_load, luaL_loadbuffer,
- * lua_gettable, lua_settable, luaL_requiref, luaL_openlibs — cart code must
- * communicate with Lua exclusively through the BLYT_LUA_EXPORT_* boundary.
+ * Deliberately omits: lua_load, luaL_loadbuffer, lua_gettable, lua_settable,
+ * luaL_requiref, luaL_openlibs — the loading/compiling class stays out (ADR-0118).
+ * lua_call/lua_pcall ARE exposed (#262, ADR-0130 amend): they invoke a Lua value
+ * the cart already reached, introducing no new code, so they stay within the
+ * restricted surface. Raw/bridged wrapper bodies use them (reverse-trampoline).
  *
  * Matches the Lua 5.4 ABI compiled with BLYT_LUA_I32_F64 (lua_Integer=int32,
  * lua_Number=double — Spike U: int32 keeps the 32-bit console identity, while
@@ -70,6 +72,20 @@ extern void lua_rawseti(lua_State *L, int idx, lua_Integer n);
 
 /* Error reporting. */
 extern int luaL_error(lua_State *L, const char *fmt, ...);
+
+/* Reverse-trampoline (#262, ADR-0130 amend): call a Lua value the wrapper has
+ * pushed (function + nargs on the stack).  lua_pcall returns a status
+ * (LUA_OK == 0 on success; the error object is left on the stack otherwise);
+ * lua_call propagates an error into the calling Lua context.  msgh must be 0 —
+ * the host-Lua bridge cannot run a message handler, and the constraint is kept
+ * on rv32/bare-metal too so behaviour is identical across every leg. */
+extern int lua_pcall(lua_State *L, int nargs, int nresults, int msgh);
+extern void lua_call(lua_State *L, int nargs, int nresults);
+#define LUA_MULTRET (-1)
+#define LUA_OK 0
+#define LUA_ERRRUN 2
+#define LUA_ERRMEM 4
+#define LUA_ERRERR 5
 
 /* Module table helper — gets or creates registry[fname]; used by cart_lua_modules. */
 extern int luaL_getsubtable(lua_State *L, int idx, const char *fname);

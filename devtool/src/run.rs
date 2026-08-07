@@ -1536,6 +1536,20 @@ fn start_watcher(project_dir: PathBuf, debug: bool, hub: DevCtrlHub) {
 
         let settle = std::time::Duration::from_millis(150);
         let mut msg_id: u64 = 1;
+
+        // Watcher-armed signal.  Every `watch()` above has returned and the
+        // ELF/asset baseline is seeded, so any edit from here on is guaranteed
+        // to be observed and diffed.  notify does not deliver events that
+        // predate the arming, so an orchestrator that edits a watched file must
+        // wait for *this* line, not guess with a fixed sleep — the arming races
+        // a saturated box and a fixed delay under-waits (issue #290, the
+        // hub-dial sibling of the #288 fixed-timeout-as-readiness flake).  Same
+        // pattern as the "GDB: WASM ready" relay-ready signal above.  stdout is
+        // line-buffered so the '\n' flushes; the explicit flush matches that
+        // signal and is cheap insurance.
+        println!("[watch] ready");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
         while let Ok(path) = rx.recv() {
             let rel = path.strip_prefix(&project_dir).unwrap_or(&path);
             println!("[watch] {} changed", rel.display());

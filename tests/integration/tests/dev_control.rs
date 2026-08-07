@@ -12,8 +12,8 @@
 mod common;
 
 use common::{
-    CartProject, blyt_bin, blytplay, build_lua_cart, require_lua_sdk, require_sdk, require_wasm,
-    sdk_dir,
+    CartProject, blyt_bin, blytplay, build_lua_cart, libretro_so, require_libretro_core,
+    require_lua_sdk, require_sdk, require_wasm, sdk_dir, test_libretro_core,
 };
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -164,8 +164,21 @@ fn spawn_player_with_dev_ctrl(
     cart: &std::path::Path,
     save_dir: &std::path::Path,
 ) -> (std::process::Child, u16, Arc<Mutex<Vec<String>>>) {
+    spawn_player_with_dev_ctrl_args(cart, save_dir, &[])
+}
+
+/// As `spawn_player_with_dev_ctrl`, but prepends `extra_args` before the cart —
+/// a general hook for passing extra player flags to a dev-ctrl reload test.
+fn spawn_player_with_dev_ctrl_args(
+    cart: &std::path::Path,
+    save_dir: &std::path::Path,
+    extra_args: &[&str],
+) -> (std::process::Child, u16, Arc<Mutex<Vec<String>>>) {
+    let mut args: Vec<&str> = vec!["--headless", "--dev-ctrl-port", "0"];
+    args.extend_from_slice(extra_args);
+    args.push(cart.to_str().unwrap());
     let mut child = std::process::Command::new(blytplay())
-        .args(["--headless", "--dev-ctrl-port", "0", cart.to_str().unwrap()])
+        .args(&args)
         .env("BLYT_SAVE_DIR", save_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -337,18 +350,30 @@ fn native_dev_control_lifecycle_commands() {
     );
 }
 
-/// Build a pure-Lua cart that prints the guest address of a freshly allocated
-/// table on every init(): `probe addr=table: 0x...`.  That address is where the
-/// libblytc arena placed the new Lua state, so it is identical on every load
-/// **iff** the arena allocator is reset on a hot swap (issue #133).  Without the
-/// reset it climbs monotonically from the very first reload, as each reload's
-/// Lua state is allocated past the previous cart's un-reclaimed arena.
+/// Build a pure-Lua cart that prints its `guest_heap_used` byte count on every
+/// init(): `probe heap=<n>`.  It allocates a deterministic, kept-alive table so
+/// the count is a fixed non-zero baseline, then reads it via
+/// `blyt32.mem.stats().cart_allocations`.  That count is identical on every load
+/// **iff** the reload resets the cart-heap accounting to a fresh-load baseline
+/// (issue #133 memory hygiene).  Without the reset it climbs monotonically from
+/// the first reload, as each reload's allocations stack on the previous cart's
+/// un-reclaimed heap.
+///
+/// (Pure-Lua carts run host-Lua by default after #236, whose allocator draws
+/// physical bytes from host malloc with a shadow arena for byte-accounting, #231 —
+/// so raw pointer addresses are host-determined and NOT a determinism signal.
+/// `guest_heap_used` is the deterministic hygiene signal, reset by
+/// `hl_rebuild_and_restore` on every hot swap; this is the host-Lua-appropriate
+/// form of the emulated-path arena-reset check.)
 fn arena_probe_cart(tmp: &TempDir) -> std::path::PathBuf {
     let project = tmp.path().join("arena_probe");
     CartProject::new()
         .lua(
-            "function init()\n\
-             \tblyt.debug.print('probe addr=' .. tostring({}))\n\
+            "local keep\n\
+             function init()\n\
+             \tkeep = {}\n\
+             \tfor i = 1, 64 do keep[i] = i * 2 end\n\
+             \tblyt.debug.print('probe heap=' .. tostring(blyt32.mem.stats().cart_allocations))\n\
              end\n\
              function update() end\n\
              function draw() end\n",
@@ -358,14 +383,14 @@ fn arena_probe_cart(tmp: &TempDir) -> std::path::PathBuf {
 }
 
 /// N consecutive hot reloads of the same cart must reach a stable steady state:
-/// every reload's arena allocations land at the same guest addresses as the very
-/// first (fresh) load — i.e. the hot-reloaded VM is bit-identical to a fresh load
-/// (issue #133, spike-W gate G4).  The cart prints the address of a fresh table
-/// in init(); `blyt_session_swap_cart` must reset the libblytc arena allocator's
-/// bump pointer + free list so that address does not drift (and, accumulated over
-/// many reloads, does not exhaust the 16 MiB arena).  Pre-fix this fails on the
-/// first reload, as the address climbs the moment a second cart load reuses the
-/// persistent arena.
+/// every reload's `guest_heap_used` equals the very first (fresh) load's — i.e.
+/// the hot-reloaded VM's cart-heap accounting is reset to a fresh-load baseline
+/// (issue #133 memory hygiene, spike-W gate G4).  The cart prints its
+/// `guest_heap_used` in init(); the reload path must empty the cart heap (reset
+/// the accounting) so the count does not drift (and, accumulated over many
+/// reloads, does not exhaust the 16 MiB budget).  Pre-fix this fails on the first
+/// reload, as the count climbs the moment a second cart load stacks on the
+/// persistent heap.
 #[test]
 fn native_dev_control_reload_arena_steady_state() {
     require_sdk();
@@ -408,29 +433,416 @@ fn native_dev_control_reload_arena_steady_state() {
     let _ = child.wait();
 
     let out = lines.lock().unwrap().clone();
-    let addrs: Vec<&str> = out
+    let heaps: Vec<&str> = out
         .iter()
-        .filter_map(|l| l.split("probe addr=").nth(1).map(str::trim))
+        .filter_map(|l| l.split("probe heap=").nth(1).map(str::trim))
         .collect();
 
     // Initial (fresh) load + N reloads = N+1 probe lines.
     assert!(
-        addrs.len() >= N + 1,
+        heaps.len() >= N + 1,
         "expected at least {} probe lines (fresh load + {N} reloads), got {}; player output:\n{:#?}",
         N + 1,
-        addrs.len(),
+        heaps.len(),
         out
     );
 
-    let baseline = addrs[0];
-    for (i, a) in addrs.iter().enumerate() {
+    let baseline = heaps[0];
+    for (i, h) in heaps.iter().enumerate() {
         assert_eq!(
-            *a, baseline,
-            "arena allocation address drifted on reload {i}: {a:?} != fresh-load baseline \
-             {baseline:?} — libblytc arena allocator not reset on the hot swap (issue #133). \
-             All probes:\n{addrs:#?}"
+            *h, baseline,
+            "guest_heap_used drifted on reload {i}: {h:?} != fresh-load baseline {baseline:?} — \
+             the cart-heap accounting was not reset on the hot swap (issue #133). \
+             All probes:\n{heaps:#?}"
         );
     }
+}
+
+/// Pure-Lua cart that reads an uncompressed bundled resource in on_load_state and
+/// echoes it (issue #246).  Byte-identical Lua across v1/v2, so the ONLY thing a
+/// reload can change is the bundled resource content — proving it is the resource
+/// TABLE, not the code, that reloaded from the new cart.
+/// 0x20000001 = R_GREETING baked constant (kind RESOURCE, id 1; ADR-0134).
+const RELOAD_RESOURCE_LUA: &str = r#"
+local function greeting()
+    return blyt.resource.text_resource(0x20000001):text() or "<nil>"
+end
+function init()
+    blyt.debug.print("init greeting=" .. greeting())
+end
+function update() end
+function draw() end
+function on_load_state(info)
+    blyt.debug.print("reload greeting=" .. greeting() .. " reason=" .. tostring(info.reason))
+end
+"#;
+
+/// Drive an in-place dev-ctrl `reload` cart-swap on the native player, swapping a
+/// cart whose bundled resource content changed (RES_V1 → RES_V2), and assert the
+/// post-swap on_load_state read returns the NEW content (issue #246).
+///
+/// The pure-Lua cart runs host-Lua by default (ADR-0136), so the dev-ctrl reload
+/// drives `blyt_hostlua_reload` (#244), whose resource reload was never exercised
+/// because `hello` has no resources.  The reload must surface RES_V2; a stale
+/// RES_V1 would mean the resource table still aliases the freed old cart map
+/// (resource.c e->data = body).  `extra_args` is a general hook for extra player
+/// flags.
+fn native_reload_resource_leg(extra_args: &[&str], leg: &str) {
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+
+    let project_v1 = tmp.path().join("reload_res_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V1")
+        .write(&project_v1);
+    let v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("reload_res_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V2")
+        .write(&project_v2);
+    let v2 = build_lua_cart(&project_v2);
+
+    // Run on a copy we overwrite in place, reproducing `blyt debug`'s in-place
+    // rebuild-then-reload (the reload reopens g_cart_path).
+    let work = tmp.path().join("cart.blyt");
+    std::fs::copy(&v1, &work).unwrap();
+
+    let (mut child, port, lines) =
+        spawn_player_with_dev_ctrl_args(&work, save_dir.path(), extra_args);
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect dev control");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let read_half = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(read_half);
+
+    // Wait for cart_v1's init() to run and read its bundled resource BEFORE
+    // reloading.  Sending the reload immediately races boot: on a fast runner the
+    // swap can happen before frame 0 runs, so v1's init never prints RES_V1 (the
+    // CI-observed flake).  This also anchors the pre-swap value the post-reload
+    // read must differ from.
+    let wait_line = |needle: &str, what: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if lines.lock().unwrap().iter().any(|l| l.contains(needle)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{leg}: timed out waiting for {what} ({needle:?}); player output:\n{}",
+                lines.lock().unwrap().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_line("init greeting=RES_V1", "cart_v1 init resource read");
+
+    // Rebuild in place (overwrite with v2, whose resource ships RES_V2), then
+    // hot reload — the swap must reload the resource table from the new cart.
+    std::fs::copy(&v2, &work).unwrap();
+    let resp = dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":1,"cmd":"reload"}"#);
+    assert!(
+        resp.contains("\"id\":1") && resp.contains("\"status\":\"ok\""),
+        "{leg}: reload did not succeed: {resp}"
+    );
+
+    // The reload's on_load_state runs synchronously inside the reload handler
+    // (before the ok response), so RES_V2 is already printed; poll to be robust.
+    wait_line(
+        "reload greeting=RES_V2 reason=3",
+        "post-reload resource read",
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Guard against a stale read masquerading as success: the post-reload value
+    // must be RES_V2, never the pre-swap RES_V1 (which would mean the table still
+    // aliased the freed old cart, #246).
+    let out = lines.lock().unwrap().join("\n");
+    assert!(
+        !out.contains("reload greeting=RES_V1"),
+        "{leg}: post-reload read returned the stale old-cart content RES_V1 (#246); \
+         player output:\n{out}"
+    );
+}
+
+/// Host-Lua path (ADR-0136): a pure-Lua cart runs host-Lua by default, so the
+/// dev-ctrl reload drives `blyt_hostlua_reload` (#244), which reloads its resource
+/// table from the new cart before the old cart is freed.  Pins that #244 handling —
+/// `hello` (its only prior reload cart) has zero resources, so this path was never
+/// exercised.
+#[test]
+fn native_dev_control_reload_reloads_resource_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+    native_reload_resource_leg(&[], "native host-Lua");
+}
+
+/// #251 (#232 S7 follow-up) — a HYBRID cart on the host-Lua path (`--host-lua`; a
+/// hybrid opts in, #236/#257 keep pure-Lua as the default host-Lua case) reloads
+/// *coordinated* across BOTH halves: the native rv32 half is `blyt_session_swap_cart`ed
+/// and the host Lua VM is rebuilt, together, so neither half is left on the old
+/// image (the silent half-reload #98 warns against).  The v1/v2 carts differ in the
+/// NATIVE half too — `compute(x)` returns `x+1` in v1 and `x+100` in v2 — so a
+/// Lua-only half-reload would surface the v2 Lua marker while `compute(41)` still
+/// returned 42; a coordinated reload returns 141.  Replaces the earlier
+/// refuse-outright guard (#232 deferred the coordinated swap to #251).
+#[test]
+fn native_dev_control_reload_hybrid_coordinated_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+
+    let tmp = TempDir::new().unwrap();
+    let save_dir = TempDir::new().unwrap();
+
+    // A hybrid: Lua half + a native C export it calls.  v1 and v2 differ in BOTH
+    // halves — the Lua marker string AND the native `compute` result — so the test
+    // can tell a coordinated reload (both new) from a silent half-reload (new Lua,
+    // stale native).
+    let hybrid_c = |ret: &str| {
+        format!(
+            "#include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(compute, int32_t x) {{ return {ret}; }}\n"
+        )
+    };
+    let hybrid_lua = |tag: &str| {
+        format!(
+            "function init() blyt.debug.print(\"hybrid {tag} init compute=\" .. compute(41)) end\n\
+             function update() end\n\
+             function draw() end\n\
+             function on_load_state(info)\n\
+                 blyt.debug.print(\"hybrid {tag} RELOADED compute=\" .. compute(41))\n\
+             end\n"
+        )
+    };
+
+    let project_v1 = tmp.path().join("hybrid_reload_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(&hybrid_c("x + 1"))
+        .lua(&hybrid_lua("V1"))
+        .write(&project_v1);
+    let v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("hybrid_reload_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(&hybrid_c("x + 100"))
+        .lua(&hybrid_lua("V2"))
+        .write(&project_v2);
+    let v2 = build_lua_cart(&project_v2);
+
+    // Run on a copy we overwrite in place (as `blyt debug`'s rebuild-then-reload).
+    let work = tmp.path().join("cart.blyt");
+    std::fs::copy(&v1, &work).unwrap();
+
+    let (mut child, port, lines) = spawn_player_with_dev_ctrl_args(&work, save_dir.path(), &[]);
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect dev control");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let read_half = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(read_half);
+
+    let wait_line = |needle: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if lines.lock().unwrap().iter().any(|l| l.contains(needle)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {needle:?}; player output:\n{}",
+                lines.lock().unwrap().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_line("hybrid V1 init compute=42");
+
+    // Overwrite with v2 and reload — the host-Lua hybrid path must reload BOTH halves.
+    std::fs::copy(&v2, &work).unwrap();
+    let resp = dev_ctrl_cmd(&mut stream, &mut reader, r#"{"id":1,"cmd":"reload"}"#);
+    assert!(
+        resp.contains("\"id\":1") && resp.contains("\"status\":\"ok\""),
+        "coordinated hybrid reload must succeed on the host-Lua path: {resp}"
+    );
+
+    // The rebuilt VM re-runs init() on the NEW cart, and on_load_state fires with the
+    // restored state — both call the NEW native `compute` (x+100 ⇒ 141).  Seeing 141
+    // (not 42) is the proof the native half swapped, not just the Lua half (anti-#98).
+    wait_line("hybrid V2 init compute=141");
+    wait_line("hybrid V2 RELOADED compute=141");
+
+    // The process is still running (a corrupted half-reload could crash on the
+    // next frame); give it a moment then confirm it has not exited.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        matches!(child.try_wait(), Ok(None)),
+        "player must still be running the reloaded cart after a coordinated reload"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // No silent half-reload: the v2 Lua half must never have run against the stale
+    // v1 native half (which would print compute=42 under a V2 marker).
+    let out = lines.lock().unwrap().join("\n");
+    assert!(
+        !out.contains("hybrid V2 init compute=42")
+            && !out.contains("hybrid V2 RELOADED compute=42"),
+        "coordinated reload must not leave the native half on the old image:\n{out}"
+    );
+}
+
+/// Drive a cart-swap `reload` through the embedded libretro core
+/// (test_libretro_core dlopens blyt_libretro.so with its OWN embedded guest
+/// libs — a distinct artifact from the sdk/lib blobs blytplay loads).  At frame
+/// `after` the harness calls blyt_libretro_reload_at(cart_v2); `extra_env` is a
+/// general hook for extra core env.  Returns the captured stderr (cart debug
+/// output arrives via the libretro log callback).
+fn libretro_reload_capture(
+    cart_v1: &std::path::Path,
+    cart_v2: &std::path::Path,
+    after: u32,
+    frames: u32,
+    extra_env: &[(&str, &str)],
+) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    cmd.arg("--run-frames")
+        .arg(frames.to_string())
+        .arg("--reload-after")
+        .arg(after.to_string())
+        .arg("--reload-path")
+        .arg(cart_v2)
+        .arg(libretro_so())
+        .arg(cart_v1);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.assert().success().get_output().stderr.clone();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// libretro leg of #246: build a pure-Lua cart pair whose bundled resource
+/// content differs (RES_V1 → RES_V2), reload-swap v1→v2 mid-run, and assert the
+/// post-swap on_load_state read surfaces RES_V2.  A pure-Lua cart runs host-Lua by
+/// default (ADR-0136), so this drives the host-Lua reload path (`hostlua_reload_impl`
+/// → `blyt_hostlua_reload`, #244); `extra_env` is a general hook.  A stale RES_V1
+/// would mean the resource table still aliases the freed old cart map.
+fn libretro_reload_resource_leg(extra_env: &[(&str, &str)], leg: &str) {
+    let tmp = TempDir::new().unwrap();
+
+    let project_v1 = tmp.path().join("reload_res_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V1")
+        .write(&project_v1);
+    let v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("reload_res_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .lua(RELOAD_RESOURCE_LUA)
+        .asset("greeting.txt", "RES_V2")
+        .write(&project_v2);
+    let v2 = build_lua_cart(&project_v2);
+
+    let out = libretro_reload_capture(&v1, &v2, 2, 6, extra_env);
+    assert!(
+        out.contains("init greeting=RES_V1"),
+        "{leg}: cart_v1 did not read its bundled resource at init; core output:\n{out}"
+    );
+    assert!(
+        out.contains("reload greeting=RES_V2 reason=3"),
+        "{leg}: post-reload resource read did NOT return the new cart's content \
+         (expected RES_V2) — resource table still aliases the freed old cart (#246); \
+         core output:\n{out}"
+    );
+}
+
+/// libretro embedded core, host-Lua path (the default, ADR-0136): pins the #244
+/// `blyt_hostlua_reload` resource handling on the embedded-guest-lib artifact.
+#[test]
+fn libretro_dev_control_reload_reloads_resource_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+    libretro_reload_resource_leg(&[], "libretro host-Lua");
+}
+
+/// libretro embedded core, host-Lua HYBRID coordinated reload (#251): the .so
+/// counterpart of `native_dev_control_reload_hybrid_coordinated_hostlua`, run
+/// against blyt_libretro.so's OWN embedded guest libs (incl. libblyt32lua-bridge.so).
+/// A hybrid runs host-Lua by default (ADR-0136); v1/v2 differ in BOTH halves
+/// (native `compute` returns x+1 vs x+100, plus the Lua marker), so seeing 141
+/// after the swap proves the native rv32 half was blyt_session_swap_cart'ed in
+/// lockstep with the Lua-VM rebuild — not left on the old image (anti-#98).
+#[test]
+fn libretro_dev_control_reload_hybrid_coordinated_hostlua() {
+    require_sdk();
+    require_lua_sdk();
+    require_libretro_core();
+
+    let tmp = TempDir::new().unwrap();
+
+    let hybrid_c = |ret: &str| {
+        format!(
+            "#include \"blyt.h\"\n\
+             BLYT_LUA_EXPORT_I32(compute, int32_t x) {{ return {ret}; }}\n"
+        )
+    };
+    let hybrid_lua = |tag: &str| {
+        format!(
+            "function init() blyt.debug.print(\"hybrid {tag} init compute=\" .. compute(41)) end\n\
+             function update() end\n\
+             function draw() end\n\
+             function on_load_state(info)\n\
+                 blyt.debug.print(\"hybrid {tag} RELOADED compute=\" .. compute(41))\n\
+             end\n"
+        )
+    };
+
+    let project_v1 = tmp.path().join("libretro_hybrid_v1");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(&hybrid_c("x + 1"))
+        .lua(&hybrid_lua("V1"))
+        .write(&project_v1);
+    let v1 = build_lua_cart(&project_v1);
+
+    let project_v2 = tmp.path().join("libretro_hybrid_v2");
+    CartProject::new()
+        .config(DEV_CTRL_CONFIG)
+        .c(&hybrid_c("x + 100"))
+        .lua(&hybrid_lua("V2"))
+        .write(&project_v2);
+    let v2 = build_lua_cart(&project_v2);
+
+    let out = libretro_reload_capture(&v1, &v2, 2, 6, &[]);
+    assert!(
+        out.contains("hybrid V1 init compute=42"),
+        "libretro host-Lua hybrid: v1 did not run its native compute at init; core output:\n{out}"
+    );
+    assert!(
+        out.contains("hybrid V2 RELOADED compute=141"),
+        "libretro host-Lua hybrid: coordinated reload did not swap the native half \
+         (expected compute=141 from the v2 native code); core output:\n{out}"
+    );
+    assert!(
+        !out.contains("hybrid V2 RELOADED compute=42")
+            && !out.contains("hybrid V2 init compute=42"),
+        "libretro host-Lua hybrid: silent half-reload — v2 Lua ran against stale v1 native:\n{out}"
+    );
 }
 
 /* ── native player as an outbound dev-control client (issue #90, option 2) ──── */
@@ -569,6 +981,57 @@ fn native_dev_control_connect_lifecycle() {
     );
 }
 
+/// Drain a child's stdout into a shared line buffer on a background thread,
+/// returning the buffer.  The thread ends at EOF (process exit / stdout close).
+/// Keeping the pipe drained also prevents the child from blocking on a full
+/// stdout buffer during a long-running session.
+fn drain_stdout_lines(stdout: impl std::io::Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let w = Arc::clone(&lines);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => w.lock().unwrap().push(line.trim_end().to_string()),
+            }
+        }
+    });
+    lines
+}
+
+/// Poll a shared line buffer until some line satisfies `pred`, up to `timeout`.
+/// Returns true if a matching line appeared in time.  This is the readiness
+/// primitive that replaces fixed sleeps: the caller waits on an observable
+/// signal (a banner, the watcher-armed line) rather than guessing a delay.
+fn wait_for_line(
+    lines: &Arc<Mutex<Vec<String>>>,
+    timeout: Duration,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if lines.lock().unwrap().iter().any(|l| pred(l)) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Parse the TCP port out of a `Dev control:  127.0.0.1:<port> …` banner line.
+fn parse_dev_ctrl_port(line: &str) -> Option<u16> {
+    let idx = line.find("127.0.0.1:")?;
+    let after = &line[idx + "127.0.0.1:".len()..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    (end > 0).then(|| after[..end].parse().ok()).flatten()
+}
+
 /// End-to-end "option 2": the real devtool owns the hub and file watcher; the
 /// player dials in and a watcher-driven rebuild reloads the *native* player the
 /// same way it reloads the browser page.  Starts `blyt run ./project`, dials its
@@ -576,6 +1039,16 @@ fn native_dev_control_connect_lifecycle() {
 /// project dir (so the player loads the devtool-rebuilt `build/.elf`), edits a
 /// source file, and asserts the player's `on_load_state` fires with
 /// reason=HOT_RELOAD(3) — i.e. the broadcast reached the dialed player.
+///
+/// Synchronisation (issue #290): the edit must not race the devtool's file
+/// watcher.  notify does not deliver events that predate its `watch()` calls, so
+/// an edit landing before the watcher is armed is lost — no rebuild, no reload,
+/// and the generous *read* poll below can never see a reload that never fired.
+/// A fixed `sleep(1s)` here under-waits under a saturated run (the hub-dial
+/// sibling of #288 / PR #289).  Instead we drain the devtool's stdout and wait
+/// for its `[watch] ready` armed-signal (and the player's dial-in banner) before
+/// editing, and on failure attribute the miss to the exact stage that dropped it
+/// using the watcher's own progress lines.
 #[test]
 fn player_dials_devtool_hub_and_reloads() {
     require_sdk();
@@ -604,18 +1077,58 @@ fn player_dials_devtool_hub_and_reloads() {
         .write(&project);
 
     // Start the devtool (release project-dir mode → hub + watcher + initial
-    // build of build/.elf).  Reuse the banner reader to get the dev ctrl port;
-    // by the time it prints, build/.elf exists for the player to load.
+    // build of build/.elf).  Drain its stdout so we can both read the dev ctrl
+    // port and, later, attribute a missed reload to the stage that dropped it.
     let mut serve = spawn_blyt_run(&project);
-    let (port, _stdout) = read_dev_ctrl_port(&mut serve);
+    let dev_out = drain_stdout_lines(serve.stdout.take().unwrap());
+
+    // Wait for the dev control port banner; fail fast (with stderr) if the
+    // devtool exits before announcing it (e.g. the initial build failed).
+    let port = loop {
+        if let Some(p) = dev_out.lock().unwrap().iter().find_map(|l| {
+            l.contains("Dev control:")
+                .then(|| parse_dev_ctrl_port(l))
+                .flatten()
+        }) {
+            break p;
+        }
+        if let Ok(Some(status)) = serve.try_wait() {
+            let mut errout = String::new();
+            if let Some(mut e) = serve.stderr.take() {
+                e.read_to_string(&mut errout).ok();
+            }
+            panic!(
+                "blyt run exited ({status}) before announcing the dev control port;\n\
+                 devtool stdout:\n{}\nstderr:\n{errout}",
+                dev_out.lock().unwrap().join("\n")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(port != 0, "devtool dev control port must be a real port");
 
     // The player dials the hub and runs on the same project dir (loads build/.elf).
     let save_dir = TempDir::new().unwrap();
     let (mut child, lines) = spawn_player_dialing(&project, port, save_dir.path());
 
-    // Give the player time to dial in, load build/.elf, and run a few frames.
-    std::thread::sleep(Duration::from_secs(1));
+    // Synchronise on real readiness signals instead of a fixed sleep (#290):
+    //  1. the devtool's file watcher is armed (`[watch] ready`) — else the edit
+    //     predates the inotify watch and is silently dropped; and
+    //  2. the player has dialed the hub (`Dev control: connected`) — else the
+    //     reload broadcast reaches zero clients.
+    assert!(
+        wait_for_line(&dev_out, Duration::from_secs(20), |l| l == "[watch] ready"),
+        "devtool file watcher never armed ([watch] ready) — the edit would race \
+         the inotify watch; devtool output:\n{}",
+        dev_out.lock().unwrap().join("\n")
+    );
+    assert!(
+        wait_for_line(&lines, Duration::from_secs(10), |l| l
+            .contains("Dev control: connected")),
+        "player never dialed the devtool hub (no 'Dev control: connected' \
+         banner); player output:\n{}",
+        lines.lock().unwrap().join("\n")
+    );
 
     // Edit a watched source file → devtool rebuilds → broadcasts reload → the
     // dialed player reopens build/.elf and runs on_load_state(HOT_RELOAD).
@@ -656,9 +1169,38 @@ fn player_dials_devtool_hub_and_reloads() {
     let _ = serve.wait(); /* reap the devtool so it doesn't linger as a zombie */
 
     let out = lines.lock().unwrap().join("\n");
+    let dev = dev_out.lock().unwrap().join("\n");
+
+    // Attribute a miss to the exact stage that dropped it (AC #290): the panic
+    // must distinguish "the watcher never fired a rebuild" from "the rebuild
+    // fired but the broadcast never reached the player", not just dump stdout.
+    let watcher_saw_edit = dev
+        .lines()
+        .any(|l| l.starts_with("[watch] ") && l.ends_with("changed"));
+    let rebuild_ran = dev.contains("[build] rebuilding");
+    let reload_broadcast = dev.lines().find(|l| l.starts_with("[reload] signalled"));
+    let diagnosis = if !watcher_saw_edit {
+        "the watcher never observed the edit (no '[watch] … changed') — the \
+         inotify watch was not armed for the change despite [watch] ready"
+    } else if let Some(rl) = reload_broadcast {
+        if rl.contains("signalled 0 ") {
+            "the rebuild fired but the reload reached 0 runtimes — the player was \
+             not a registered hub client when the broadcast went out"
+        } else {
+            "the rebuild fired and the reload was broadcast to ≥1 runtime, but the \
+             player never applied it (on_load_state did not run) — loss is player-side"
+        }
+    } else if rebuild_ran {
+        "the watcher observed the edit and started a rebuild, but no reload was \
+         broadcast (build failed or the cart was deemed unchanged) — see [build]/[reload]"
+    } else {
+        "the watcher observed the edit but no rebuild started"
+    };
+
     assert!(
         seen,
         "watcher-driven reload did not reach the dialed player (expected \
-         on_load_state reason=HOT_RELOAD(3)); player output:\n{out}"
+         on_load_state reason=HOT_RELOAD(3)).\nDiagnosis: {diagnosis}.\n\
+         --- devtool output ---\n{dev}\n--- player output ---\n{out}"
     );
 }

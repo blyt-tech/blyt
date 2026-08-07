@@ -850,6 +850,9 @@ class BlytGdbDapProxy {
 		/* End of the current reload auto-continue window (epoch ms); 0 = none. */
 		this._reloadWindowUntil = 0;
 		this._devCtrlSock = null;
+		/* Teardown state for the stdin write guard (issue #268). */
+		this._disposed = false;
+		this._procGone = false;
 
 		/* VS Code's DebugAdapterInlineImplementation requires the DebugAdapter
 		 * interface: onDidSendMessage must be a vscode.Event<T>, not a plain
@@ -865,6 +868,24 @@ class BlytGdbDapProxy {
 			this._drain();
 		});
 		this._proc.stderr.on('data', () => {});
+		this._proc.on('exit', () => {
+			this._procGone = true;
+		});
+
+		/* Teardown race guard (issue #268): on session end the lldb-dap child can
+		 * exit before our last stdin.write lands.  The write then raises EPIPE
+		 * with nothing to catch it, and Node surfaces it as an uncaught exception
+		 * (plus "Unexpected SIGPIPE") — reddening an otherwise-green test-vscode
+		 * run from a teardown hook.  Mirror the dev-ctrl socket guard below
+		 * (`sock.on('error', …)`), but scoped: swallow the error only once the
+		 * child is gone or we are disposing.  A write error while the child is
+		 * still alive is a genuine failure and is left to surface, so we don't
+		 * mask a real mid-session fault. */
+		this._proc.stdin.on('error', (err) => {
+			if (this._disposed || this._procGone || this._proc.exitCode != null)
+				return;
+			throw err;
+		});
 
 		/* Observe the devtool's dev-control hub (issue #119): on each `reload`
 		 * broadcast, open an auto-continue window so the reload's solib-swap
@@ -949,6 +970,18 @@ class BlytGdbDapProxy {
 		}
 	}
 
+	/* Frame a JSON payload as a DAP message and write it to lldb-dap's stdin.
+	 * Skips the write once the child is gone or we are disposing so we never
+	 * attempt to write into a dead pipe (issue #268); the async EPIPE that can
+	 * still slip through the race is caught by the stdin `error` handler in the
+	 * constructor. */
+	_writeFrame(json) {
+		if (this._disposed || this._procGone) return;
+		this._proc.stdin.write(
+			`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`,
+		);
+	}
+
 	_ask(cmd, args) {
 		const seq = ++this._lldbSeq;
 		return new Promise((resolve) => {
@@ -959,9 +992,7 @@ class BlytGdbDapProxy {
 				command: cmd,
 				arguments: args || {},
 			});
-			this._proc.stdin.write(
-				`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`,
-			);
+			this._writeFrame(json);
 		});
 	}
 
@@ -980,9 +1011,7 @@ class BlytGdbDapProxy {
 				}),
 			);
 			const json = JSON.stringify({ ...msg, seq });
-			this._proc.stdin.write(
-				`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`,
-			);
+			this._writeFrame(json);
 		}
 	}
 
@@ -1042,6 +1071,7 @@ class BlytGdbDapProxy {
 	}
 
 	dispose() {
+		this._disposed = true;
 		try {
 			this._proc.kill();
 		} catch (_) {}
@@ -1055,6 +1085,26 @@ class BlytGdbDapProxy {
 
 function activate(context) {
 	const output = vscode.window.createOutputChannel('Blyt');
+
+	/* Test-only diagnostics tee (issue #304).  When a debug launch is cancelled
+	 * the resolver returns undefined, and VS Code turns that into a bare
+	 * startDebugging()===false with no reason attached — the reason otherwise
+	 * lives only in this Output channel, which the headless integration harness
+	 * cannot read.  When BLYT_IT_DIAG_FILE is set (the harness sets it per
+	 * window), record the cancellation reason there so a false return can name
+	 * its cause instead of being re-diagnosed from scratch.  Fully inert unless
+	 * that env var is set, so it does not change what a real debug session does
+	 * (no manual VS Code retest needed). */
+	function diagCancel(reason) {
+		const p = process.env.BLYT_IT_DIAG_FILE;
+		if (!p) return;
+		output.appendLine(`[cancel] ${reason}`);
+		try {
+			fs.appendFileSync(p, `${reason}\n`);
+		} catch {
+			/* best-effort diagnostics */
+		}
+	}
 
 	/* Open the cart game panel, or navigate the existing one to a new URL.
 	 *
@@ -1244,7 +1294,10 @@ function activate(context) {
 
 				output.show(true);
 				const target = resolveTarget(folder, config);
-				if (!target) return undefined;
+				if (!target) {
+					diagCancel('resolveTarget found no cart to debug');
+					return undefined;
+				}
 				const { cart, cwd, isLua, isHybrid } = target;
 
 				/* Mode taxonomy (#90):
@@ -1601,6 +1654,9 @@ function activate(context) {
 					result = await startDevtool(launchArg, cwd, output);
 				} catch (e) {
 					vscode.window.showErrorMessage(`Blyt: ${e.message}`);
+					diagCancel(
+						`startDevtool (blyt debug) failed: ${e.message}`,
+					);
 					return undefined;
 				}
 				const { proc, httpPort, dapPort, gdbPort, devCtrlPort } =
@@ -1629,6 +1685,7 @@ function activate(context) {
 						'Blyt: blyt debug did not announce a GDB port. ' +
 							'Ensure the debug WASM build includes BLYT_GDB=ON.',
 					);
+					diagCancel('blyt debug announced no GDB port');
 					return undefined;
 				}
 

@@ -135,6 +135,9 @@ function makeClient(port) {
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 async function main() {
+	// A hybrid runs on the native host-Lua path by default (ADR-0136), so the
+	// interrupt lands in the native rv32 half (running inside a trampoline call)
+	// while the Lua half runs on the host VM.
 	const blytplay = spawn(BLYTRUN, ['--gdb', '0', '--headless', CART], {
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});

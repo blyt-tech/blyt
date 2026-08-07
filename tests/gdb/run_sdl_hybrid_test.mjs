@@ -77,6 +77,9 @@ function findBothPorts(proc) {
 }
 
 async function main() {
+	// A hybrid runs on the native host-Lua path by default (ADR-0136): the Lua half
+	// on the host VM, the rv32 GDB stub on the native half — two debuggers, one
+	// cart.
 	const blytplay = spawn(
 		BLYTRUN,
 		['--debug', '0', '--gdb', '0', '--headless', CART],

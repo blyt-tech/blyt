@@ -1,0 +1,7 @@
+# Build products of the benchmark harness — binaries, generated cart projects and
+# the vendored fork copy used for the patched-VM proxy. All reproducible via
+# scripts/; none belong in git.
+dist/
+cartprojects/
+cartprojects-emulated/
+native_bench

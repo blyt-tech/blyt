@@ -3,7 +3,7 @@ mod common;
 use assert_cmd::Command;
 use common::{
     CartProject, blyt_bin, blytplay, build_lua_cart, require_cpp_sdk, require_libretro_core,
-    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs,
+    require_lua_sdk, require_rust_riscv_target, require_sdk, require_wasm, run_cart_all_legs_exact,
     run_cart_libretro, run_cart_libretro_expect_fail, run_cart_native, run_cart_native_expect_fail,
     run_cart_wasm, sdk_dir,
 };
@@ -1501,7 +1501,7 @@ function init()
         pat = pat + 1
     end
     blyt.debug.print(string.format(
-        "utf8 b=%d c=%d off3=%d cp3=%d sum=%d pat=%d",
+        "<m:utf8 b=%d c=%d off3=%d cp3=%d sum=%d pat=%d>",
         #s, utf8.len(s), utf8.offset(s, 3),
         utf8.codepoint(s, utf8.offset(s, 3)), sum, pat))
 end
@@ -1522,5 +1522,5 @@ fn lua_utf8_library_all_legs() {
     let cart = build_lua_cart(&project);
     assert!(cart.exists(), "cart not found at {}", cart.display());
 
-    run_cart_all_legs(&cart, "utf8 b=6 c=3 off3=4 cp3=8364 sum=8694 pat=3");
+    run_cart_all_legs_exact(&cart, "m", &["utf8 b=6 c=3 off3=4 cp3=8364 sum=8694 pat=3"]);
 }

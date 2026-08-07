@@ -61,7 +61,25 @@ typedef struct {
                                        * (deterministic); host-written, guest-read */
     uint32_t resource_cache_used; /* resident decompressed cache bytes (advisory,
                                    * #159); host-written, guest-read */
+    uint32_t guest_heap_baseline; /* runtime-scaffolding bytes to exclude from the
+                                   * cart-attributable heap (#231): guest_heap_used
+                                   * captured once after VM/runtime setup, before the
+                                   * cart's first allocation. Zero on legs with no
+                                   * scaffolding (C carts, emulated) → no-op. Makes
+                                   * cart_allocations + the fail-point cross-leg
+                                   * deterministic despite per-leg runtime overhead
+                                   * (the host-Lua fast path's driver coroutines vs a
+                                   * direct C frame loop). Leg-local; never serialized. */
 } blyt_mem_accounting_t;
+
+/* Cart-attributable heap: live bytes minus the runtime-scaffolding baseline,
+ * clamped at 0. This is the figure the 16 MB budget predicate and the
+ * introspection API (cart_allocations) use, so both are identical across legs for
+ * the same cart regardless of each leg's runtime overhead (#231). */
+static inline uint32_t blyt_mem_cart_heap(const blyt_mem_accounting_t *a) {
+    return a->guest_heap_used > a->guest_heap_baseline ? a->guest_heap_used - a->guest_heap_baseline
+                                                       : 0u;
+}
 
 /* Does an allocation of `incoming` bytes fit the unified budget, given the
  * current heap usage and non-evictable resource footprint? Overflow-safe (sums

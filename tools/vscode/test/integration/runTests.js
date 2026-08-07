@@ -34,7 +34,17 @@ const { runTests } = require('@vscode/test-electron');
  * cacheable in CI. Bump deliberately. */
 const VSCODE_VERSION = '1.125.1';
 
-/* Each cart runs in its own VS Code window with only its own spec. */
+/* Each cart runs in its own VS Code window with only its own spec.
+ *
+ * `name` (optional) is the display + throwaway-workspace key; it defaults to
+ * `dir` and only needs setting when two entries share a dir (so their
+ * workspaces don't collide).  `env` (optional) is merged into extensionTestsEnv
+ * for that window — used to select a runtime variant of the SAME cart+spec.
+ *
+ * The `hello` cart ran twice until ADR-0136's end-state landed: once emulated and
+ * once with BLYT_HOSTLUA=1 on the native host-Lua VM. Both now take the same path
+ * (a Lua-bearing cart is always host-Lua on a non-RISC-V host), so the second
+ * entry was an exact duplicate and is gone. */
 const CARTS = [
 	{ dir: 'hello', spec: 'lua.test.js' },
 	{ dir: 'hello-c', spec: 'c.test.js' },
@@ -54,8 +64,11 @@ function selectCarts(carts) {
 	const sel = process.env.BLYT_IT_CART;
 	if (!sel) return carts;
 	const filtered = carts.filter(
-		({ dir, spec }) =>
-			dir === sel || spec === sel || `${dir}/${spec}`.includes(sel),
+		({ dir, spec, name }) =>
+			dir === sel ||
+			spec === sel ||
+			name === sel ||
+			`${name || dir}/${spec}`.includes(sel),
 	);
 	if (filtered.length === 0)
 		fail(
@@ -88,16 +101,22 @@ async function main() {
 	const cachePath = process.env.BLYT_VSCODE_TEST_CACHE || undefined;
 
 	let anyFailed = false;
-	for (const { dir, spec } of selectCarts(CARTS)) {
+	for (const { dir, spec, name, env: cartEnv } of selectCarts(CARTS)) {
+		const key =
+			name || dir; /* display + workspace key (unique per entry) */
 		/* Each cart is its own single-folder workspace. Copy (minus build/) and
-		 * build --debug; the extension rebuilds incrementally in-session. */
+		 * build --debug; the extension rebuilds incrementally in-session.  The
+		 * workspace folder keeps its example basename (`dir`) — the specs look it
+		 * up by name via h.folder(dir) — under a per-entry parent (`key`) so two
+		 * entries sharing a dir (e.g. `hello-c`'s native + wasm specs) get
+		 * distinct workspaces. */
 		const src = path.join(repoRoot, 'examples', dir);
-		const workspace = path.join(tmpRoot, dir);
+		const workspace = path.join(tmpRoot, key, dir);
 		fs.cpSync(src, workspace, {
 			recursive: true,
 			filter: (s) => path.basename(s) !== 'build',
 		});
-		console.log(`[runTests] blyt build --debug ${dir} …`);
+		console.log(`[runTests] blyt build --debug ${key} …`);
 		const r = cp.spawnSync(
 			path.join(sdkDir, 'bin', 'blyt'),
 			['build', '--debug', workspace],
@@ -108,7 +127,23 @@ async function main() {
 		const userDataDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), 'blyt-vscode-ud-'),
 		);
-		console.log(`[runTests] running ${spec} in a ${dir} window …`);
+		/* Both of VS Code's writable state dirs must be redirected out of the
+		 * package. @vscode/test-electron defaults --extensions-dir (and
+		 * --user-data-dir) to <package>/.vscode-test/*, which BLYT_VSCODE_TEST_CACHE
+		 * does NOT cover — cachePath only redirects the VS Code *download*. Under
+		 * test-linux-docker the repo is mounted read-only, so that default made the
+		 * leg depend on host state: a checkout that had never run this suite
+		 * natively had no .vscode-test/, and VS Code died at startup with ENOENT
+		 * (mkdir), while one that had ran but logged EROFS on every extensions.json
+		 * write. A tmp dir per window is both hermetic and writable. */
+		const extensionsDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), 'blyt-vscode-ext-'),
+		);
+		/* Per-window diagnostics file (issue #304): the extension appends the
+		 * reason each time it cancels a launch, and the harness reads it back so a
+		 * `startDebugging()===false` names its cause instead of a bare boolean. */
+		const diagFile = path.join(userDataDir, 'blyt-cancel-diag.log');
+		console.log(`[runTests] running ${spec} in a ${key} window …`);
 		try {
 			await runTests({
 				version: VSCODE_VERSION,
@@ -119,6 +154,8 @@ async function main() {
 					workspace,
 					'--user-data-dir',
 					userDataDir,
+					'--extensions-dir',
+					extensionsDir,
 					'--disable-workspace-trust',
 					'--disable-gpu',
 					'--no-cached-data',
@@ -138,12 +175,16 @@ async function main() {
 					BLYT_TRACE: '',
 					BLYT_IT_SPEC: spec,
 					BLYT_IT_GREP: process.env.BLYT_IT_GREP || '',
+					BLYT_IT_DIAG_FILE: diagFile,
+					/* Per-entry `env` overrides; the extension's spawned
+					 * blytdebug inherits the extension-host env. */
+					...(cartEnv || {}),
 				},
 			});
 		} catch (err) {
 			anyFailed = true;
 			console.error(
-				`[runTests] ${dir} (${spec}) failed: ${err?.message ? err.message : err}`,
+				`[runTests] ${key} (${spec}) failed: ${err?.message ? err.message : err}`,
 			);
 		}
 

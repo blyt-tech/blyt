@@ -1194,6 +1194,54 @@ int blyt_cart_has_native_lifecycle(const blyt_cart_t *cart) {
     return 0;
 }
 
+int blyt_cart_has_native_code(const blyt_cart_t *cart) {
+    /* A pure-Lua cart's only defined FUNC symbols are the packer-generated Lua
+     * bootstrap (`_blyt_entry` + `cart_lua_modules`); everything else is
+     * cart-authored native code (a C/Rust/C++ half — its `.lua_exports` wrappers,
+     * native lifecycle callbacks, or even an unexported helper).  A Lua cart with
+     * native objects is linked `--export-dynamic` (devtool build/mod.rs), so those
+     * functions survive `--gc-sections` in `.dynsym` even when nothing calls them —
+     * making this a reliable "has a native half" test for the host-Lua dispatch
+     * predicate (#236: a hybrid stays emulated by default so its native half runs
+     * under rv32emu and GDB can attach to it). */
+    static const char *const bootstrap[] = {"_blyt_entry", "cart_lua_modules", NULL};
+    if (!cart)
+        return 0;
+    const Elf32_Ehdr *eh = (const Elf32_Ehdr *)cart->map;
+    const uint8_t *base = (const uint8_t *)cart->map;
+    const Elf32_Shdr *shdrs = (const Elf32_Shdr *)(base + eh->e_shoff);
+    for (uint16_t i = 0; i < eh->e_shnum; i++) {
+        if (shdrs[i].sh_type != SHT_DYNSYM)
+            continue;
+        uint32_t stridx = shdrs[i].sh_link;
+        if (stridx >= eh->e_shnum)
+            break;
+        const char *strtab = (const char *)(base + shdrs[stridx].sh_offset);
+        const Elf32_Sym *syms = (const Elf32_Sym *)(base + shdrs[i].sh_offset);
+        uint32_t nsyms = shdrs[i].sh_size / sizeof(Elf32_Sym);
+        for (uint32_t j = 0; j < nsyms; j++) {
+            if (syms[j].st_shndx == SHN_UNDEF)
+                continue;
+            if (ELF32_ST_TYPE(syms[j].st_info) != STT_FUNC)
+                continue;
+            if (ELF32_ST_BIND(syms[j].st_info) == STB_LOCAL)
+                continue;
+            const char *sym_name = strtab + syms[j].st_name;
+            int is_bootstrap = 0;
+            for (int k = 0; bootstrap[k]; k++) {
+                if (strcmp(sym_name, bootstrap[k]) == 0) {
+                    is_bootstrap = 1;
+                    break;
+                }
+            }
+            if (!is_bootstrap)
+                return 1;
+        }
+        break;
+    }
+    return 0;
+}
+
 int blyt_cart_has_layouts(const blyt_cart_t *cart) {
     return blyt_cart_find_section(cart, ".cart.layouts", NULL) != NULL;
 }

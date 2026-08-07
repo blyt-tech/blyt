@@ -185,19 +185,45 @@ void *blyt_resource_bytes_get(blyt_bytes_resource_t id, size_t *len);
  * blyt_mem_stats reports cart-visible working-memory usage so a cart can make
  * informed release decisions near the 16 MB budget.
  *
- * DETERMINISM CONTRACT (ADR-0029 amendment, #159) — read before branching on
- * any of these.  The fields are TIERED, and mixing the tiers is a bug:
+ * DETERMINISM CONTRACT (ADR-0029 amendment, #159/#231) — read before branching
+ * on any of these.  The fields are TIERED, and mixing the tiers is a bug.
  *
- *   Deterministic — bit-identical across every peer/platform, SAFE to branch
- *   game logic on:
+ * The contract is the *budget*, not the byte count.  What a cart may branch game
+ * logic on is: the 16 MB cap, and the OUTCOME of an allocation against it (does
+ * malloc / blyt_resource_load succeed or return NULL/INVALID).  That outcome is
+ * deterministic across every peer/platform — a cart can never exceed the budget,
+ * and the fail-point coincides across legs for any realistic workload.
+ *
+ *   Deterministic — bit-identical across every peer/platform, SAFE to branch on:
  *     - budget_cap (always 16 MB)
- *     - the *outcome* of an allocation: a blyt_resource_load / malloc returning
- *       BLYT_RESOURCE_INVALID / NULL at the cap (see ADR-0008 / #158).
+ *     - the fail *outcome*: a malloc / blyt_resource_load returning NULL /
+ *       BLYT_RESOURCE_INVALID at the cap.
+ *     - cart_allocations (guest_heap_used) — the exact byte count.
+ *
+ *   cart_allocations is byte-identical on every leg.  The cart heap runs through
+ *   one arena (ADR-0008 / #158) counted at the 32-bit canonical on all of them:
+ *   on a 64-bit host (the native host-Lua fast path, ADR-0136) the accounting
+ *   seam (#231/#267) models Lua object sizes down to their rv32 widths and pins
+ *   the host-width constants that are observable through this API — the auxlib
+ *   buffer threshold and the GC's pacing constants — to the same canonical, so
+ *   neither wider host pointers nor a differently-paced collector can move the
+ *   count.  All the host-Lua legs additionally execute the cart through one
+ *   shared coroutine driver and build their scaffolding through one shared
+ *   registration (#242/#267), so the allocation sequence is identical by
+ *   construction rather than by agreement.
+ *
+ *   That makes the count safe to branch on, but think twice before you do: it is
+ *   a fact about this runtime's allocator, not about your game.  It is stable
+ *   across peers and replays at a given cart+runtime version, and it is NOT
+ *   stable across a runtime upgrade or a Lua bump — those legitimately move it.
+ *   Branching on the fail outcome expresses "am I out of memory"; branching on
+ *   the exact byte count pins your game's behaviour to an implementation detail
+ *   that is only promised to be *the same everywhere*, not to be *the same
+ *   forever*.
  *
  *   Advisory — history-dependent (LRU/eviction order differs across platforms),
- *   MUST NOT feed deterministic game state.  They are a *tuning* signal for
- *   "should I proactively release something", which is itself a memory decision,
- *   not game state:
+ *   MUST NOT feed deterministic game state.  A *tuning* signal for "should I
+ *   proactively release something", itself a memory decision, not game state:
  *     - resource_cache_used, total_used
  *     - the resources[] residency snapshot (which resources are loaded, and the
  *       loaded count returned)
@@ -206,7 +232,8 @@ void *blyt_resource_bytes_get(blyt_bytes_resource_t id, size_t *len);
 /* Scalar memory stats.  total_used == cart_allocations + resource_cache_used. */
 typedef struct {
     uint32_t resource_cache_used; /* advisory: resident decompressed resource bytes */
-    uint32_t cart_allocations; /* live cart heap bytes (guest_heap_used) */
+    uint32_t cart_allocations; /* diagnostic: live cart heap bytes; branch on the fail
+                                * outcome, not this value (see contract above) */
     uint32_t total_used; /* advisory: cart_allocations + resource_cache_used */
     uint32_t budget_cap; /* deterministic: 16 MB working-memory cap */
 } blyt_mem_stats_t;
@@ -296,6 +323,17 @@ void blyt_frame_done(void);
 /* -------------------------------------------------------------------------
  * Debug output (ADR-0085, ECALL 1)
  * ------------------------------------------------------------------------- */
+
+/* Write one diagnostic line.
+ *
+ * LINE-ORIENTED: one call emits exactly one line.  The runtime appends the
+ * trailing newline, so `s` should NOT end in one — a message that does yields a
+ * blank line after it, identically on every leg.  Every execution model honours
+ * this framing: the emulated legs through their host log sink, bare metal by
+ * writing the newline itself after the payload (#291).
+ *
+ * Diagnostics only: output is not part of the determinism/save-state contract,
+ * and a shipped console may drop it entirely. */
 void blyt_console_debug(const char *s);
 
 /* -------------------------------------------------------------------------

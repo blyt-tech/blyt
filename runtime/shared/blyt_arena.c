@@ -44,7 +44,10 @@ static inline uint32_t align_up(uint32_t n, uint32_t al) {
 static inline int cap_allows(const blyt_arena_t *a, uint32_t consumed) {
     if (!a->acct)
         return 1;
-    return blyt_mem_alloc_fits(a->acct->guest_heap_used, a->acct->non_evictable_footprint,
+    /* Budget the cart-attributable heap (excludes the runtime-scaffolding
+     * baseline, #231) so the fail-point is cross-leg deterministic. Baseline is 0
+     * where unset (C carts, emulated), so this is the plain guest_heap_used there. */
+    return blyt_mem_alloc_fits(blyt_mem_cart_heap(a->acct), a->acct->non_evictable_footprint,
                                consumed);
 }
 
@@ -94,13 +97,23 @@ static void ensure_ready(blyt_arena_t *a) {
     a->ready = 1;
 }
 
-void *blyt_arena_malloc(blyt_arena_t *a, size_t n) {
+/* A block's `_pad` doubles as the "not cart-attributable" marker (#231): a
+ * no-acct block (a Lua thread's data stack / CallInfo — VM execution scratch, not
+ * cart data) is physically allocated but excluded from guest_heap_used and the
+ * 16 MB budget, so the count is independent of how the runtime drives the cart
+ * (native calls lifecycle fns from C; wasm resumes them in a driver coroutine).
+ * free() reads this back so the exclusion is symmetric without the caller having
+ * to re-flag the free. 0 = accounted (the default for every other allocation). */
+#define BLK_NOACCT 1u
+
+static void *arena_malloc_core(blyt_arena_t *a, size_t n, int noacct) {
     if (!a->base || !a->size)
         return NULL;
     ensure_ready(a);
     if (n == 0)
         n = 1;
     uint32_t need = align_up((uint32_t)n + HDR_SIZE, BLYT_ARENA_ALIGN);
+    uint32_t mark = noacct ? BLK_NOACCT : 0u;
 
     /* First-fit search of the free list. */
     uint32_t *prev = &a->free_head;
@@ -111,9 +124,10 @@ void *blyt_arena_malloc(blyt_arena_t *a, size_t n) {
             uint32_t rem = h->size - need;
             int split = (rem >= HDR_SIZE + BLYT_ARENA_ALIGN);
             /* Consumed live bytes: `need` if we split off the remainder, else
-             * the whole block. Gate the unified budget on the honest figure. */
+             * the whole block. Gate the unified budget on the honest figure —
+             * skipped entirely for no-acct scratch, which the budget ignores. */
             uint32_t consumed = split ? need : h->size;
-            if (!cap_allows(a, consumed))
+            if (!noacct && !cap_allows(a, consumed))
                 return NULL;
             if (split) {
                 blk_hdr_t *tail = hdr_at(a, coff + need);
@@ -128,7 +142,9 @@ void *blyt_arena_malloc(blyt_arena_t *a, size_t n) {
             }
             h->free = 0;
             h->next = BLYT_ARENA_NONE;
-            acct_add(a, h->size);
+            h->_pad = mark;
+            if (!noacct)
+                acct_add(a, h->size);
             return (char *)h + HDR_SIZE;
         }
         prev = &h->next;
@@ -137,16 +153,28 @@ void *blyt_arena_malloc(blyt_arena_t *a, size_t n) {
     /* Bump-allocate a fresh block from the uninitialised tail. */
     if ((uint64_t)a->bump + need > (uint64_t)a->size)
         return NULL;
-    if (!cap_allows(a, need))
+    if (!noacct && !cap_allows(a, need))
         return NULL;
     blk_hdr_t *h = hdr_at(a, a->bump);
     h->size = need;
     h->free = 0;
     h->next = BLYT_ARENA_NONE;
-    h->_pad = 0;
+    h->_pad = mark;
     a->bump += need;
-    acct_add(a, need);
+    if (!noacct)
+        acct_add(a, need);
     return (char *)h + HDR_SIZE;
+}
+
+void *blyt_arena_malloc(blyt_arena_t *a, size_t n) {
+    return arena_malloc_core(a, n, 0);
+}
+
+/* As blyt_arena_malloc but the block is VM execution scratch: physically
+ * allocated, but not counted toward guest_heap_used or the 16 MB budget (#231).
+ * See BLK_NOACCT. */
+void *blyt_arena_malloc_noacct(blyt_arena_t *a, size_t n) {
+    return arena_malloc_core(a, n, 1);
 }
 
 void blyt_arena_free(blyt_arena_t *a, void *p) {
@@ -155,16 +183,17 @@ void blyt_arena_free(blyt_arena_t *a, void *p) {
     blk_hdr_t *h = (blk_hdr_t *)((char *)p - HDR_SIZE);
     if (h->free)
         return; /* double-free: silently ignore */
-    acct_sub(a, h->size);
+    if (h->_pad != BLK_NOACCT)
+        acct_sub(a, h->size); /* no-acct scratch was never added; don't subtract */
     h->free = 1;
     h->next = a->free_head;
     a->free_head = off_of(a, h);
     coalesce_forward(a, h);
 }
 
-void *blyt_arena_realloc(blyt_arena_t *a, void *p, size_t n) {
+static void *arena_realloc_core(blyt_arena_t *a, void *p, size_t n, int noacct) {
     if (!p)
-        return blyt_arena_malloc(a, n);
+        return arena_malloc_core(a, n, noacct);
     if (!n) {
         blyt_arena_free(a, p);
         return NULL;
@@ -173,12 +202,22 @@ void *blyt_arena_realloc(blyt_arena_t *a, void *p, size_t n) {
     size_t cap = h->size - HDR_SIZE;
     if (n <= cap)
         return p; /* fits in place; accounting unchanged */
-    void *q = blyt_arena_malloc(a, n);
+    void *q = arena_malloc_core(a, n, noacct);
     if (!q)
         return NULL;
     memcpy(q, p, cap);
-    blyt_arena_free(a, p);
+    blyt_arena_free(a, p); /* reads the old block's no-acct marker itself */
     return q;
+}
+
+void *blyt_arena_realloc(blyt_arena_t *a, void *p, size_t n) {
+    return arena_realloc_core(a, p, n, 0);
+}
+
+/* No-acct counterpart to blyt_arena_realloc (#231): the grown/shrunk block stays
+ * VM execution scratch, excluded from guest_heap_used and the budget. */
+void *blyt_arena_realloc_noacct(blyt_arena_t *a, void *p, size_t n) {
+    return arena_realloc_core(a, p, n, 1);
 }
 
 void *blyt_arena_calloc(blyt_arena_t *a, size_t nmemb, size_t sz) {

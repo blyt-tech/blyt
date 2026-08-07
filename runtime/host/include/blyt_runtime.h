@@ -63,6 +63,13 @@ void blyt_cart_close(blyt_cart_t *cart);
  */
 int blyt_cart_has_native_lifecycle(const blyt_cart_t *cart);
 
+/* True iff the cart carries a native half (a C/Rust/C++ half) — i.e. it defines
+ * any non-local FUNC symbol beyond the Lua bootstrap (`_blyt_entry`,
+ * `cart_lua_modules`).  Distinguishes a pure-Lua cart from a hybrid for the
+ * host-Lua dispatch predicate, catching even an unexported native helper (kept in
+ * `.dynsym` by the cart's `--export-dynamic` link). */
+int blyt_cart_has_native_code(const blyt_cart_t *cart);
+
 /*
  * Bitmask of lifecycle callbacks defined in native (.dynsym) or Lua (.cart.lua).
  * Bit 0=init, 1=update, 2=draw, 3=on_new_state, 4=on_save_state,
@@ -151,6 +158,12 @@ typedef enum blyt_cart_run_err {
     BLYT_RUN_FN_DONE = 7, /* host→guest fn call completed; call blyt_session_fn_return_value */
     BLYT_RUN_FN_ERROR = 8, /* ADR-0130: bridged Lua→native call raised a Lua error;
                             * the error value is on top of the exchange thread */
+    BLYT_RUN_REVERSE_CALL_PENDING = 9, /* #272 (DAP only): the rv32 is parked at a
+                                        * reverse-trampoline PCALL op; the frontend
+                                        * must drive the Lua callback at this clean
+                                        * (yieldable) C boundary — see
+                                        * blyt_session_reverse_call_* — then re-enter
+                                        * run_frame to advance the guest past the op. */
 } blyt_cart_run_err_t;
 
 /*
@@ -179,6 +192,14 @@ typedef struct blyt_state_ctx blyt_state_ctx_t;
 /* Create a session for the given cart.  Returns NULL on failure.
  * The cart must outlive the session. */
 blyt_session_t *blyt_session_create(blyt_cart_t *cart, blyt_log_fn log_fn);
+
+/* Create a session in ADR-0130 host-Lua bridge mode (#232): the cart's native
+ * half runs under rv32emu but links the bridge stub (libblyt32lua-bridge.so)
+ * instead of the in-guest Lua VM, so its Lua C API calls trap to a host-side Lua
+ * VM.  Used by the host-Lua fast path (WASM run_lua_cart, native
+ * cart_run_hostlua) for hybrid carts; pair with blyt_session_lua_bridge_attach.
+ * Identical to blyt_session_create otherwise.  Returns NULL on failure. */
+blyt_session_t *blyt_session_create_lua_bridge(blyt_cart_t *cart, blyt_log_fn log_fn);
 
 /*
  * Run the cart until the next BLYT_ECALL_FRAME_DONE boundary or until it
@@ -481,6 +502,16 @@ blyt_state_ctx_t *blyt_session_state_ctx(blyt_session_t *s);
 const char *blyt_session_save_dir(blyt_session_t *s);
 const char *blyt_session_cart_name(blyt_session_t *s);
 
+/* Unified 16 MB budget across a host-Lua hybrid's two arenas (#250, ADR-0008).
+ * The hybrid's Lua half runs in a host-VM arena; its native half runs EMULATED
+ * in this rv32 session's own arena.  blyt_session_cart_heap reads the native
+ * half's live cart heap (folded into mem.stats + the host-VM predicate);
+ * blyt_session_set_peer_heap pushes the Lua half's heap the other way so the
+ * native arena's malloc/pin fails once the COMBINED footprint exceeds 16 MB —
+ * matching the single shared pool bare-metal rv32 uses natively. */
+uint32_t blyt_session_cart_heap(blyt_session_t *s);
+void blyt_session_set_peer_heap(blyt_session_t *s, uint32_t bytes);
+
 /* --- ECALL-bridged Lua C API (ADR-0130, WASM hybrid carts) ----------------- */
 
 /* .lua_exports entry flags (byte after ret_type; 0 in pre-ADR-0130 carts). */
@@ -505,6 +536,99 @@ void blyt_session_lua_bridge_attach(blyt_session_t *s, struct lua_State *exch);
  * the exchange thread; guest registers restored).
  */
 int blyt_session_begin_bridged_call(blyt_session_t *s, uint32_t wrap_addr);
+
+/*
+ * Reverse-trampoline exchange-thread pool depth (#262).  A native→Lua callback
+ * runs on an exchange thread; each further native call it makes needs a distinct
+ * clean one, so native→Lua→native nesting of depth N needs N+1 threads.  The
+ * frontends (native cart_run_hostlua.c + wasm_main.c) pre-create a pool this deep;
+ * deeper nesting is a clean Lua error, not corruption.  8 is far beyond any
+ * realistic reverse-trampoline chain.
+ */
+#define BLYT_HOSTLUA_EXCH_POOL_DEPTH 8
+
+/*
+ * Re-entrant call frame (#262): the full mutable rv32 CPU + bridge state that
+ * blyt_session_begin_fn_call / begin_bridged_call overwrite.  A native→Lua
+ * callback (the reverse-trampoline PCALL op) can re-enter native — the Lua
+ * callback calls another export — while the OUTER guest call is parked mid-ECALL
+ * on the single rv32 CPU.  A trampoline that drives a call while one may already
+ * be in flight must save this frame first and restore it after its drive, so the
+ * nested call does not clobber the suspended outer one.  The C recursion of the
+ * trampolines is the save stack; the fields are plain copies so no rv32 internals
+ * leak into this header.
+ */
+typedef struct {
+    uint32_t regs[32];
+    uint32_t pc;
+    uint32_t fcsr;
+    uint64_t fregs[32];
+    uint32_t bridge_saved_regs[32];
+    uint32_t bridge_saved_fcsr;
+    uint64_t bridge_saved_fregs[32];
+    uint32_t trace_fn_addr;
+    uint32_t lua_bridge_token;
+    bool lua_bridge_active;
+    bool lua_bridge_error;
+    bool fn_return_done;
+} blyt_session_call_frame_t;
+
+void blyt_session_save_call_frame(blyt_session_t *s, blyt_session_call_frame_t *frame);
+void blyt_session_restore_call_frame(blyt_session_t *s, const blyt_session_call_frame_t *frame);
+
+/*
+ * Reverse-trampoline (native→Lua callback) driver — DAP debugging only (#272).
+ *
+ * Normally the reverse-trampoline PCALL op runs `lua_pcall(EX)` synchronously
+ * inside the rv32 ECALL dispatch (deep inside rv_step).  On WASM, a DAP pause
+ * inside such a callback pauses by `lua_yield`, which cannot cross the
+ * `lua_pcall` + rv32-interpreter C frames.  So when DAP is enabled, the PCALL op
+ * instead PARKS the rv32 (halt, PC left at the op) and run_frame returns
+ * BLYT_RUN_REVERSE_CALL_PENDING; the frontend trampoline — now at a clean,
+ * yieldable C boundary below its driver coroutine — drives the callback here via
+ * `lua_resume(EX)` (which also makes `lua_yield(EX)` legal), so a WASM pause can
+ * unwind through it via `lua_yieldk`.  Native blocks-a-thread inside the hook, so
+ * the resume never yields and the flow runs inline.  Bare-metal / emulated legs
+ * never take this path.  No-ops (return false / LUA_OK) when BLYT_LUA_BRIDGE is
+ * not compiled in.
+ *
+ * The descriptor is CALLER-OWNED (a C local, or continuation-stable storage on
+ * WASM) so nested native→Lua→native→Lua callbacks — whose parks would otherwise
+ * clobber a shared slot — each keep their own parked frame; the trampoline's C
+ * recursion (native) / per-depth storage (WASM) is the save stack.  Usage on
+ * BLYT_RUN_REVERSE_CALL_PENDING:
+ *   blyt_reverse_call_t rc;
+ *   blyt_session_reverse_call_take(s, &rc);   // copies out + frees the handoff slot
+ *   int st;
+ *   while ((st = blyt_session_reverse_resume(s, &rc, from_L)) == LUA_YIELD)
+ *       ... yield the driver coroutine (lua_yieldk); re-enter on resume ...
+ *   blyt_session_finish_reverse_call(s, &rc, st);   // parks -> guest register + PC
+ *   ... re-enter blyt_session_run_frame to continue the guest ...
+ */
+typedef struct {
+    struct lua_State *exch; /* the callback's exchange thread */
+    int32_t nargs;
+    int32_t nresults; /* LUA_MULTRET (-1) or a fixed count */
+    int32_t base; /* exch stack level below the function — results land at base+1.. */
+    int is_protected; /* pcall (return status) vs call (re-raise) semantics */
+    bool started; /* false until the first resume; true across a DAP-yield continue */
+    blyt_session_call_frame_t frame; /* parked outer-call rv32 CPU + bridge state */
+} blyt_reverse_call_t;
+
+/* Copy the parked reverse-call descriptor out to `*out` and free the run-context
+ * handoff slot (so a nested park can reuse it).  Returns false (and leaves *out
+ * unset) if none is pending. */
+bool blyt_session_reverse_call_take(blyt_session_t *s, blyt_reverse_call_t *out);
+/* Start (or, after a DAP yield, continue) the parked callback on rc->exch.
+ * `from` is the resuming (driver-coroutine) lua_State.  Returns a lua_resume
+ * status: LUA_OK (done), LUA_YIELD (paused — call again to continue), or a Lua
+ * error code.  Results/error are left on rc->exch. */
+int blyt_session_reverse_resume(blyt_session_t *s, blyt_reverse_call_t *rc, struct lua_State *from);
+/* Finalise the parked reverse call with the terminal `lua_resume` status: trims
+ * rc->exch results to rc->nresults, restores rc->frame, and either writes the Lua
+ * status into the guest result register + advances past the op, or (unprotected
+ * error) re-raises into the guest (halt, run_frame returns BLYT_RUN_FN_ERROR). */
+void blyt_session_finish_reverse_call(blyt_session_t *s, blyt_reverse_call_t *rc, int status);
 
 /*
  * Visitor callback for blyt_session_visit_lua_exports.
@@ -570,6 +694,15 @@ int blyt_session_gdb_wait_client_continue(blyt_session_t *s);
  * afterwards, so the normal game loop continues from the same point.
  */
 void blyt_reset_every_frame_cycle(blyt_session_t *s);
+
+/* Zero every recorded cart BSS region of the session (guest static/global vars,
+ * the native half of a hybrid included) — the standalone half of step 3 of the
+ * reset-every-frame cycle.  The host-Lua reset paths (native cart_run_hostlua.c
+ * and WASM wasm_main.c) call this to reset a hybrid's persisting rv32 session in
+ * lockstep with their Lua VM rebuild, so a native half that parks mutable state
+ * in its own BSS (not a state buffer) resets identically to the emulated leg
+ * under --reset-every-frame (#261). */
+void blyt_session_zero_guest_bss(blyt_session_t *s);
 
 /* Force-evict every eviction-eligible resource in the session's table (ADR-0027
  * v2, #137): the "evict all evictable now" forcing primitive behind the

@@ -48,6 +48,23 @@ pub fn blyt_bin() -> PathBuf {
     sdk_dir().join("bin/blyt")
 }
 
+/// The Spike Z native host-Lua determinism leg (issue #225): the Lua fork
+/// compiled native (x86-64 / arm64) with the ADR-0135 blyt_fpm seam, run over
+/// the parity cart. Built directly into the CMake tree (not the SDK) by
+/// `cmake --build build --target blyt_hostlua_native`; only exists on
+/// x86-64/arm64 hosts (the leg guards on arch in CMake).
+pub fn hostlua_native() -> PathBuf {
+    build_dir().join("frontends/native-hostlua/blyt_hostlua_native")
+}
+
+/// The Q1 negative-control variant of [`hostlua_native`]: identical build but
+/// with FMA contraction enabled (`-ffp-contract=fast`). On FMA silicon its
+/// C-level contraction torture must diverge from the `-ffp-contract=off` build,
+/// proving the flag is load-bearing and the gate has teeth (#225 Q1).
+pub fn hostlua_native_fma() -> PathBuf {
+    build_dir().join("frontends/native-hostlua/blyt_hostlua_native_fma")
+}
+
 // -------------------------------------------------------------------------
 // Spike X graphics reference (issue #188)
 //
@@ -59,9 +76,436 @@ pub fn blyt_bin() -> PathBuf {
 // is palette-independent (it operates on palette indices).  The reference
 // mirrors runtime/shared/blyt_raster.c primitive-for-primitive.
 //
-// Shared here (rather than per-suite) so the emulated trio (gfx.rs) and the
-// native QEMU gate (native_qemu.rs) hash against ONE golden and cannot drift.
+// Shared here (rather than per-suite) so the host-runtime legs (gfx.rs — C carts
+// emulated, Lua carts host-Lua) and the native QEMU gate (native_qemu.rs) hash
+// against ONE golden and cannot drift.
 // -------------------------------------------------------------------------
+/// Shared carts + pinned goldens for the non-FP determinism parity matrix
+/// (#235, Spike Z Q5). Referenced by both `nonfp_parity.rs` (the host-Lua-leg
+/// suite) and `native_qemu.rs` (the RISC-V hardware-path gate) so the cart
+/// source and golden digests have a single source of truth — a regenerated
+/// golden updates every leg at once. See `nonfp_parity.rs` for the reference
+/// model (ADR-0136) and rationale.
+pub mod nonfp {
+    /// State-buffer config with a single f64 field, for the NaN-boundary cart.
+    pub const NAN_CONFIG: &str = "\
+records:
+  NanBuf:
+    fields:
+      - { name: v, type: f64 }
+state_buffers:
+  nanbuf:
+    record: NanBuf
+    count: 1
+";
+
+    /// Writes non-canonical NaNs (sign-set quiet, signaling, negative
+    /// signaling, payload-bearing) + finite f64 controls through the `S`
+    /// proxy's f64 field, reads each back, and folds the *stored* bits into an
+    /// i32 FNV-1a digest. The store path canonicalizes (ADR-0010), so the
+    /// digest only matches across legs if every leg canonicalizes identically.
+    /// Also prints the explicit canonical value for a positive contract check.
+    ///
+    /// `lua_Integer` is 32-bit (BLYT_LUA_I32_F64), so a 64-bit NaN pattern
+    /// can't be a literal — doubles are assembled from two little-endian 32-bit
+    /// halves.
+    pub const NAN_CART: &str = r#"
+local FNV_OFFSET = 0x811c9dc5
+local FNV_PRIME = 0x01000193
+local hash = FNV_OFFSET
+local function fold_byte(b)
+    hash = (hash ~ (b & 0xff)) * FNV_PRIME
+end
+local function fold_i32(x)
+    fold_byte(x & 0xff)
+    fold_byte((x >> 8) & 0xff)
+    fold_byte((x >> 16) & 0xff)
+    fold_byte((x >> 24) & 0xff)
+end
+local function bits_to_double(lo, hi)
+    return (string.unpack("<d", string.pack("<I4I4", lo & 0xffffffff, hi & 0xffffffff)))
+end
+local function double_bits(d)
+    return string.unpack("<I4I4", string.pack("<d", d))
+end
+local function fold_double(d)
+    local lo, hi = double_bits(d)
+    fold_i32(lo)
+    fold_i32(hi)
+end
+local function digest_hex()
+    local b0, b1, b2, b3 = hash & 0xff, (hash >> 8) & 0xff, (hash >> 16) & 0xff, (hash >> 24) & 0xff
+    return string.format("%02x%02x%02x%02x", b3, b2, b1, b0)
+end
+
+function init()
+    local slot = blyt.buf.alloc_slot(S.NANBUF)
+    local inputs = {
+        bits_to_double(0x00000000, 0xFFF80000), -- sign-set quiet NaN
+        bits_to_double(0x00000001, 0x7FF00000), -- signaling NaN
+        bits_to_double(0x00000001, 0xFFF00000), -- negative signaling NaN
+        bits_to_double(0xDEADBEEF, 0x7FF80000), -- quiet NaN with payload
+        bits_to_double(0x00000000, 0x40090000), -- finite 3.125 control
+        bits_to_double(0x00000000, 0xC0000000), -- finite -2.0 control
+    }
+    for i = 1, #inputs do
+        S.nanbuf[slot].v = inputs[i]
+        fold_double(S.nanbuf[slot].v)
+    end
+    blyt.debug.print("<m:[blyt:nonfphash] " .. digest_hex() .. ">")
+    -- Explicit ADR-0010 contract: a non-canonical sign-set NaN reads back as the
+    -- canonical positive quiet NaN 0x7FF8000000000000 on every leg.
+    S.nanbuf[slot].v = bits_to_double(0x00000000, 0xFFF80000)
+    local lo, hi = double_bits(S.nanbuf[slot].v)
+    blyt.debug.print(string.format("<m:[blyt:canon-f64] %08x:%08x>", hi & 0xffffffff, lo & 0xffffffff))
+end
+function update()
+    blyt.quit()
+end
+function draw() end
+"#;
+
+    /// Pinned golden for the NaN-boundary digest. Regenerate by running any leg
+    /// and copying the `[blyt:nonfphash]` value.
+    pub const NAN_DIGEST: &str = "[blyt:nonfphash] e2d2f194";
+    /// The canonical f64 NaN (ADR-0010, 0x7FF8000000000000) printed hi:lo.
+    pub const NAN_CANON_LINE: &str = "[blyt:canon-f64] 7ff80000:00000000";
+
+    /// Folds finalizer (`__gc`) execution order across three collection phases
+    /// into an i32 FNV-1a digest. Finalization order is a pure function of
+    /// allocation / collection order under the shared Lua 5.4 GC, so only a
+    /// GC-order divergence can move the digest.
+    pub const GC_CART: &str = r#"
+local FNV_OFFSET = 0x811c9dc5
+local FNV_PRIME = 0x01000193
+local hash = FNV_OFFSET
+local function fold_byte(b)
+    hash = (hash ~ (b & 0xff)) * FNV_PRIME
+end
+local function fold_str(s)
+    for i = 1, #s do
+        fold_byte(s:byte(i))
+    end
+    fold_byte(0)
+end
+local function fold_i32(x)
+    fold_byte(x & 0xff)
+    fold_byte((x >> 8) & 0xff)
+    fold_byte((x >> 16) & 0xff)
+    fold_byte((x >> 24) & 0xff)
+end
+local function digest_hex()
+    local b0, b1, b2, b3 = hash & 0xff, (hash >> 8) & 0xff, (hash >> 16) & 0xff, (hash >> 24) & 0xff
+    return string.format("%02x%02x%02x%02x", b3, b2, b1, b0)
+end
+
+local order = {}
+local function finalizable(tag)
+    return setmetatable({}, { __gc = function() order[#order + 1] = tag end })
+end
+
+function init()
+    -- Phase 1: create finalizable objects, drop all refs, collect.
+    do
+        local objs = {}
+        for i = 1, 12 do
+            objs[i] = finalizable(string.format("a%02d", i))
+        end
+        objs = nil
+    end
+    collectgarbage("collect")
+    fold_str("phase1:" .. table.concat(order, ","))
+
+    -- Phase 2: interleave survivors with garbage to exercise mark order.
+    order = {}
+    local keep = {}
+    do
+        for i = 1, 20 do
+            local o = finalizable(string.format("b%02d", i))
+            if i % 3 == 0 then
+                keep[#keep + 1] = o -- survives this collection
+            end
+        end
+    end
+    collectgarbage("collect")
+    fold_str("phase2:" .. table.concat(order, ","))
+    fold_i32(#keep)
+
+    -- Phase 3: drop survivors, final sweep (two cycles to drain finalizers).
+    keep = nil
+    order = {}
+    collectgarbage("collect")
+    collectgarbage("collect")
+    fold_str("phase3:" .. table.concat(order, ","))
+
+    blyt.debug.print("<m:[blyt:gchash] " .. digest_hex() .. ">")
+end
+function update()
+    blyt.quit()
+end
+function draw() end
+"#;
+
+    /// Pinned golden for the GC finalization-order digest.
+    pub const GC_DIGEST: &str = "[blyt:gchash] 12522721";
+}
+
+pub mod fp {
+    //! Shared FP parity cart + pinned golden (#223/#225, ADR-0135/0136).
+    //! Referenced by both `fp_parity.rs` (the host-Lua-leg suite) and
+    //! `native_qemu.rs` (the RISC-V hardware-path gate) so the cart source and the
+    //! golden digest have a single source of truth. See `fp_parity.rs` for the full
+    //! reference model (ADR-0136).
+
+    /// The parity cart. Pure Lua, no exports/layouts → host-Lua fast path on WASM.
+    /// See the module doc for what it proves. Kept in one place so the corpus and the
+    /// pinned digest below stay in sync.
+    pub const FP_PARITY_CART: &str = r#"
+-- FP parity gate (#223 AC1). Folds the raw f64 bit patterns of the
+-- cart-reachable Zone-2 (transcendental) + number-conversion surface over an
+-- adversarial corpus into an i32 FNV-1a digest. Only a divergent f64 bit pattern
+-- can move the digest (integer hashing is bit-deterministic across legs).
+
+-- ---- i32 FNV-1a over bytes -------------------------------------------------
+-- 0x811C9DC5 wraps into i32 as a negative value; the wrap is identical on every
+-- leg. 0x01000193 (16777619) fits i32. Integer * wraps mod 2^32 (two's comp).
+local FNV_OFFSET = 0x811c9dc5
+local FNV_PRIME = 0x01000193
+
+local hash = FNV_OFFSET
+-- Snapshot of `hash` taken after the transcendental + Zone-1 surface and before
+-- the Phase-B number-format surface (see run_corpus): the #225 cross-arch gate
+-- value. Defaults to the full hash so a leg that never calls run_corpus still
+-- prints a well-defined line.
+local core_hash = FNV_OFFSET
+
+local function fold_byte(b)
+    hash = (hash ~ b) * FNV_PRIME
+end
+
+-- Fold every byte of an arbitrary (binary-safe) string into the digest.
+local function fold_str(s)
+    for i = 1, #s do
+        fold_byte(s:byte(i))
+    end
+    -- length terminator so "ab".."" and "a".."b" boundaries can't collide
+    fold_byte(0)
+end
+
+-- ADR-0010: a NaN's sign and payload are NOT part of the determinism contract —
+-- they are canonicalized at the state-buffer boundary (blyt_canon_f64). WASM
+-- makes an arithmetically-produced NaN's sign bit nondeterministic (x86-64
+-- yields fff8..., arm64 / the softfloat reference yield the RISC-V canonical
+-- 7ff8...), so hashing the raw transient NaN would test something the console
+-- deliberately does not pin. Canonicalize every NaN to 0x7ff8000000000000 before
+-- it enters the digest, exactly as the state-buffer boundary does; finite results
+-- (where the seam's guarantee actually lives) fold through unchanged.
+local CANON_NAN = string.unpack("<d", "\0\0\0\0\0\0\248\127") -- 0x7ff8000000000000
+local function canon(x)
+    if x ~= x then -- x ~= x is true iff x is NaN, regardless of sign/payload
+        return CANON_NAN
+    end
+    return x
+end
+
+-- Fold a double's raw little-endian IEEE-754 bits (NaN canonicalized per above).
+-- string.pack("<d") writes the exact bit pattern the VM holds.
+local function fold_f64(x)
+    fold_str(string.pack("<d", canon(x)))
+end
+
+-- ---- human-readable spot values (localize any divergence) ------------------
+local spot = {}
+local function packhex(x)
+    -- big-endian raw bytes -> 16 hex nibbles
+    local b = string.pack(">d", x)
+    local out = {}
+    for i = 1, 8 do
+        out[i] = string.format("%02x", b:byte(i))
+    end
+    return table.concat(out)
+end
+local function spotval(name, x)
+    spot[#spot + 1] = name .. "=" .. packhex(canon(x))
+end
+
+-- ---- adversarial corpus ----------------------------------------------------
+-- Compile-time literals: identical bytecode on every leg (luac runs once). The
+-- divergence under test is the RUNTIME evaluation of math.*/^ on these inputs.
+local pi = math.pi
+local inf = math.huge
+local nan = inf - inf
+local inputs = {
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    -0.5,
+    2.0,
+    -2.0,
+    3.0,
+    10.0,
+    100.0,
+    0.1,
+    0.2,
+    0.3,
+    0.75,
+    -0.75,
+    pi,
+    pi / 2,
+    pi / 4,
+    pi * 2,
+    pi * 1000000.0, -- near-multiple-of-pi argument reduction stress
+    355.0 / 113.0,
+    1e-1,
+    1e-300,
+    2.2250738585072014e-308, -- min normal
+    5e-324, -- min positive subnormal
+    1e-320, -- a subnormal
+    1e300,
+    1.7976931348623157e308, -- DBL_MAX
+    1e308,
+    inf,
+    -inf,
+    nan,
+}
+
+-- Unary functions. asin/acos/log/sqrt applied to out-of-domain inputs yield NaN
+-- / +-Inf on purpose: NaN-payload and infinity bit patterns are exactly what the
+-- softfloat RISC-V specialization pins and where a foreign libm can diverge.
+local unary = {
+    { "sin", math.sin },
+    { "cos", math.cos },
+    { "tan", math.tan },
+    { "asin", math.asin },
+    { "acos", math.acos },
+    { "atan", math.atan },
+    { "exp", math.exp },
+    { "log", math.log },
+    { "sqrt", math.sqrt }, -- Zone-1 (IEEE sqrt) but included for completeness
+}
+
+-- Binary. atan2 == math.atan(y, x); pow == y ^ x (Lua `^` -> luai_numpow, the
+-- Zone-2 op ADR-0135 routes through the seam); fmod is Zone-1.
+local pairs_yx = {}
+do
+    local sample = { -3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 10.0, pi, 0.1, inf, -inf, nan }
+    for i = 1, #sample do
+        for j = 1, #sample do
+            pairs_yx[#pairs_yx + 1] = { sample[i], sample[j] }
+        end
+    end
+end
+
+-- strtod corpus: parsed at RUNTIME via tonumber (exercises l_str2d per leg, not
+-- the compile-time lexer).
+local strtod_inputs = {
+    "0",
+    "-0",
+    "0.1",
+    "0.2",
+    "3.141592653589793",
+    "2.718281828459045",
+    "1e308",
+    "1e-308",
+    "5e-324",
+    "2.2250738585072014e-308",
+    "1.7976931348623157e308",
+    "0.30000000000000004",
+    "123456789.123456789",
+    "1e-1",
+    "9007199254740993", -- 2^53+1, not exactly representable
+    "inf",
+    "-inf",
+    "nan",
+}
+
+local function run_corpus()
+    -- Zone-2 unary transcendentals
+    for u = 1, #unary do
+        local f = unary[u][2]
+        for i = 1, #inputs do
+            fold_f64(f(inputs[i]))
+        end
+    end
+    -- atan2 (binary atan), pow (^), fmod
+    for p = 1, #pairs_yx do
+        local y, x = pairs_yx[p][1], pairs_yx[p][2]
+        fold_f64(math.atan(y, x))
+        fold_f64(y ^ x)
+        fold_f64(math.fmod(y, x))
+    end
+    -- CORE digest snapshot (#225 / Spike Z): everything folded so far is the
+    -- Zone-2 transcendental + Zone-1 (sqrt/fmod) surface the ADR-0135 seam pins.
+    -- The native host-Lua leg must reproduce this bit-for-bit on FMA silicon
+    -- (x86-64/arm64) using ONLY the in-house musl kernels — no host libm, no
+    -- strtod/number-format (that surface is Phase B and stays out of the gate,
+    -- else a host-libc strtod difference would masquerade as a seam divergence).
+    core_hash = hash
+    -- number formatting: tostring(x) bytes AND tonumber(tostring(x)) round trip.
+    -- canon() first so tostring(NaN) is "nan" on every host (an x86-64 sign-set
+    -- NaN would otherwise stringify to "-nan"); finite values are unchanged.
+    for i = 1, #inputs do
+        local s = tostring(canon(inputs[i]))
+        fold_str(s)
+        -- Lua's tonumber deliberately rejects "inf"/"nan" (-> nil), identically
+        -- on every leg; guard so non-finite round-trips fold a constant.
+        fold_f64(tonumber(s) or 0.0)
+    end
+    -- strtod: tonumber(string)
+    for i = 1, #strtod_inputs do
+        fold_f64(tonumber(strtod_inputs[i]) or 0.0)
+    end
+
+    -- spot values for human divergence localization
+    spotval("sin1", math.sin(1.0))
+    spotval("cos1", math.cos(1.0))
+    spotval("tan1", math.tan(1.0))
+    spotval("exp1", math.exp(1.0))
+    spotval("log2", math.log(2.0))
+    spotval("pow_2_0.5", 2.0 ^ 0.5)
+    spotval("atan2_1_1", math.atan(1.0, 1.0))
+    spotval("sinbigpi", math.sin(pi * 1000000.0))
+    spotval("asin2_nan", math.asin(2.0))
+    spotval("sqrtneg_nan", math.sqrt(-1.0))
+    spotval("ts_0.1", tonumber(tostring(0.1)))
+end
+
+local function digest_hex(h)
+    local b0 = h & 0xff
+    local b1 = (h >> 8) & 0xff
+    local b2 = (h >> 16) & 0xff
+    local b3 = (h >> 24) & 0xff
+    return string.format("%02x%02x%02x%02x", b3, b2, b1, b0)
+end
+
+function init()
+    run_corpus()
+    -- Core (transcendental + Zone-1) — the #225 native cross-arch gate value.
+    -- Wrapped in a self-delimiting <m:...> marker (#284) so cross-leg exact
+    -- comparison sees only cart output; the `[blyt:...]` substring the QEMU gate
+    -- and native-host-Lua leg assert on is unchanged inside the marker.
+    blyt.debug.print("<m:[blyt:fphash-core] " .. digest_hex(core_hash) .. ">")
+    -- Full (adds Phase-B number-format) — the #223 Phase-A cross-leg gate value.
+    blyt.debug.print("<m:[blyt:fphash] " .. digest_hex(hash) .. ">")
+    for i = 1, #spot do
+        blyt.debug.print("<m:[blyt:fpspot] " .. spot[i] .. ">")
+    end
+end
+
+function update()
+    blyt.quit()
+end
+
+function draw() end
+"#;
+
+    /// The pinned reference digest — the softfloat reference value every leg must
+    /// reproduce. Regenerate (see module doc) if the corpus above changes.
+    pub const FP_PARITY_DIGEST: &str = "[blyt:fphash] f7a69261";
+}
+
 pub mod gfx {
     pub const FRAME_W: usize = 320;
     pub const FRAME_H: usize = 240;
@@ -78,8 +522,9 @@ pub mod gfx {
 
     /// Emit a Lua `draw()` body that issues `ops` via the `blyt32.gfx.*`
     /// primitives — the Lua-cart counterpart of [`c_draw_body`], drawing the
-    /// identical frame so a Lua cart hashes to the same golden across the
-    /// emulated-Lua legs (native/libretro) and the host-Lua fast path (wasm).
+    /// identical frame so a Lua cart hashes to the same golden across the three
+    /// host-Lua legs (blytplay/wasm/libretro — the default for a pure-Lua cart on
+    /// non-RISC-V hosts after #236).
     pub fn lua_draw_body(ops: &[Op]) -> String {
         let mut s = String::new();
         for op in ops {
@@ -894,6 +1339,25 @@ pub fn require_wasm() {
     );
 }
 
+/// Require the Spike Z native host-Lua leg (#225). Built into the CMake tree on
+/// x86-64/arm64 hosts by `cmake --build build --target blyt_hostlua_native`.
+pub fn require_hostlua_native() {
+    assert!(
+        hostlua_native().exists(),
+        "native host-Lua leg not built — run \
+         `cmake --build build --target blyt_hostlua_native` (x86-64/arm64 hosts only)"
+    );
+}
+
+/// Require the Q1 negative-control (FMA-contraction) variant (#225).
+pub fn require_hostlua_native_fma() {
+    assert!(
+        hostlua_native_fma().exists(),
+        "native host-Lua FMA control not built — run \
+         `cmake --build build --target blyt_hostlua_native_fma` (x86-64/arm64 hosts only)"
+    );
+}
+
 /// Require the debug WASM runtime (blytdebug.*, DAP/GDB enabled) for the WASM
 /// DAP/GDB tests (ADR-0129).
 pub fn require_wasm_debug() {
@@ -1057,6 +1521,140 @@ pub fn build_lua_cart(project_dir: &std::path::Path) -> PathBuf {
     ))
 }
 
+// ── #278: shared hybrid init-budget probe ────────────────────────────────────
+//
+// A hybrid whose Lua init() fills the cart heap in fixed 64 KiB blocks BEFORE any
+// native call, with an 8 MiB persistent resource reserved from frame 0. The
+// surviving block count measures the budget headroom the init() allocations see.
+// Shared here so the host-Lua leg parity test (hostlua_hybrid.rs) and the
+// bare-metal QEMU anchor (native_qemu.rs) run the byte-identical cart and pin to
+// the SAME count — see hostlua_hybrid.rs for the full rationale.
+
+/// Trivial native half; its `.lua_exports` makes the cart a hybrid (a SEPARATE
+/// rv32 session arena). Never called during init(), so no trampoline couples the
+/// two arenas before the budget probe.
+pub const INIT_BUDGET_HYBRID_C: &str = r#"#include "blyt.h"
+BLYT_LUA_MODULE_EXPORT_RAW(host, noop) {
+    (void)L;
+    return 0;
+}
+"#;
+
+/// Lua half: fill in 64 KiB blocks, hold each distinct long-string body live,
+/// print the surviving count, then release so the cart exits cleanly on every leg
+/// (the count, not an ENOMEM crash, is the observable).
+pub const INIT_BUDGET_HYBRID_LUA: &str = r#"
+require("host") -- hybrid marker; calls NO native fn before the fill below
+local CHUNK = 64 * 1024
+local KEEP = {}
+function init()
+    local n = 0
+    while n < 4096 do
+        local ok, s = pcall(string.rep, "x", CHUNK)
+        if not ok or not s then break end
+        n = n + 1
+        KEEP[n] = s
+    end
+    blyt.debug.print("INITBUDGET filled=" .. n)
+    KEEP = {}
+    collectgarbage("collect")
+end
+function update() blyt.quit() end
+function draw() end
+"#;
+
+/// Persistent-resource size the probe reserves from frame 0 (8 MiB).
+pub const INIT_BUDGET_PERSIST_BYTES: usize = 8 * 1024 * 1024;
+
+/// Deterministic surviving 64 KiB-block count once the 8 MiB persistent
+/// reservation is honoured (16 - 8 MiB headroom, minus runtime scaffolding). The
+/// emulated rv32 oracle, bare metal, and all three host-Lua legs must agree on
+/// this exact figure (#278); before the fix the host-Lua legs fill ~255 (the full
+/// 16 MiB). A scaffolding shift moves it — update here and both callers follow.
+pub const INIT_BUDGET_FILLED: u64 = 127;
+
+// ── #280: the same probe, driven across the --reset-every-frame cycle ────────
+//
+// #278 seeded the #250 arena coupling at frame 0 only on each leg's INITIAL-LOAD
+// path, leaving the shared VM-rebuild path unseeded. The rebuild empties the
+// arena (zeroing non_evictable_footprint) and re-runs init(), so the reset
+// cycle's init() sees the full 16 MiB again until the first native trampoline —
+// the #278 divergence a second time, on a different code path.
+//
+// This probe is the #278 cart plus a state-buffer frame counter, which is the
+// only state that survives a reset cycle (Lua globals are wiped with the VM and
+// the native half's BSS is zeroed in lockstep, #261) and so is what lets the cart
+// run far enough to be reset at all. It prints its surviving block count from
+// EVERY init() — frame 0 and each rebuild — and all of them must agree.
+//
+// Bare metal has no reset cycle to anchor against directly (the native launcher
+// has no --reset-every-frame; it is a host-driven VM-rebuild stress). The anchor
+// is transitive instead: the invariant is that a rebuild's init() sees the SAME
+// headroom as frame 0, and frame 0's headroom is pinned to real RISC-V hardware
+// by native_qemu.rs Gate 8c on the sibling #278 cart. Asserting every cycle here
+// reproduces that same figure carries the hardware anchor onto the reset path.
+
+/// Native half for the reset-path probe — identical in role to
+/// [`INIT_BUDGET_HYBRID_C`]: a `.lua_exports` hybrid marker never called before
+/// the fill, so no trampoline couples the two arenas ahead of the measurement.
+pub const RESET_BUDGET_HYBRID_C: &str = INIT_BUDGET_HYBRID_C;
+
+/// State-buffer declaration carrying the frame counter across the reset cycle.
+pub const RESET_BUDGET_HYBRID_CONFIG: &str = "\
+records:
+  Globals:
+    fields:
+      - { name: frame, type: i32 }
+state_buffers:
+  globals:
+    record: Globals
+    count: 1
+";
+
+/// Lua half: the [`INIT_BUDGET_HYBRID_LUA`] fill, reported from every init() —
+/// frame 0 and each `--reset-every-frame` rebuild — with the frame counter
+/// round-tripped through a state buffer so the cart survives to be reset.
+pub const RESET_BUDGET_HYBRID_LUA: &str = r#"
+require("host") -- hybrid marker; calls NO native fn before the fill below
+local CHUNK = 64 * 1024
+local KEEP = {}
+local frame = 0
+
+function init()
+    local n = 0
+    while n < 4096 do
+        local ok, s = pcall(string.rep, "x", CHUNK)
+        if not ok or not s then break end
+        n = n + 1
+        KEEP[n] = s
+    end
+    blyt.debug.print("RESETBUDGET filled=" .. n)
+    KEEP = {}
+    collectgarbage("collect")
+end
+
+function on_new_state()
+    blyt.buf.alloc_slot(S.GLOBALS)
+end
+
+function update()
+    frame = frame + 1
+    if frame >= 3 then
+        blyt.quit()
+    end
+end
+
+function draw() end
+
+function on_save_state()
+    S.globals[0].frame = frame
+end
+
+function on_load_state(_info)
+    frame = S.globals[0].frame
+end
+"#;
+
 /// Run a cart with blytplay --headless; assert `expected` appears in stdout.
 pub fn run_cart_native(cart: &std::path::Path, expected: &str) {
     run_cart_native_with_env(cart, &[], expected)
@@ -1107,6 +1705,190 @@ pub fn run_cart_native_with_env(
     assert!(
         String::from_utf8_lossy(&output).contains(expected),
         "expected {:?} in native output, got: {}",
+        expected,
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// Concatenate a finished command's stdout then stderr into one string.
+///
+/// The capture helpers surface **both** streams so an aborting cart is diagnosed
+/// as the cart/runtime error it is, not a bare missing line (#295). A Lua error /
+/// S-proxy type failure is printed to stderr and aborts the cart before it writes
+/// the value to stdout; a stdout-only capture returned an empty string and the
+/// caller's value parser panicked with a generic "no such line", discarding the
+/// real `[blyt] ...:N: <message>` cause (it cost real time on #270's
+/// `set_u32 = 4e9` i32-overflow trap). Callers extract a specific line/marker, so
+/// folding stderr in never confuses them — it only makes a failure legible.
+fn stdout_then_stderr(output: &std::process::Output) -> String {
+    let mut s = String::from_utf8_lossy(&output.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&output.stderr));
+    s
+}
+
+/// Run a cart on blytplay --headless with extra env and return its combined
+/// stdout+stderr (see [`stdout_then_stderr`]), for tests that parse a printed
+/// value (rather than assert a fixed line) and compare it across legs — e.g. the
+/// cross-leg `guest_heap_used` equality oracle (#231): capture the native
+/// host-Lua count (the default for a pure-Lua cart on non-RISC-V hosts,
+/// ADR-0136) and require it identical to the wasm32 sibling.
+pub fn capture_cart_native(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(blytplay());
+    cmd.args(["--headless", cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    stdout_then_stderr(cmd.assert().success().get_output())
+}
+
+/// Run a cart through a WASM runtime dir and return its **combined stdout+stderr**,
+/// asserting a clean exit (status 0). The dir selects the runtime: `find_wasm_dir()`
+/// for release (`blytplay.js`), `find_wasm_debug_dir()` for debug (`blytdebug.js`) —
+/// the driver loads whichever the dir ships.
+///
+/// Unlike [`capture_cart_wasm`] (stdout only) this also folds in stderr, where the
+/// host-Lua leg's reported Lua errors land (`blyt_js_error` → `console.error`), so an
+/// erroring cart's bare message is visible alongside its `blyt.debug.print` markers
+/// for cross-leg recovery assertions (#264). Asserting `.success()` is itself the
+/// AC#3 check: a cart that errors in a callback then calls `blyt.quit()` must still
+/// exit 0.
+fn capture_cart_wasm_dir(wasm_dir: &std::path::Path, cart: &std::path::Path) -> String {
+    use assert_cmd::Command;
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+    let output = Command::new("node")
+        .args([
+            driver.to_str().unwrap(),
+            wasm_dir.to_str().unwrap(),
+            cart.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let mut s = String::from_utf8_lossy(&output.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&output.stderr));
+    s
+}
+
+/// [`capture_cart_wasm_dir`] against the **release** WASM runtime (`blyt run`).
+pub fn capture_cart_wasm_combined(cart: &std::path::Path) -> String {
+    capture_cart_wasm_dir(&find_wasm_dir(), cart)
+}
+
+/// [`capture_cart_wasm_dir`] against the **debug** WASM runtime (`blyt debug`,
+/// `blytdebug.js` with BLYT_DAP/BLYT_GDB compiled in). Driven headlessly with no DAP
+/// client (`blyt_js_dap_port() == 0`), so the cart runs standalone — this is the
+/// leg that would trip the `runtimeKeepalivePop` assertion if the error-teardown
+/// keepalive accounting regressed (#102/#264 AC#5).
+pub fn capture_cart_wasm_debug_combined(cart: &std::path::Path) -> String {
+    capture_cart_wasm_dir(&find_wasm_debug_dir(), cart)
+}
+
+/// Run a cart on the WASM runner with extra env and return its combined
+/// stdout+stderr (see [`stdout_then_stderr`]) — the wasm32 companion to
+/// [`capture_cart_native`] for cross-leg value comparison. The WASM runtime
+/// prints an aborting cart's error to stderr (`blyt_js_error` → `console.error`),
+/// so folding stderr in is what closes the #295 gap on this leg specifically.
+pub fn capture_cart_wasm(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
+    use assert_cmd::Command;
+    let driver = repo_root().join("tests/wasm/run_cart.js");
+    let wasm_dir = find_wasm_dir();
+    let mut cmd = Command::new("node");
+    cmd.args([
+        driver.to_str().unwrap(),
+        wasm_dir.to_str().unwrap(),
+        cart.to_str().unwrap(),
+    ]);
+    if !extra_env.is_empty() {
+        let pairs: Vec<String> = extra_env
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "\"{}\":\"{}\"",
+                    k,
+                    v.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect();
+        let env_json = format!("{{{}}}", pairs.join(","));
+        cmd.args(["", &env_json]);
+    }
+    stdout_then_stderr(cmd.assert().success().get_output())
+}
+
+/// Run a cart through the embedded libretro core with extra env and return its
+/// full output — the libretro companion to [`capture_cart_native`] /
+/// [`capture_cart_wasm`] for cross-leg value comparison. The embedded core logs
+/// to stderr, so that is what is captured.
+pub fn capture_cart_libretro(cart: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    // The embedded core logs to stderr; fold stdout in too for uniformity with
+    // the other capture helpers so any leg's abort diagnostic is surfaced (#295).
+    stdout_then_stderr(cmd.assert().success().get_output())
+}
+
+/// Like [`capture_cart_native`], but also passes blytplay flags — for probes that
+/// need a run-mode knob (`--reset-every-frame`) and parse a printed value rather
+/// than assert a fixed line (#280).
+pub fn capture_cart_native_with_flags(
+    cart: &std::path::Path,
+    extra_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(blytplay());
+    cmd.arg("--headless");
+    for f in extra_flags {
+        cmd.arg(f);
+    }
+    cmd.arg(cart.to_str().unwrap());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    stdout_then_stderr(cmd.assert().success().get_output())
+}
+
+/// Like [`capture_cart_libretro`], but also passes `test_libretro_core` flags —
+/// the libretro companion to [`capture_cart_native_with_flags`] (#280). Flags
+/// precede the core/cart operands, matching [`run_cart_libretro_with_flags`].
+pub fn capture_cart_libretro_with_flags(
+    cart: &std::path::Path,
+    extra_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> String {
+    use assert_cmd::Command;
+    let mut cmd = Command::new(test_libretro_core());
+    for f in extra_flags {
+        cmd.arg(f);
+    }
+    cmd.args([libretro_so().to_str().unwrap(), cart.to_str().unwrap()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    stdout_then_stderr(cmd.assert().success().get_output())
+}
+
+/// Run a cart on the native host-Lua determinism leg (Spike Z, #225); assert
+/// `expected` appears in stdout. The cart must be pure Lua (the leg reads its
+/// `.cart.lua` bytecode section) and must terminate itself via `blyt.quit()`.
+pub fn run_cart_native_hostlua(cart: &std::path::Path, expected: &str) {
+    use assert_cmd::Command;
+    let output = Command::new(hostlua_native())
+        .arg(cart.to_str().unwrap())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&output).contains(expected),
+        "expected {:?} in native host-Lua output, got: {}",
         expected,
         String::from_utf8_lossy(&output)
     );
@@ -1326,42 +2108,354 @@ pub fn run_cart_all_legs(cart: &std::path::Path, expected: &str) {
     run_cart_libretro(cart, expected);
 }
 
-/// Like [`run_cart_all_legs`], but drives each leg's `--reset-every-frame`
-/// save/restore stress cycle, translating the per-leg knob (blytplay flag /
-/// `BLYT_RESET_EVERY_FRAME` env / driver flag). The cart must terminate itself
-/// (call `blyt.quit()` / `blyt_quit()`), as the WASM and libretro drivers do not
-/// pass a frame cap.
-pub fn run_cart_all_legs_reset_every_frame(cart: &std::path::Path, expected: &str) {
-    run_cart_native_with_flags(cart, &["--reset-every-frame"], expected);
-    run_cart_wasm_with_env(cart, &[("BLYT_RESET_EVERY_FRAME", "1")], expected);
-    run_cart_libretro_with_flags(cart, &["--reset-every-frame"], expected);
+/// Every `[blyt:fbhash]`/`[blyt:palhash]` line a leg emitted, in order,
+/// normalised to the marker-onward text so a leg-specific log prefix does not
+/// defeat the comparison.
+///
+/// Line-based extraction (unlike the self-delimiting [`cart_markers`]) is safe
+/// here because each hash is emitted as its own whole log line on every leg that
+/// runs `BLYT_FRAME_HASH` — the three host runtimes. (Bare metal newline-frames
+/// its console output too since #291, but never runs `BLYT_FRAME_HASH`.)
+pub fn frame_hash_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            ["[blyt:fbhash]", "[blyt:palhash]"]
+                .iter()
+                .find_map(|tag| line.find(tag).map(|i| line[i..].trim_end().to_owned()))
+        })
+        .collect()
 }
 
-/// Like [`run_cart_all_legs`], but force-evicts every evictable resource after
-/// each frame (ADR-0027 v2, #137), translating the per-leg knob (blytplay
+/// The parity check behind [`run_cart_all_legs_frame_hash_exact`], returning the
+/// mismatch message (or `None` when the legs agree) instead of panicking, so its
+/// teeth can be unit-tested against synthetic divergent sequences.
+///
+/// Two conditions, both required:
+/// 1. **Cross-leg determinism** — the three legs emit the *identical* ordered
+///    hash sequence. This is the tooth a per-leg substring frame-hash check
+///    lacks: that passes if `expected` appears on *any* frame of
+///    *any* leg, so a leg that diverges on a non-target frame, renders a
+///    different number of frames, or repeats one stays green (the #280/#283
+///    class). An exact sequence compare cannot.
+/// 2. **Content pin** — `expected` (one `[blyt:fbhash]`/`[blyt:palhash]` line)
+///    occurs in that agreed sequence, so cross-leg agreement on the *wrong*
+///    content (all legs identically broken) is still caught.
+///
+/// There is no real cross-leg divergence to ablate against — determinism holds —
+/// so the proof that this rejects divergence is a unit test on synthetic
+/// sequences, not a red cart.
+pub fn frame_hash_parity_error(
+    native: &[String],
+    wasm: &[String],
+    libretro: &[String],
+    expected: &str,
+) -> Option<String> {
+    let expected = expected.trim();
+    let show = |seq: &[String]| {
+        if seq.is_empty() {
+            "(no [blyt:fbhash]/[blyt:palhash] lines)".to_owned()
+        } else {
+            seq.join("\n")
+        }
+    };
+    if native != wasm {
+        return Some(format!(
+            "frame-hash sequence diverged between native and wasm.\n\
+             native ({} lines):\n{}\nwasm ({} lines):\n{}",
+            native.len(),
+            show(native),
+            wasm.len(),
+            show(wasm),
+        ));
+    }
+    if native != libretro {
+        return Some(format!(
+            "frame-hash sequence diverged between native and libretro.\n\
+             native ({} lines):\n{}\nlibretro ({} lines):\n{}",
+            native.len(),
+            show(native),
+            libretro.len(),
+            show(libretro),
+        ));
+    }
+    if !native.iter().any(|l| l == expected) {
+        return Some(format!(
+            "expected frame-hash line {expected:?} not found in the agreed \
+             sequence ({} lines):\n{}",
+            native.len(),
+            show(native),
+        ));
+    }
+    None
+}
+
+/// The exact-sequence frame-hash parity check (#284): run `cart` with
+/// `BLYT_FRAME_HASH=1` on all three host-runtime legs, require every
+/// leg to emit the *identical* ordered `[blyt:fbhash]`/`[blyt:palhash]` sequence,
+/// and pin `expected` present in it. See [`frame_hash_parity_error`] for why a
+/// per-leg substring check's per-frame blindness is a determinism hole this closes.
+pub fn run_cart_all_legs_frame_hash_exact(cart: &std::path::Path, expected: &str) {
+    let env = [("BLYT_FRAME_HASH", "1")];
+    let native = frame_hash_lines(&capture_cart_native(cart, &env));
+    let wasm = frame_hash_lines(&capture_cart_wasm(cart, &env));
+    let libretro = frame_hash_lines(&capture_cart_libretro(cart, &env));
+    if let Some(msg) = frame_hash_parity_error(&native, &wasm, &libretro, expected) {
+        panic!("{msg}");
+    }
+}
+
+/// Extract a cart's own markers from one leg's captured output, in order. A
+/// marker is `<{tag}:PAYLOAD>`; each PAYLOAD is returned.
+///
+/// Raw leg outputs are not directly comparable: the libretro driver prints a
+/// version banner and a debug guest lib emits ungated trace lines, so isolating
+/// what the *cart* emitted is what lets the comparison be EXACT without first
+/// normalising every leg's own noise.
+///
+/// Markers are self-delimiting rather than line-based on purpose: a marker stays
+/// findable however its leg framed the surrounding output, so the comparison
+/// never depends on log framing it is not trying to test. That mattered acutely
+/// before #291, when bare metal's `blyt_console_debug` went straight to
+/// `write(2)` with no trailing newline and a whole run arrived as one line — a
+/// line-based extractor yielded NOTHING there, failing (or with an
+/// `is_empty()`-tolerant assertion, passing) for a reason that had nothing to do
+/// with the cart. Every leg line-frames its console output now, but the
+/// self-delimiting form keeps a marker intact even when a leg interleaves its own
+/// output mid-line. The line framing itself is asserted in
+/// tests/console_framing.rs and QEMU Gate 36, via [`marker_lines`].
+pub fn cart_markers(output: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}:");
+    let mut out = Vec::new();
+    let mut rest = output;
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + open.len()..];
+        match rest.find('>') {
+            Some(end) => {
+                out.push(rest[..end].to_owned());
+                rest = &rest[end + 1..];
+            }
+            None => break, /* truncated output — stop rather than invent a marker */
+        }
+    }
+    out
+}
+
+/// Assert one leg's markers are EXACTLY `expected` — same payloads, same order,
+/// same count. Public so callers whose per-leg invocation does not fit a fixed
+/// helper — e.g. the hybrid matrix's native-lifecycle test, which passes a
+/// *different* safety-cap flag to the blytplay legs (`--quit-after`) than to the
+/// libretro legs (`--run-frames`) — can still assert every leg against one shared
+/// `expected` (identical-to-`expected` on every leg ⇒ all legs identical).
+pub fn assert_markers_exact(leg: &str, output: &str, tag: &str, expected: &[&str]) {
+    let got = cart_markers(output, tag);
+    assert_eq!(
+        got,
+        expected,
+        "\n{leg} leg emitted a different marker sequence.\n  expected ({} lines): {:#?}\n  got      ({} lines): {:#?}\nfull {leg} output:\n{output}",
+        expected.len(),
+        expected,
+        got.len(),
+        got,
+    );
+}
+
+/// Every output line carrying a `<{tag}:…>` marker, trimmed — the **line-based**
+/// view of cart output, as opposed to [`cart_markers`]' self-delimiting scan.
+///
+/// This is the teeth for the `blyt_console_debug` line-framing contract (#291):
+/// one call emits exactly one line, so a cart that made N calls must produce N
+/// marker-bearing lines, each equal to exactly one whole marker. Two markers
+/// sharing a line (bare metal's pre-#291 behaviour, where consecutive calls ran
+/// together into one unbroken write) fails the equality, as does a call that
+/// emitted no line at all.
+pub fn marker_lines(output: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}:");
+    output
+        .lines()
+        .filter(|line| line.contains(&open))
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+/// Assert one leg framed each `<{tag}:…>` marker on its own line — the
+/// `blyt_console_debug` line-framing contract (#291), which every leg including
+/// bare metal must satisfy identically.
+///
+/// `expected` is the whole markers (`<lf:one>`, …), not the payloads
+/// [`assert_markers_exact`] compares: the point here is *where the line breaks
+/// fall*, which a payload-only comparison cannot see. Cross-checks the
+/// self-delimiting [`cart_markers`] scan so a cart that never ran is reported as
+/// that, rather than as a framing failure.
+pub fn assert_marker_lines_exact(leg: &str, output: &str, tag: &str, expected: &[&str]) {
+    let payloads = cart_markers(output, tag);
+    assert_eq!(
+        payloads.len(),
+        expected.len(),
+        "\n{leg} leg emitted {} <{tag}:…> markers, expected {} — the cart did not run as \
+         expected, so its line framing cannot be judged.\nfull {leg} output:\n{output}",
+        payloads.len(),
+        expected.len(),
+    );
+    let got = marker_lines(output, tag);
+    assert_eq!(
+        got,
+        expected,
+        "\n{leg} leg did not frame one console_debug call per line (#291).\n  \
+         expected ({} lines): {:#?}\n  got      ({} lines): {:#?}\nfull {leg} output:\n{output}",
+        expected.len(),
+        expected,
+        got.len(),
+        got,
+    );
+}
+
+/// The exact-match counterpart to [`run_cart_all_legs`] (#284): run `cart` on all
+/// three host-runtime legs and require each leg's marker lines (see
+/// [`cart_marker_lines`]) to equal `expected` exactly.
+///
+/// [`run_cart_all_legs`] and friends assert only that a substring *appears* in
+/// each leg's output, so a leg that runs an extra frame, or repeats a lifecycle
+/// callback, still passes. That is how #283 stayed invisible: blytplay drove one
+/// `--reset-every-frame` cycle too many and re-entered `init()` on an
+/// already-finished cart, and every substring assertion was still satisfied.
+/// Reach for this helper whenever the *number* of times something happens is
+/// part of the contract — frame counts above all, since a cart's frame count is
+/// cart-observable and determinism is the core contract.
+pub fn run_cart_all_legs_exact(cart: &std::path::Path, tag: &str, expected: &[&str]) {
+    assert_markers_exact("native", &capture_cart_native(cart, &[]), tag, expected);
+    assert_markers_exact("wasm", &capture_cart_wasm(cart, &[]), tag, expected);
+    assert_markers_exact("libretro", &capture_cart_libretro(cart, &[]), tag, expected);
+}
+
+/// Cross-leg exact parity for carts whose marker sequence is deterministic but
+/// not practical to enumerate — e.g. an oracle cart that folds a runtime-computed
+/// corpus into per-item lines (`[blyt:fpspot] …`) whose values the test does not
+/// hard-code. Requires all three host-runtime legs to emit the **identical**
+/// marker sequence (same payloads, order, and count) and requires `must_contain`
+/// to be one of those markers (a pinned reference value, e.g. the golden digest).
+///
+/// This is the marker analog of [`run_cart_all_legs_frame_hash_exact`]: cross-leg
+/// sequence equality plus a content pin, for when [`run_cart_all_legs_exact`]'s
+/// fully-enumerated `expected` is impractical. It is strictly stronger than the
+/// substring check it replaces — that pinned only that the digest *appeared* on
+/// each leg, blind to whether the surrounding per-item lines agreed or even
+/// matched in number across legs.
+pub fn run_cart_all_legs_exact_cross_leg(cart: &std::path::Path, tag: &str, must_contain: &str) {
+    let native = cart_markers(&capture_cart_native(cart, &[]), tag);
+    let wasm = cart_markers(&capture_cart_wasm(cart, &[]), tag);
+    let libretro = cart_markers(&capture_cart_libretro(cart, &[]), tag);
+    assert_eq!(
+        native,
+        wasm,
+        "native vs wasm marker sequence diverged for tag {tag:?}:\n  native ({}): {native:#?}\n  wasm ({}): {wasm:#?}",
+        native.len(),
+        wasm.len(),
+    );
+    assert_eq!(
+        native,
+        libretro,
+        "native vs libretro marker sequence diverged for tag {tag:?}:\n  native ({}): {native:#?}\n  libretro ({}): {libretro:#?}",
+        native.len(),
+        libretro.len(),
+    );
+    assert!(
+        native.iter().any(|m| m == must_contain),
+        "pinned reference {must_contain:?} not found in the agreed marker sequence ({}): {native:#?}",
+        native.len(),
+    );
+}
+
+/// [`run_cart_all_legs_exact`] under each leg's `--reset-every-frame` save/restore
+/// stress cycle, translating the per-leg knob (blytplay flag /
+/// `BLYT_RESET_EVERY_FRAME` env / driver flag). The cart must terminate itself.
+pub fn run_cart_all_legs_exact_reset_every_frame(
+    cart: &std::path::Path,
+    tag: &str,
+    expected: &[&str],
+) {
+    assert_markers_exact(
+        "native",
+        &capture_cart_native_with_flags(cart, &["--reset-every-frame"], &[]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "wasm",
+        &capture_cart_wasm(cart, &[("BLYT_RESET_EVERY_FRAME", "1")]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "libretro",
+        &capture_cart_libretro_with_flags(cart, &["--reset-every-frame"], &[]),
+        tag,
+        expected,
+    );
+}
+
+/// The exact-sequence resource-eviction parity check (#284): force-evict every
+/// evictable resource after each frame (ADR-0027 v2, #137; blytplay
 /// `--evict-every-frame` flag / `BLYT_RESOURCE_EVICT_EVERY_FRAME` env / driver
-/// flag). A cart that re-reads a resource each frame thus rehydrates it from
-/// scratch every frame; asserting the same `expected` here and under plain
-/// [`run_cart_all_legs`] proves eviction is cart-invisible (bytes byte-identical
-/// after rehydration, output unchanged). The cart must terminate itself.
-pub fn run_cart_all_legs_evict_every_frame(cart: &std::path::Path, expected: &str) {
-    run_cart_native_with_flags(cart, &["--evict-every-frame"], expected);
-    run_cart_wasm_with_env(cart, &[("BLYT_RESOURCE_EVICT_EVERY_FRAME", "1")], expected);
-    run_cart_libretro_with_flags(cart, &["--evict-every-frame"], expected);
+/// flag) and require each leg's full marker sequence to equal `expected`. A cart
+/// that re-reads a resource each frame emits one marker per frame; asserting the
+/// exact sequence proves every rehydration produced byte-identical bytes on every
+/// leg — a substring match would pass even if a single frame's re-decode
+/// diverged, since the other frames still carry the expected line. The cart must
+/// terminate itself.
+pub fn run_cart_all_legs_exact_evict_every_frame(
+    cart: &std::path::Path,
+    tag: &str,
+    expected: &[&str],
+) {
+    assert_markers_exact(
+        "native",
+        &capture_cart_native_with_flags(cart, &["--evict-every-frame"], &[]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "wasm",
+        &capture_cart_wasm(cart, &[("BLYT_RESOURCE_EVICT_EVERY_FRAME", "1")]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "libretro",
+        &capture_cart_libretro_with_flags(cart, &["--evict-every-frame"], &[]),
+        tag,
+        expected,
+    );
 }
 
-/// Like [`run_cart_all_legs`], but for carts that do disk-backed
-/// `save_write`/`save_read`: each leg is given a `BLYT_SAVE_DIR`. Native and
-/// libretro share a fresh host tempdir; WASM uses `/tmp` (the only path that
-/// exists in its Emscripten MEMFS by default — a host tempdir path would not).
-/// Each leg writes its save before reading it back within the same run, so the
-/// shared native/libretro dir is self-contained per leg.
-pub fn run_cart_all_legs_with_save_dir(cart: &std::path::Path, expected: &str) {
+/// The exact-sequence save-dir parity check (#284) for carts that do disk-backed
+/// `save_write`/`save_read`: each leg is given a `BLYT_SAVE_DIR` (native/libretro
+/// share a fresh host tempdir, WASM uses `/tmp` — the only path in its Emscripten
+/// MEMFS by default), and each leg's full marker sequence must equal `expected`
+/// rather than merely containing a substring. Each leg writes its save before
+/// reading it back within the same run, so the shared native/libretro dir is
+/// self-contained per leg.
+pub fn run_cart_all_legs_exact_with_save_dir(cart: &std::path::Path, tag: &str, expected: &[&str]) {
     let save_dir = tempfile::TempDir::new().unwrap();
     let sd = save_dir.path().to_str().unwrap();
-    run_cart_native_with_env(cart, &[("BLYT_SAVE_DIR", sd)], expected);
-    run_cart_wasm_with_env(cart, &[("BLYT_SAVE_DIR", "/tmp")], expected);
-    run_cart_libretro_with_env(cart, &[("BLYT_SAVE_DIR", sd)], expected);
+    assert_markers_exact(
+        "native",
+        &capture_cart_native(cart, &[("BLYT_SAVE_DIR", sd)]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "wasm",
+        &capture_cart_wasm(cart, &[("BLYT_SAVE_DIR", "/tmp")]),
+        tag,
+        expected,
+    );
+    assert_markers_exact(
+        "libretro",
+        &capture_cart_libretro(cart, &[("BLYT_SAVE_DIR", sd)]),
+        tag,
+        expected,
+    );
 }
 
 /// Cross-version save round trip (issue #112): a `writer` cart (declaring one

@@ -1,0 +1,3266 @@
+/*
+ * cart_run_hostlua.c — native host-Lua fast path runner (#238, epic #230).
+ *
+ * Sibling to cart_run.c's blyt_session_*: runs a pure-Lua cart's bytecode in a
+ * Lua VM compiled natively for the host (the deterministic seam VM,
+ * cmake/blyt_hostlua_vm.cmake) instead of the RV32 Lua VM under rv32emu.  The
+ * native port of frontends/wasm/wasm_main.c's run_lua_cart — same Lua fork
+ * (BLYT_LUA_I32_F64), same cart bytecode, same fixed hash seed, same blyt_fpm
+ * transcendental seam, same restricted stdlib subset — so its cart-visible
+ * output is byte-identical to every other leg (determinism is the core
+ * contract, ADR-0007).
+ *
+ * The whole execution body compiles only when the seam VM is available
+ * (BLYT_HOSTLUA_EXEC, set on libblyt by CMake); otherwise the entry points below
+ * degrade to no-ops so the frontend falls back to the rv32 session transparently.
+ *
+ * S2 scope (#238): VM create + restricted stdlib + the minimal blyt/blyt32 API a
+ * pure-Lua cart reaches for output and termination (debug.print, quit,
+ * should_quit) + sandboxed require + BLMC/raw bytecode loader + direct-call
+ * init/update/draw/on_quit/cleanup lifecycle.  State buffers (S-proxy) land in S3,
+ * save/restore + reset-every-frame in S4.  Unimplemented cart APIs error LOUDLY
+ * rather than silently no-op (anti-#98).
+ */
+
+#include <stdbool.h>
+
+#include "blyt_hostlua.h"
+
+#ifdef BLYT_HOSTLUA_EXEC
+
+#include <ctype.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "lauxlib.h"
+#include "lua.h"
+#include "lualib.h"
+
+#ifdef BLYT_DAP
+#include "dap_transport_tcp_lua.h" /* native host-Lua DAP server (#234) */
+#include "master_hook.h" /* fc_consolelua_master_hook_install + fc_master_hook_cfg */
+#endif
+
+#include "blyt_arena.h" /* runtime/shared: single-sourced cart-heap arena (#158) */
+#include "blyt_frame_hash.h" /* runtime/shared: cross-leg framebuffer hash (#188) */
+#include "blyt_handle.h" /* runtime/shared: console-wide handle encoding (ADR-0134) */
+#include "blyt_hostlua_api.h" /* runtime/shared: the ONE host-Lua API registration (#267) */
+#include "blyt_hostlua_driver.h" /* runtime/shared: the ONE cart-driving model (#242) */
+#include "blyt_hostlua_heap.h" /* runtime/shared: rv32 heap-seam handoff (#231) */
+#include "blyt_mem_budget.h" /* runtime/shared: unified 16 MB budget (ADR-0008 #158) */
+#include "blyt_palettes.h" /* runtime/shared: built-in palette resolver (#201) */
+#include "blyt_phase.h" /* runtime/shared: lifecycle phase (draw()-only gate, #205) */
+#include "blyt_raster.h" /* runtime/shared: integer rasterizer core (#188) */
+#include "blyt_resource_codec.h" /* runtime/shared: BLYT_RES_ALGO_NONE (#157) */
+#include "resource.h" /* blyt_resource_table_t + lifecycle (#93/#158) */
+#include "save.h" /* blyt_save_write / blyt_save_read */
+#include "state_buffer.h" /* blyt_state_ctx_t + typed accessors */
+#include "testcard.h" /* PM5544 testcard (drawn until the cart draws, #204) */
+
+/* Reverse-trampoline exchange-thread pool depth (#262): shared with the wasm
+ * frontend via blyt_runtime.h so both legs bound native→Lua→native nesting
+ * identically. */
+#define HL_EXCH_POOL_DEPTH BLYT_HOSTLUA_EXCH_POOL_DEPTH
+
+/* Host-Lua surface pool (blyt32.surface.*, #205/#208, #231).  A pure-Lua cart on
+ * this path has no session, so its surfaces live in the runner (the session-less
+ * mirror of the WASM leg's g_lua_surf pool — none of that leg's hybrid/session
+ * routing applies here).  Slot 0 is the screen: its pixels resolve to the
+ * runner's fb on each access.  Off-screen slots hold malloc'd buffers, freed at
+ * the frame boundary (draw-scoped, #205). */
+#define HL_SURFACE_MAX 64
+typedef struct {
+    uint8_t *pixels;
+    int32_t w, h;
+    uint16_t gen;
+    bool in_use;
+    bool is_screen;
+    bool locked; /* exclusive tier-2 lock held (#207/#208) */
+} hl_surface_t;
+
+struct blyt_hostlua {
+    lua_State *L;
+    blyt_cart_t *cart; /* for save_version + cart id (save subdir) */
+    blyt_log_fn log_fn;
+    /* .cart.lua bytecode (into the cart mmap) — kept so the reset-every-frame
+     * cycle can rebuild the VM from the same chunk. */
+    const unsigned char *bytecode;
+    size_t bytecode_size;
+    /* State buffers (ADR-0009/0010): a standalone ctx — the host-Lua path has no
+     * blyt_session, so it owns the ctx directly instead of borrowing the
+     * session's (the WASM pure-Lua path's g_lua_state_ctx equivalent).  NULL when
+     * the cart declares no .cart.layouts. */
+    blyt_state_ctx_t *state_ctx;
+    char *save_dir; /* $BLYT_SAVE_DIR (strdup'd), or NULL */
+    char cart_name[64]; /* manifest id — the save subdirectory name */
+    int quit; /* blyt.quit() latch (mirrors g_quit_requested in blyt_main) */
+    bool done; /* on_quit() + cleanup() already run */
+    /* Gfx fast path (#188 / Spike X, #231): a runner-owned paletted framebuffer
+     * the blyt32.gfx.* bindings rasterize into (the host-Lua equivalent of the
+     * emulated path's session->pixels[]) plus the active palette.  The host-Lua
+     * path has no session, so — like the state ctx — the runner owns these
+     * directly (the WASM leg's standalone g_lua_pixels / g_lua_gfx_palette). */
+    uint8_t fb[BLYT_FRAME_W * BLYT_FRAME_H]; /* paletted back buffer (1 byte/px) */
+    uint32_t palette[256]; /* active 256-entry XRGB8888 palette */
+    bool drawn; /* a blyt32.gfx.* op ran ⇒ displace the testcard (sticky) */
+    uint32_t frame_count; /* testcard animation counter (== session->frame_count) */
+    /* Surface pool (#205/#208, #231) + the per-frame tier-2 lock epoch (bumped
+     * each frame so a lock never outlives the draw it was taken in). */
+    hl_surface_t surf[HL_SURFACE_MAX];
+    bool surf_init;
+    uint32_t lock_epoch;
+    /* Cart heap (#158, #231): on this 64-bit host the Lua VM's objects carry
+     * 8-byte pointers, so physical bytes come from plain host malloc (unbounded —
+     * a 16 MB-budget cart may use ~2× host RAM, fine on desktop).  `arena` is a
+     * separate rv32-sized SHADOW allocator: the fork (BLYT_HOSTLUA_HEAP_SEAM)
+     * publishes each allocation's rv32-equivalent size (blyt_hostlua_heap_rv_pending),
+     * and hl_lua_alloc drives this arena at those sizes so guest_heap_used and the
+     * 16 MB fail-point are byte-identical to the wasm32 leg (DIRECTION 1).  Each
+     * physical block carries a small prefix holding its shadow-arena offset. */
+    blyt_mem_accounting_t mem_acct;
+    blyt_arena_t arena;
+    /* Resource table (#93/#158/#231): a pure-Lua cart has no session, so its
+     * blyt.resource.* table lives in the runner (the session-less mirror of the
+     * WASM leg's g_lua_resources).  non_evictable_footprint in mem_acct above is
+     * published from it, feeding the same unified 16 MB budget predicate. */
+    blyt_resource_table_t resources;
+    bool resources_loaded;
+    /* Hybrid carts (#232, ADR-0130): a Lua+native cart runs its Lua half on this
+     * host VM while the native C/Rust half stays EMULATED in an rv32 session.
+     * `session` is non-NULL only for a hybrid (a .lua_exports cart); the exchange
+     * thread `lua_exch` (a Lua thread off hl->L, anchored via lua_exch_ref) is
+     * where the ADR-0130 bridge executes the native half's Lua C API calls.  Both
+     * are recreated on every VM rebuild (reset/reload) inside build_vm; the
+     * session itself persists across rebuilds.  The native counterpart of the
+     * WASM leg's g_session / g_lua_exch. */
+    blyt_session_t *session;
+    /* ADR-0130 exchange-thread pool (#232, #262).  A reverse-trampoline callback
+     * runs ON an exchange thread, so a nested native→Lua→native call needs a
+     * DISTINCT clean one: the trampoline uses exch_pool[exch_depth] at each
+     * nesting level (pool[0] is the base the bridge attaches to).  All are
+     * anchored off hl->L (registry) and recreated on every VM rebuild; lua_close
+     * frees the registry, so no explicit unref is needed at teardown. */
+    lua_State *exch_pool[HL_EXCH_POOL_DEPTH];
+    int exch_pool_ref[HL_EXCH_POOL_DEPTH];
+    int exch_depth; /* active reverse-trampoline nesting level */
+    lua_State *lua_exch; /* == exch_pool[0]; NULL when no exchange thread anchored */
+    /* Source-level debugging (#234): when set, build_vm arms the DAP master hook
+     * on hl->L (re-armed on every reset/reload rebuild) and destroy shuts the DAP
+     * server down. */
+    bool dap_enabled;
+    /* Deferred-boot debug session (#234/#251): when set, init()/on_new_state() are
+     * NOT run at create — the frontend gates on every active debugger (the Lua-half
+     * DAP configurationDone AND/OR the native-half GDB client attach+continue) and
+     * then runs the boot via blyt_hostlua_dap_wait_ready, so a breakpoint in init()
+     * (Lua or native) is armed before it fires.  Set for a GDB-only hybrid too,
+     * where dap_enabled is false but the boot must still wait for the GDB gate. */
+    bool debug;
+    bool booted; /* init()/on_new_state() have run (the deferred debug boot) */
+    /* The shared coroutine driver (#242, blyt_hostlua_driver.h): the cart runs
+     * inside `co` — the boot chunk first, then the per-frame chunk resumed once
+     * per blyt_hostlua_run_frame — so this leg's allocation sequence is identical
+     * to the wasm leg's by construction (one chunk source, one coroutine shape),
+     * which is what makes guest_heap_used byte-exact across legs.  The coroutine
+     * is ONLY the execution container: native still pauses for a debugger by
+     * BLOCKING this thread (dap_transport_tcp_lua.c), never by yielding.
+     * Anchored in the registry via co_ref so it survives GC; both are rebuilt on
+     * every VM rebuild (reset/reload/restart). */
+    lua_State *co;
+    int co_ref; /* LUA_NOREF when no coroutine is anchored */
+    bool running_co; /* co holds the frame chunk (else the boot chunk) */
+};
+
+/* The runner is stashed in the lua_State's extra space so the C API callbacks
+ * can reach its log channel + quit latch without a file-scoped global (unlike
+ * the WASM leg's g_lua — a native player could in principle host more than one). */
+static blyt_hostlua_t *hl_from(lua_State *L) {
+    return *(blyt_hostlua_t **)lua_getextraspace(L);
+}
+
+/* Per-physical-block prefix holding the block's rv32 shadow-arena offset. 16
+ * bytes keeps the object pointer (raw + prefix) 16-byte aligned — the max
+ * natural alignment of any Lua value (the f64 in the Value union), matching the
+ * arena's own guarantee. */
+#define HL_HEAP_PREFIX 16u
+
+/* lua_Alloc for the native host-Lua fast path (#231).  Physical bytes come from
+ * plain host malloc (unbounded); a separate rv32-sized SHADOW arena (hl->arena)
+ * produces the canonical guest_heap_used and the 16 MB fail-point.  The fork
+ * (BLYT_HOSTLUA_HEAP_SEAM) publishes each allocation's rv32-equivalent size in
+ * blyt_hostlua_heap_rv_pending just before calling here; we size the shadow block
+ * from that so the count is byte-identical to the wasm32 host-Lua leg (which runs
+ * the identical runner but at 32-bit object sizes).  Each physical block carries
+ * a prefix storing its shadow-arena offset so free/realloc can locate the twin.
+ *
+ * Shadow region is 16 MB — the exact rv32 budget — so blyt_arena_malloc returns
+ * NULL (→ Lua ENOMEM) at precisely the point rv32/wasm32 hit the cap; the
+ * physical host allocation is never the limiting factor.  The unified budget's
+ * non-evictable resource footprint feeds the same predicate via mem_acct. */
+static void *hl_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    (void)osize;
+    blyt_hostlua_t *hl = (blyt_hostlua_t *)ud;
+
+    if (nsize == 0) { /* free */
+        if (ptr) {
+            char *raw = (char *)ptr - HL_HEAP_PREFIX;
+            uint32_t soff = *(uint32_t *)(void *)raw;
+            blyt_arena_free(&hl->arena, (char *)hl->arena.base + soff);
+            free(raw);
+        }
+        return NULL;
+    }
+
+    if (!hl->arena.base) { /* lazily create the rv32 shadow region */
+        void *region = malloc(BLYT_MEM_BUDGET_BYTES);
+        if (!region)
+            return NULL;
+        hl->arena.base = region;
+        hl->arena.size = BLYT_MEM_BUDGET_BYTES;
+        hl->arena.acct = &hl->mem_acct;
+    }
+
+    /* rv32-equivalent size the fork just published for this request, consumed
+     * atomically (single-threaded VM).  A request the fork routed through its
+     * luaM typed layer carries a real published size; one that reached the raw
+     * lua_Alloc callback directly (the auxlib buffer's heap box / external-string
+     * body — lauxlib.c resizebox) leaves the pending size UNSET, and a raw byte
+     * buffer holds no pointers, so its rv32 size is just the host `nsize`.  Reset
+     * so the NEXT allocation is only credited a published size if the fork
+     * actually published one for it (else a stale value would mis-size a raw
+     * buffer — the cause of multi-KB external strings under-counting to nothing). */
+    size_t rv = blyt_hostlua_heap_rv_pending;
+    blyt_hostlua_heap_rv_pending = BLYT_HOSTLUA_HEAP_RV_UNSET;
+    if (rv == BLYT_HOSTLUA_HEAP_RV_UNSET)
+        rv = nsize;
+
+    /* VM execution scratch (a thread's data stack / CallInfo, #231): allocate the
+     * shadow block no-acct so it is excluded from guest_heap_used and the 16 MB
+     * budget — the cart-attributable heap must not depend on how the runtime
+     * drives the cart (this leg calls lifecycle fns from C; the wasm leg resumes
+     * them in a driver coroutine).  Consumed atomically, identical logic to the
+     * wasm runner so any residual is cross-leg-identical.  free() reads the
+     * marker from the shadow block itself, so the free path is unchanged. */
+    int noacct = blyt_hostlua_heap_stack_pending;
+    blyt_hostlua_heap_stack_pending = 0;
+
+    if (!ptr) { /* malloc */
+        void *sp =
+            noacct ? blyt_arena_malloc_noacct(&hl->arena, rv) : blyt_arena_malloc(&hl->arena, rv);
+        if (!sp)
+            return NULL; /* rv32 budget exceeded → Lua sees ENOMEM */
+        char *raw = (char *)malloc(nsize + HL_HEAP_PREFIX);
+        if (!raw) {
+            blyt_arena_free(&hl->arena, sp);
+            return NULL;
+        }
+        *(uint32_t *)(void *)raw = (uint32_t)((char *)sp - (char *)hl->arena.base);
+        return raw + HL_HEAP_PREFIX;
+    }
+
+    /* realloc */
+    char *raw = (char *)ptr - HL_HEAP_PREFIX;
+    uint32_t old_soff = *(uint32_t *)(void *)raw;
+    void *base_sp = (char *)hl->arena.base + old_soff;
+    void *new_sp = noacct ? blyt_arena_realloc_noacct(&hl->arena, base_sp, rv)
+                          : blyt_arena_realloc(&hl->arena, base_sp, rv);
+    if (!new_sp)
+        return NULL; /* rv32 budget exceeded */
+    char *new_raw = (char *)realloc(raw, nsize + HL_HEAP_PREFIX);
+    if (!new_raw)
+        return NULL; /* true host OOM (shadow already resized; process is dying) */
+    *(uint32_t *)(void *)new_raw = (uint32_t)((char *)new_sp - (char *)hl->arena.base);
+    return new_raw + HL_HEAP_PREFIX;
+}
+
+/* blyt.debug.print(s) / blyt32.debug.print(s): the cart's cross-leg output
+ * channel.  Routed through the runner's log_fn — the SAME callback the emulated
+ * path drives from blyt_console_debug — so a line printed here is byte-identical
+ * to the emulated leg (the frontend's log sink appends the newline). */
+static int l_debug_print(lua_State *L) {
+    const char *s = luaL_checkstring(L, 1);
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl && hl->log_fn)
+        hl->log_fn(s);
+    return 0;
+}
+
+static int l_quit(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl)
+        hl->quit = 1;
+    return 0;
+}
+
+static int l_should_quit(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    lua_pushboolean(L, hl ? hl->quit : 0);
+    return 1;
+}
+
+/* Forward decl: the shared driver's __blyt_call dispatches through this (defined
+ * with the rest of the lifecycle plumbing below). */
+static int call_lifecycle(blyt_hostlua_t *hl, lua_State *L, const char *name);
+
+/* `__blyt_call(name)` — the shared driver chunk's lifecycle dispatch (#242).
+ *
+ * Runs on the COROUTINE's lua_State (the incoming L), not on hl->L: the cart's
+ * callbacks must execute on the thread the driver chunk is running, so the DAP
+ * master hook armed on that thread sees them and the call frames sit where the
+ * shared execution model puts them.
+ *
+ * call_lifecycle pcalls, so a Lua error is caught HERE, inside the coroutine —
+ * the coroutine never unwinds and stays resumable, which is what gives every leg
+ * the guest's report-and-continue semantics (#236/#258/#264). */
+static void hl_report_lua_error(blyt_hostlua_t *hl, lua_State *L);
+
+#ifdef BLYT_DAP
+/* Exception message handler for the lifecycle pcall (#319).  A message handler
+ * runs the instant an uncaught error is raised — before the frame unwinds — so
+ * this is the only point where the erroring cart's live call stack is still
+ * walkable.  Capture it for the pending exception stop, then return the error
+ * object unchanged so the existing report-and-continue path (l_blyt_call_k ->
+ * hl_report_lua_error) is untouched. */
+static int l_hl_dap_exc_msgh(lua_State *L) {
+    fc_hostlua_dap_capture_exception(L);
+    return 1; /* leave the error object (arg 1) as the handler's result */
+}
+#endif
+
+static int l_blyt_call_k(lua_State *L, int status, lua_KContext ctx) {
+    int msgh = (int)ctx; /* stack index of the #319 message handler, or 0 */
+    if (status != LUA_OK && status != LUA_YIELD)
+        hl_report_lua_error(hl_from(L), L);
+    if (msgh > 0)
+        lua_remove(L, msgh); /* balance the handler pushed in l_blyt_call */
+    return 0;
+}
+
+static int l_blyt_call(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    lua_getglobal(L, name);
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    /* Under a debugger, push an exception message handler UNDER the function so an
+     * uncaught error's live stack is captured before it unwinds (#319).  The index
+     * is threaded through the continuation's ctx so it is removed on both the
+     * direct-return and (wasm) yield-resume completion paths. */
+    lua_KContext msgh = 0;
+#ifdef BLYT_DAP
+    {
+        blyt_hostlua_t *hl = hl_from(L);
+        if (hl && hl->dap_enabled) {
+            lua_pushcfunction(L, l_hl_dap_exc_msgh); /* [name][fn][msgh] */
+            lua_insert(L, -2); /* [name][msgh][fn] */
+            msgh = (lua_KContext)(lua_gettop(L) - 1);
+        }
+    }
+#endif
+    /* lua_pcallK with a continuation — the same call shape the wasm leg uses, so
+     * the two legs' allocation sequences stay identical by construction.  Native
+     * never actually yields here (it pauses for a debugger by BLOCKING the thread,
+     * dap_transport_tcp_lua.c), but the wasm leg MUST be able to yield out of a
+     * breakpoint through this frame, and the shared driver only stays shared if
+     * both legs call the cart the same way. */
+    int st = lua_pcallk(L, 0, 0, (int)msgh, msgh, l_blyt_call_k);
+    return l_blyt_call_k(L, st, msgh);
+}
+
+/* Phase brackets (#205, #232 S4) driven by the shared chunk; no-ops for a
+ * session-less pure-Lua cart (blyt_session_set_phase(NULL)). */
+static int l_phase_update(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl)
+        blyt_session_set_phase(hl->session, BLYT_PHASE_UPDATE);
+    return 0;
+}
+
+static int l_phase_draw(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl)
+        blyt_session_set_phase(hl->session, BLYT_PHASE_DRAW);
+    return 0;
+}
+
+static int l_phase_none(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl)
+        blyt_session_set_phase(hl->session, BLYT_PHASE_NONE);
+    return 0;
+}
+
+/* Sandboxed require(): the host-Lua fast path replaces the default searcher with
+ * a hard error so a cart cannot reach the host filesystem — only modules already
+ * registered in package.loaded (native exports) resolve.  Mirrors the WASM leg. */
+static int l_require(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+    lua_getfield(L, -1, name);
+    if (!lua_isnil(L, -1))
+        return 1;
+    return luaL_error(L, "module '%s' not found (blyt sandbox: only native exports available)",
+                      name);
+}
+
+/* Derive a require()-able module name from a loaded chunk's embedded source
+ * (basename minus ".lua"); the chunk function must be on the stack top and is
+ * left untouched.  Mirrors chunk_module_name in libblyt32lua / the WASM leg. */
+static void hl_chunk_module_name(lua_State *L, char *out, size_t outsz) {
+    out[0] = '\0';
+    lua_Debug ar;
+    lua_pushvalue(L, -1);
+    if (lua_getinfo(L, ">S", &ar) && ar.source) {
+        const char *src = ar.source;
+        if (*src == '@' || *src == '=')
+            src++;
+        const char *base = src;
+        for (const char *p = src; *p; p++)
+            if (*p == '/' || *p == '\\')
+                base = p + 1;
+        size_t len = strlen(base);
+        if (len > 4 && strcmp(base + len - 4, ".lua") == 0)
+            len -= 4;
+        if (len >= outsz)
+            len = outsz - 1;
+        memcpy(out, base, len);
+        out[len] = '\0';
+    }
+}
+
+/* Load the cart's .cart.lua: a single raw bytecode chunk, or the BLMC
+ * multi-chunk container (issue #54).  A chunk returning a non-nil table is
+ * registered as a require()-able module (cart_resources, ADR-0040), keyed by
+ * source basename — byte-for-byte the WASM leg's loader.  Returns 0 on success;
+ * on failure leaves an error string on the stack top. */
+static int load_lua_bytecode(lua_State *L, const unsigned char *data, size_t size) {
+    if (size >= 8 && data[0] == 'B' && data[1] == 'L' && data[2] == 'M' && data[3] == 'C') {
+        unsigned int nchunks = (unsigned int)data[4] | ((unsigned int)data[5] << 8) |
+                               ((unsigned int)data[6] << 16) | ((unsigned int)data[7] << 24);
+        data += 8;
+        size -= 8;
+        for (unsigned int ci = 0; ci < nchunks; ci++) {
+            if (size < 4) {
+                lua_pushstring(L, "BLMC truncated");
+                return 1;
+            }
+            unsigned int csz = (unsigned int)data[0] | ((unsigned int)data[1] << 8) |
+                               ((unsigned int)data[2] << 16) | ((unsigned int)data[3] << 24);
+            data += 4;
+            size -= 4;
+            if (csz > size) {
+                lua_pushstring(L, "BLMC chunk size overflow");
+                return 1;
+            }
+            if (luaL_loadbuffer(L, (const char *)data, csz, "@chunk") != LUA_OK)
+                return 1;
+            char modname[64];
+            hl_chunk_module_name(L, modname, sizeof(modname));
+            if (lua_pcall(L, 0, 1, 0) != LUA_OK)
+                return 1;
+            if (modname[0] != '\0' && !lua_isnil(L, -1)) {
+                luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+                lua_pushvalue(L, -2);
+                lua_setfield(L, -2, modname);
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1); /* chunk return value */
+            data += csz;
+            size -= csz;
+        }
+        return 0;
+    }
+    if (luaL_loadbuffer(L, (const char *)data, size, "@cart") != LUA_OK)
+        return 1;
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK)
+        return 1;
+    return 0;
+}
+
+/* Register the blyt/blyt32 API surface a pure-Lua cart reaches for output and
+ * termination: blyt.debug.print, blyt.quit, blyt.should_quit, blyt_quit,
+ * blyt32.debug.print.  Mirrors the WASM leg's core registration in run_lua_cart
+ * (the fuller surface — state buffers, gfx — lands in S3/#231). */
+
+/* Open the sandboxed standard-library subset the host-Lua fast path exposes
+ * (base/math/string/table/coroutine/utf8) — the SAME set, opened the SAME way
+ * (luaL_requiref, not luaL_openlibs, so io/os stay out). */
+static void open_libs(lua_State *L) {
+    luaL_requiref(L, "_G", luaopen_base, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, "math", luaopen_math, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, "string", luaopen_string, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, "table", luaopen_table, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, "coroutine", luaopen_coroutine, 1);
+    lua_pop(L, 1);
+    luaL_requiref(L, LUA_UTF8LIBNAME, luaopen_utf8, 1);
+    lua_pop(L, 1);
+}
+
+/* ── State buffers (ADR-0009/0010) + S proxy + save/load ─────────────────────
+ *
+ * Ported from the WASM host-Lua fast path (wasm_main.c: buf_* helpers, the S
+ * proxy generator, wasm_register_state_api).  The only structural change: the
+ * active state ctx comes from the runner (hl->state_ctx) instead of a
+ * file-scoped g_lua_state_ctx / session, since a native player could host more
+ * than one runner.  Behaviour — the typed accessors, the generated S proxy, the
+ * save/load hooks — is byte-for-byte the WASM leg's, so a state-buffer cart's
+ * output is identical across every leg. */
+
+/* The active state ctx: a hybrid cart (#232) shares its rv32 session's ctx so the
+ * Lua and native halves see the SAME buffers (the native half reaches them via
+ * BLYT_ECALL_BUF_OP); a pure-Lua cart uses the runner's standalone ctx.  The
+ * native mirror of the WASM leg's active_state_ctx(). */
+static blyt_state_ctx_t *hl_active_ctx(blyt_hostlua_t *hl) {
+    if (!hl)
+        return NULL;
+    if (hl->session)
+        return blyt_session_state_ctx(hl->session);
+    return hl->state_ctx;
+}
+
+/* Save-slot location: a hybrid persists to its session's save dir / cart id so a
+ * save round-trips through the same files as the emulated leg. */
+static const char *hl_active_save_dir(blyt_hostlua_t *hl) {
+    return hl->session ? blyt_session_save_dir(hl->session) : hl->save_dir;
+}
+static const char *hl_active_cart_name(blyt_hostlua_t *hl) {
+    return hl->session ? blyt_session_cart_name(hl->session) : hl->cart_name;
+}
+
+static blyt_state_ctx_t *hl_ctx(lua_State *L) {
+    return hl_active_ctx(hl_from(L));
+}
+
+static uint32_t buf_get_bits(lua_State *L) {
+    uint32_t bits = 0;
+    blyt_state_ctx_t *ctx = hl_ctx(L);
+    if (ctx)
+        blyt_state_get(ctx, (uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                       (uint32_t)luaL_checkinteger(L, 3) & 0xFFFF, &bits);
+    return bits;
+}
+static void buf_set_bits(lua_State *L, uint32_t bits, uint8_t type_tag) {
+    blyt_state_ctx_t *ctx = hl_ctx(L);
+    if (ctx)
+        blyt_state_set(ctx, (uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                       (uint32_t)luaL_checkinteger(L, 3) & 0xFFFF, bits, type_tag);
+}
+
+/* Type tags: i8=0, u8=1, i16=2, u16=3, i32=4, u32=5, f32=6, bool=7, f64=8 */
+static int l_buf_get_f32(lua_State *L) {
+    uint32_t bits = buf_get_bits(L);
+    float f;
+    memcpy(&f, &bits, 4);
+    lua_pushnumber(L, (lua_Number)f);
+    return 1;
+}
+static int l_buf_set_f32(lua_State *L) {
+    float f = (float)luaL_checknumber(L, 4);
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    buf_set_bits(L, bits, 6);
+    return 0;
+}
+static int l_buf_get_f64(lua_State *L) {
+    uint64_t bits = 0;
+    blyt_state_ctx_t *ctx = hl_ctx(L);
+    if (ctx)
+        blyt_state_get64(ctx, (uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                         (uint32_t)luaL_checkinteger(L, 3) & 0xFFFF, &bits);
+    double d;
+    memcpy(&d, &bits, 8);
+    lua_pushnumber(L, (lua_Number)d);
+    return 1;
+}
+static int l_buf_set_f64(lua_State *L) {
+    double d = (double)luaL_checknumber(L, 4);
+    uint64_t bits;
+    memcpy(&bits, &d, 8);
+    blyt_state_ctx_t *ctx = hl_ctx(L);
+    if (ctx)
+        blyt_state_set64(ctx, (uint32_t)luaL_checkinteger(L, 1), (int32_t)luaL_checkinteger(L, 2),
+                         (uint32_t)luaL_checkinteger(L, 3) & 0xFFFF, bits);
+    return 0;
+}
+static int l_buf_get_i32(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)(int32_t)buf_get_bits(L));
+    return 1;
+}
+static int l_buf_set_i32(lua_State *L) {
+    buf_set_bits(L, (uint32_t)(int32_t)luaL_checkinteger(L, 4), 4);
+    return 0;
+}
+static int l_buf_get_u32(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)buf_get_bits(L));
+    return 1;
+}
+static int l_buf_set_u32(lua_State *L) {
+    buf_set_bits(L, (uint32_t)luaL_checkinteger(L, 4), 5);
+    return 0;
+}
+static int l_buf_get_i16(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)(int16_t)(uint16_t)buf_get_bits(L));
+    return 1;
+}
+static int l_buf_set_i16(lua_State *L) {
+    buf_set_bits(L, (uint32_t)(uint16_t)(int16_t)luaL_checkinteger(L, 4), 2);
+    return 0;
+}
+static int l_buf_get_u16(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)(uint16_t)buf_get_bits(L));
+    return 1;
+}
+static int l_buf_set_u16(lua_State *L) {
+    buf_set_bits(L, (uint32_t)(uint16_t)luaL_checkinteger(L, 4), 3);
+    return 0;
+}
+static int l_buf_get_i8(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)(int8_t)(uint8_t)buf_get_bits(L));
+    return 1;
+}
+static int l_buf_set_i8(lua_State *L) {
+    buf_set_bits(L, (uint32_t)(uint8_t)(int8_t)luaL_checkinteger(L, 4), 0);
+    return 0;
+}
+static int l_buf_get_u8(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)(uint8_t)buf_get_bits(L));
+    return 1;
+}
+static int l_buf_set_u8(lua_State *L) {
+    buf_set_bits(L, (uint32_t)(uint8_t)luaL_checkinteger(L, 4), 1);
+    return 0;
+}
+static int l_buf_get_bool(lua_State *L) {
+    lua_pushboolean(L, buf_get_bits(L) ? 1 : 0);
+    return 1;
+}
+static int l_buf_set_bool(lua_State *L) {
+    buf_set_bits(L, lua_toboolean(L, 4) ? 1u : 0u, 7);
+    return 0;
+}
+static int l_buf_alloc_slot(lua_State *L) {
+    int32_t slot = -1;
+    blyt_state_ctx_t *ctx = hl_ctx(L);
+    if (ctx)
+        blyt_state_alloc_slot(ctx, (uint32_t)luaL_checkinteger(L, 1), &slot);
+    lua_pushinteger(L, slot);
+    return 1;
+}
+static int l_buf_free_slot(lua_State *L) {
+    blyt_state_ctx_t *ctx = hl_ctx(L);
+    if (ctx)
+        blyt_state_free_slot(ctx, (uint32_t)luaL_checkinteger(L, 1),
+                             (int32_t)luaL_checkinteger(L, 2));
+    return 0;
+}
+/* Packed entity refs (ADR-0096) — host-Lua equivalents of the blyt.buf.ref*
+ * bindings in libblyt32lua. */
+static int l_buf_ref(lua_State *L) {
+    uint32_t ref = 0;
+    blyt_state_ctx_t *ctx = hl_ctx(L);
+    if (ctx)
+        ref = blyt_state_ref(ctx, (uint32_t)luaL_checkinteger(L, 1),
+                             (int32_t)luaL_checkinteger(L, 2));
+    lua_pushinteger(L, (lua_Integer)ref);
+    return 1;
+}
+static int l_buf_ref_valid(lua_State *L) {
+    int v = 0;
+    blyt_state_ctx_t *ctx = hl_ctx(L);
+    if (ctx)
+        v = blyt_state_ref_valid(ctx, (uint32_t)luaL_checkinteger(L, 1),
+                                 (uint32_t)luaL_checkinteger(L, 2));
+    lua_pushboolean(L, v);
+    return 1;
+}
+static int l_buf_ref_slot(lua_State *L) {
+    /* Pure bit math — must match blyt_buffer_ref_slot in blyt.h. */
+    lua_pushinteger(L, (lua_Integer)((uint32_t)luaL_checkinteger(L, 1) & 0xFFFFu));
+    return 1;
+}
+
+static int l_save_write(lua_State *L) {
+    uint32_t slot = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_hostlua_t *hl = hl_from(L);
+    /* Ask the cart to flush transient state into buffers before persisting. */
+    lua_getglobal(L, "on_save_state");
+    if (lua_isfunction(L, -1))
+        lua_pcall(L, 0, 0, 0);
+    else
+        lua_pop(L, 1);
+    int r = -1;
+    blyt_state_ctx_t *ctx = hl_active_ctx(hl);
+    if (hl && ctx)
+        r = blyt_save_write(ctx, hl_active_save_dir(hl), hl_active_cart_name(hl), slot,
+                            blyt_cart_save_version(hl->cart));
+    lua_pushinteger(L, r);
+    return 1;
+}
+
+static int l_save_read(lua_State *L) {
+    uint32_t slot = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_hostlua_t *hl = hl_from(L);
+    int r = -1;
+    uint32_t saved_version = 0;
+    blyt_state_ctx_t *ctx = hl_active_ctx(hl);
+    if (hl && ctx)
+        r = blyt_save_read(ctx, hl_active_save_dir(hl), hl_active_cart_name(hl), slot,
+                           &saved_version);
+    lua_pushinteger(L, r);
+    if (r == BLYT_RUN_OK) {
+        lua_getglobal(L, "on_load_state");
+        if (lua_isfunction(L, -1)) {
+            lua_newtable(L);
+            lua_pushinteger(L, 0); /* reason=BLYT_LOAD_SAVE_GAME */
+            lua_setfield(L, -2, "reason");
+            lua_pushinteger(L, (lua_Integer)saved_version);
+            lua_setfield(L, -2, "saved_cart_version");
+            lua_pcall(L, 1, 0, 0);
+        } else {
+            lua_pop(L, 1);
+        }
+    }
+    return 1;
+}
+
+/* Register blyt.buf.* + blyt.save_write/read (and the blyt32.* aliases) into the
+ * Lua state.  Byte-for-byte the WASM leg's wasm_register_state_api. */
+static void register_state_api(lua_State *L) {
+    static const struct {
+        const char *name;
+        lua_CFunction fn;
+    } buf_fns[] = {
+        {"get_f32", l_buf_get_f32},
+        {"set_f32", l_buf_set_f32},
+        {"get_f64", l_buf_get_f64},
+        {"set_f64", l_buf_set_f64},
+        {"get_i32", l_buf_get_i32},
+        {"set_i32", l_buf_set_i32},
+        {"get_u32", l_buf_get_u32},
+        {"set_u32", l_buf_set_u32},
+        {"get_i16", l_buf_get_i16},
+        {"set_i16", l_buf_set_i16},
+        {"get_u16", l_buf_get_u16},
+        {"set_u16", l_buf_set_u16},
+        {"get_i8", l_buf_get_i8},
+        {"set_i8", l_buf_set_i8},
+        {"get_u8", l_buf_get_u8},
+        {"set_u8", l_buf_set_u8},
+        {"get_bool", l_buf_get_bool},
+        {"set_bool", l_buf_set_bool},
+        {"alloc_slot", l_buf_alloc_slot},
+        {"free_slot", l_buf_free_slot},
+        {"ref", l_buf_ref},
+        {"ref_valid", l_buf_ref_valid},
+        {"ref_slot", l_buf_ref_slot},
+        {NULL, NULL},
+    };
+    lua_newtable(L); /* buf subtable */
+    for (int i = 0; buf_fns[i].name; i++) {
+        lua_pushcfunction(L, buf_fns[i].fn);
+        lua_setfield(L, -2, buf_fns[i].name);
+    }
+    /* blyt.buf */
+    lua_getglobal(L, "blyt");
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, "buf");
+    /* blyt32.buf = blyt.buf */
+    lua_getglobal(L, "blyt32");
+    if (lua_istable(L, -1)) {
+        lua_pushvalue(L, -3);
+        lua_setfield(L, -2, "buf");
+    }
+    lua_pop(L, 2); /* pop blyt32 (or nil) + blyt */
+    lua_pop(L, 1); /* pop buf table */
+
+    /* blyt.save_write / blyt.save_read */
+    lua_getglobal(L, "blyt");
+    lua_pushcfunction(L, l_save_write);
+    lua_setfield(L, -2, "save_write");
+    lua_pushcfunction(L, l_save_read);
+    lua_setfield(L, -2, "save_read");
+    lua_getglobal(L, "blyt32");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -2, "save_write");
+        lua_setfield(L, -2, "save_write");
+        lua_getfield(L, -2, "save_read");
+        lua_setfield(L, -2, "save_read");
+    }
+    lua_pop(L, 2); /* pop blyt32 (or nil) + blyt */
+}
+
+/* Build + eval the Lua chunk that creates the `S` proxy global, mirroring the
+ * packer-generated register_cart_state_S() but using blyt.buf.get_T/set_T (no
+ * ECALL).  Byte-for-byte the WASM leg's wasm_register_s_proxy, reading the
+ * runner's own ctx. */
+static void register_s_proxy(lua_State *L, blyt_state_ctx_t *ctx) {
+    /* Indexed by type_tag; MUST cover every tag through f64=8 (state_buffer.c).
+     * The bound below is `< 9` to match. A tag that falls past this table routes
+     * to the wrong accessor — the #235 bug (f64 fell through to i32) and the
+     * class #253 swept; any new field type must extend this array in lockstep. */
+    static const char *type_names[] = {"i8",  "u8",  "i16",  "u16", "i32",
+                                       "u32", "f32", "bool", "f64"};
+
+    if (!ctx || ctx->n_buffers == 0)
+        return;
+
+    size_t cap = 4096 + ctx->n_buffers * 600;
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++)
+        cap += ctx->buffers[bi].n_fields * 150;
+
+    char *buf = malloc(cap);
+    if (!buf)
+        return;
+    size_t pos = 0;
+
+#define APPEND(s)                                                                                  \
+    do {                                                                                           \
+        size_t _n = strlen(s);                                                                     \
+        if (pos + _n + 1 <= cap) {                                                                 \
+            memcpy(buf + pos, s, _n);                                                              \
+            pos += _n;                                                                             \
+            buf[pos] = '\0';                                                                       \
+        }                                                                                          \
+    } while (0)
+#define APPENDF(...)                                                                               \
+    do {                                                                                           \
+        int _n = snprintf(buf + pos, cap - pos, __VA_ARGS__);                                      \
+        if (_n > 0 && (size_t)_n < cap - pos)                                                      \
+            pos += (size_t)_n;                                                                     \
+    } while (0)
+
+    APPEND("do\nlocal _buf=blyt.buf\nS={}\n");
+
+    /* Integer constants: S.BUFNAME = buf_id, S.BUFNAME_FIELDNAME = field_h */
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++) {
+        blyt_buffer_ctx_t *bc = &ctx->buffers[bi];
+        uint32_t buf_id = bc->buf_id;
+
+        APPENDF("S.");
+        for (const char *p = bc->name; *p; p++)
+            buf[pos++] = (char)toupper((unsigned char)*p);
+        buf[pos] = '\0';
+        APPENDF("=%u\n", buf_id);
+
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            uint32_t field_h = (buf_id << 16) | (fi + 1);
+            APPENDF("S.");
+            for (const char *p = bc->name; *p; p++)
+                buf[pos++] = (char)toupper((unsigned char)*p);
+            buf[pos++] = '_';
+            buf[pos] = '\0';
+            for (const char *p = bc->field_names[fi]; *p; p++)
+                buf[pos++] = (char)toupper((unsigned char)*p);
+            buf[pos] = '\0';
+            APPENDF("=%u\n", field_h);
+        }
+    }
+
+    /* Proxy tables: one per buffer */
+    for (uint32_t bi = 0; bi < ctx->n_buffers; bi++) {
+        blyt_buffer_ctx_t *bc = &ctx->buffers[bi];
+        uint32_t buf_id = bc->buf_id;
+
+        APPENDF("local _b%u_rmt={}\n", buf_id);
+
+        APPENDF("_b%u_rmt.__index=function(t,k)\nlocal s=rawget(t,1)\n", buf_id);
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            uint8_t tag = bc->field_types[fi];
+            const char *tname = (tag < 9) ? type_names[tag] : "i32";
+            APPENDF("%s k==\"%s\" then return _buf.get_%s(%u,s,%u)\n", fi == 0 ? "if" : "elseif",
+                    bc->field_names[fi], tname, buf_id, fi + 1);
+        }
+        APPEND("end\nend\n");
+
+        APPENDF("_b%u_rmt.__newindex=function(t,k,v)\nlocal s=rawget(t,1)\n", buf_id);
+        for (uint32_t fi = 0; fi < bc->n_fields; fi++) {
+            uint8_t tag = bc->field_types[fi];
+            const char *tname = (tag < 9) ? type_names[tag] : "i32";
+            APPENDF("%s k==\"%s\" then _buf.set_%s(%u,s,%u,v)\n", fi == 0 ? "if" : "elseif",
+                    bc->field_names[fi], tname, buf_id, fi + 1);
+        }
+        APPEND("end\nend\n");
+
+        APPENDF("local _b%u_rows={}\n", buf_id);
+        APPENDF("for i=0,%u do local r={i};setmetatable(r,_b%u_rmt);_b%u_rows[i]=r end\n",
+                bc->count > 0 ? bc->count - 1 : 0, buf_id, buf_id);
+
+        APPENDF("S.%s=setmetatable({},{__index=function(t,k) if k==\"count\" then return %u end "
+                "return _b%u_rows[k] end})\n",
+                bc->name, bc->count, buf_id);
+    }
+
+    APPEND("end\n");
+
+#undef APPEND
+#undef APPENDF
+
+    if (luaL_loadbuffer(L, buf, pos, "@s_proxy") != LUA_OK) {
+        fprintf(stderr, "[blyt] register_s_proxy load error: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    } else if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        fprintf(stderr, "[blyt] register_s_proxy eval error: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+
+    free(buf);
+}
+
+/* Typed resource-constant userdata (ADR-0068/0134, #166/#214): typed-ness is the
+ * metatable.  Declared up here so the gfx palette_set (below) can accept a palette
+ * constant (R.<NAME>); the accessors/registration live in the resource section. */
+/* Registry keys for the typed resource constants. Aliased to the shared source
+ * (blyt_hostlua_api.h) so this leg and the WASM leg cannot disagree on a string
+ * Lua uses as an identity key — they were previously separate per-leg #defines
+ * that merely happened to hold equal text (#267). */
+#define HL_RESOURCE_TEXT_CONST_MT BLYT_HOSTLUA_RESOURCE_TEXT_CONST_MT
+#define HL_RESOURCE_BYTES_CONST_MT BLYT_HOSTLUA_RESOURCE_BYTES_CONST_MT
+#define HL_RESOURCE_PALETTE_CONST_MT BLYT_HOSTLUA_RESOURCE_PALETTE_CONST_MT
+
+typedef struct {
+    uint32_t id; /* the baked console-wide constant (ADR-0134) */
+    int is_text;
+} hl_resource_const_t;
+
+/* Resolve a palette handle to 256-entry XRGB8888 bytes (built-in or cart asset);
+ * defined in the resource section. */
+static const uint8_t *hl_resolve_palette(blyt_hostlua_t *hl, uint32_t handle);
+
+/* ── Gfx fast path (#188 / Spike X, #231) ────────────────────────────────────
+ *
+ * blyt32.gfx.* rasterize into the runner's own paletted framebuffer via the
+ * shared integer rasterizer (blyt_raster.c) — the SAME core the emulated gfx
+ * ECALL handlers (cart_run.c) and the WASM host-Lua bindings (wasm_main.c) run,
+ * so the pixels are bit-identical to every other leg.  A pure-Lua cart on this
+ * path has no session (`hl->session` is non-NULL only for a hybrid), so the draw
+ * target is always the runner's standalone fb — none of the WASM leg's
+ * "session buffer when hybrid" routing is needed here. */
+
+/* Seed the palette before init, matching the pre-init auto-load the emulated
+ * legs perform into session->palette (#201/#204, ADR-0088): the cart's declared
+ * `palettes: default:` handle when it names a built-in, else the runtime default
+ * (aurora).  A cart-provenance custom default palette (#214) needs the resource
+ * table (deferred to #231's heap half); until then it falls back to aurora.  So
+ * a cart that never calls palette_set renders — and its testcard remaps —
+ * against the same palette on every leg. */
+static void hl_palette_ensure_default(blyt_hostlua_t *hl) {
+    /* Hybrids are unaffected: their active palette is the session's, already
+     * seeded by blyt_session_create — same carve-out as the WASM leg (#193). */
+    if (hl->session)
+        return;
+    uint32_t handle = blyt_cart_default_palette(hl->cart);
+    if (handle == 0)
+        handle = BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME);
+    const uint8_t *pal = hl_resolve_palette(hl, handle); /* built-in OR cart asset (#214) */
+    if (!pal)
+        pal = (const uint8_t *)blyt_builtin_palette(
+            BLYT_RESOURCE_ENCODE(BLYT_PAL_ID_AURORA, BLYT_RESOURCE_PROV_RUNTIME));
+    /* Explicit little-endian decode: cart-resource bytes may be unaligned, and an
+     * explicit LE reconstruction stays bit-identical to every other leg. */
+    for (int i = 0; i < 256; i++)
+        hl->palette[i] = (uint32_t)pal[i * 4] | ((uint32_t)pal[i * 4 + 1] << 8) |
+                         ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
+}
+
+/* The cart-facing framebuffer (#193, the native port of the WASM leg's
+ * lua_gfx_fb).  For a HYBRID cart a session is live — its native half runs in
+ * rv32emu (ADR-0130) and draws via the gfx ECALL handlers into the session's
+ * canonical framebuffer — so the host-Lua half must rasterize into the SAME
+ * buffer.  Drawing into hl->fb instead leaves the native half's acquire/present
+ * in session->pixels[], which nothing presents: its output is silently dropped
+ * (exactly the wasm defect #193 fixed, never ported to this runner).  Only a
+ * genuinely session-less pure-Lua cart uses the standalone hl->fb. */
+static uint8_t *hl_gfx_fb(blyt_hostlua_t *hl) {
+    if (hl->session)
+        return (uint8_t *)blyt_session_get_pixels(hl->session);
+    return hl->fb;
+}
+
+/* The active 256-entry palette (#201/#204) — the SAME "session when present,
+ * else standalone" routing as hl_gfx_fb, so a hybrid's Lua-half palette_set()
+ * lands in the session's canonical palette (shared with the native half via
+ * cart_run.c's ECALL handler) rather than a parallel buffer that never reaches
+ * present.  A hybrid's session palette is seeded by blyt_session_create, so
+ * hl_palette_ensure_default only applies to the session-less case. */
+static uint32_t *hl_gfx_palette(blyt_hostlua_t *hl) {
+    if (hl->session)
+        return (uint32_t *)blyt_session_get_palette(hl->session);
+    return hl->palette;
+}
+
+static int l_gfx_clear(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_raster_clear(hl_gfx_fb(hl), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                      (uint8_t)luaL_checkinteger(L, 1));
+    hl->drawn = true;
+    return 0;
+}
+static int l_gfx_pixel(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_raster_pixel(hl_gfx_fb(hl), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                      (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                      (uint8_t)luaL_checkinteger(L, 3));
+    hl->drawn = true;
+    return 0;
+}
+static int l_gfx_rect_fill(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_raster_rect_fill(hl_gfx_fb(hl), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                          (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                          (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                          (uint8_t)luaL_checkinteger(L, 5));
+    hl->drawn = true;
+    return 0;
+}
+static int l_gfx_line(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_raster_line(hl_gfx_fb(hl), BLYT_FRAME_W, BLYT_FRAME_W, BLYT_FRAME_H,
+                     (int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                     (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                     (uint8_t)luaL_checkinteger(L, 5));
+    hl->drawn = true;
+    return 0;
+}
+
+/* blyt32.gfx.palette_set(handle|R.<NAME>) (#201/#214): load a built-in OR a
+ * cart-asset palette into the active palette.  Accepts an integer built-in handle
+ * or a palette-constant userdata; a no-op on a handle that does not resolve to a
+ * 256-entry palette (the SAME defined outcome as the WASM leg). */
+static int l_gfx_palette_set(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_resource_const_t *c =
+        (hl_resource_const_t *)luaL_testudata(L, 1, HL_RESOURCE_PALETTE_CONST_MT);
+    uint32_t handle = c ? c->id : (uint32_t)luaL_checkinteger(L, 1);
+    const uint8_t *pal = hl_resolve_palette(hl, handle);
+    if (pal) {
+        uint32_t *dst = hl_gfx_palette(hl);
+        for (int i = 0; i < 256; i++)
+            dst[i] = (uint32_t)pal[i * 4] | ((uint32_t)pal[i * 4 + 1] << 8) |
+                     ((uint32_t)pal[i * 4 + 2] << 16) | ((uint32_t)pal[i * 4 + 3] << 24);
+    }
+    return 0;
+}
+
+/* Emit the deterministic framebuffer + palette hashes when BLYT_FRAME_HASH is
+ * set — the host-Lua fast path's equivalent of the host runtime's
+ * blyt_emit_frame_hash (cart_run.c), over the same paletted bytes so every leg's
+ * hash matches (#188/#204).  Off by default; zero cost when unset. */
+static void hl_emit_frame_hash(blyt_hostlua_t *hl) {
+    static int s_on = -1;
+    if (s_on < 0)
+        s_on = getenv("BLYT_FRAME_HASH") != NULL ? 1 : 0;
+    if (!s_on || !hl->log_fn)
+        return;
+    char buf[64];
+    uint64_t h = blyt_frame_hash(hl_gfx_fb(hl), (size_t)BLYT_FRAME_W * (size_t)BLYT_FRAME_H);
+    snprintf(buf, sizeof(buf), "[blyt:fbhash] %016llx", (unsigned long long)h);
+    hl->log_fn(buf);
+    uint64_t ph = blyt_frame_hash((const uint8_t *)hl_gfx_palette(hl), 256 * sizeof(uint32_t));
+    snprintf(buf, sizeof(buf), "[blyt:palhash] %016llx", (unsigned long long)ph);
+    hl->log_fn(buf);
+}
+
+/* Finalise a completed frame: while the cart has not drawn, render the testcard
+ * into fb (mirroring the emulated path's !cart_has_drawn testcard in
+ * blyt_session_run_frame), then emit the cross-leg frame hash.  For a HYBRID
+ * EITHER half drawing displaces the test card (#193): hl->drawn covers the Lua
+ * half, blyt_session_cart_has_drawn the native one — otherwise a cart that draws
+ * only from its native half would still show the test card here. */
+static void hl_frame_done(blyt_hostlua_t *hl) {
+    bool drawn = hl->drawn || (hl->session && blyt_session_cart_has_drawn(hl->session));
+    if (!drawn)
+        blyt_testcard_draw(hl->frame_count++, hl_gfx_palette(hl), hl_gfx_fb(hl));
+    hl_emit_frame_hash(hl);
+}
+
+/* ── Surface fast path (#205/#208, #231) ─────────────────────────────────────
+ *
+ * The session-less half of the WASM leg's blyt32.surface.* bindings.  A pure-Lua
+ * cart's surfaces live in hl->surf; the SAME shared rasterizer draws them, so
+ * they are pixel-identical to every leg.  Tier-1 (create/destroy/clear/pixel/
+ * rect_fill/line/blit) plus the tier-2 per-pixel lock (acquire → get/set/clear/
+ * rect_fill/line → release).  Off-screen slots are always runner-local, but the
+ * SCREEN surface resolves through hl_gfx_fb() on every access, so a hybrid's
+ * screen writes land in the session's canonical framebuffer alongside its native
+ * half (#193) — the runner does have a session once the cart is a hybrid (#232). */
+
+#define HL_LOCK_MT BLYT_HOSTLUA_LOCK_MT /* shared key — see blyt_hostlua_api.h */
+
+static void hl_surf_ensure_init(blyt_hostlua_t *hl) {
+    if (hl->surf_init)
+        return;
+    hl->surf[0].in_use = true;
+    hl->surf[0].is_screen = true;
+    hl->surf[0].w = BLYT_FRAME_W;
+    hl->surf[0].h = BLYT_FRAME_H;
+    hl->surf_init = true;
+}
+
+static hl_surface_t *hl_surf_resolve(blyt_hostlua_t *hl, uint32_t h) {
+    hl_surf_ensure_init(hl);
+    if (!blyt_handle_is_surface(h))
+        return NULL;
+    uint32_t idx = blyt_dyn_decode_index(h);
+    if (idx >= HL_SURFACE_MAX)
+        return NULL;
+    hl_surface_t *s = &hl->surf[idx];
+    if (!s->in_use || (uint16_t)blyt_dyn_decode_gen(h) != s->gen)
+        return NULL;
+    if (s->is_screen)
+        s->pixels =
+            hl_gfx_fb(hl); /* screen pixels are always the live fb (session's for a hybrid) */
+    return s;
+}
+
+/* #207: while a tier-2 lock is held the lock owns the surface, so tier-1 ops /
+ * blit / destroy through the handle are rejected (defined no-op). */
+static hl_surface_t *hl_surf_resolve_drawable(blyt_hostlua_t *hl, uint32_t h) {
+    hl_surface_t *s = hl_surf_resolve(hl, h);
+    return (s && s->locked) ? NULL : s;
+}
+
+typedef struct {
+    uint8_t *pixels;
+    int32_t w, h;
+    bool is_screen;
+} hl_draw_target_t;
+
+/* Unified tier-1 drawable target (#210, the native port of the WASM leg's
+ * lua_resolve_target).  A HYBRID cart runs its native half in the rv32 session;
+ * resolving against the session's ONE surface registry keeps the Lua half's
+ * surfaces and handles coherent with that native half — a Lua-created off-screen
+ * handle passed across the bridge must resolve to the SAME slot when the native
+ * half blits it, and a lock taken by one half must be seen by the other (#207).
+ * Two registries is precisely the divergence #210 fixed on wasm.  A session-less
+ * pure-Lua cart resolves against the local hl->surf pool. */
+static bool hl_resolve_target(blyt_hostlua_t *hl, uint32_t h, hl_draw_target_t *t) {
+    if (hl->session) {
+        t->pixels = blyt_session_surface_drawable(hl->session, h, &t->w, &t->h, &t->is_screen);
+        return t->pixels != NULL;
+    }
+    hl_surface_t *s = hl_surf_resolve_drawable(hl, h);
+    if (!s)
+        return false;
+    t->pixels = s->pixels;
+    t->w = s->w;
+    t->h = s->h;
+    t->is_screen = s->is_screen;
+    return true;
+}
+
+/* Reap draw-scoped off-screen surfaces at the frame boundary (#205) and
+ * force-release any lock the cart forgot — including the screen (slot 0), which
+ * is never freed but must not carry a lock into the next frame (#208).  Mirrors
+ * the emulated path's frame-entry reap in blyt_session_run_frame. */
+static void hl_surf_reap(blyt_hostlua_t *hl) {
+    /* A hybrid's surfaces live in the session's unified registry (#210), so reap
+     * THAT.  blyt_session_run_frame suppresses its own reap for host-fn drives
+     * (it fires once per C-export trampoline call, which would reap mid-frame),
+     * so this per-real-frame call is what actually frees them. */
+    if (hl->session) {
+        blyt_session_reap_surfaces(hl->session);
+        return;
+    }
+    hl_surf_ensure_init(hl);
+    hl->surf[0].locked = false;
+    for (uint32_t i = 1; i < HL_SURFACE_MAX; i++) {
+        if (hl->surf[i].in_use) {
+            free(hl->surf[i].pixels);
+            hl->surf[i].pixels = NULL;
+            hl->surf[i].in_use = false;
+            hl->surf[i].locked = false;
+            hl->surf[i].gen++;
+        }
+    }
+}
+
+static int l_surface_create(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    int32_t w = (int32_t)luaL_checkinteger(L, 1);
+    int32_t h = (int32_t)luaL_checkinteger(L, 2);
+    if (hl->session) { /* hybrid: create in the session's unified registry (#210) */
+        lua_pushinteger(L, (lua_Integer)blyt_session_surface_create(hl->session, w, h));
+        return 1;
+    }
+    hl_surf_ensure_init(hl);
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) {
+        lua_pushinteger(L, (lua_Integer)BLYT_HANDLE_NONE);
+        return 1;
+    }
+    uint32_t idx = 0;
+    for (uint32_t i = 1; i < HL_SURFACE_MAX; i++) {
+        if (!hl->surf[i].in_use) {
+            idx = i;
+            break;
+        }
+    }
+    uint8_t *buf = idx ? (uint8_t *)malloc((size_t)w * (size_t)h) : NULL;
+    if (!buf) {
+        lua_pushinteger(L, (lua_Integer)BLYT_HANDLE_NONE);
+        return 1;
+    }
+    blyt_raster_clear(buf, w, w, h, 0); /* blank = palette index 0 */
+    hl->surf[idx].pixels = buf;
+    hl->surf[idx].w = w;
+    hl->surf[idx].h = h;
+    hl->surf[idx].in_use = true;
+    hl->surf[idx].is_screen = false;
+    lua_pushinteger(L, (lua_Integer)blyt_surface_encode(hl->surf[idx].gen, idx));
+    return 1;
+}
+
+static int l_surface_destroy(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (hl->session) { /* hybrid: destroy in the session's unified registry (#210) */
+        blyt_session_surface_destroy(hl->session, (uint32_t)luaL_checkinteger(L, 1));
+        return 0;
+    }
+    hl_surface_t *s = hl_surf_resolve_drawable(hl, (uint32_t)luaL_checkinteger(L, 1)); /* #207 */
+    if (s && !s->is_screen) {
+        free(s->pixels);
+        s->pixels = NULL;
+        s->in_use = false;
+        s->gen++;
+    }
+    return 0;
+}
+
+static int l_surface_clear(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_draw_target_t t;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &t)) {
+        blyt_raster_clear(t.pixels, t.w, t.w, t.h, (uint8_t)luaL_checkinteger(L, 2));
+        if (t.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_surface_pixel(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_draw_target_t t;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &t)) {
+        blyt_raster_pixel(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
+                          (int)luaL_checkinteger(L, 3), (uint8_t)luaL_checkinteger(L, 4));
+        if (t.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_surface_rect_fill(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_draw_target_t t;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &t)) {
+        blyt_raster_rect_fill(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
+                              (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                              (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (t.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_surface_line(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_draw_target_t t;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &t)) {
+        blyt_raster_line(t.pixels, t.w, t.w, t.h, (int)luaL_checkinteger(L, 2),
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                         (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (t.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_surface_blit(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    /* Reject if either endpoint is unresolvable or locked (#207). */
+    hl_draw_target_t d, s;
+    if (hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 1), &d) &&
+        hl_resolve_target(hl, (uint32_t)luaL_checkinteger(L, 2), &s)) {
+        blyt_raster_blit(d.pixels, d.w, d.w, d.h, s.pixels, s.w, s.w, s.h,
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4));
+        if (d.is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+
+/* Tier-2 per-pixel lock (#208).  acquire() materialises a direct pointer to the
+ * surface's canonical buffer and marks it locked; per-pixel get/set then touch
+ * host memory with no crossing.  The per-frame epoch (hl->lock_epoch) is the
+ * staleness guard.  An OOB get/set is a defined no-op (the determinism-bearing
+ * behaviour, uniform across legs; the debug hard-error is not wired on the fast
+ * path, exactly as on the WASM leg). */
+typedef struct {
+    /* PREFIX — byte-identical to the guest binding's lua_lock_t (blyt32lua.c:
+     * blyt_lock_t + epoch + released) and hence to `struct blyt_fp_lock`, the
+     * layout the #208 VM fast paths read a lock through when
+     * BLYT_HOSTLUA_PIXEL_BENCH is compiled in.  Do not reorder (asserted below). */
+    uint8_t *pixels;
+    int32_t stride; /* bytes per row (== w; surfaces are tightly packed) */
+    int32_t w, h;
+    uint32_t token; /* session release token (hybrid); BLYT_HANDLE_NONE pure-Lua */
+    uint32_t epoch; /* hl->lock_epoch captured at acquire */
+    int32_t released; /* int, not bool: the VM fast path reads an `int released` */
+    /* Host-Lua-only tail — past the prefix, invisible to the VM fast paths. */
+    uint32_t handle; /* surface handle (pure-Lua release re-resolve) */
+    bool is_screen; /* writes flip hl->drawn */
+} hl_lock_t;
+
+/* ── #208 per-pixel VM fast paths — EXPERIMENT, NOT SHIPPED ──────────────────
+ *
+ * Compiled only under BLYT_HOSTLUA_PIXEL_BENCH, which the Spike Y repeat pairs
+ * with a Lua fork carrying the `spike/208-lua-vm-fastpixel` OP_SELF +
+ * OP_CALL-inline patches (bench/spike-y/scripts/build-fastpixel-player.sh).  The
+ * patched luaV_execute recognises a tier-2 lock by metatable identity and runs
+ * lk:set / lk:get inline — no __index lookup, no C call frame — falling through
+ * to the real C function for anything unusual (foreign self, non-integer args,
+ * OOB, stale lock), so the checked semantics are preserved.  It reaches the
+ * runtime through exactly these symbols.  See bench/spike-y/REPEAT-RESULTS.md.
+ *
+ * The globals are process-wide (the patch's contract); safe today because a
+ * process hosts one host-Lua VM, but that is why this stays behind a flag. */
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+_Static_assert(offsetof(hl_lock_t, pixels) == 0, "#208 lock prefix: pixels");
+_Static_assert(offsetof(hl_lock_t, stride) == sizeof(uint8_t *), "#208 lock prefix: stride");
+_Static_assert(offsetof(hl_lock_t, w) == sizeof(uint8_t *) + 4, "#208 lock prefix: w");
+_Static_assert(offsetof(hl_lock_t, h) == sizeof(uint8_t *) + 8, "#208 lock prefix: h");
+_Static_assert(offsetof(hl_lock_t, token) == sizeof(uint8_t *) + 12, "#208 lock prefix: token");
+_Static_assert(offsetof(hl_lock_t, epoch) == sizeof(uint8_t *) + 16, "#208 lock prefix: epoch");
+_Static_assert(offsetof(hl_lock_t, released) == sizeof(uint8_t *) + 20,
+               "#208 lock prefix: released");
+
+unsigned int blyt_lua_lock_epoch = 0; /* mirrors hl->lock_epoch for the VM */
+void *blyt_lua_lock_mt = NULL; /* the lock metatable, by pointer identity */
+int (*blyt_lua_fp_get)(lua_State *) = NULL;
+int (*blyt_lua_fp_set)(lua_State *) = NULL;
+int (*blyt_lua_fp_set_pixel)(lua_State *) = NULL;
+
+/* The live screen lock, for the implicit-lock set_pixel(x,y,c) form.  Owned by
+ * Lua (userdata do not move); the epoch check is what makes a stale pointer a
+ * defined no-op rather than a dangling write. */
+static hl_lock_t *hl_fp_screen = NULL;
+
+void blyt_lua_fast_set_pixel(int x, int y, int c) {
+    hl_lock_t *u = hl_fp_screen;
+    if (u && !u->released && u->epoch == blyt_lua_lock_epoch && x >= 0 && x < u->w && y >= 0 &&
+        y < u->h)
+        u->pixels[(uint32_t)y * (uint32_t)u->stride + (uint32_t)x] = (uint8_t)c;
+}
+#endif /* BLYT_HOSTLUA_PIXEL_BENCH */
+
+static int l_surface_acquire(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    uint32_t h = (uint32_t)luaL_checkinteger(L, 1);
+    uint8_t *pixels = NULL;
+    int32_t w = 0, hh = 0;
+    uint32_t token = BLYT_HANDLE_NONE;
+    bool is_screen;
+    if (hl->session) { /* hybrid: the session's unified registry (#210/#207) */
+        pixels = blyt_session_surface_acquire(hl->session, h, &w, &hh, &token);
+        is_screen = (h == (uint32_t)BLYT_SCREEN);
+    } else { /* pure-Lua: the local pool */
+        hl_surface_t *s = hl_surf_resolve(hl, h);
+        if (s && !s->locked) {
+            s->locked = true;
+            pixels = s->pixels;
+            w = s->w;
+            hh = s->h;
+        }
+        is_screen = s ? s->is_screen : false;
+    }
+    if (!pixels) {
+        lua_pushnil(L);
+        return 1;
+    }
+    hl_lock_t *u = (hl_lock_t *)lua_newuserdatauv(L, sizeof(*u), 0);
+    u->pixels = pixels;
+    u->stride = w;
+    u->w = w;
+    u->h = hh;
+    u->handle = h;
+    u->token = token;
+    u->epoch = hl->lock_epoch;
+    u->released = 0;
+    u->is_screen = is_screen;
+    luaL_setmetatable(L, HL_LOCK_MT);
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+    if (is_screen) {
+        hl_fp_screen = u;
+        /* The VM fast path stores straight into the buffer without reaching
+         * l_lock_set, so it cannot flip hl->drawn per write; acquiring the screen
+         * is the last point that can.  Experiment-only, hence the guard. */
+        hl->drawn = true;
+    }
+#endif
+    return 1;
+}
+
+static hl_lock_t *hl_lock_live(lua_State *L, int idx) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = (hl_lock_t *)luaL_checkudata(L, idx, HL_LOCK_MT);
+    if (u->released || u->epoch != hl->lock_epoch)
+        return NULL;
+    return u;
+}
+
+static int l_lock_get(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    int32_t x = (int32_t)luaL_checkinteger(L, 2);
+    int32_t y = (int32_t)luaL_checkinteger(L, 3);
+    if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h) {
+        /* Debug-cart bounds check, byte-identical to the guest binding
+         * (blyt32lua.c lua_lock_get); release reads as cleared. */
+        if (blyt_cart_is_debug(hl->cart))
+            return luaL_error(L, "lk:get out of bounds or on a released lock");
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    lua_pushinteger(L, (lua_Integer)u->pixels[(uint32_t)y * (uint32_t)u->w + (uint32_t)x]);
+    return 1;
+}
+static int l_lock_set(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    int32_t x = (int32_t)luaL_checkinteger(L, 2);
+    int32_t y = (int32_t)luaL_checkinteger(L, 3);
+    uint8_t c = (uint8_t)luaL_checkinteger(L, 4);
+    if (!u || x < 0 || x >= u->w || y < 0 || y >= u->h) {
+        /* Debug-cart bounds check, byte-identical to the guest binding
+         * (blyt32lua.c lua_lock_set); release is a silent no-op. */
+        if (blyt_cart_is_debug(hl->cart))
+            return luaL_error(L, "lk:set out of bounds or on a released lock");
+        return 0;
+    }
+    u->pixels[(uint32_t)y * (uint32_t)u->w + (uint32_t)x] = c;
+    if (u->is_screen)
+        hl->drawn = true;
+    return 0;
+}
+static int l_lock_clear(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    if (u) {
+        blyt_raster_clear(u->pixels, u->w, u->w, u->h, (uint8_t)luaL_checkinteger(L, 2));
+        if (u->is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_lock_rect_fill(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    if (u) {
+        blyt_raster_rect_fill(u->pixels, u->w, u->w, u->h, (int)luaL_checkinteger(L, 2),
+                              (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                              (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (u->is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_lock_line(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = hl_lock_live(L, 1);
+    if (u) {
+        blyt_raster_line(u->pixels, u->w, u->w, u->h, (int)luaL_checkinteger(L, 2),
+                         (int)luaL_checkinteger(L, 3), (int)luaL_checkinteger(L, 4),
+                         (int)luaL_checkinteger(L, 5), (uint8_t)luaL_checkinteger(L, 6));
+        if (u->is_screen)
+            hl->drawn = true;
+    }
+    return 0;
+}
+static int l_lock_release(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    hl_lock_t *u = (hl_lock_t *)luaL_checkudata(L, 1, HL_LOCK_MT);
+    if (!u->released && u->epoch == hl->lock_epoch) {
+        if (hl->session) { /* hybrid: release in the session's registry (#210) */
+            blyt_session_surface_release(hl->session, u->token);
+        } else {
+            hl_surface_t *s = hl_surf_resolve(hl, u->handle);
+            if (s)
+                s->locked = false;
+        }
+    }
+    u->released = 1;
+    return 0;
+}
+
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+/* blyt32.surface.set_pixel(x, y, c) — EXPERIMENT (see the #208 block above).
+ * The implicit-lock form Spike Y measured: no handle argument, no userdata
+ * check, so it costs a plain call rather than OP_SELF + a metatable lookup.  It
+ * writes the screen lock acquired earlier this frame (a no-op if there is none).
+ * NOT in the shipped API on any leg — adding it for real is a cart-visible
+ * change that would have to land on the guest and WASM bindings too. */
+static int l_surface_set_pixel(lua_State *L) {
+    blyt_lua_fast_set_pixel((int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                            (int)luaL_checkinteger(L, 3));
+    return 0;
+}
+
+/* Publish the identities the patched VM compares against, and bind set_pixel.
+ * Runs immediately after blyt_hostlua_register_api so the metatable exists. */
+static void hl_wire_pixel_bench(lua_State *L) {
+    blyt_lua_fp_get = l_lock_get;
+    blyt_lua_fp_set = l_lock_set;
+    blyt_lua_fp_set_pixel = l_surface_set_pixel;
+    luaL_getmetatable(L, HL_LOCK_MT);
+    blyt_lua_lock_mt = (void *)lua_topointer(L, -1);
+    lua_pop(L, 1);
+    lua_getglobal(L, "blyt32");
+    lua_getfield(L, -1, "surface");
+    lua_pushcfunction(L, l_surface_set_pixel); /* light C fn — the OP_CALL path needs LUA_VLCF */
+    lua_setfield(L, -2, "set_pixel");
+    lua_pop(L, 2);
+}
+#endif /* BLYT_HOSTLUA_PIXEL_BENCH */
+
+/* ── Resource table + mem.stats (#93/#158/#159, #231) ────────────────────────
+ *
+ * The session-less half of the WASM leg's blyt.resource.* / blyt32.mem.stats
+ * bindings.  A pure-Lua cart reads the runner's own resource table directly (no
+ * ECALL, no session); the pin/refcount/footprint semantics replicate the rv32
+ * RESOURCE_* ECALL handlers in cart_run.c, so the host-Lua path is behaviourally
+ * identical to every emulated leg.  Footprint is published into mem_acct's
+ * non_evictable_footprint, feeding the SAME unified budget predicate the cart
+ * heap uses. */
+
+static blyt_resource_table_t *hl_active_resources(blyt_hostlua_t *hl) {
+    /* A hybrid resolves its ONE cart-facing table from the session (#276),
+     * matching the WASM leg's active_resource_table(): the native C/Rust half's
+     * resource ECALLs land in the session's ctx.resources, so the Lua half's
+     * blyt.resource.* + mem.stats bindings must read that SAME table or the two
+     * host-Lua legs disagree on residency/pin state (anti-#98, ADR-0007/0029).
+     * Only a session-less pure-Lua cart owns a runner table. */
+    if (hl->session)
+        return blyt_session_resources(hl->session);
+    return hl->resources_loaded ? &hl->resources : NULL;
+}
+
+/* Republish the non-evictable footprint from the table and bound the resident
+ * evictable cache to the room it leaves — the host-Lua mirror of the host
+ * mem_acct_publish_footprint (#158).  Call after any pin/unpin. */
+static void hl_publish_footprint(blyt_hostlua_t *hl, blyt_resource_table_t *t) {
+    uint32_t footprint = t ? blyt_resource_table_footprint(t) : 0u;
+    /* Unified budget (#250): a hybrid's emulated native half runs in a SEPARATE
+     * rv32 session arena; its live cart heap counts against the SAME logical
+     * 16 MB pool, so fold it into this (host-VM) arena's non-evictable footprint
+     * term.  The native arena symmetrically folds this arena's heap
+     * (blyt_session_set_peer_heap), so an allocation from either half fails once
+     * the combined footprint would exceed 16 MB — the single shared pool bare
+     * metal uses natively.  0 for a pure-Lua cart (no session). */
+    if (hl->session)
+        footprint += blyt_session_cart_heap(hl->session);
+    hl->mem_acct.non_evictable_footprint = footprint;
+    if (t)
+        blyt_resource_table_evict_to_fit(
+            t, blyt_mem_cache_room(blyt_mem_cart_heap(&hl->mem_acct), footprint));
+}
+
+/* Would newly pinning `e` (adding e->len to the footprint when it is so far
+ * evictable) still fit the unified budget?  Mirrors mem_acct_reference_fits. */
+static int hl_reference_fits(blyt_hostlua_t *hl, blyt_resource_table_t *t,
+                             const blyt_resource_entry_t *e, int was_evictable) {
+    uint32_t incoming = was_evictable ? (uint32_t)e->len : 0u;
+    return blyt_mem_alloc_fits(blyt_mem_cart_heap(&hl->mem_acct), blyt_resource_table_footprint(t),
+                               incoming);
+}
+
+/* Resolve a baked resource constant to its table entry (ADR-0134): a cart-bundled
+ * RESOURCE only.  NULL for a non-resource kind, runtime provenance, or absent id. */
+static blyt_resource_entry_t *hl_resolve(blyt_resource_table_t *t, uint32_t handle) {
+    if (!t || !blyt_handle_is_resource(handle) ||
+        blyt_resource_decode_provenance(handle) != BLYT_RESOURCE_PROV_CART)
+        return NULL;
+    return blyt_resource_table_find_mut(t, blyt_resource_decode_id(handle));
+}
+
+/* Pin exactly as the rv32 RESOURCE_PIN handler does: budget-gate, materialize,
+ * bump pin, touch for LRU, republish footprint.  *out = resident bytes (NULL/0
+ * is a valid success), false on absent / over budget / decode failure. */
+static bool hl_pin_entry(blyt_hostlua_t *hl, blyt_resource_table_t *t, blyt_resource_entry_t *e,
+                         const uint8_t **out) {
+    *out = NULL;
+    if (!e || !hl_reference_fits(hl, t, e, blyt_rl_is_evictable(&e->rl)))
+        return false;
+    const uint8_t *bytes = blyt_resource_entry_data(e);
+    if (!bytes && e->len)
+        return false; /* decode failed */
+    blyt_rl_pin(&e->rl);
+    blyt_resource_table_touch(t, e); /* recency for LRU (#158) */
+    hl_publish_footprint(hl, t); /* footprint grew; bound cache */
+    *out = bytes;
+    return true;
+}
+
+static void hl_unpin_entry(blyt_hostlua_t *hl, blyt_resource_table_t *t, blyt_resource_entry_t *e) {
+    blyt_rl_unpin(&e->rl);
+    hl_publish_footprint(hl, t); /* footprint may have shrunk (#158) */
+}
+
+/* Resolve a palette handle to its 256-entry XRGB8888 bytes (#201/#214): RUNTIME
+ * -> built-in table; CART -> the resource table (must hold exactly 1024 bytes). */
+static const uint8_t *hl_resolve_palette(blyt_hostlua_t *hl, uint32_t handle) {
+    if (blyt_resource_decode_provenance(handle) == BLYT_RESOURCE_PROV_RUNTIME)
+        return (const uint8_t *)blyt_builtin_palette(handle);
+    blyt_resource_entry_t *e = hl_resolve(hl_active_resources(hl), handle);
+    if (!e || e->len != 256u * sizeof(uint32_t))
+        return NULL;
+    return blyt_resource_entry_data(e);
+}
+
+static hl_resource_const_t *hl_opt_const(lua_State *L, int idx) {
+    void *p = luaL_testudata(L, idx, HL_RESOURCE_TEXT_CONST_MT);
+    if (!p)
+        p = luaL_testudata(L, idx, HL_RESOURCE_BYTES_CONST_MT);
+    if (!p)
+        p = luaL_testudata(L, idx, HL_RESOURCE_PALETTE_CONST_MT);
+    return (hl_resource_const_t *)p;
+}
+
+static int l_res_text_resource(lua_State *L) {
+    hl_resource_const_t *c = (hl_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = (uint32_t)luaL_checkinteger(L, 1);
+    c->is_text = 1;
+    luaL_setmetatable(L, HL_RESOURCE_TEXT_CONST_MT);
+    return 1;
+}
+static int l_res_bytes_resource(lua_State *L) {
+    hl_resource_const_t *c = (hl_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = (uint32_t)luaL_checkinteger(L, 1);
+    c->is_text = 0;
+    luaL_setmetatable(L, HL_RESOURCE_BYTES_CONST_MT);
+    return 1;
+}
+static int l_res_palette_resource(lua_State *L) {
+    hl_resource_const_t *c = (hl_resource_const_t *)lua_newuserdatauv(L, sizeof(*c), 0);
+    c->id = (uint32_t)luaL_checkinteger(L, 1);
+    c->is_text = 0;
+    luaL_setmetatable(L, HL_RESOURCE_PALETTE_CONST_MT);
+    return 1;
+}
+static int l_res_palette_tostring(lua_State *L) {
+    hl_resource_const_t *c = luaL_checkudata(L, 1, HL_RESOURCE_PALETTE_CONST_MT);
+    lua_pushfstring(L, "palette<%d>", (int)c->id);
+    return 1;
+}
+static int l_res_const_id(lua_State *L) {
+    hl_resource_const_t *c = hl_opt_const(L, 1);
+    luaL_argcheck(L, c != NULL, 1, "resource constant expected");
+    lua_pushinteger(L, (lua_Integer)c->id);
+    return 1;
+}
+static int l_res_const_eq(lua_State *L) {
+    hl_resource_const_t *a = hl_opt_const(L, 1);
+    hl_resource_const_t *b = hl_opt_const(L, 2);
+    lua_pushboolean(L, a && b && a->id == b->id && a->is_text == b->is_text);
+    return 1;
+}
+static int l_res_const_tostring(lua_State *L) {
+    hl_resource_const_t *c = hl_opt_const(L, 1);
+    luaL_argcheck(L, c != NULL, 1, "resource constant expected");
+    lua_pushfstring(L, c->is_text ? "text_resource<%d>" : "bytes_resource<%d>", (int)c->id);
+    return 1;
+}
+/* text constant :text() — owned copy, trailing storage NUL stripped (#166). */
+static int l_res_const_text(lua_State *L) {
+    hl_resource_const_t *c = luaL_checkudata(L, 1, HL_RESOURCE_TEXT_CONST_MT);
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    blyt_resource_entry_t *e = hl_resolve(t, c->id);
+    const uint8_t *bytes = NULL;
+    if (!hl_pin_entry(hl, t, e, &bytes)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    size_t content = (e->len >= 1 && bytes[e->len - 1] == '\0') ? e->len - 1 : e->len;
+    lua_pushlstring(L, (const char *)bytes, content);
+    hl_unpin_entry(hl, t, e);
+    return 1;
+}
+/* bytes constant :bytes() — owned copy of the exact bytes, verbatim (#162). */
+static int l_res_const_bytes(lua_State *L) {
+    hl_resource_const_t *c = luaL_checkudata(L, 1, HL_RESOURCE_BYTES_CONST_MT);
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    blyt_resource_entry_t *e = hl_resolve(t, c->id);
+    const uint8_t *bytes = NULL;
+    if (!hl_pin_entry(hl, t, e, &bytes)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, (const char *)bytes, e->len);
+    hl_unpin_entry(hl, t, e);
+    return 1;
+}
+/* Module-level pin/unpin: kind-agnostic raw escape hatch, takes the constant. */
+static int l_res_pin(lua_State *L) {
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    blyt_resource_entry_t *e = hl_resolve(t, id);
+    const uint8_t *bytes = NULL;
+    if (!hl_pin_entry(hl, t, e, &bytes)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlightuserdata(L, (void *)(uintptr_t)bytes);
+    lua_pushinteger(L, (lua_Integer)e->len);
+    return 2;
+}
+static int l_res_unpin(lua_State *L) {
+    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    blyt_resource_entry_t *e = hl_resolve(t, id);
+    if (e)
+        hl_unpin_entry(hl, t, e);
+    return 0;
+}
+
+/* blyt32.mem.stats() (ADR-0029, #159): reads the accounting block + resource
+ * table directly (no ECALL).  Byte-for-byte behaviourally the WASM/guest path;
+ * see the determinism-vs-advisory contract on blyt_mem_stats in blyt.h. */
+static int l_mem_stats(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    blyt_resource_table_t *t = hl_active_resources(hl);
+    uint32_t cache_used = t ? blyt_resource_table_resident_decompressed(t) : 0u;
+    /* cart_allocations spans the WHOLE cart (#250): the Lua half's host-VM arena
+     * PLUS a hybrid's emulated native half, whose libblytc allocations live in the
+     * rv32 session's separate arena.  Folding the two here makes the figure the
+     * combined cart-attributable heap the unified 16 MB pool tracks — byte-identical
+     * across the host-Lua legs, which drive the identical emulated native half. */
+    uint32_t heap_used = blyt_mem_cart_heap(&hl->mem_acct);
+    if (hl->session)
+        heap_used += blyt_session_cart_heap(hl->session);
+
+    lua_createtable(L, 0, 5);
+    lua_pushinteger(L, (lua_Integer)cache_used);
+    lua_setfield(L, -2, "resource_cache_used");
+    lua_pushinteger(L, (lua_Integer)heap_used);
+    lua_setfield(L, -2, "cart_allocations");
+    lua_pushinteger(L, (lua_Integer)(heap_used + cache_used));
+    lua_setfield(L, -2, "total_used");
+    lua_pushinteger(L, (lua_Integer)BLYT_MEM_BUDGET_BYTES);
+    lua_setfield(L, -2, "budget_cap");
+
+    lua_newtable(L); /* resources_loaded */
+    uint32_t shown = 0;
+    if (t) {
+        for (size_t i = 0; i < t->count; i++) {
+            const blyt_resource_entry_t *e = &t->entries[i];
+            if (!(e->persistent || e->owned != NULL ||
+                  (e->algo == BLYT_RES_ALGO_NONE && e->last_access > 0)))
+                continue;
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, (lua_Integer)blyt_resource_encode(e->id, BLYT_RESOURCE_PROV_CART));
+            lua_setfield(L, -2, "id");
+            lua_pushinteger(L, (lua_Integer)(uint32_t)e->len);
+            lua_setfield(L, -2, "size");
+            lua_rawseti(L, -2, (lua_Integer)(++shown));
+        }
+    }
+    lua_setfield(L, -2, "resources_loaded");
+    return 1;
+}
+
+/* Report an uncaught Lua error from a cart callback and POP it (#258).
+ *
+ * The one place this leg turns a caught error into output, shared by the driver's
+ * __blyt_call and the C-side lifecycle calls (on_save_state / on_load_state), so
+ * the reporting contract can't drift between them. */
+static void hl_report_lua_error(blyt_hostlua_t *hl, lua_State *L) {
+    const char *msg = lua_tostring(L, -1);
+    if (!hl) {
+        lua_pop(L, 1);
+        return;
+    }
+#ifdef BLYT_DAP
+    /* Exception breakpoints (#257): when a client has set an exception filter
+     * that matches this uncaught Lua error, block here on the exception stop
+     * until the client resumes / disconnects — the native analog of the WASM
+     * leg's blyt_dap_report_exception park.  No filter set → returns 0 and the
+     * error falls through to the normal (non-fatal, printed) handling below,
+     * matching a plain run. */
+    if (hl->dap_enabled)
+        fc_hostlua_dap_report_exception(msg ? msg : "(error)", 1);
+#endif
+    /* Byte-parity with the guest (#258): the BARE lua_tostring message, no
+     * host-Lua-only wrapper and no stderr fallback, so a cart author sees
+     * identical error text on desktop host-Lua and on hardware / emulated. */
+    if (hl->log_fn)
+        hl->log_fn(msg ? msg : "(no message)");
+    lua_pop(L, 1);
+}
+
+/* Call a global lifecycle function `name` if it is defined.  Returns 0 when the
+ * callback ran cleanly (or is undefined) and -1 when it raised a Lua error (the
+ * message is logged).
+ *
+ * The C-side entry point, used for the callbacks the driver chunk does not own
+ * (on_save_state / on_load_state / on_assets_reloaded), which run on hl->L
+ * outside the coroutine.  The cart's init/update/draw/on_quit/cleanup instead go
+ * through the shared driver's __blyt_call (#242). */
+static int call_lifecycle(blyt_hostlua_t *hl, lua_State *L, const char *name) {
+    lua_getglobal(L, name);
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        hl_report_lua_error(hl, L);
+        return -1;
+    }
+    return 0;
+}
+
+bool blyt_hostlua_available(void) {
+    return true;
+}
+
+/* Build a fresh Lua VM into hl->L: create the state, stash the runner, open the
+ * restricted stdlib + blyt/blyt32 API, re-register the state API + S proxy
+ * against the (already-initialised) hl->state_ctx, and load the cart bytecode.
+ * Does NOT run lifecycle callbacks — the caller drives init()/on_new_state().
+ * Used both at create() and to rebuild the VM each --reset-every-frame cycle
+ * (mirroring the WASM leg's wasm_lua_rebuild).  Returns 0 on success (hl->L
+ * live), -1 on failure (hl->L closed and NULLed, error logged). */
+/* ── Hybrid bridge: Lua half (this host VM) → native half (rv32 session) ──────
+ *
+ * The native counterpart of the WASM leg's trampoline machinery (wasm_main.c).
+ * A .lua_exports cart's native functions are installed as Lua closures on this
+ * VM; calling one drives the emulated native half via the frontend-agnostic
+ * session API (begin_fn_call / begin_bridged_call / run_frame).  Two kinds:
+ *   - typed (≤4 scalar args, no bridge ECALLs): marshal Lua args into rv32
+ *     registers, run the native fn to completion, read back the scalar return.
+ *   - bridged (ADR-0130 raw exports): move the Lua args onto the exchange thread,
+ *     invoke the guest wrapper (which reads/pushes its own Lua values through
+ *     BLYT_ECALL_LUA_OP against the exchange thread), move the results back.
+ * Unlike the WASM leg there is no lua_yieldk/GDB-coroutine path: native debug
+ * pauses by blocking a thread (#234), so the drive loop is a plain while.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/* Lua scalar type codes in a .lua_exports entry (blyt.h BLYT_LUA_TYPE_*). */
+#define HL_LUA_TYPE_VOID 0
+#define HL_LUA_TYPE_I32 1
+#define HL_LUA_TYPE_U32 2
+#define HL_LUA_TYPE_F32 3
+#define HL_LUA_TYPE_BOOL 4
+
+static uint32_t hl_lua_to_rv32(lua_State *L, int idx, int type) {
+    switch (type) {
+    case HL_LUA_TYPE_I32:
+        return (uint32_t)(int32_t)lua_tointeger(L, idx);
+    case HL_LUA_TYPE_U32:
+        return (uint32_t)lua_tointeger(L, idx);
+    case HL_LUA_TYPE_F32: {
+        float f = (float)lua_tonumber(L, idx);
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        return bits;
+    }
+    case HL_LUA_TYPE_BOOL:
+        return lua_toboolean(L, idx) ? 1u : 0u;
+    default:
+        return 0u;
+    }
+}
+
+static void hl_rv32_to_lua(lua_State *L, uint32_t val, int type) {
+    switch (type) {
+    case HL_LUA_TYPE_I32:
+        lua_pushinteger(L, (lua_Integer)(int32_t)val);
+        break;
+    case HL_LUA_TYPE_U32:
+        lua_pushinteger(L, (lua_Integer)(uint32_t)val);
+        break;
+    case HL_LUA_TYPE_F32: {
+        float f;
+        memcpy(&f, &val, 4);
+        lua_pushnumber(L, (lua_Number)f);
+        break;
+    }
+    case HL_LUA_TYPE_BOOL:
+        lua_pushboolean(L, val ? 1 : 0);
+        break;
+    default:
+        break; /* VOID: push nothing */
+    }
+}
+
+/* Unified 16 MB budget coupling across the two hybrid arenas (#250).  Before
+ * driving the emulated native half, publish this (host-VM) arena's live cart heap
+ * into the session so the native arena's malloc/pin predicate charges the combined
+ * footprint; after it returns, fold the native half's now-updated cart heap back
+ * into this arena's predicate.  Both host-Lua legs do this at the SAME trampoline
+ * points, so the fail-point is deterministic and leg-identical.  hl_publish_footprint
+ * already adds the session heap, so `leave` is just a republish. */
+static void hl_budget_enter_native(blyt_hostlua_t *hl) {
+    if (hl->session)
+        blyt_session_set_peer_heap(hl->session, blyt_mem_cart_heap(&hl->mem_acct));
+}
+static void hl_budget_leave_native(blyt_hostlua_t *hl) {
+    if (hl->session)
+        hl_publish_footprint(hl, hl_active_resources(hl));
+}
+
+/* Drive the emulated native half until the in-flight call completes, then push
+ * its scalar return.  A native blyt_quit() during the call latches hl->quit
+ * (the host-Lua mirror of the WASM leg's g_lua_quit propagation). */
+static int hl_run_trampoline_loop(lua_State *L, blyt_hostlua_t *hl, int ret_type) {
+    blyt_cart_run_err_t ferr;
+    do {
+        ferr = blyt_session_run_frame(hl->session);
+    } while (ferr != BLYT_RUN_FN_DONE && ferr != BLYT_RUN_FN_ERROR &&
+             ferr != BLYT_RUN_ERR_ECALL_TRAP && ferr != BLYT_RUN_ERR_ABORT);
+    if (ferr != BLYT_RUN_FN_DONE)
+        return luaL_error(L, "blyt hybrid: native call failed");
+    uint32_t ret_val = blyt_session_fn_return_value(hl->session);
+    if (!hl->quit && blyt_session_check_guest_quit(hl->session))
+        hl->quit = 1;
+    hl_budget_leave_native(hl); /* native heap settled — refold into the budget (#250) */
+    hl_rv32_to_lua(L, ret_val, ret_type);
+    return (ret_type == HL_LUA_TYPE_VOID) ? 0 : 1;
+}
+
+/* Typed export closure.  Upvalues: [1]=fn_addr [2]=nargs [3..6]=arg_types [7]=ret_type. */
+static int hl_typed_trampoline(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    uint32_t fn_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
+    int nargs = (int)lua_tointeger(L, lua_upvalueindex(2));
+    uint32_t args[4] = {0};
+    for (int i = 0; i < nargs && i < 4; i++)
+        args[i] = hl_lua_to_rv32(L, i + 1, (int)lua_tointeger(L, lua_upvalueindex(3 + i)));
+    hl_budget_enter_native(hl); /* publish the Lua-half heap into the budget (#250) */
+    blyt_session_begin_fn_call(hl->session, fn_addr, nargs, args);
+    int ret_type = (int)lua_tointeger(L, lua_upvalueindex(7));
+    return hl_run_trampoline_loop(L, hl, ret_type);
+}
+
+/* Bridged (ADR-0130 raw) export closure.  Upvalue: [1]=wrap_addr. */
+static int hl_bridged_trampoline(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    uint32_t wrap_addr = (uint32_t)(uintptr_t)lua_touserdata(L, lua_upvalueindex(1));
+    int n = lua_gettop(L);
+
+    /* Reverse-trampoline re-entrancy (#262): the callback that reached this export
+     * may itself be running ON an exchange thread (a native→Lua callback via the
+     * PCALL op), so a nested native call needs a DISTINCT clean thread.
+     * exch_pool[exch_depth] is guaranteed != L — the caller runs on
+     * exch_pool[depth-1] (or hl->co at depth 0).  Point the bridge at it for the
+     * call and pop back to the caller's thread on the way out. */
+    if (hl->exch_depth >= HL_EXCH_POOL_DEPTH)
+        return luaL_error(L, "blyt hybrid: reverse-trampoline nesting too deep");
+    lua_State *ex = hl->exch_pool[hl->exch_depth];
+    if (!lua_checkstack(ex, n + 2))
+        return luaL_error(L, "blyt hybrid: exchange stack overflow");
+    lua_settop(ex, 0); /* defensive: previous call always cleans up */
+    lua_xmove(L, ex, n); /* wrapper sees args at exch indices 1..n */
+
+    lua_State *prev_exch = hl->lua_exch;
+    hl->lua_exch = ex;
+    blyt_session_lua_bridge_attach(hl->session, ex);
+    hl->exch_depth++;
+
+    hl_budget_enter_native(hl); /* publish the Lua-half heap into the budget (#250) */
+    if (blyt_session_begin_bridged_call(hl->session, wrap_addr) != 0) {
+        hl->exch_depth--;
+        hl->lua_exch = prev_exch;
+        blyt_session_lua_bridge_attach(hl->session, prev_exch);
+        return luaL_error(L, "blyt hybrid: bridged call setup failed");
+    }
+
+    /* Cross-boundary DAP stepping (#273): the wrapper about to run may call a Lua
+     * function BACK (the reverse-trampoline), which executes on `ex` — a different
+     * lua_State from this caller `L`.  Publish the caller's logical depth as the
+     * frame base so the master hook's step-depth comparison composes across that
+     * boundary.  Restored (below) alongside the exch_depth pop, before any
+     * error re-raise longjmps, so nesting stays balanced.  caller_depth counts L's
+     * own live frames (added to any outer base — the C recursion is the stack). */
+#ifdef BLYT_DAP
+    int saved_frame_base = fc_master_hook_cfg.dap_frame_base;
+    if (hl->dap_enabled) {
+        lua_Debug fbar;
+        int caller_depth = 0;
+        while (lua_getstack(L, caller_depth, &fbar))
+            caller_depth++;
+        fc_master_hook_cfg.dap_frame_base = saved_frame_base + caller_depth;
+    }
+#endif
+
+    blyt_cart_run_err_t ferr;
+    for (;;) {
+        ferr = blyt_session_run_frame(hl->session);
+        if (ferr == BLYT_RUN_REVERSE_CALL_PENDING) {
+            /* #272: the rv32 parked at a native→Lua callback PCALL op (DAP only).
+             * Drive the callback here, at a clean C boundary.  This leg pauses by
+             * blocking the exec thread inside the DAP hook (never lua_yield), so
+             * the resume runs to a terminal status inline; the defensive loop just
+             * guards the invariant. */
+            blyt_reverse_call_t rc;
+            blyt_session_reverse_call_take(hl->session, &rc);
+            int st;
+            while ((st = blyt_session_reverse_resume(hl->session, &rc, L)) == LUA_YIELD)
+                ;
+            blyt_session_finish_reverse_call(hl->session, &rc, st);
+            continue;
+        }
+        if (ferr == BLYT_RUN_FN_DONE || ferr == BLYT_RUN_FN_ERROR ||
+            ferr == BLYT_RUN_ERR_ECALL_TRAP || ferr == BLYT_RUN_ERR_ABORT)
+            break;
+    }
+
+    /* Pop the nesting NOW — before any result marshalling that could raise — so
+     * hl->lua_exch / exch_depth stay consistent even on a longjmp.  `ex` (local)
+     * still holds the wrapper's results/error. */
+#ifdef BLYT_DAP
+    fc_master_hook_cfg.dap_frame_base = saved_frame_base;
+#endif
+    hl->exch_depth--;
+    hl->lua_exch = prev_exch;
+    blyt_session_lua_bridge_attach(hl->session, prev_exch);
+
+    if (ferr == BLYT_RUN_FN_ERROR) {
+        /* The wrapper raised a Lua error; guest registers were restored.  Re-raise
+         * inside this Lua call so a script-level pcall catches it (ADR-0130). */
+        if (lua_gettop(ex) < 1)
+            lua_pushstring(ex, "blyt hybrid: unknown error");
+        lua_xmove(ex, L, 1);
+        lua_settop(ex, 0);
+        return lua_error(L);
+    }
+    if (ferr != BLYT_RUN_FN_DONE) {
+        lua_settop(ex, 0);
+        return luaL_error(L, "blyt hybrid: bridged call failed");
+    }
+    int m = (int)blyt_session_fn_return_value(hl->session); /* a0 = wrapper result count */
+    if (!hl->quit && blyt_session_check_guest_quit(hl->session))
+        hl->quit = 1;
+    hl_budget_leave_native(hl); /* native heap settled — refold into the budget (#250) */
+    int avail = lua_gettop(ex);
+    if (m < 0 || m > avail)
+        m = 0;
+    luaL_checkstack(L, m + 1, "bridged results");
+    lua_xmove(ex, L, m);
+    lua_settop(ex, 0);
+    return m;
+}
+
+#ifdef BLYT_DAP
+/* Cross-boundary splice provider (#273): given a Lua thread paused inside a
+ * native->Lua callback, return the parent thread whose live stack sits below it
+ * in the spliced call chain.  A reverse-trampoline callback runs on
+ * exch_pool[k]; its caller ran on exch_pool[k-1] (or the driver coroutine hl->co
+ * at depth 0).  Returns NULL at the root (hl->co) or when L is not an active
+ * exchange thread, ending the splice walk in dap_lua_inspect.c.  Recovers hl from
+ * L's extraspace (copied to every child thread), so it needs no global. */
+static lua_State *hl_dap_parent_thread(lua_State *L) {
+    blyt_hostlua_t *hl = hl_from(L);
+    if (!hl || L == hl->co)
+        return NULL;
+    for (int k = 0; k < hl->exch_depth && k < HL_EXCH_POOL_DEPTH; k++)
+        if (L == hl->exch_pool[k])
+            return (k == 0) ? hl->co : hl->exch_pool[k - 1];
+    return NULL;
+}
+#endif
+
+/* Install one closure per .lua_exports entry as a Lua global, or as module.fn for
+ * a dotted lua_name.  Mirrors wasm_visit_export_cb byte-for-byte. */
+static void hl_visit_export_cb(const char *lua_name, uint32_t fn_guest_addr,
+                               uint32_t wrap_guest_addr, uint8_t flags, uint8_t nargs,
+                               const uint8_t arg_types[4], uint8_t ret_type, void *userdata) {
+    lua_State *L = (lua_State *)userdata;
+    if (flags & BLYT_LUA_EXPORT_FLAG_BRIDGED) {
+        lua_pushlightuserdata(L, (void *)(uintptr_t)wrap_guest_addr);
+        lua_pushcclosure(L, hl_bridged_trampoline, 1);
+    } else {
+        lua_pushlightuserdata(L, (void *)(uintptr_t)fn_guest_addr);
+        lua_pushinteger(L, nargs);
+        for (int j = 0; j < 4; j++)
+            lua_pushinteger(L, arg_types[j]);
+        lua_pushinteger(L, ret_type);
+        lua_pushcclosure(L, hl_typed_trampoline, 7);
+    }
+
+    const char *dot = strchr(lua_name, '.');
+    if (!dot) {
+        lua_setglobal(L, lua_name);
+    } else {
+        char mod[32];
+        int mod_len = (int)(dot - lua_name);
+        if (mod_len >= (int)sizeof(mod))
+            mod_len = (int)sizeof(mod) - 1;
+        for (int i = 0; i < mod_len; i++)
+            mod[i] = lua_name[i];
+        mod[mod_len] = '\0';
+        const char *fn = dot + 1;
+
+        lua_getglobal(L, mod);
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            lua_newtable(L);
+            lua_pushvalue(L, -1);
+            lua_setglobal(L, mod);
+            luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+            lua_pushvalue(L, -2);
+            lua_setfield(L, -2, mod);
+            lua_pop(L, 1); /* pop _LOADED */
+        }
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, fn);
+        lua_pop(L, 2); /* pop module table + original closure */
+    }
+}
+
+/* Wire the hybrid bridge onto a freshly built VM (called from build_vm before the
+ * bytecode runs, so require()'d native modules and called globals already exist).
+ * Creates the registry-anchored exchange thread, attaches it to the session, and
+ * installs the export trampolines.  No-op for a pure-Lua runner (no session). */
+static void hl_wire_hybrid(blyt_hostlua_t *hl) {
+    if (!hl->session)
+        return;
+    for (int i = 0; i < HL_EXCH_POOL_DEPTH; i++) {
+        hl->exch_pool[i] = lua_newthread(hl->L);
+        hl->exch_pool_ref[i] = luaL_ref(hl->L, LUA_REGISTRYINDEX);
+    }
+    hl->exch_depth = 0;
+    hl->lua_exch = hl->exch_pool[0];
+    blyt_session_lua_bridge_attach(hl->session, hl->lua_exch);
+    blyt_session_visit_lua_exports(hl->session, hl_visit_export_cb, hl->L);
+}
+
+/* Install a cart-native lifecycle fn `fn_guest_addr` as the zero-arg void Lua
+ * global `name` so call_lifecycle picks it up like a Lua-defined callback.  The
+ * native counterpart of wasm_main.c's maybe_inject_lifecycle_cb — a plain typed
+ * trampoline with nargs=0 and VOID arg/return types. */
+static void hl_inject_lifecycle_cb(lua_State *L, const char *name, uint32_t fn_guest_addr) {
+    lua_pushlightuserdata(L, (void *)(uintptr_t)fn_guest_addr);
+    lua_pushinteger(L, 0); /* nargs = 0 */
+    lua_pushinteger(L, HL_LUA_TYPE_VOID); /* arg_types[0..3] */
+    lua_pushinteger(L, HL_LUA_TYPE_VOID);
+    lua_pushinteger(L, HL_LUA_TYPE_VOID);
+    lua_pushinteger(L, HL_LUA_TYPE_VOID);
+    lua_pushinteger(L, HL_LUA_TYPE_VOID); /* ret_type */
+    lua_pushcclosure(L, hl_typed_trampoline, 7);
+    lua_setglobal(L, name);
+}
+
+/* Inject a hybrid cart's native lifecycle callbacks as Lua-global trampolines
+ * (#232 S4).  Called from build_vm AFTER the cart bytecode has run, so the Lua
+ * halves' globals already exist and a conflict (a callback defined in BOTH the
+ * native and Lua halves) can be detected.  Returns 0 on success, -1 on conflict
+ * (error logged; the caller closes the VM).  No-op for a pure-Lua runner. */
+static int hl_inject_native_lifecycle(blyt_hostlua_t *hl) {
+    if (!hl->session)
+        return 0;
+    static const struct {
+        const char *name;
+        uint32_t (*fn)(blyt_session_t *);
+    } cbs[] = {
+        {"init", blyt_session_cart_fn_init},
+        {"on_new_state", blyt_session_cart_fn_on_new_state},
+        {"update", blyt_session_cart_fn_update},
+        {"draw", blyt_session_cart_fn_draw},
+        {"on_quit", blyt_session_cart_fn_on_quit},
+        {"cleanup", blyt_session_cart_fn_cleanup},
+    };
+    for (size_t i = 0; i < sizeof(cbs) / sizeof(cbs[0]); i++) {
+        uint32_t fn = cbs[i].fn(hl->session);
+        if (!fn)
+            continue; /* callback lives in a runtime stub, not the cart itself. */
+        lua_getglobal(hl->L, cbs[i].name);
+        int has_lua = lua_isfunction(hl->L, -1);
+        lua_pop(hl->L, 1);
+        if (has_lua) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "blyt-hostlua: lifecycle '%s' defined in both native and Lua", cbs[i].name);
+            if (hl->log_fn)
+                hl->log_fn(buf);
+            else
+                fprintf(stderr, "%s\n", buf);
+            return -1;
+        }
+        hl_inject_lifecycle_cb(hl->L, cbs[i].name, fn);
+    }
+    return 0;
+}
+
+/* Close the VM and drop the driver's coroutine handles with it (#242).
+ *
+ * lua_close frees the registry, so `co_ref` becomes a dangling index into a dead
+ * state: it MUST be reset here, or the next hl_make_co would luaL_unref a stale
+ * index in the rebuilt VM's registry and free an unrelated object. */
+static void hl_close_vm(blyt_hostlua_t *hl) {
+    if (hl->L)
+        lua_close(hl->L);
+    hl->L = NULL;
+    hl->co = NULL;
+    hl->co_ref = LUA_NOREF;
+    hl->running_co = false;
+    hl->lua_exch = NULL;
+    for (int i = 0; i < HL_EXCH_POOL_DEPTH; i++) {
+        hl->exch_pool[i] = NULL;
+        hl->exch_pool_ref[i] = LUA_NOREF; /* lua_close freed the registry */
+    }
+    hl->exch_depth = 0;
+}
+
+/* Replace the driver coroutine with a fresh thread running `chunk` (#242).
+ *
+ * The thread is anchored in the registry (luaL_ref) so it survives GC while the
+ * C side holds only a lua_State*, and any previously anchored thread is released
+ * first.  Mirrors — and now shares its chunk source with — the wasm leg.
+ * Returns 0, or -1 with the load error reported through the log channel. */
+static int hl_make_co(blyt_hostlua_t *hl, const char *chunk) {
+    if (hl->co_ref != LUA_NOREF) {
+        luaL_unref(hl->L, LUA_REGISTRYINDEX, hl->co_ref);
+        hl->co_ref = LUA_NOREF;
+    }
+    hl->co = lua_newthread(hl->L);
+    hl->co_ref = luaL_ref(hl->L, LUA_REGISTRYINDEX); /* pops the thread */
+    hl->running_co = false;
+    if (luaL_loadstring(hl->co, chunk) != LUA_OK) {
+        const char *msg = lua_tostring(hl->co, -1);
+        if (hl->log_fn)
+            hl->log_fn(msg ? msg : "(driver chunk load failed)");
+        lua_pop(hl->co, 1);
+        return -1;
+    }
+#ifdef BLYT_DAP
+    /* Arm the master hook on the coroutine too: the cart's callbacks execute on
+     * THIS thread, so a hook armed only on hl->L would never see them (the wasm
+     * leg installs per-coroutine for the same reason). */
+    if (hl->dap_enabled)
+        fc_consolelua_master_hook_install(hl->co);
+#endif
+    return 0;
+}
+
+/* Run the boot chunk to completion, then swap the driver over to the frame chunk
+ * (#242) — the shared driver's boot→running transition.
+ *
+ * A Lua error inside init()/on_new_state() is caught by the pcall in __blyt_call
+ * and reported there, so the resume returns LUA_OK and the cart still boots:
+ * report-and-continue, matching the guest's blyt_cart_init (#258).  Returns 0 on
+ * success, -1 if the frame chunk could not be built. */
+static int hl_boot(blyt_hostlua_t *hl) {
+    if (!hl->co || hl->running_co)
+        return 0;
+    int nres = 0;
+    int st = lua_resume(hl->co, NULL, 0, &nres);
+    while (st == LUA_YIELD) {
+        lua_settop(hl->co, 0); /* a boot-phase yield is not a frame boundary */
+        st = lua_resume(hl->co, NULL, 0, &nres);
+    }
+    if (st != LUA_OK) {
+        /* __blyt_call swallows callback errors, so reaching here means the driver
+         * chunk itself failed — report it rather than losing it silently. */
+        const char *msg = lua_tostring(hl->co, -1);
+        if (hl->log_fn)
+            hl->log_fn(msg ? msg : "(driver boot failed)");
+        lua_settop(hl->co, 0);
+    }
+    if (hl_make_co(hl, BLYT_HOSTLUA_CO_BODY_RUNNING) != 0)
+        return -1;
+    hl->running_co = true;
+    return 0;
+}
+
+/* This leg's half of the shared registration (blyt_hostlua_api.h, #267): the C
+ * bodies behind each name. The sequence itself — which registrations run, in
+ * what order — lives in that header, so this leg cannot drift out of step with
+ * the WASM one by editing a local copy. `pre_gfx` is NULL: unlike the WASM leg,
+ * native has no default palette to materialise before the gfx table is built. */
+static const blyt_hostlua_api_t hl_api_fns = {
+    .debug_print = l_debug_print,
+    .quit = l_quit,
+    .should_quit = l_should_quit,
+    .require_fn = l_require,
+
+    .blyt_call = l_blyt_call,
+    .phase_update = l_phase_update,
+    .phase_draw = l_phase_draw,
+    .phase_none = l_phase_none,
+
+    .gfx_clear = l_gfx_clear,
+    .gfx_pixel = l_gfx_pixel,
+    .gfx_rect_fill = l_gfx_rect_fill,
+    .gfx_line = l_gfx_line,
+    .gfx_palette_set = l_gfx_palette_set,
+
+    .surface_create = l_surface_create,
+    .surface_destroy = l_surface_destroy,
+    .surface_clear = l_surface_clear,
+    .surface_pixel = l_surface_pixel,
+    .surface_rect_fill = l_surface_rect_fill,
+    .surface_line = l_surface_line,
+    .surface_blit = l_surface_blit,
+    .surface_acquire = l_surface_acquire,
+
+    .lock_get = l_lock_get,
+    .lock_set = l_lock_set,
+    .lock_clear = l_lock_clear,
+    .lock_rect_fill = l_lock_rect_fill,
+    .lock_line = l_lock_line,
+    .lock_release = l_lock_release,
+
+    .res_const_text = l_res_const_text,
+    .res_const_bytes = l_res_const_bytes,
+    .res_const_eq = l_res_const_eq,
+    .res_const_id = l_res_const_id,
+    .res_const_tostring = l_res_const_tostring,
+    .res_palette_tostring = l_res_palette_tostring,
+    .res_text_resource = l_res_text_resource,
+    .res_bytes_resource = l_res_bytes_resource,
+    .res_palette_resource = l_res_palette_resource,
+    .res_pin = l_res_pin,
+    .res_unpin = l_res_unpin,
+
+    .mem_stats = l_mem_stats,
+};
+
+/* Hook adapters: the shared sequence calls these at the canonical position for
+ * the two registrations whose backends are genuinely leg-specific. */
+static void hl_hook_state_api(lua_State *L, void *ctx) {
+    (void)ctx;
+    register_state_api(L);
+}
+
+static void hl_hook_s_proxy(lua_State *L, void *ctx) {
+    register_s_proxy(L, (blyt_state_ctx_t *)ctx);
+}
+
+static int build_vm(blyt_hostlua_t *hl, bool reload_boot) {
+    /* lua_newstate with the arena-backed allocator (#158) + the seam VM's pinned
+     * hash seed (luaL_makeseed(NULL) == luai_makeseed override 0x424C5954) — the
+     * SAME seed luaL_newstate uses, kept for determinism (mirrors the WASM leg). */
+    hl->L = lua_newstate(hl_lua_alloc, hl, luaL_makeseed(NULL));
+    if (!hl->L)
+        return -1;
+    *(blyt_hostlua_t **)lua_getextraspace(hl->L) = hl;
+
+    open_libs(hl->L);
+
+    /* The whole blyt/blyt32 surface, in the canonical cross-leg order
+     * (blyt_hostlua_api.h, #267). State API + S proxy ride hooks at their
+     * canonical position — they must land before the bytecode/init so
+     * on_new_state can alloc slots. The ctx (standalone for pure-Lua, the
+     * session's for a hybrid #232) is initialised once and persists across
+     * rebuilds so its buffers survive the snapshot/restore cycle. */
+    blyt_state_ctx_t *sctx = hl_active_ctx(hl);
+    blyt_hostlua_api_t api = hl_api_fns;
+    if (sctx) {
+        api.register_state_api = hl_hook_state_api;
+        api.register_s_proxy = hl_hook_s_proxy;
+        api.ctx = sctx;
+    }
+    blyt_hostlua_register_api(hl->L, &api);
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+    hl_wire_pixel_bench(hl->L);
+#endif
+
+    /* Hybrid (#232): attach the exchange thread and install the native-export
+     * trampolines BEFORE the bytecode runs, so the cart's top-level
+     * require("mod") / global calls resolve against the native exports. */
+    hl_wire_hybrid(hl);
+
+    if (load_lua_bytecode(hl->L, hl->bytecode, hl->bytecode_size) != 0) {
+        const char *msg = lua_tostring(hl->L, -1);
+        if (hl->log_fn) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "blyt-hostlua: failed to load cart bytecode: %s",
+                     msg ? msg : "(no message)");
+            hl->log_fn(buf);
+        } else {
+            fprintf(stderr, "blyt-hostlua: failed to load cart bytecode: %s\n",
+                    msg ? msg : "(no message)");
+        }
+        hl_close_vm(hl);
+        return -1;
+    }
+
+    /* Hybrid native-lifecycle injection (#232 S4): install the cart's own native
+     * lifecycle callbacks (blyt_cart_update etc.) as Lua-global trampolines now
+     * that the bytecode has run and the Lua halves' globals exist, so a callback
+     * defined in both halves is caught.  Before the baseline so these scaffolding
+     * closures are excluded from the cart-attributable heap. */
+    if (hl_inject_native_lifecycle(hl) != 0) {
+        hl_close_vm(hl);
+        return -1;
+    }
+
+#ifdef BLYT_DAP
+    /* Arm the DAP master hook on the fresh VM so breakpoints/steps fire in the
+     * lifecycle callbacks (#234).  Re-run on every rebuild (reset/reload).
+     *
+     * MUST precede hl_make_co: fc_consolelua_master_hook_install derives its hook
+     * mask from fc_master_hook_cfg.dap_enabled, so a coroutine created while that
+     * flag is still false would be installed with an EMPTY mask and the cart's
+     * callbacks — which run on that coroutine — would never trap.  lua_sethook
+     * does not allocate, so arming here is baseline-neutral. */
+    if (hl->dap_enabled) {
+        fc_master_hook_cfg.dap_enabled = true;
+        /* Splice a callback-paused stack onto its native caller for stackTrace /
+         * step-depth / inspection across the boundary (#273). */
+        fc_dap_parent_thread = hl_dap_parent_thread;
+        fc_consolelua_master_hook_install(hl->L);
+        /* Reverse-trampoline callbacks (#262) run on the exchange threads, NOT on
+         * hl->L or the driver coroutine, so a breakpoint in a Lua function reached
+         * via a native->Lua call fires only if the pool carries the hook too.
+         * Hooks are per-thread in Lua 5.4 and not inherited by lua_newthread, so
+         * arm every pool thread here — after dap_enabled is set (so the mask is
+         * non-empty) and on every rebuild (hl_wire_hybrid recreates the pool). */
+        for (int i = 0; i < HL_EXCH_POOL_DEPTH; i++)
+            if (hl->exch_pool[i])
+                fc_consolelua_master_hook_install(hl->exch_pool[i]);
+    }
+#endif
+
+    /* Build the driver's BOOT coroutine (#242) — before the baseline, so the
+     * coroutine thread and the boot chunk's interned strings are scaffolding, not
+     * cart-attributable.  The frame chunk is deliberately NOT compiled here: it is
+     * built at the boot→running transition (hl_boot), i.e. AFTER the baseline, so
+     * its strings ARE counted.  That split is not arbitrary — it is the shared
+     * driver's one definition of what counts, applied identically on every leg. */
+    if (hl_make_co(hl, reload_boot ? BLYT_HOSTLUA_CO_BODY_RELOAD_INIT
+                                   : BLYT_HOSTLUA_CO_BODY_INIT) != 0) {
+        hl_close_vm(hl);
+        return -1;
+    }
+
+    /* Capture the runtime-scaffolding baseline (#231): everything allocated up to
+     * here — the VM, stdlibs, blyt/blyt32 API, S proxy, the loaded cart bytecode
+     * and the driver's boot coroutine — is runtime overhead. Excluding it makes
+     * guest_heap_used / cart_allocations and the 16 MB fail-point count only the
+     * cart's own runtime allocations, so they are byte-identical across legs.
+     * Re-captured on every (re)build.
+     *
+     * Every host-Lua leg builds this scaffolding the same way by construction:
+     * the same shared driver (blyt_hostlua_driver.h, #242) and the same shared
+     * API registration in one canonical order (blyt_hostlua_api.h, #267). The old
+     * native-vs-wasm asymmetries are gone.
+     *
+     * Note what "the same" has to mean here, because #267 found it the hard way:
+     * subtracting a baseline removes the scaffolding's BYTES but not its LAYOUT.
+     * The arena is first-fit and charges a recycled block whole when the
+     * remainder cannot be split, so scaffolding built in a different ORDER — or
+     * swept at different points by a differently-paced GC — leaves a different
+     * free list, and the cart's own later allocations get charged against it
+     * differently. Hence both the shared registration here and the rv32 pins on
+     * the fork's GC pacing constants; the baseline alone was never enough.
+     *
+     * Collect first (#231): the baseline must be the *settled* scaffolding
+     * footprint, not a snapshot that still holds build-time transient garbage; any
+     * uncollected remainder biases the subtraction. A full collection here pins the
+     * baseline to the reachable scaffolding, so guest_heap_used − baseline is the
+     * byte-identical cart-attributable heap. */
+    lua_gc(hl->L, LUA_GCCOLLECT);
+    hl->mem_acct.guest_heap_baseline = hl->mem_acct.guest_heap_used;
+
+    /* Seed the unified-budget coupling before the freshly built VM's init() runs
+     * (#278 at frame 0; #280 on every rebuild).  The #250 coupling otherwise
+     * fires only at trampoline points, so a hybrid's init() would allocate
+     * against the full 16 MB and ignore its own persistent reservation until the
+     * first native call — diverging from bare metal, which reserves persistent
+     * from frame 0 (ADR-0028).
+     *
+     * Doing it HERE rather than in hl_new covers every path that rebuilds a VM —
+     * the reset-every-frame cycle and hot reload (hl_rebuild_and_restore) and the
+     * DAP restart — not just the initial load.  The rebuild paths reset the arena
+     * beforehand, which zeroes guest_heap_used but NOT non_evictable_footprint,
+     * so this leg happened to retain a stale-but-plausible reservation across a
+     * rebuild; that was luck, not design (the WASM leg clears the footprint on
+     * arena reset and so lost it outright, #280).  Re-publishing both directions
+     * here makes the reservation explicit and current on every leg and path.
+     * Guarded on hl->session inside, so a no-op for a pure-Lua cart. */
+    hl_budget_enter_native(hl);
+    hl_budget_leave_native(hl);
+    return 0;
+}
+
+/* Allocate a runner and build its VM (resources + palette + state ctx + VM),
+ * but do NOT run the init() boot — the caller decides when (immediately for a
+ * plain run, or after the debug gates for a debug session).  `dap_enabled` arms
+ * the DAP master hook inside build_vm (#234).  `debug` defers the boot so the
+ * frontend can gate on every active debugger before init() runs (#234/#251) — a
+ * GDB-only hybrid passes dap_enabled=false, debug=true.  Returns the runner (VM
+ * live, uninitialised) or NULL on failure. */
+static blyt_hostlua_t *hl_new(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap_enabled, bool debug) {
+    if (!cart)
+        return NULL;
+
+    size_t lua_size = 0;
+    const void *bytecode = blyt_cart_find_section(cart, ".cart.lua", &lua_size);
+    if (!bytecode || !lua_size)
+        return NULL;
+
+    blyt_hostlua_t *hl = calloc(1, sizeof(*hl));
+    if (!hl)
+        return NULL;
+    hl->log_fn = log_fn;
+    hl->cart = cart;
+    hl->bytecode = (const unsigned char *)bytecode;
+    hl->bytecode_size = lua_size;
+    hl->dap_enabled = dap_enabled; /* build_vm arms the master hook when set (#234) */
+    hl->debug = debug; /* boot deferred to the frontend's debug gate (#234/#251) */
+    for (int i = 0; i < HL_EXCH_POOL_DEPTH; i++)
+        hl->exch_pool_ref[i] = LUA_NOREF; /* calloc's 0 is a VALID ref, not "unset" */
+    hl->co_ref = LUA_NOREF; /* calloc's 0 is a VALID registry ref, not "unset" */
+
+    /* Hybrid (#232): a cart has a native C/Rust half if it exports Lua-callable
+     * functions (.lua_exports) OR defines native lifecycle callbacks
+     * (blyt_cart_update etc. in its own code — #232 S4).  Create the rv32 session
+     * that runs it — in bridge mode, so it links the bridge stub
+     * (libblyt32lua-bridge.so) and its Lua C API calls trap to this host VM.  The
+     * session persists across VM rebuilds; build_vm re-attaches the exchange
+     * thread, re-installs the export trampolines, and re-injects the native
+     * lifecycle globals each rebuild.  Created BEFORE the resource table (#276):
+     * a hybrid's ONE cart-facing table is the session's ctx.resources (which
+     * blyt_session_create_lua_bridge already loads + persistent-preloads), so the
+     * runner never mirrors it — hl_active_resources resolves it from the session. */
+    if (blyt_hostlua_cart_has_native_half(cart)) {
+        hl->session = blyt_session_create_lua_bridge(cart, log_fn);
+        if (!hl->session) {
+            if (log_fn)
+                log_fn("blyt-hostlua: hybrid session create failed");
+            free(hl);
+            return NULL;
+        }
+    }
+
+    /* Resource table (#93/#158/#231/#276): only a session-less pure-Lua cart owns
+     * a runner table (the session-less mirror of the WASM leg's g_lua_resources).
+     * A hybrid uses the session's ctx.resources, loaded once by the session above
+     * — never double-loaded here, which would also double-count the resource
+     * footprint against the unified 16 MB budget (#250).  Must precede the palette
+     * seed below, which may resolve a cart-provenance declared default (#214)
+     * against whichever table hl_active_resources returns. */
+    if (!hl->session) {
+        blyt_resource_table_init(&hl->resources);
+        blyt_resource_table_load_for_cart(&hl->resources, cart);
+        blyt_resource_table_load_persistent_from_cart(&hl->resources, cart);
+        if (blyt_resource_table_preload_persistent(&hl->resources) != 0) {
+            if (log_fn)
+                log_fn("blyt-hostlua: persistent resource preload failed");
+            blyt_resource_table_clear(&hl->resources);
+            free(hl);
+            return NULL;
+        }
+        hl->resources_loaded = true;
+        hl_publish_footprint(hl, &hl->resources);
+    }
+
+    hl_palette_ensure_default(hl); /* built-in or cart-asset declared default (#214) */
+
+    /* State buffers: a pure-Lua cart with .cart.layouts gets a standalone ctx
+     * (no session/emulator).  Initialised once here; the VM built below registers
+     * the blyt.buf.* + save API and the generated S proxy against it.  A hybrid
+     * cart instead shares its session's state ctx (wired in #232 S3), so it does
+     * not build a standalone one here. */
+    if (!hl->session && blyt_cart_has_layouts(cart)) {
+        hl->state_ctx = malloc(sizeof(*hl->state_ctx));
+        if (!hl->state_ctx || blyt_state_ctx_init(cart, hl->state_ctx) < 0) {
+            if (log_fn)
+                log_fn("blyt-hostlua: state ctx init failed");
+            else
+                fprintf(stderr, "blyt-hostlua: state ctx init failed\n");
+            free(hl->state_ctx);
+            free(hl);
+            return NULL;
+        }
+        const char *save_dir = getenv("BLYT_SAVE_DIR");
+        if (save_dir)
+            hl->save_dir = strdup(save_dir);
+        /* The manifest id names the save subdirectory (validated ≤63 bytes). */
+        snprintf(hl->cart_name, sizeof(hl->cart_name), "%s", blyt_cart_id(cart));
+    }
+
+    if (build_vm(hl, false) != 0) {
+        if (hl->session)
+            blyt_session_destroy(hl->session);
+        if (hl->state_ctx) {
+            blyt_state_ctx_destroy(hl->state_ctx);
+            free(hl->state_ctx);
+        }
+        if (hl->resources_loaded)
+            blyt_resource_table_clear(&hl->resources);
+        free(hl->save_dir);
+        free(hl);
+        return NULL;
+    }
+
+    /* The frame-0 budget seed (#278) now lives at the tail of build_vm, which
+     * runs it on the initial load AND on every rebuild (#280). */
+    return hl;
+}
+
+blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
+    blyt_hostlua_t *hl = hl_new(cart, log_fn, false, false);
+    if (!hl)
+        return NULL;
+
+    /* Boot phase of the guest blyt_main loop: init() then on_new_state(), run
+     * inside the shared driver's boot coroutine (#242).  A Lua error in either is
+     * REPORTED (bare, by the pcall in __blyt_call) and the cart still boots —
+     * matching the guest's blyt_cart_init, which calls call_global("init") and
+     * ignores its result, leaving the main loop to run update()/draw() (#258).
+     * Neither aborts the cart. */
+    if (hl_boot(hl) != 0) {
+        blyt_hostlua_destroy(hl);
+        return NULL;
+    }
+    hl->booted = true;
+    return hl;
+}
+
+blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap) {
+#if defined(BLYT_DAP) || defined(BLYT_GDB)
+    /* Build the VM (arming the DAP master hook iff `dap`) but DEFER init()/on_new_state()
+     * so the frontend can gate on every active debugger before it runs (#234/#251):
+     * the Lua-half DAP configurationDone and/or the native-half GDB attach+continue.
+     * A GDB-only hybrid passes dap=false — no DAP hook/server — and the boot is still
+     * withheld until blyt_hostlua_dap_wait_ready runs it after the GDB gate. */
+    return hl_new(cart, log_fn, dap, true);
+#else
+    (void)cart;
+    (void)log_fn;
+    (void)dap;
+    return NULL;
+#endif
+}
+
+blyt_session_t *blyt_hostlua_session(blyt_hostlua_t *hl) {
+    return hl ? hl->session : NULL;
+}
+
+int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port) {
+#ifdef BLYT_DAP
+    if (!hl || !hl->dap_enabled)
+        return -1;
+    int p = fc_hostlua_dap_listen(0); /* OS-assigned, mirroring the emulated path */
+    if (p < 0)
+        return -1;
+    if (actual_port)
+        *actual_port = p;
+    return 0;
+#else
+    (void)hl;
+    (void)actual_port;
+    return -1;
+#endif
+}
+
+int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
+    if (!hl || !hl->debug)
+        return 0;
+#ifdef BLYT_DAP
+    /* DAP session: block until the client sends configurationDone (breakpoints set)
+     * before booting, so an init() breakpoint fires.  A GDB-only hybrid session
+     * (dap_enabled false) skips this — the frontend has already gated on the native
+     * GDB client's attach+continue, so its breakpoints are armed too. */
+    if (hl->dap_enabled && !fc_hostlua_dap_wait_ready())
+        return 0; /* server shut down before configurationDone */
+#endif
+    /* Run the deferred boot (under the armed hook, if any) so a breakpoint in init()
+     * — Lua-half (DAP) or native-half (GDB) — pauses before the cart proceeds. */
+    if (!hl->booted) {
+        if (hl_boot(hl) != 0)
+            return 0;
+        hl->booted = true;
+    }
+    return 1;
+}
+
+int blyt_hostlua_dap_restart(blyt_hostlua_t *hl) {
+#ifdef BLYT_DAP
+    if (!hl || !hl->dap_enabled)
+        return -1;
+
+    /* DAP restart (#257): re-launch the cart from scratch — the host-Lua analog
+     * of retro_reset on the emulated restart path.  Tear the VM down and rebuild
+     * it fresh (no state preserved: a restart is a re-run, not a hot reload), then
+     * defer init() to the next wait_ready so a breakpoint in init() fires after
+     * the client re-sends configurationDone.  build_vm re-arms the master hook. */
+    hl_close_vm(hl);
+    if (hl->arena.base)
+        blyt_arena_reset(&hl->arena);
+    /* A restart is a fresh re-run, so the full boot chunk (init + on_new_state) —
+     * unlike the reload/reset rebuild, which preserves state and runs init() only. */
+    if (build_vm(hl, false) != 0) {
+        hl->done = true;
+        return -1;
+    }
+    /* Fresh launch: zero the state buffers so the restarted cart sees them as it
+     * would on a first boot (the state ctx persists across VM rebuilds, so it
+     * must be explicitly re-zeroed here — unlike the reload/reset cycle, no
+     * snapshot is restored over them). */
+    blyt_state_ctx_t *sctx = hl_active_ctx(hl);
+    if (sctx)
+        blyt_state_ctx_zero_data(sctx);
+
+    hl->booted = false;
+    hl->done = false;
+    hl->quit = 0;
+    return 0;
+#else
+    (void)hl;
+    return -1;
+#endif
+}
+
+/* Shared tail of the reset-every-frame cycle and the hot reload (#244): tear the
+ * VM down, rebuild it from hl->bytecode (re-arming the DAP master hook), re-run
+ * init(), then restore `snap` over the fresh buffers and replay
+ * on_load_state(HOT_RELOAD).  Consumes `snap` (freed here).  On rebuild failure
+ * the runner is marked done and false is returned; true on success. */
+static bool hl_rebuild_and_restore(blyt_hostlua_t *hl, blyt_state_snapshot_t *snap) {
+    /* Tear down the VM and rebuild it (all Lua globals wiped — the host-Lua
+     * equivalent of zeroing guest BSS; build_vm re-arms the DAP hook, #234). */
+    hl_close_vm(hl);
+    /* Empty the cart heap so the reloaded VM's allocations are bit-identical to a
+     * first load (mirrors the WASM leg's wasm_lua_arena_reset).  lua_close already
+     * frees the old VM's objects through the allocator; this zeroes any residual
+     * accounting so guest_heap_used restarts from 0. */
+    if (hl->arena.base)
+        blyt_arena_reset(&hl->arena);
+    /* reload_boot: the rebuilt VM runs init() ONLY — a reload/reset PRESERVES
+     * state, so on_new_state() must not fire; the restore + on_load_state tail
+     * below is what re-seeds the cart (#242 routes this through the shared
+     * driver's reload boot chunk). */
+    if (build_vm(hl, true) != 0) {
+        /* Rebuild failed: the runner is unusable; mark done so run_frame stops. */
+        if (snap)
+            blyt_state_snapshot_free(snap);
+        hl->done = true;
+        return false;
+    }
+
+    /* Re-run init() on the fresh VM inside the driver's boot coroutine (under the
+     * re-armed hook, an init() breakpoint pauses here — the reload-while-debug
+     * re-fire, #244), then swap the driver to the frame chunk. */
+    if (hl_boot(hl) != 0) {
+        if (snap)
+            blyt_state_snapshot_free(snap);
+        hl->done = true;
+        return false;
+    }
+
+    /* Restore state buffers + notify the cart (BLYT_LOAD_HOT_RELOAD = 3). */
+    if (snap) {
+        blyt_state_ctx_restore_snapshot(hl_active_ctx(hl), snap);
+        blyt_state_snapshot_free(snap);
+    }
+    lua_getglobal(hl->L, "on_load_state");
+    if (lua_isfunction(hl->L, -1)) {
+        lua_newtable(hl->L);
+        lua_pushinteger(hl->L, 3); /* BLYT_LOAD_HOT_RELOAD */
+        lua_setfield(hl->L, -2, "reason");
+        lua_pushinteger(hl->L, 0);
+        lua_setfield(hl->L, -2, "saved_cart_version");
+        lua_pcall(hl->L, 1, 0, 0);
+    } else {
+        lua_pop(hl->L, 1);
+    }
+    return true;
+}
+
+void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
+    if (!hl || hl->done)
+        return;
+
+    /* Mirror the WASM leg's wasm_lua_reset_cycle (full VM rebuild preserving
+     * state): flush transient state → snapshot buffers → zero buffers → tear the
+     * VM down and rebuild it → init() → restore buffers → on_load_state(HOT_RELOAD).
+     * The emulated leg reaches the same observable state by zeroing guest BSS
+     * instead of recreating the VM; the cart-visible round-trip is identical, and
+     * asserting the same output here as a plain run is the determinism stress. */
+
+    /* 1. Ask the cart to flush any transient state into state buffers. */
+    call_lifecycle(hl, hl->L, "on_save_state");
+
+    /* 2. Snapshot + 3. zero state buffers (no-ops when the cart has no buffers,
+     * where the cycle is just a VM rebuild). */
+    blyt_state_snapshot_t *snap = NULL;
+    blyt_state_ctx_t *sctx = hl_active_ctx(hl);
+    if (sctx) {
+        snap = blyt_state_ctx_snapshot(sctx);
+        blyt_state_ctx_zero_data(sctx);
+    }
+
+    /* 3b. Hybrid (#261): zero the persisting rv32 session's guest BSS — the native
+     * half's static/global state — in lockstep with the Lua VM rebuild below.  The
+     * emulated leg zeroes ALL guest BSS at this step (blyt_session_zero_guest_bss)
+     * and re-runs init(); the Lua VM tear-down/rebuild is the host-Lua equivalent
+     * for the Lua half, but the native half lives in the session, which persists
+     * across the rebuild, so it must be zeroed explicitly here.  Done AFTER the
+     * snapshot (so on_save_state saw a coherent image) and BEFORE hl_rebuild_and_
+     * restore, whose hl_boot re-runs init() — which drives the native init through
+     * the trampoline when it is the injected `init`, re-priming the just-zeroed BSS
+     * exactly as the emulated leg does.  No session PC/reg save-restore is needed:
+     * unlike the emulated game loop, the native half is only ever driven call-by-
+     * call via trampolines and is always at rest between frames. */
+    if (hl->session)
+        blyt_session_zero_guest_bss(hl->session);
+
+    /* 4–6. Rebuild from the SAME bytecode, restore, notify. */
+    hl_rebuild_and_restore(hl, snap);
+}
+
+bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart, uint32_t load_base,
+                         const char *reported_path, bool fire_solib) {
+    if (!hl || hl->done || !new_cart)
+        return false;
+
+    /* Validate the new image BEFORE disturbing the live VM: a cart without a
+     * .cart.lua section can't run on this path, so keep the old VM running and
+     * let the caller keep the old cart (mirrors reload_impl's pre-swap open). */
+    size_t lua_size = 0;
+    const void *bytecode = blyt_cart_find_section(new_cart, ".cart.lua", &lua_size);
+    if (!bytecode || !lua_size)
+        return false;
+
+    /* Snapshot live state from the CURRENT VM first.  on_save_state runs in the
+     * OLD Lua VM — and, for a hybrid, drives the OLD native half — BEFORE any
+     * swap, so it sees a coherent old image (the same order as the reset cycle and
+     * the WASM pure-Lua reload).  Must precede blyt_session_swap_cart below, which
+     * destroys+re-inits the (session-owned) state ctx. */
+    call_lifecycle(hl, hl->L, "on_save_state");
+    blyt_state_ctx_t *sctx = hl_active_ctx(hl);
+    blyt_state_snapshot_t *snap = sctx ? blyt_state_ctx_snapshot(sctx) : NULL;
+
+    /* Hybrid (#251): swap the native rv32 half FIRST, so the Lua VM rebuild below
+     * re-wires the bridge + native-lifecycle trampolines (in build_vm) against the
+     * NEW native image.  blyt_session_swap_cart is atomic on failure — it fails
+     * before overwriting anything — so a bad native image leaves the old session
+     * (and this VM) running: restore the just-taken snapshot over the untouched
+     * buffers and refuse, no silent half-reload.  The swap also destroys+re-inits
+     * the session state ctx fresh from new_cart and reloads the session's own
+     * (native-facing) resource table, which is why the snapshot is taken above. */
+    if (hl->session) {
+        if (!blyt_session_swap_cart(hl->session, new_cart, load_base, reported_path)) {
+            if (hl->log_fn)
+                hl->log_fn("blyt-hostlua: hybrid reload failed to swap the native half; "
+                           "keeping the current cart");
+            if (snap) {
+                blyt_state_ctx_restore_snapshot(sctx, snap);
+                blyt_state_snapshot_free(snap);
+            }
+            return false;
+        }
+    } else if (sctx) {
+        /* Pure-Lua: no session to swap.  The standalone ctx persists across the
+         * rebuild, so zero it now for a fresh-load-identical restore target (a
+         * hybrid ctx was just re-init fresh by the swap, so this only applies
+         * here). */
+        blyt_state_ctx_zero_data(sctx);
+    }
+
+    /* Re-point the runner's OWN (Lua-facing) resource table + cart/bytecode at
+     * new_cart.  Resource-table entries alias the cart map zero-copy (resource.c),
+     * so it must happen while the old cart is still valid — the caller closes it
+     * only after we return.  For a hybrid the session's NATIVE-facing resources
+     * were already reloaded inside swap_cart; this is the host-side Lua mirror.
+     * Re-seed the default palette from the new cart's assets too (the new init()
+     * may still override it). */
+    if (hl->resources_loaded) {
+        blyt_resource_table_clear(&hl->resources);
+        blyt_resource_table_load_for_cart(&hl->resources, new_cart);
+        blyt_resource_table_load_persistent_from_cart(&hl->resources, new_cart);
+        if (blyt_resource_table_preload_persistent(&hl->resources) != 0 && hl->log_fn)
+            hl->log_fn("blyt-hostlua: reload persistent resource preload failed");
+        hl_publish_footprint(hl, &hl->resources);
+    }
+    hl->cart = new_cart;
+    hl->bytecode = (const unsigned char *)bytecode;
+    hl->bytecode_size = lua_size;
+    hl_palette_ensure_default(hl);
+
+#ifdef BLYT_GDB
+    /* Debug reload (#251/#119): rebind the native GDB/lldb view to the swapped
+     * image's DWARF BEFORE the rebuilt init() runs — the reload-time equivalent of
+     * the startup native-breakpoint-armed-before-init() gate, so a breakpoint in a
+     * native lifecycle/export fires on the reloaded run.  No-op without an attached
+     * GDB client or for a pure-Lua runner (no session).  The Lua half's
+     * source-level DAP breakpoints persist host-side and re-arm on the VM rebuild
+     * inside build_vm. */
+    if (fire_solib && hl->session)
+        blyt_session_gdb_notify_cart_reloaded(hl->session, new_cart, load_base, reported_path);
+#else
+    (void)fire_solib;
+#endif
+
+    /* Rebuild the Lua VM from the NEW bytecode (re-wiring the bridge + native
+     * lifecycle against the swapped session for a hybrid), re-run init(), restore
+     * the snapshot, replay on_load_state(HOT_RELOAD). */
+    return hl_rebuild_and_restore(hl, snap);
+}
+
+/* Dev-mode asset hot-swap (issue #118/#122) for the native host-Lua path — the
+ * session-less mirror of blyt_session_reload_resources + notify_assets_reloaded.
+ * Unlike a code reload it does NOT rebuild the VM: it re-reads the resource table
+ * (picking up edited bytes from the dev staging dir, BLYT_RESOURCE_DIR) and then
+ * fires the cart's optional Lua `on_assets_reloaded(ids)` global with the changed
+ * ids — exactly what the WASM host-Lua leg does (wasm_main.c).  Returns false if
+ * the resource reload fails. */
+bool blyt_hostlua_update_assets(blyt_hostlua_t *hl, blyt_cart_t *cart, const uint32_t *ids,
+                                size_t n) {
+    if (!hl || hl->done || !cart)
+        return false;
+
+    /* Re-read the resource table from the (edited) cart — the same clear+reload
+     * the hot reload uses, but the live VM is left running.  load_for_cart clears
+     * first, so this both drops superseded entries and re-reads the current ones. */
+    if (hl->resources_loaded) {
+        blyt_resource_table_clear(&hl->resources);
+        blyt_resource_table_load_for_cart(&hl->resources, cart);
+        blyt_resource_table_load_persistent_from_cart(&hl->resources, cart);
+        if (blyt_resource_table_preload_persistent(&hl->resources) != 0) {
+            if (hl->log_fn)
+                hl->log_fn("blyt-hostlua: update_assets persistent preload failed");
+            return false;
+        }
+        hl_publish_footprint(hl, &hl->resources);
+    }
+    /* A hybrid opted into host-Lua also keeps its native half's resources in the
+     * rv32 session; reload those too so a native re-read sees the new bytes. */
+    if (hl->session)
+        blyt_session_reload_resources(hl->session, cart);
+
+    /* Fire the cart's on_assets_reloaded(ids): a 1-based Lua array of the changed
+     * ids, the same shape the guest libblyt32lua builds for the emulated path. */
+    lua_State *L = hl->L;
+    if (L) {
+        lua_getglobal(L, "on_assets_reloaded");
+        if (lua_isfunction(L, -1)) {
+            lua_createtable(L, (int)n, 0);
+            for (size_t i = 0; i < n; i++) {
+                lua_pushinteger(L, (lua_Integer)ids[i]);
+                lua_seti(L, -2, (lua_Integer)(i + 1));
+            }
+            if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+                if (hl->log_fn)
+                    hl->log_fn(lua_tostring(L, -1));
+                lua_pop(L, 1);
+            }
+        } else {
+            lua_pop(L, 1);
+        }
+    }
+    return true;
+}
+
+/* Host-initiated save to a disk slot (dev-control `save_state`) — the session-less
+ * mirror of blyt_session_save_state.  Flushes transient state via on_save_state,
+ * then serialises the state buffers to disk (the same path the cart's
+ * blyt.save_write drives, l_save_write).  Returns 0 on success. */
+int blyt_hostlua_save_state(blyt_hostlua_t *hl, uint32_t slot) {
+    if (!hl || !hl->L)
+        return -1;
+    lua_getglobal(hl->L, "on_save_state");
+    if (lua_isfunction(hl->L, -1))
+        lua_pcall(hl->L, 0, 0, 0);
+    else
+        lua_pop(hl->L, 1);
+    blyt_state_ctx_t *ctx = hl_active_ctx(hl);
+    if (!ctx)
+        return -1;
+    return blyt_save_write(ctx, hl_active_save_dir(hl), hl_active_cart_name(hl), slot,
+                           blyt_cart_save_version(hl->cart));
+}
+
+/* Host-initiated load from a disk slot (dev-control `load_state`) — the
+ * session-less mirror of blyt_session_load_state.  Reads the slot, then notifies
+ * the cart's on_load_state(reason=SAVE_GAME, version) with the writer's version
+ * from the save header.  Returns 0 on success (BLYT_RUN_OK). */
+int blyt_hostlua_load_state(blyt_hostlua_t *hl, uint32_t slot) {
+    if (!hl || !hl->L)
+        return -1;
+    blyt_state_ctx_t *ctx = hl_active_ctx(hl);
+    if (!ctx)
+        return -1;
+    uint32_t saved_version = 0;
+    int r =
+        blyt_save_read(ctx, hl_active_save_dir(hl), hl_active_cart_name(hl), slot, &saved_version);
+    if (r != 0)
+        return r;
+    lua_getglobal(hl->L, "on_load_state");
+    if (lua_isfunction(hl->L, -1)) {
+        lua_newtable(hl->L);
+        lua_pushinteger(hl->L, 0); /* reason=BLYT_LOAD_SAVE_GAME */
+        lua_setfield(hl->L, -2, "reason");
+        lua_pushinteger(hl->L, (lua_Integer)saved_version);
+        lua_setfield(hl->L, -2, "saved_cart_version");
+        lua_pcall(hl->L, 1, 0, 0);
+    } else {
+        lua_pop(hl->L, 1);
+    }
+    return 0;
+}
+
+blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
+    if (!hl)
+        return BLYT_RUN_ERR_EMU;
+    if (hl->done)
+        return BLYT_RUN_OK;
+
+#ifdef BLYT_DAP
+    /* DAP restart (#257): a `restart` request set the pending flag while paused;
+     * return BLYT_RUN_RESTART so the frontend rebuilds the VM and re-waits for
+     * configurationDone (the native analog of the emulated path's
+     * BLYT_RUN_RESTART → retro_reset + blyt_session_dap_reattach).  Checked before
+     * running the frame so no stale update()/draw() runs against the VM being
+     * torn down. */
+    if (hl->dap_enabled && fc_hostlua_dap_restart_pending())
+        return BLYT_RUN_RESTART;
+#endif
+
+    if (!hl->co || !hl->running_co)
+        return BLYT_RUN_ERR_EMU; /* not booted — the frontend must boot first */
+
+    /* Frame entry (mirrors blyt_session_run_frame): bump the tier-2 lock epoch so
+     * any lock from the previous frame is now stale, and reap the previous
+     * frame's draw-scoped off-screen surfaces. */
+    hl->lock_epoch++;
+#ifdef BLYT_HOSTLUA_PIXEL_BENCH
+    /* Keep the VM's process-global epoch in step with this VM's (#208 bench). */
+    blyt_lua_lock_epoch = hl->lock_epoch;
+    hl_fp_screen = NULL;
+#endif
+    hl_surf_reap(hl);
+
+    /* Resume the shared driver's frame chunk (#242): ONE resume == ONE frame, the
+     * coroutine.yield() at the bottom of the loop being the frame boundary.  The
+     * chunk owns the phase brackets, the update/draw dispatch and the quit test,
+     * so this leg and the wasm leg execute the cart through the identical
+     * allocation sequence.
+     *
+     * Quit ordering is the chunk's `while not blyt.should_quit()`, tested only at
+     * the top — so a quit requested during update() still runs THIS frame's
+     * draw(), mirroring blyt_main's `while (!g_quit_requested)`.  on_quit() +
+     * cleanup() run in the chunk's tail, after which the resume returns LUA_OK.
+     *
+     * A Lua error in update()/draw() is PRINTED and NON-FATAL: __blyt_call pcalls
+     * each callback, so the error never unwinds this coroutine and the next frame
+     * still runs — byte-for-byte the emulated guest's per-frame `call_global`
+     * (blyt32lua.c), which blyt_console_debugs the error and returns.  A resume
+     * error here therefore means the DRIVER failed, not the cart. */
+    int nres = 0;
+    int st = lua_resume(hl->co, NULL, 0, &nres);
+
+    if (st == LUA_OK) {
+        /* The loop exited and on_quit()/cleanup() have run — the cart is done. */
+        hl->done = true;
+        return BLYT_RUN_OK;
+    }
+    if (st != LUA_YIELD) {
+        const char *msg = lua_tostring(hl->co, -1);
+        if (hl->log_fn)
+            hl->log_fn(msg ? msg : "(driver frame failed)");
+        lua_settop(hl->co, 0);
+        hl->done = true;
+        return BLYT_RUN_ERR_ABORT;
+    }
+    lua_settop(hl->co, 0); /* discard yielded values — the normal frame yield */
+
+    /* A native lifecycle callback may have latched a quit through the trampoline
+     * loop; also poll the session directly so a quit requested by the emulated
+     * half ends the loop on the next frame (mirrors blyt_main's post-frame check). */
+    if (hl->session && !hl->quit && blyt_session_check_guest_quit(hl->session))
+        hl->quit = 1;
+
+    hl_frame_done(hl);
+    return BLYT_RUN_FRAME_DONE;
+}
+
+/* Read-only accessors the frontend uses to present the host-Lua framebuffer
+ * (there is no session, so retro_run cannot go through blyt_session_expand_frame
+ * — it expands these directly into its XRGB buffer). */
+/* Presentation reads the SAME buffers the cart drew into — the session's for a
+ * hybrid, the runner's own for a pure-Lua cart (#193, hl_gfx_fb). */
+const uint8_t *blyt_hostlua_get_pixels(blyt_hostlua_t *hl) {
+    return hl ? hl_gfx_fb(hl) : NULL;
+}
+const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl) {
+    return hl ? hl_gfx_palette(hl) : NULL;
+}
+
+void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
+    if (!hl)
+        return;
+#ifdef BLYT_DAP
+    if (hl->dap_enabled)
+        fc_hostlua_dap_shutdown();
+#endif
+    if (hl->L)
+        lua_close(hl->L); /* frees the exchange thread with the registry */
+    /* Tear down the emulated native half (#232 hybrid). */
+    if (hl->session)
+        blyt_session_destroy(hl->session);
+    /* Free any off-screen surface buffers still resident (slot 0 = screen aliases
+     * fb, never freed).  free(NULL) is a no-op for unused slots. */
+    for (uint32_t i = 1; i < HL_SURFACE_MAX; i++)
+        free(hl->surf[i].pixels);
+    free(hl->arena.base); /* the 16 MB cart-heap region (#158) */
+    if (hl->resources_loaded)
+        blyt_resource_table_clear(&hl->resources);
+    if (hl->state_ctx) {
+        blyt_state_ctx_destroy(hl->state_ctx);
+        free(hl->state_ctx);
+    }
+    free(hl->save_dir);
+    free(hl);
+}
+
+/* Dispatch predicate (ADR-0136 end-state).  On a non-RISC-V host, host-Lua is THE
+ * shipped execution path for every Lua-bearing cart — pure-Lua or hybrid, run or
+ * debug.  The emulated RV32 Lua VM is retired as a shipped path there, and the
+ * transitional `BLYT_HOSTLUA` opt-in that used to select between the two models is
+ * gone: there is nothing left to select.
+ *
+ * How the end-state was reached: #236 flipped pure-Lua RUN, #257 brought the native
+ * host-Lua DAP to parity (restart / exception breakpoints / loadedSources /
+ * source-map / multifile / evaluate-upvalue) and flipped pure-Lua DEBUG, and #251
+ * wired native-half GDB + coordinated hot-reload so a HYBRID no longer needs the
+ * emulated session to debug the half that rv32emu still runs.
+ *
+ * A hybrid is NOT special-cased here.  Its Lua half runs in this VM and its native
+ * half keeps running under rv32emu in a bridge-mode session (ADR-0130) that the
+ * runner owns — see blyt_hostlua_cart_has_native_half, the single source of truth
+ * for whether that session exists.
+ *
+ * A pure-native cart (no .cart.lua) returns false and keeps the rv32 session path.
+ *
+ * The compile gate BLYT_HOSTLUA_EXEC lives only in this TU: on real RISC-V hardware
+ * it is absent and the #else stub returns false, so carts run native RV32 with no
+ * host check needed here — which is also why the RV32 Lua build (libblyt32lua.so)
+ * remains live, and why its parity coverage is the QEMU native gate. */
+bool blyt_hostlua_cart_has_native_half(const blyt_cart_t *cart) {
+    if (!cart)
+        return false;
+    return blyt_cart_find_section(cart, ".lua_exports", NULL) != NULL ||
+           blyt_cart_has_native_lifecycle(cart);
+}
+
+bool blyt_hostlua_should_use(const blyt_cart_t *cart) {
+    if (!cart)
+        return false;
+    if (!blyt_cart_find_section(cart, ".cart.lua", NULL))
+        return false;
+    return true; /* any Lua-bearing cart, pure or hybrid, run or debug */
+}
+
+#else /* !BLYT_HOSTLUA_EXEC — seam VM absent; the frontend falls back to rv32. */
+
+bool blyt_hostlua_available(void) {
+    return false;
+}
+
+bool blyt_hostlua_should_use(const blyt_cart_t *cart) {
+    (void)cart;
+    return false;
+}
+
+bool blyt_hostlua_cart_has_native_half(const blyt_cart_t *cart) {
+    (void)cart;
+    return false;
+}
+
+blyt_hostlua_t *blyt_hostlua_create(blyt_cart_t *cart, blyt_log_fn log_fn) {
+    (void)cart;
+    (void)log_fn;
+    return NULL;
+}
+
+blyt_hostlua_t *blyt_hostlua_create_debug(blyt_cart_t *cart, blyt_log_fn log_fn, bool dap) {
+    (void)cart;
+    (void)log_fn;
+    (void)dap;
+    return NULL;
+}
+
+blyt_session_t *blyt_hostlua_session(blyt_hostlua_t *hl) {
+    (void)hl;
+    return NULL;
+}
+
+int blyt_hostlua_dap_listen(blyt_hostlua_t *hl, int *actual_port) {
+    (void)hl;
+    (void)actual_port;
+    return -1;
+}
+
+int blyt_hostlua_dap_wait_ready(blyt_hostlua_t *hl) {
+    (void)hl;
+    return 0;
+}
+
+int blyt_hostlua_dap_restart(blyt_hostlua_t *hl) {
+    (void)hl;
+    return -1;
+}
+
+blyt_cart_run_err_t blyt_hostlua_run_frame(blyt_hostlua_t *hl) {
+    (void)hl;
+    return BLYT_RUN_ERR_EMU;
+}
+
+const uint8_t *blyt_hostlua_get_pixels(blyt_hostlua_t *hl) {
+    (void)hl;
+    return NULL;
+}
+
+const uint32_t *blyt_hostlua_get_palette(blyt_hostlua_t *hl) {
+    (void)hl;
+    return NULL;
+}
+
+void blyt_hostlua_reset_every_frame_cycle(blyt_hostlua_t *hl) {
+    (void)hl;
+}
+
+bool blyt_hostlua_reload(blyt_hostlua_t *hl, blyt_cart_t *new_cart, uint32_t load_base,
+                         const char *reported_path, bool fire_solib) {
+    (void)hl;
+    (void)new_cart;
+    (void)load_base;
+    (void)reported_path;
+    (void)fire_solib;
+    return false;
+}
+
+bool blyt_hostlua_update_assets(blyt_hostlua_t *hl, blyt_cart_t *cart, const uint32_t *ids,
+                                size_t n) {
+    (void)hl;
+    (void)cart;
+    (void)ids;
+    (void)n;
+    return false;
+}
+
+int blyt_hostlua_save_state(blyt_hostlua_t *hl, uint32_t slot) {
+    (void)hl;
+    (void)slot;
+    return -1;
+}
+
+int blyt_hostlua_load_state(blyt_hostlua_t *hl, uint32_t slot) {
+    (void)hl;
+    (void)slot;
+    return -1;
+}
+
+void blyt_hostlua_destroy(blyt_hostlua_t *hl) {
+    (void)hl;
+}
+
+#endif /* BLYT_HOSTLUA_EXEC */

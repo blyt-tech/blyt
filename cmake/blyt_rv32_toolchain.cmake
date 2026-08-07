@@ -6,7 +6,8 @@
 # arguments from the sdk target).
 #
 # Sets (empty string when unavailable): BLYT_RV32_CLANG / BLYT_RV32_CLANGPP /
-# BLYT_RV32_LLD BLYT_RV32_OBJCOPY / BLYT_RV32_AR / BLYT_RV32_LLDB_DAP
+# BLYT_RV32_LLD BLYT_RV32_OBJCOPY / BLYT_RV32_AR / BLYT_RV32_LLDB_DAP /
+# BLYT_RV32_NM
 #
 # Resolution order: 1. Known candidate clang/lld pairs, verified with a riscv32
 # probe compile. 2. A previously downloaded toolchain at
@@ -21,6 +22,7 @@ set(BLYT_RV32_LLD "")
 set(BLYT_RV32_OBJCOPY "")
 set(BLYT_RV32_AR "")
 set(BLYT_RV32_LLDB_DAP "")
+set(BLYT_RV32_NM "")
 
 option(BLYT_RV32_FETCH
        "Download an LLVM release at configure time if no riscv32 clang found"
@@ -157,6 +159,13 @@ if(BLYT_RV32_CLANG)
     set(BLYT_RV32_LLDB_DAP "${_TOOL_DIR}/lldb-dap${_VER_SUFFIX}")
   elseif(EXISTS "${_TOOL_DIR}/lldb-dap")
     set(BLYT_RV32_LLDB_DAP "${_TOOL_DIR}/lldb-dap")
+  endif()
+  # llvm-nm: reads back the rv32 object-size probe for the host-Lua heap seam
+  # (cmake/blyt_gen_rv32_sizeof.cmake, #231).
+  if(_VER_SUFFIX AND EXISTS "${_TOOL_DIR}/llvm-nm${_VER_SUFFIX}")
+    set(BLYT_RV32_NM "${_TOOL_DIR}/llvm-nm${_VER_SUFFIX}")
+  elseif(EXISTS "${_TOOL_DIR}/llvm-nm")
+    set(BLYT_RV32_NM "${_TOOL_DIR}/llvm-nm")
   endif()
   message(STATUS "RV32 toolchain: clang = ${BLYT_RV32_CLANG}")
 else()

@@ -31,6 +31,15 @@ const CONDITIONAL_COND = process.env.BLYT_DAP_CONDITIONAL_COND || '';
 const CONDITIONAL_COND_EDIT = process.env.BLYT_DAP_CONDITIONAL_COND_EDIT || '';
 const TEST_RESTART = !!process.env.BLYT_DAP_TEST_RESTART;
 const EXCEPTION_FILTER = process.env.BLYT_DAP_EXCEPTION_FILTER || '';
+/* When >0, assert that the exception stop is INSPECTABLE: stackTrace must
+ * succeed and include a frame at this (1-based) line — the Lua error site. This
+ * guards the #319 regression where the host-Lua exception stop parked after the
+ * erroring frame had unwound (paused_L == NULL), so stackTrace returned "not
+ * paused" and VS Code showed no call stack / locals. */
+const EXCEPTION_EXPECT_LINE = parseInt(
+	process.env.BLYT_DAP_EXCEPTION_EXPECT_LINE || '0',
+	10,
+);
 /* When set, the cart is expected to raise a Lua error during init() with no
  * exception breakpoint configured.  The driver only completes configuration and
  * lets the runtime run to its error; the orchestrator then asserts (on the
@@ -44,6 +53,10 @@ const EVALUATE_EXPECT = process.env.BLYT_DAP_EVALUATE_EXPECT || '';
  * loadedSources paths outward to this dir (issue #51).  SOURCE_PATH is then the
  * local workspace path; without it, SOURCE_PATH is the canonical /blyt/cart one. */
 const CWD = process.env.BLYT_DAP_CWD || '';
+/* Scripted cross-boundary step sequence (issue #273); see step 5b in run(). */
+const SEQUENCE = process.env.BLYT_DAP_SEQUENCE
+	? JSON.parse(process.env.BLYT_DAP_SEQUENCE)
+	: null;
 
 if (!ENDPOINT) {
 	process.stderr.write(
@@ -262,6 +275,35 @@ async function run() {
 			exStopped.body.reason === 'exception',
 			`exception stop: reason is "exception" (got "${exStopped.body.reason}")`,
 		);
+		if (EXCEPTION_EXPECT_LINE) {
+			/* The stop must be inspectable — a call stack pointing at the error
+			 * site — matching the emulated path (#319). request() rejects on a
+			 * success:false response ("not paused"), so catch and leave stk null
+			 * to fail the assertion cleanly rather than throw. */
+			let stk = null;
+			try {
+				stk = await request('stackTrace', { threadId: 1 });
+			} catch (_) {
+				/* server replied "not paused" — the regression; stk stays null */
+			}
+			assert(
+				!!stk &&
+					Array.isArray(stk.stackFrames) &&
+					stk.stackFrames.length >= 1,
+				'exception stop: stackTrace is inspectable (≥1 frame)',
+			);
+			assert(
+				!!stk &&
+					stk.stackFrames.some(
+						(f) => f.line === EXCEPTION_EXPECT_LINE,
+					),
+				`exception stop: a frame is at the error line ${EXCEPTION_EXPECT_LINE} (got ${
+					stk
+						? JSON.stringify(stk.stackFrames.map((f) => f.line))
+						: 'no stack'
+				})`,
+			);
+		}
 		await request('continue', { threadId: 1 });
 		_closeConn();
 		return;
@@ -296,6 +338,82 @@ async function run() {
 		stopped.body.reason === 'breakpoint' || stopped.body.reason === 'step',
 		`stopped.reason is breakpoint (got "${stopped.body.reason}")`,
 	);
+
+	/* 5b. Scripted step sequence (issue #273) — a data-driven walk that the Rust
+	 * test supplies via BLYT_DAP_SEQUENCE so the cart and its expected landings
+	 * live together.  Each entry optionally issues a step command ("do":
+	 * stepIn/next/stepOut/continue) and asserts against the resulting stop:
+	 *   reason  — the stopped-event reason
+	 *   stack   — exact top-to-bottom array of frame LINE numbers (pins the
+	 *             cross-boundary stackTrace splice: e.g. [3, 9] == callback frame
+	 *             on_native@3 spliced onto its native caller init@9)
+	 *   frames  — expected number of stack frames (redundant guard on `stack`)
+	 *   eval    — [{frame, expr, result}] evaluate in a spliced frame (pins
+	 *             parent-frame inspection across the boundary)
+	 * The first entry (no "do") asserts against the initial breakpoint stop. */
+	if (SEQUENCE) {
+		let stop = stopped;
+		for (const s of SEQUENCE) {
+			if (s.do === 'continue') {
+				await request('continue', { threadId: 1 });
+				break;
+			}
+			if (s.do) {
+				const nextStopP = nextEvent('stopped');
+				await request(s.do, { threadId: 1 });
+				stop = await nextStopP;
+			}
+			const label = s.do ? `after ${s.do}` : 'initial stop';
+			if (s.reason)
+				assert(
+					stop.body.reason === s.reason,
+					`${label}: reason "${s.reason}" (got "${stop.body.reason}")`,
+				);
+			if (s.stack || s.frames != null || s.eval) {
+				const stk = await request('stackTrace', { threadId: 1 });
+				/* Assert on Lua-SOURCE frames only.  The two DAP backends differ on
+				 * C-frame display (the emulated dap_server.c lists the native
+				 * run_cb [C] frame; the host-Lua dap_lua_inspect.c skips C frames) —
+				 * an incidental, pre-existing policy difference, not the #273
+				 * contract.  Filtering to .lua frames makes one script assert the
+				 * meaningful splice on both legs. */
+				const luaFrames = (stk.stackFrames || []).filter((f) =>
+					(f.source?.path || '').endsWith('.lua'),
+				);
+				if (s.frames != null)
+					assert(
+						luaFrames.length === s.frames,
+						`${label}: ${s.frames} Lua frame(s) (got ${luaFrames.length})`,
+					);
+				if (s.stack) {
+					const lines = luaFrames.map((f) => f.line);
+					assert(
+						JSON.stringify(lines) === JSON.stringify(s.stack),
+						`${label}: spliced Lua-frame lines ${JSON.stringify(s.stack)} (got ${JSON.stringify(lines)})`,
+					);
+				}
+				for (const e of s.eval || []) {
+					/* Target the frame by its currentline (e.line) rather than an
+					 * index, so the emulated leg's extra C frame doesn't shift it. */
+					const frame = (stk.stackFrames || []).find(
+						(f) => f.line === e.line,
+					);
+					const fid = frame?.id ?? 0;
+					const ev = await request('evaluate', {
+						expression: e.expr,
+						frameId: fid,
+						context: 'watch',
+					});
+					assert(
+						ev.result === e.result,
+						`${label}: evaluate("${e.expr}") at line ${e.line} == "${e.result}" (got "${ev.result}")`,
+					);
+				}
+			}
+		}
+		_closeConn();
+		return;
+	}
 
 	/* 6. threads */
 	const threads = await request('threads');

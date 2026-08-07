@@ -57,6 +57,7 @@ extern int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap);
 #define OP_SETGLOBAL 22
 #define OP_ERROR 23
 #define OP_ERRMSG 24
+#define OP_PCALL 25
 
 #define ST_OK 0
 #define ST_RETRY 1
@@ -272,6 +273,22 @@ void lua_setglobal(lua_State *L, const char *name) {
     bridge_op(OP_SETGLOBAL, L, (uint32_t)(uintptr_t)name, (uint32_t)strlen(name), 0, NULL, NULL);
 }
 
+/* Reverse-trampoline (#262, ADR-0130 amend): call a Lua value the native half
+ * pushed (function + nargs already on the exchange stack).  msgh must be 0 — the
+ * bridge cannot run a message handler; a nonzero msgh is a clean Lua error, kept
+ * identical on the rv32/bare-metal wrapper (lua_runtime_stubs.c) for parity. */
+int lua_pcall(lua_State *L, int nargs, int nresults, int msgh) {
+    if (msgh != 0)
+        return luaL_error(L, "blyt bridge: lua_pcall message handler must be 0");
+    return (int)bridge_op(OP_PCALL, L, (uint32_t)nargs, (uint32_t)nresults, 1, NULL, NULL);
+}
+
+/* Unprotected: on a callee error the host halts without advancing PC and
+ * re-raises into the calling Lua context, so control does not return here. */
+void lua_call(lua_State *L, int nargs, int nresults) {
+    bridge_op(OP_PCALL, L, (uint32_t)nargs, (uint32_t)nresults, 0, NULL, NULL);
+}
+
 const char *lua_typename(lua_State *L, int tp) {
     (void)L;
     switch (tp) {
@@ -409,6 +426,10 @@ void blyt_cart_on_save_state(void) {
 }
 void blyt_cart_on_load_state(blyt_load_info_t info) {
     (void)info;
+}
+void blyt_cart_on_quit(void) {
+}
+void blyt_cart_cleanup(void) {
 }
 void blyt_cart_on_assets_reloaded(const uint32_t *ids, size_t n) {
     (void)ids;

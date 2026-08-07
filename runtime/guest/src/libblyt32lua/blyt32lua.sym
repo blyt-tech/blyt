@@ -37,6 +37,10 @@
     lua_next;
     lua_typename;
     luaL_checklstring;
+    /* #262 reverse-trampoline: native half calls a pushed Lua value back
+     * (ADR-0130 amend; ADR-0118 — no code loading, calls an existing value) */
+    lua_pcall;
+    lua_call;
     /* ADR-0011: proxy metatable construction in devtool-generated glue */
     lua_setmetatable;
     lua_rawgeti;
@@ -49,6 +53,8 @@
     blyt_cart_on_new_state;
     blyt_cart_on_save_state;
     blyt_cart_on_load_state;
+    blyt_cart_on_quit;
+    blyt_cart_cleanup;
     blyt_cart_on_assets_reloaded;
   local: *;
 };

@@ -46,7 +46,10 @@ set(FETCHCONTENT_BASE_DIR
 # (e.g. uninitialised submodule directories in a new worktree) are ignored.
 macro(_blyt_fc_local dep dir sentinel)
   if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/${dir}/${sentinel}")
-    set("FETCHCONTENT_SOURCE_DIR_${dep}"
+    # FetchContent reads FETCHCONTENT_SOURCE_DIR_<UPPERCASE-name>; the lowercase
+    # spelling is a distinct, ignored cache variable (blyt#228).
+    string(TOUPPER "${dep}" _dep_upper)
+    set("FETCHCONTENT_SOURCE_DIR_${_dep_upper}"
         "${CMAKE_SOURCE_DIR}/third_party/${dir}"
         CACHE PATH "" FORCE)
     message(STATUS "FetchContent ${dep}: using local third_party/${dir}/")
@@ -99,13 +102,26 @@ FetchContent_Declare(
 # the fork tags and tarballs exist, clone the fork into third_party/<dep> — the
 # auto-detection macro above will pick it up at configure time.
 
-# lua: blyt-tech fork adds BLYT_LUA_I32_F64 (int32 + float64) for RV32D.
-set(LUA_VERSION "v5.5.0-blyt-v0-p1")
+# lua: blyt-tech fork adds BLYT_LUA_I32_F64 (int32 + float64) for RV32D. p2 adds
+# the ADR-0135 host-Lua FP determinism seam (lmathlib.c/llimits.h route Zone-2
+# transcendentals + pow through blyt_fpm when BLYT_HOSTLUA_FP_SEAM is defined).
+# p3 adds the Phase-B number-format companion (luaconf.h routes lua_str2number /
+# l_sprintf through blyt_fpm_strtod / blyt_fpm_snprintf under the same guard).
+# p4 adds the rv32 heap-accounting seam (BLYT_HOSTLUA_HEAP_SEAM / _ACCT) that
+# makes guest_heap_used byte-identical on the 64-bit host: rv32 object sizing +
+# LUAL_BUFFERSIZE pin + stack/CallInfo exclusion (#231), kind-aware long-string
+# sizing (#267 — Lua 5.5 has three long-string layouts and the seam first
+# modelled all three as LSTRREG, over-counting every luaL_Buffer-boxed external
+# string by the falloc/ud pointer pair), and the GC's pacing constants
+# (LUAI_GCSTEPSIZE, incstep's work-per-step divisor) pinned to rv32 instead of
+# the host's sizeof(Table) / sizeof(void*) (#267 — pacing is observable through
+# cart_allocations, because sweep order drives which arena blocks get recycled).
+set(LUA_VERSION "v5.5.0-blyt-v0-p4")
 FetchContent_Declare(
   lua
   URL "https://github.com/blyt-tech/lua/archive/refs/tags/${LUA_VERSION}.tar.gz"
   URL_HASH
-    SHA256=c2d9a3864e7468b4b3dc8f0548ebe82aa5dd64515f9b715342637b0f796e2feb)
+    SHA256=aa76bf19a2bf5cf7adce4337ef3ddba924e35dfbcb9006926872388ea396caaf)
 
 # rv32emu: custom tarball with softfloat submodule embedded. Tag convention:
 # g<upstream-sha>-blyt-v0-p<N> (upstream has no version tags)
@@ -403,29 +419,62 @@ target_link_libraries(libblytemu PRIVATE libsoftfloat)
 # -------------------------------------------------------------------------
 include(cmake/blyt_rv32_toolchain.cmake)
 include(cmake/blyt_guest_libs.cmake)
+# The shipped native host-Lua VM recipe (issue #238, epic #230). Defines
+# BLYT_HOSTLUA_VM_AVAILABLE + blyt_add_hostlua_vm(); the determinism gate
+# (frontends/native-hostlua) reuses the same helper.
+include(cmake/blyt_hostlua_vm.cmake)
 
 # -------------------------------------------------------------------------
 # Host runtime libraries (stubs for future expansion; only libblyt is real)
 # -------------------------------------------------------------------------
 
-# Host-native Lua static library for cart inspection
-# (blyt_cart_lua_lifecycle_mask). Uses onelua.c which bundles all Lua sources;
-# MAKE_LIB=1 suppresses main().
-set(_LUA_HOST_DIR "${lua_SOURCE_DIR}")
-if(EXISTS "${_LUA_HOST_DIR}/onelua.c")
-  add_library(liblua_host STATIC "${_LUA_HOST_DIR}/onelua.c")
-  # MAKE_LIB=1 suppresses main(). BLYT_LUA_I32_F64=1 matches the ilp32f guest
-  # bytecode integer/float sizes so the host VM can load cart bytecode compiled
-  # for RISC-V. BLYT_LUA_I32_F64=1 is PUBLIC so it propagates to callers
-  # (cart_load.c) that include lua.h — keeping function pointer types consistent
-  # with the library.
+# Host-native Lua static library. Serves BOTH cart inspection
+# (blyt_cart_lua_lifecycle_mask) and — on supported hosts — cart *execution*
+# (the native host-Lua fast path, #238). The linker permits only one
+# onelua.c-derived Lua VM per binary, so inspection and execution share one VM:
+# the seam-compiled deterministic VM where it can be built (x86-64 / arm64),
+# else a plain host-libm VM for inspection only (execution falls back to
+# emulated RV32 Lua).
+#
+# _HOST_LUA_VM_TARGET names the VM libblyt links; _HOST_LUA_EXEC is TRUE when it
+# is the deterministic seam VM (the host-Lua execution path is buildable).
+set(_HOST_LUA_VM_TARGET "")
+set(_HOST_LUA_EXEC FALSE)
+if(BLYT_HOSTLUA_VM_AVAILABLE)
+  # Seam-wired deterministic VM (pinned hash seed, -ffp-contract=off, in-house
+  # musl kernels via blyt_fpm) — the shipped host-Lua fast-path VM (#238).
+  blyt_add_hostlua_vm(blyt_hostlua_vm -ffp-contract=off)
+  # Engage the rv32 heap-accounting seam (#231) on the shipped libblyt VM only —
+  # NOT the determinism-gate VM (frontends/native-hostlua), which has no runner
+  # to drive the shadow arena and must stay a plain link.  The generated rv32
+  # sizeof header + its include dir + build dependency are wired in by
+  # blyt_add_hostlua_vm.
+  if(TARGET blyt_lua_rv32_sizeof_header)
+    # BLYT_HOSTLUA_HEAP_SEAM implies the stack-exclusion accounting layer
+    # (BLYT_HOSTLUA_HEAP_ACCT, #231) via lmem.h; wasm defines ACCT directly.
+    target_compile_definitions(blyt_hostlua_vm PRIVATE BLYT_HOSTLUA_HEAP_SEAM=1)
+  else()
+    message(
+      WARNING
+        "blyt#231: rv32 sizeof header unavailable — host-Lua heap seam OFF (guest_heap_used will over-report on the 64-bit native leg)"
+    )
+  endif()
+  set(_HOST_LUA_VM_TARGET blyt_hostlua_vm)
+  set(_HOST_LUA_EXEC TRUE)
+elseif(EXISTS "${lua_SOURCE_DIR}/onelua.c")
+  # Fallback: plain host-libm VM, inspection only (no determinism guarantees, so
+  # not usable for execution). BLYT_LUA_I32_F64=1 matches the ilp32d guest
+  # bytecode sizes so the host VM can load cart bytecode; PUBLIC so it
+  # propagates to callers (cart_load.c) that include lua.h.
+  add_library(liblua_host STATIC "${lua_SOURCE_DIR}/onelua.c")
   target_compile_definitions(
     liblua_host
     PRIVATE MAKE_LIB=1
     PUBLIC BLYT_LUA_I32_F64=1)
-  target_include_directories(liblua_host PUBLIC "${_LUA_HOST_DIR}")
+  target_include_directories(liblua_host PUBLIC "${lua_SOURCE_DIR}")
   target_link_libraries(liblua_host PUBLIC m)
   set_target_properties(liblua_host PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  set(_HOST_LUA_VM_TARGET liblua_host)
 endif()
 
 add_library(libblytcommon INTERFACE)
@@ -437,6 +486,7 @@ add_library(
   libblyt STATIC
   runtime/host/src/libblyt/cart_load.c
   runtime/host/src/libblyt/cart_run.c
+  runtime/host/src/libblyt/cart_run_hostlua.c
   runtime/host/src/libblyt/resource.c
   runtime/host/src/libblyt/state_buffer.c
   runtime/host/src/libblyt/save.c
@@ -451,7 +501,9 @@ add_library(
   runtime/shared/blyt_blys.c
   runtime/shared/blyt_raster.c
   runtime/shared/blyt_frame_hash.c
-  runtime/shared/blyt_palettes.c)
+  runtime/shared/blyt_palettes.c
+  # cart-heap arena for the native host-Lua VM's allocator (#158, #231)
+  runtime/shared/blyt_arena.c)
 set_target_properties(libblyt PROPERTIES OUTPUT_NAME blyt)
 # blyt_libretro.so (a shared MODULE) links libblyt.a; compile with -fPIC so the
 # same static library is usable in both executables and shared objects.
@@ -476,9 +528,14 @@ target_link_libraries(
   libblyt
   PUBLIC flatccrt
   PRIVATE libblytemu zstd_decode)
-if(TARGET liblua_host)
-  target_link_libraries(libblyt PRIVATE liblua_host)
+if(_HOST_LUA_VM_TARGET)
+  target_link_libraries(libblyt PRIVATE ${_HOST_LUA_VM_TARGET})
   target_compile_definitions(libblyt PRIVATE BLYT_HAVE_HOST_LUA=1)
+  if(_HOST_LUA_EXEC)
+    # The deterministic seam VM is present: the native host-Lua execution path
+    # (cart_run_hostlua.c) is buildable (#238).
+    target_compile_definitions(libblyt PRIVATE BLYT_HOSTLUA_EXEC=1)
+  endif()
 endif()
 add_dependencies(libblyt flatbuffers_generated)
 
@@ -554,6 +611,7 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     libblyt_debug STATIC
     runtime/host/src/libblyt/cart_load.c
     runtime/host/src/libblyt/cart_run.c
+    runtime/host/src/libblyt/cart_run_hostlua.c
     runtime/host/src/libblyt/resource.c
     runtime/host/src/libblyt/state_buffer.c
     runtime/host/src/libblyt/save.c
@@ -566,7 +624,9 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     runtime/shared/blyt_blys.c
     runtime/shared/blyt_raster.c
     runtime/shared/blyt_frame_hash.c
-    runtime/shared/blyt_palettes.c)
+    runtime/shared/blyt_palettes.c
+    # cart-heap arena for the native host-Lua VM's allocator (#158, #231)
+    runtime/shared/blyt_arena.c)
   set_target_properties(libblyt_debug PROPERTIES OUTPUT_NAME blyt_debug
                                                  POSITION_INDEPENDENT_CODE ON)
   target_include_directories(
@@ -579,15 +639,31 @@ if((BLYT_DAP AND TARGET dap) OR (BLYT_GDB AND TARGET gdb_stub))
     libblyt_debug
     PUBLIC flatccrt
     PRIVATE libblytemu zstd_decode)
-  if(TARGET liblua_host)
-    target_link_libraries(libblyt_debug PRIVATE liblua_host)
+  if(_HOST_LUA_VM_TARGET)
+    target_link_libraries(libblyt_debug PRIVATE ${_HOST_LUA_VM_TARGET})
     target_compile_definitions(libblyt_debug PRIVATE BLYT_HAVE_HOST_LUA=1)
+    if(_HOST_LUA_EXEC)
+      target_compile_definitions(libblyt_debug PRIVATE BLYT_HOSTLUA_EXEC=1)
+    endif()
   endif()
   add_dependencies(libblyt_debug flatbuffers_generated)
   if(BLYT_DAP AND TARGET dap)
     target_compile_definitions(libblyt_debug PRIVATE BLYT_DAP=1)
     target_include_directories(libblyt_debug PRIVATE "${BLYT_DAP_DIR}")
     target_link_libraries(libblyt_debug PRIVATE dap)
+    # Native host-Lua DAP (#234): the master hook + shared inspection core +
+    # native TCP transport run host-side against the fork Lua VM
+    # (blyt_hostlua_vm supplies the lua/lstate headers via its PUBLIC includes).
+    # Distinct from the dap_server.c ECALL path already in libdap.a.  Needs
+    # pthreads for the reader thread / blocking pause.
+    if(_HOST_LUA_EXEC AND TARGET Threads::Threads)
+      target_sources(
+        libblyt_debug
+        PRIVATE "${BLYT_DAP_DIR}/master_hook.c"
+                "${BLYT_DAP_DIR}/dap_lua_inspect.c"
+                "${BLYT_DAP_DIR}/dap_transport_tcp_lua.c")
+      target_link_libraries(libblyt_debug PRIVATE Threads::Threads)
+    endif()
   endif()
   if(BLYT_GDB AND TARGET gdb_stub)
     target_compile_definitions(libblyt_debug PRIVATE BLYT_GDB=1)
@@ -717,6 +793,12 @@ if(LIBBLYTC_OUT)
   if(LIBBLYT32LUA_OUT)
     list(APPEND _bin2c_args blyt32lua_so "${LIBBLYT32LUA_OUT}")
     list(APPEND _bin2c_deps "${LIBBLYT32LUA_OUT}")
+    # ADR-0130 bridge stub — the core's host-Lua path (#238/#232) links it into
+    # the emulated native half of a hybrid cart, remapping libblyt32lua.so.
+    if(LIBBLYT32LUA_BRIDGE_OUT)
+      list(APPEND _bin2c_args blyt32lua_bridge_so "${LIBBLYT32LUA_BRIDGE_OUT}")
+      list(APPEND _bin2c_deps "${LIBBLYT32LUA_BRIDGE_OUT}")
+    endif()
   endif()
   add_custom_command(
     OUTPUT "${EMBEDDED_LIBS_C}"
@@ -747,6 +829,13 @@ else()
   add_library(blyt_libretro INTERFACE)
   message(STATUS "blyt_libretro: skipping (need clang riscv32 + lld + musl)")
 endif()
+
+# -------------------------------------------------------------------------
+# Native host-Lua determinism leg (Spike Z, issue #225) — the FMA-silicon +
+# cross-arch FP parity probe for the host-Lua-everywhere direction. Guards on
+# host arch internally (x86-64 / arm64 only). Not a shipped player.
+# -------------------------------------------------------------------------
+add_subdirectory(frontends/native-hostlua)
 
 # -------------------------------------------------------------------------
 # blyt_native — LP64 RISC-V launcher for trusted native cart execution

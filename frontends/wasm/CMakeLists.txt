@@ -118,11 +118,87 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
+# ADR-0135 (blyt#223): host-Lua floating-point determinism seam.
+#
+# The host-Lua fast path must reproduce the emulated softfloat reference
+# bit-for-bit (ADR-0007). Its Zone-2 transcendentals (math.*, and `^` via
+# luai_numpow) previously resolved to Emscripten's bundled libm — a
+# coincidental, unpinned agreement (blyt#223). With BLYT_HOSTLUA_FP_SEAM
+# defined, the fork's lmathlib.c/llimits.h route those ops through blyt_fpm_* to
+# the SAME blyt-tech musl generic-C src/math kernels the emulated legs use,
+# compiled here into the host-Lua VM (in-house libm). On WASM the kernels run on
+# native f64, which equals the softfloat reference on WASM MVP (no scalar FMA) —
+# the parity gate proves it. Zone-1 basic ops stay native. (strtod/number-format
+# is Phase B.)
+#
+# Built as a separate static library so musl's own internal headers apply ONLY
+# to these TUs — they never leak into the rest of the module, which uses
+# Emscripten's sysroot. The library's strong `sin`/`cos`/… definitions override
+# the lazily linked host libm archive, so the host-Lua VM reaches only the
+# pinned kernels.
+set(BLYT_HOSTLUA_FP_SEAM OFF)
+if(BLYT_LUA_SOURCES AND EXISTS "${BLYT_MUSL_SOURCE_DIR}/src/math/sin.c")
+  file(GLOB _BLYT_MUSL_MATH_SRCS "${BLYT_MUSL_SOURCE_DIR}/src/math/*.c")
+  # Phase B (ADR-0135, #225): the renamed blyt-tech musl string↔number
+  # conversion subset — strtod + floatscan + the vfprintf float-format path —
+  # compiled under a blyt_fpm_ namespace (blyt_fpm_musl_renames.h,
+  # force-included) so it does not override Emscripten's module libc.
+  # blyt_fpm_conv.c re-provides the byte-neutral plumbing leaves. Pins
+  # tostring/tonumber/string.format to the same conversion implementation the
+  # emulated softfloat reference uses (the fork's luaconf.h routes
+  # lua_str2number / l_sprintf here under the seam macro).
+  set(_BLYT_MUSL_CONV_SRCS
+      "${BLYT_MUSL_SOURCE_DIR}/src/stdlib/strtod.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/internal/floatscan.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/internal/shgetc.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/stdio/vfprintf.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/stdio/vsnprintf.c"
+      "${BLYT_MUSL_SOURCE_DIR}/src/stdio/snprintf.c"
+      "${BLYT_ROOT}/runtime/shared/blyt_fpm_conv.c")
+  add_library(
+    blyt_hostlua_fpm STATIC "${BLYT_ROOT}/runtime/shared/blyt_fpm_soft.c"
+                            ${_BLYT_MUSL_MATH_SRCS} ${_BLYT_MUSL_CONV_SRCS})
+  # musl compiles against its own internal headers. riscv32 == wasm32 for the
+  # ILP32 integer sizes and 128-bit long double, so the reference's bits/ config
+  # matches — maximising parity with the emulated legs.
+  target_include_directories(
+    blyt_hostlua_fpm
+    # blyt_fpm_musl_shim (empty syscall_arch.h + bits/syscall.h) shadows musl's
+    # arch/riscv32 syscall stubs — whose RISC-V register asm wasm-ld cannot
+    # parse even though the seam never issues a syscall — so it must come first.
+    PRIVATE "${BLYT_ROOT}/runtime/shared/blyt_fpm_musl_shim"
+            "${BLYT_ROOT}/runtime/shared" # blyt_fpm.h
+            "${BLYT_MUSL_SOURCE_DIR}/src/include"
+            "${BLYT_MUSL_SOURCE_DIR}/include"
+            "${BLYT_MUSL_SOURCE_DIR}/arch/riscv32"
+            "${BLYT_MUSL_SOURCE_DIR}/arch/generic"
+            "${BLYT_MUSL_SOURCE_DIR}/src/internal")
+  # The vendored conversion TUs (+ plumbing support file) get the rename header
+  # force-included so their public + musl-internal symbols land in the blyt_fpm_
+  # namespace. The math kernels keep their real names (the seam overrides host
+  # libm), so it is NOT applied to them.
+  set_source_files_properties(
+    ${_BLYT_MUSL_CONV_SRCS}
+    PROPERTIES COMPILE_OPTIONS
+               "-include;${BLYT_ROOT}/runtime/shared/blyt_fpm_musl_renames.h")
+  # Determinism (ADR-0007): contraction off, no fast-math, no constant-folding
+  # to the host libm; -w silences musl's intentional idioms (mirrors
+  # LIBBLYTC_CFLAGS).
+  target_compile_options(
+    blyt_hostlua_fpm PRIVATE -ffp-contract=off -fno-fast-math -fno-builtin -w)
+  set(BLYT_HOSTLUA_FP_SEAM ON)
+  message(
+    STATUS "blyt WASM: host-Lua FP seam enabled (in-house musl math + conv)")
+endif()
+
+# -------------------------------------------------------------------------
 # DAP debugging support (Lua source-level via Debug Adapter Protocol)
 #
-# When ON: compile dap_transport_wasm.c + master_hook.c into blytplay and define
-# BLYT_DAP=1.  Pausing the Lua VM uses Lua coroutine yield (not ASYNCIFY), so no
-# special link options are needed.
+# When ON: compile dap_transport_wasm.c + dap_lua_inspect.c + master_hook.c into
+# blytplay and define BLYT_DAP=1.  Pausing the Lua VM uses Lua coroutine yield
+# (not ASYNCIFY), so no special link options are needed.  dap_lua_inspect.c is
+# the transport-neutral protocol/inspection core shared with the native TCP
+# transport (issue #234).
 # -------------------------------------------------------------------------
 set(BLYT_DAP_DIR "${BLYT_ROOT}/runtime/host/src/dap")
 option(BLYT_DAP "Enable DAP Lua debugger support" ON)
@@ -132,7 +208,7 @@ set(BLYT_DAP_DEFS "")
 set(BLYT_DAP_LINK_OPTS "")
 if(BLYT_DAP AND EXISTS "${LUA_DIR}/lvm.c")
   list(APPEND BLYT_DAP_SOURCES "${BLYT_DAP_DIR}/dap_transport_wasm.c"
-       "${BLYT_DAP_DIR}/master_hook.c")
+       "${BLYT_DAP_DIR}/dap_lua_inspect.c" "${BLYT_DAP_DIR}/master_hook.c")
   list(APPEND BLYT_DAP_DEFS BLYT_DAP=1)
   # wdap_dequeue_json (EM_JS) calls _malloc/_free from JavaScript.
   list(APPEND BLYT_DAP_LINK_OPTS "-sEXPORTED_FUNCTIONS=_main,_malloc,_free")
@@ -386,13 +462,36 @@ set(BLYT_WASM_OUT_DIR
     CACHE PATH "Output directory for the WASM player artifacts")
 set_target_properties(
   blytplay
-  PROPERTIES OUTPUT_NAME "${BLYT_WASM_NAME}"
-             SUFFIX ".html"
-             RUNTIME_OUTPUT_DIRECTORY "${BLYT_WASM_OUT_DIR}")
+  PROPERTIES
+    OUTPUT_NAME "${BLYT_WASM_NAME}"
+    SUFFIX ".html"
+    RUNTIME_OUTPUT_DIRECTORY "${BLYT_WASM_OUT_DIR}"
+    # The HTML shell + pre-js are consumed at LINK time via --shell-file
+    # / --pre-js; declare them so an edit relinks (ninja does not infer
+    # link-flag file inputs).
+    LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/shell.html;${CMAKE_CURRENT_SOURCE_DIR}/module_pre.js"
+)
 
 set(_BLYT_LUA_DEFS "")
 if(BLYT_LUA_SOURCES)
   list(APPEND _BLYT_LUA_DEFS BLYT_LUA=1 BLYT_LUA_I32_F64=1 LUA_USE_LONGJMP=1)
+  # blyt#231: exclude a Lua thread's data stack / CallInfo (VM execution
+  # scratch) from guest_heap_used so the count matches the native host-Lua leg,
+  # which drives lifecycle fns from C rather than through the co_body coroutine.
+  # Enables the stack-exclusion layer in the fork's lmem.h + wasm_main.c's
+  # lua_Alloc.
+  list(APPEND _BLYT_LUA_DEFS BLYT_HOSTLUA_HEAP_ACCT=1)
+  # ADR-0135 (blyt#223): gate the fork's lmathlib.c/llimits.h Zone-2 routing.
+  if(BLYT_HOSTLUA_FP_SEAM)
+    list(APPEND _BLYT_LUA_DEFS BLYT_HOSTLUA_FP_SEAM=1)
+    # Contraction off on the host-Lua VM sources (AC: previously unset on WASM
+    # Lua) so Zone-1 basic ops stay bit-identical to the softfloat reference on
+    # any host with hardware FMA. WASM MVP has no scalar FMA, but pin it anyway.
+    set_source_files_properties(
+      ${BLYT_LUA_SOURCES} PROPERTIES COMPILE_OPTIONS
+                                     "-ffp-contract=off;-fno-fast-math")
+  endif()
   # Fixed Lua hash seed (ADR-0130/ADR-0066): identical string hashing — and
   # therefore pairs()/lua_next order, table.sort pivots, math.random streams —
   # across the rv32 and WASM execution paths.  0x424C5954 = "BLYT". NOTE: must
@@ -468,6 +567,13 @@ target_include_directories(
           ${_BLYT_LUA_INCLUDES}
           ${_BLYT_DAP_INCLUDES}
           ${_BLYT_GDB_INCLUDES})
+
+# ADR-0135 (blyt#223): link the in-house musl math seam. Placed before
+# Emscripten's system libm (appended last) so its strong sin/cos/pow/… override
+# the host libm for the host-Lua VM.
+if(BLYT_HOSTLUA_FP_SEAM)
+  target_link_libraries(blytplay PRIVATE blyt_hostlua_fpm)
+endif()
 
 # Emscripten link options
 target_link_options(

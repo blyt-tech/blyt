@@ -744,6 +744,7 @@ else()
       ${SF_MWORD}
       "${LUA32_DIR}/softfloat_builtins.c"
       "${LUA32_DIR}/lua_runtime_stubs.c"
+      "${LUA32_DIR}/lua_reverse_tramp.c"
       "${LUA32_DIR}/blyt32lua.c"
       ${_VLUA_DAP_SRCS}
       CFLAGS
@@ -801,6 +802,9 @@ else()
       "${_VDIR}/libblyt32.so")
     list(APPEND _guest_lib_outputs "${_VDIR}/libblyt32lua-bridge.so")
   endforeach()
+  # Release bridge stub — embedded into the libretro core so its host-Lua path
+  # can run hybrid carts (the native half links the bridge, #232 S5).
+  set(LIBBLYT32LUA_BRIDGE_OUT "${SDK_LIB}/libblyt32lua-bridge.so")
 
   # blyt-luac — host-native Lua bytecode compiler (BLYT_LUA_I32_F64=1 to match
   # the guest VMs' 4-byte lua_Integer / lua_Number).
@@ -1159,6 +1163,7 @@ if(BLYT_BUILD_NATIVE)
       "${_LIBBLYTC_NATIVE_OBJ}"
       "${LUA32_DIR}/lua_native_malloc.c"
       "${LUA32_DIR}/lua_native_stubs.c"
+      "${LUA32_DIR}/lua_reverse_tramp.c"
       "${LUA32_DIR}/blyt32lua.c"
       CFLAGS
       ${LUA_MUSL_INCLUDES}
